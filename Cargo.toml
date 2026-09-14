@@ -3,28 +3,30 @@
 # build, and a virtual root has no `[package]` to read.
 [workspace]
 members = [
-    "components/github-issue",
-    "components/pty-stats",
-    "crates/agent-spec",
-    "crates/demo-resolver-wasm",
-    "crates/st-runtime",
-    "crates/st2-resource-protocol",
-    "crates/st2-resource-providers",
-    "crates/st2-resource-wasip2",
-    "crates/st2-wire",
-    "crates/st3",
-    "crates/st3-schema",
-    "crates/st3-migrate",
+  "components/github-issue",
+  "components/github-pr",
+  "components/pty-stats",
+  "components/vista",
+  "crates/agent-spec",
+  "crates/demo-resolver-wasm",
+  "crates/st-runtime",
+  "crates/st2-resource-protocol",
+  "crates/st2-resource-providers",
+  "crates/st2-resource-wasip2",
+  "crates/st2-wire",
+  "crates/st3",
+  "crates/st3-migrate",
+  "crates/st3-schema",
 ]
 default-members = [
-    ".",
-    "crates/agent-spec",
-    "crates/st-runtime",
-    "crates/st2-resource-protocol",
-    "crates/st2-wire",
-    "crates/st3",
-    "crates/st3-schema",
-    "crates/st3-migrate",
+  ".",
+  "crates/agent-spec",
+  "crates/st-runtime",
+  "crates/st2-resource-protocol",
+  "crates/st2-wire",
+  "crates/st3",
+  "crates/st3-migrate",
+  "crates/st3-schema",
 ]
 
 [package]
@@ -59,7 +61,6 @@ st2-resource-protocol = { path = "crates/st2-resource-protocol" }
 st2-resource-providers = { path = "crates/st2-resource-providers", optional = true }
 st2-resource-wasip2 = { path = "crates/st2-resource-wasip2", optional = true, features = ["runtime"] }
 st2-wire = { path = "crates/st2-wire" }
-st-runtime = { path = "crates/st-runtime" }
 tempfile = "3"
 toml = "0.9"
 opentelemetry = "0.30"

@@ -32,10 +32,10 @@ pub mod declared;
 pub mod discovery;
 mod kdl_format;
 pub mod kdl_version;
+pub mod spec;
 pub mod profile;
 #[cfg(feature = "wasm-resolver")]
 pub mod profile_wasm;
-pub mod spec;
 
 pub use declared::{
     DeclaredAgent, DeclaredDiagnostic, DeclaredDiagnosticCode, DeclaredDocument, DeclaredEntry,
@@ -46,15 +46,17 @@ pub use discovery::{
     Declared, Discovered, SpecError, discover, discover_file, discover_strict, is_catalog_path,
     parse_declared, path_defaults,
 };
+pub use spec::{
+    AGENT_ADDRESS_MAX_BYTES, AGENT_ADDRESS_SEGMENT_MAX_BYTES, AGENT_ID_MAX_BYTES,
+    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
+    Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
+    SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
+    stream_name_of_task, validate_agent_address, validate_agent_id,
+    validate_desired_state_reason,
+};
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,
     ProfileCapability, ProfileClass, ProfileDescriptor, ProfileRuntime, ProfileSnapshot,
     ProfileSource, ProfileTopic, Resolution, ResourceProfile, ResourceProfileRefresh,
     ResourceProfileRegistry, RuntimeTopology, SelectorSchema, SelectorValidationError,
-};
-pub use spec::{
-    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
-    Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
-    SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
-    stream_name_of_task, validate_desired_state_reason,
 };

@@ -43,6 +43,15 @@ transport runs. Open questions are tracked in
 [open-questions.md](./open-questions.md); the direction this design deliberately
 does not take yet is in [roadmap.md](./roadmap.md).
 
+The `agent` field's immutable-ID meaning is the accepted target, and it ships
+as a new record version, `st2.harness-context.v2`: the version suffix is the
+read contract, so changing an existing field's meaning reserves the next
+version rather than reusing `v1`. Records and producers stay on
+`st2.harness-context.v1`, whose `agent` remains a bus identity, until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+Version 2 is otherwise identical to the shape below, and the reader-first
+rollout accepts both versions before any version-2 writer activates.
+
 ## Scope
 
 This specification defines the harness-context record, its freshness and
@@ -92,9 +101,10 @@ namespace is st2's own and is not registered anywhere; st2 core is its steward.
 The version suffix is the read contract, not the field set: additive fields do
 not bump it, and a reader that finds any other schema string refuses the record
 rather than guessing at fields spelled like this version's. Examples: valid
-`st2.harness-context.v1`; a future breaking shape `st2.harness-context.v2`;
-foreign and therefore refused `com.example.harness-context.v1`; invalid (no
-version) `st2.harness-context`.
+`st2.harness-context.v1`; the reserved immutable-ID shape
+`st2.harness-context.v2`, which tolerant readers accept before any producer
+emits it; foreign and therefore refused `com.example.harness-context.v1`;
+invalid (no version) `st2.harness-context`.
 
 ## Record (HC-R01, HC-R04)
 
@@ -107,7 +117,7 @@ replicated subtree (see
 ```json
 {
   "schema": "st2.harness-context.v1",
-  "agent": "<identity>",
+  "agent": "<identity in v1; agent ID in v2>",
   "harness": "claude | codex | pi | omp | opencode",
   "usedTokens": 92283,
   "windowTokens": 258400,
@@ -218,11 +228,14 @@ What a reader projects, in evaluation order:
 | Evidence | Projects as | Reason |
 | --- | --- | --- |
 | No record file | `null` | never observed |
-| Unreadable, unparseable, or non-v1 `schema` | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
+| Unreadable, unparseable, or a `schema` outside the accepted versions | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
 | Unrecognized `harness` | `null`, warning logged | the arithmetic is unknown, so the numbers have no meaning |
 | `observedAtMs` > now + `HARNESS_CONTEXT_FUTURE_SKEW` | `null` | a clock this wrong makes the derived age meaningless |
 | `observedAtMs` ≤ now − `HARNESS_CONTEXT_STALE` | the reading, `stale: true`, with `ageMs` | HC-R06: returned with its age, never derived away |
 | Otherwise | the reading, `stale: false`, with `ageMs` | — |
+
+The accepted versions are `st2.harness-context.v1` and, once tolerant readers
+ship, `st2.harness-context.v2`; any other schema string is refused.
 
 `ageMs` is derived by the reader from `observedAtMs`; no read path consults file
 mtime. There is no `unknown` vocabulary on this axis and no path from any
@@ -241,12 +254,16 @@ reading arrives
    +-- compaction edge?                                  -> write
    +-- floor(used / (BUCKET_PERCENT% of window)) changed
    |     since the last written reading?                  -> write
+   +-- proven Claude account-window exhaustion changed?   -> write
    +-- record older than HARNESS_CONTEXT_HEARTBEAT?       -> write
    +-- otherwise                                          -> skip
 ```
 
-Fixed quantization at 1% of the window — 100 buckets — plus a compaction edge
-and a 300-second heartbeat. The heartbeat fires only when the producer holds a
+Fixed quantization at 1% of the window — 100 buckets — plus a compaction edge,
+a bounded Claude exhaustion/reset edge, and a 300-second heartbeat. Codex
+account-window occupancy does not classify availability because Codex can
+continue through credits and this record does not carry the credit metadata
+needed to prove otherwise. The heartbeat fires only when the producer holds a
 reading taken since the last write: it re-publishes a *fresh* reading whose
 bucket happens not to have changed, and never re-stamps a stale one. A producer
 with no new reading writes nothing at all, and the record ages visibly through
@@ -359,19 +376,19 @@ Two obligations follow on st2's side:
   and renames only the canonical path in. Measured free: p50 0.217 ms staged
   outside versus 0.222 ms as a sibling.
 
-  **Where, decided during implementation (2026-08-29): the agent directory's
-  parent** — `<catalog>/agents/<host>/` for the layout st2 publishes. The
-  obvious alternative, walking up for the catalog's control directory and
-  staging in `<catalog>/.st2/staging`, reads better and is wrong: the search has
-  no way to tell *this* catalog's control directory from any unrelated one above
-  the agent, and it was caught doing exactly that in a test — an agent directory
-  under `/tmp` on a host carrying a stray `/tmp/.st2` staged into a foreign
-  tree, and potentially a foreign filesystem, which costs the rename its
-  atomicity. The parent needs no discovery, cannot escape, holds nothing the
-  transport replicates (only agent directories, and a dotted temporary name
-  matches no include entry), and is correct for a flat catalog as well as a
-  published one. An agent directory with no parent is an error rather than a
-  quiet write inside the subtree.
+  **Where:** `<catalog>/.st2/harness-context-staging`, derived only from the
+  exact canonical `<catalog>/agents/<host>/<identity>` ancestry. Every ancestry
+  component and the staging directory must be a real directory, and the staging
+  and agent directories must report the same filesystem device; otherwise the
+  writer fails rather than searching upward, following a symlink, or degrading
+  atomic publication to a copy.
+
+  Earlier writers staged at `<catalog>/agents/<host>` and could leave
+  `.harness-context.tmp-<numeric-pid>-<numeric-counter>` behind after a crash.
+  Current-catalog identity walkers overlook only an exact legacy name that is a
+  regular non-symlink file, and leave it untouched for a possibly-live old
+  writer. Directories, symlinks, special files, generic dotfiles, near misses,
+  and prepared-catalog topology remain strict.
 
   `harness-state` keeps staging beside itself for now. The two records share the
   extracted `write_json_atomic` helper, which takes the staging directory as an
@@ -800,7 +817,7 @@ The producer is otherwise the pi one with two divergences, both measured:
 The version pin (HC-R13, HC-T03) extends the existing launch gate rather than
 adding a mechanism beside it, and the two answer deliberately different
 questions. `SUPPORTED_OMP_MINORS` admits a **minor series**, because a patch
-inside an admitted minor costs no new evidence (decision 0007); the fixture pins
+inside an admitted minor costs no new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate); the fixture pins
 the **exact builds** a number's meaning was measured on, because "`tokens` is
 prompt-only input" is a property of a build and not of any documented contract.
 `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`
@@ -1055,10 +1072,11 @@ each only once a real test proves it (per `CLAUDE.md`):
 - **Replicated-path discipline** (new row, once proved) — st2 pins the exact
   driver-record names it expects the transport's include list to carry, and no
   staging file is ever created inside the replicated subtree. Both are silent
-  failures in production, so both need a test that asserts the names and paths
-  themselves: one pinning `harness-state` and `harness-context` as the names
-  st2 publishes for replication, one asserting that a write leaves no
-  non-canonical file behind in the agent directory.
+  failures in production, so tests pin `harness-state` and `harness-context`,
+  assert staging below the catalog control directory with same-filesystem
+  atomic publication and cleanup, and bound legacy-reader compatibility to the
+  exact regular-file shape without changing a digest, snapshot, or message
+  address.
 - **Status-line slot chaining** (HC-R18) — a rendered status-line registration
   invokes the operator's downstream renderer. The slot is single-valued and the
   winner replaces rather than merges, so a test that only checks st2's command

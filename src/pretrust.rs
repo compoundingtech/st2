@@ -10,12 +10,12 @@
 //! A booted Claude process periodically flushes `.claude.json`. One explicit batch prevents sibling
 //! trust writes from losing updates.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+
+use crate::flock::{self, FileLock};
 
 /// The claude config file: `$CLAUDE_CONFIG_DIR/.claude.json` if set, else `$HOME/.claude.json`.
 fn config_path() -> Result<PathBuf> {
@@ -43,13 +43,6 @@ pub fn pretrust(dirs: &[PathBuf]) -> Result<usize> {
 /// calls this after task environment selection and before it starts Claude.
 pub fn pretrust_claude(dirs: &[PathBuf]) -> Result<usize> {
     pretrust_at(&config_path()?, dirs)
-}
-
-/// Pre-trust workspaces for Codex only in the caller's ambient config. This remains available to
-/// explicit tooling, but reconciliation does not call it: a provider command may select an
-/// account-specific `CODEX_HOME` only after st2 launches it.
-pub fn pretrust_codex(dirs: &[PathBuf]) -> Result<usize> {
-    pretrust_codex_at(&codex_config_path()?, dirs)
 }
 
 /// The codex config file: `$CODEX_HOME/config.toml` if set, else `~/.codex/config.toml`.
@@ -94,18 +87,9 @@ pub fn pretrust_codex_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
         n += 1;
     }
     if !appended.is_empty() {
-        if let Some(parent) = config.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let mut out = existing;
         out.push_str(&appended);
-        // Atomic replace so a crashed write never corrupts the codex config.
-        let mut tmp = config.as_os_str().to_owned();
-        tmp.push(format!(".st2trust.{}", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, config)
-            .with_context(|| format!("renaming {} into {}", tmp.display(), config.display()))?;
+        write_atomic_str(config, &out)?;
     }
     Ok(n)
 }
@@ -151,7 +135,11 @@ pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
     Ok(dirs.len())
 }
 
-struct ConfigLock(File);
+/// The writer lock for one foreign harness config. Read only by `Drop`: the guard's job is to
+/// outlive the read-merge-publish cycle, and closing the descriptor is what releases it.
+struct ConfigLock {
+    _held: FileLock,
+}
 
 impl ConfigLock {
     fn acquire(config: &Path) -> Result<Self> {
@@ -162,29 +150,11 @@ impl ConfigLock {
         let mut path = config.as_os_str().to_owned();
         path.push(".st2trust.lock");
         let path = PathBuf::from(path);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
+        let file = flock::open(&path, flock::Open::Create)
             .with_context(|| format!("opening {}", path.display()))?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        anyhow::ensure!(
-            result == 0,
-            "locking {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-        Ok(Self(file))
-    }
-}
-
-impl Drop for ConfigLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let held = FileLock::hold_blocking(file, flock::Mode::Exclusive)
+            .map_err(|error| anyhow::anyhow!("locking {}: {error}", path.display()))?;
+        Ok(Self { _held: held })
     }
 }
 
@@ -199,17 +169,28 @@ fn canonical_key(dir: &Path) -> String {
         .into_owned()
 }
 
-/// Write `value` to `config` atomically (temp in the same dir + rename), so a crashed write never
-/// corrupts the real config. The temp name carries the pid so concurrent pretrusts don't collide.
+/// Write `value` to `config` atomically, so a crashed write never corrupts the real config.
 fn write_atomic(config: &Path, value: &Value) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(value).context("serializing claude config")?;
+    write_atomic_str(config, &rendered)
+}
+
+/// Stage-and-rename `contents` over `config`. The staging name carries the pid so concurrent
+/// pretrusts do not collide.
+///
+/// Deliberately NOT the shared `fsatomic` primitive, and the reason is the same one that keeps
+/// this module out of it: these are files st2 does not own — `~/.claude.json` and
+/// `~/.codex/config.toml` — so the staged file must inherit the umask a harness's own config
+/// carries rather than st2's `0600`, and the staging path must sit beside the config under a name
+/// its owner will recognize.
+fn write_atomic_str(config: &Path, contents: &str) -> Result<()> {
     let mut tmp = config.as_os_str().to_owned();
     tmp.push(format!(".st2trust.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if let Some(parent) = config.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let s = serde_json::to_string_pretty(value).context("serializing claude config")?;
-    std::fs::write(&tmp, s).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, config)
         .with_context(|| format!("renaming {} into {}", tmp.display(), config.display()))?;
     Ok(())
@@ -356,5 +337,53 @@ mod tests {
                 .into_owned();
             assert_eq!(v["projects"][&key]["hasTrustDialogAccepted"], json!(true));
         }
+    }
+
+    /// The transport hardened this lock file with `O_NOFOLLOW`; nothing pinned it before.
+    #[test]
+    fn a_symlinked_trust_lock_is_refused_instead_of_locking_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(".claude.json.st2trust.lock"))
+            .unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let error = pretrust_at(&config, std::slice::from_ref(&workspace)).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "a symlinked trust lock must be refused, got {error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+        assert!(!config.exists(), "a refused lock must publish nothing");
+    }
+
+    #[test]
+    fn the_trust_lock_is_created_private_and_excludes_a_second_holder() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let lock_path = tmp.path().join(".claude.json.st2trust.lock");
+        let held = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // `flock` locks the open file description, so a second open in this process contends.
+        let probe = || {
+            let file = flock::open(&lock_path, flock::Open::Existing).unwrap();
+            FileLock::hold(file, flock::Mode::Exclusive, flock::Wait::Now)
+                .unwrap()
+                .is_some()
+        };
+        assert!(!probe(), "a live trust-lock holder must exclude a second writer");
+        drop(held);
+        assert!(probe(), "dropping the guard must release the trust lock");
     }
 }

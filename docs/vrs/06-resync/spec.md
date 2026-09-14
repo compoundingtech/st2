@@ -5,6 +5,10 @@ inherits [stream](../04-stream/spec.md) (`event`, `event-id`, `key`,
 supersession) and [Agent Spec](../02-agent-spec/spec.md) (`resource binding`,
 `carrier`).
 
+The ID-keyed owner and event-emission terms are the accepted target. The current
+implementation retains bus-identity subscription keys until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Data flow
 
 ```text
@@ -20,7 +24,7 @@ resync watcher thread
    '- equal → nothing; changed → queue per class window
    |
    v  window boundary
-st2::event::emit_builtin_resync(bus_id,
+st2::event::emit_builtin_resync(agent_id,
                  event-id=<sha256(canonical binding/path/old/new/occurrence body)>,
                  key=<binding label>, supersede=true,
                  subject="resource <binding> changed")
@@ -63,8 +67,9 @@ resolution first resolves the binding's own carrier, then validates and walks
 the seat's supervisor chain against the pass's complete discovered spec vector.
 At every non-retired ancestor it resolves active bindings with the same profile
 scheme against that ancestor's own declaration directory. Each inherited
-subscription retains the ancestor's binding label qualified by owner bus ID
-(`goal@hetz.root`), so mutations in two layers cannot share a supersession key.
+subscription retains the ancestor's binding label qualified by immutable agent
+ID (`goal@<agent-id>`), so address changes cannot create a new supersession key
+and mutations in two layers cannot share one.
 A suspended ancestor contributes its layer and traversal continues, but the
 suspended seat itself owns no active subscription. A retired ancestor
 contributes no layer, but traversal continues to its ancestors.
@@ -120,6 +125,16 @@ meaningful.
   acknowledged upsert at the exact live transition before execution advances
   to any later task. Both paths resolve supervisor-chain carriers against the
   complete discovered spec vector, never a one-spec view.
+- Publication runs on a dedicated thread, never the thread that answers a pass's
+  acknowledged upserts, so a pass completes while publications are pending,
+  refused, or blocked on another process's lock. The watcher thread captures a
+  transition, hands it off, and applies the outcome when it returns, remaining
+  the only writer of carrier state; re-observing the carrier after an outcome is
+  what schedules the next attempt. One publication is outstanding per
+  subscription at a time. A queued publication is dropped when its subscription
+  is deactivated or removed by a refresh, while one the emitter already started
+  completes with its outcome discarded, so nothing is published to a seat whose
+  subscription the pass has already removed.
 - After lifecycle execution, each reconcile pass atomically refreshes the watch
   set through separate catalog and subscription inputs. The catalog input is
   every valid discovered declaration, including suspended and retired topology
@@ -132,11 +147,12 @@ meaningful.
   If strict discovery temporarily rejects a declaration whose exact canonical
   seat remains observed alive, its prior declaration subscription survives with
   its carrier state and pending transition; it drops as soon as that seat is
-  not live. Existing valid subscriptions are matched by declaration path and
-  binding label. Each refresh takes bus id, canonical seat id, carrier path,
-  label, and class from the current declaration while retaining carrier state,
-  the per-subscription occurrence sequence, any immutable pending transition,
-  and dirty state; only new subscriptions seed silently with sequence zero.
+  not live. Existing valid subscriptions are matched by immutable agent ID and
+  binding label. Each refresh takes agent ID, current bus address, canonical
+  seat ID, carrier path, label, and class from the current declaration while
+  retaining carrier state, the per-subscription occurrence sequence, any
+  immutable pending transition, and dirty state; only new subscriptions seed
+  silently with sequence zero.
 - A previously blind path is state-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure degrades to timer-based carrier polling over the watch
@@ -198,6 +214,22 @@ remain distinct occurrences, while a retry remains the same reservation. A
 supervisor restart changes the incarnation namespace and silently seeds new
 subscription sequences. The durable dedup horizon remains the stream receipt
 ring.
+
+A failed publication is classified by what could admit it later, because eligibility is resolved
+under the catalog-authoring lock and a refusal therefore follows from the declaration rather than
+from timing. Retrying one is pure cost: every attempt re-resolves the catalog to reach the same
+answer.
+
+- A recipient that is declared but not running parks its reservation. The subscription captures
+  nothing and schedules nothing while parked, and the reservation is retained beyond the
+  subscription itself, which the next refresh drops. It re-arms with its exact reserved bytes when
+  a refresh carries that recipient again, which happens only while it is running. Dropping it at
+  the refusal would instead lose a resync the agent should see on resume.
+- An ambiguous recipient, a recipient owned by another host, and a recipient that does not declare
+  the stream are refused permanently. The reservation is dropped after one diagnostic, and the
+  carrier baseline advances so the same transition is not captured again.
+- Everything else is retryable, including an absent declaration and a catalog mid-edit: a
+  declaration being replaced by rename is briefly absent, so its reservation is kept.
 
 ## What this does not do
 

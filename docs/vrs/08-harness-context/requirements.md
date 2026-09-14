@@ -103,7 +103,13 @@ record.
   other purposes, buys nothing a named include entry does not — bounded by
   st2-side test that pins the names it expects (HC-R05), and by the fact that no
   correctness property here depends on the transport at all: everything works
-  with no replication, and remote visibility is what is lost.
+  with no replication, and remote visibility is what is lost. Both records are
+  published mode `0600` — as is every record st2's shared publication primitive
+  writes, though not the bus message files, which stay at the writing process's
+  umask — so a transport reading the catalog as a different unprivileged uid
+  needs that decision taken deliberately rather than inherited from a default.
+  No such transport runs today, which is also what leaves the wire-cost half of
+  `DQ-C1` unmeasured.
 
 ## Requirements
 

@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use kdl::KdlDocument;
@@ -14,7 +13,6 @@ use sha2::{Digest, Sha256};
 use crate::message;
 
 const REQUEST_VERSION: u32 = 1;
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePrincipal {
@@ -452,22 +450,15 @@ fn publish_once(
     })
 }
 
+/// Reserve the idempotency record, reporting whether this call is the one that created it.
+/// Hardlinked rather than renamed for that boolean: the caller replays an interrupted send when
+/// the name was already taken, and replaces nothing.
 fn atomic_create(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
-    let parent = path.parent().context("state record has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".request-state.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&temporary, bytes)?;
-    let result = match fs::hard_link(&temporary, path) {
-        Ok(()) => Ok(true),
-        Err(_) if path.is_file() => Ok(false),
-        Err(error) => Err(error.into()),
-    };
-    let _ = fs::remove_file(temporary);
-    result
+    Ok(crate::fsatomic::create_once(
+        path,
+        bytes,
+        crate::fsatomic::Staging::new(".request-state"),
+    )?)
 }
 
 fn record_path(directory: &Path, key: &str) -> PathBuf {
@@ -503,4 +494,39 @@ fn parse_request_message(message: &message::Message) -> anyhow::Result<RequestEn
 fn read_inbox_or_archive(agent_dir: &Path, filename: &str) -> anyhow::Result<message::Message> {
     message::read_msg(&message::inbox_dir(agent_dir), filename)
         .or_else(|_| message::read_msg(&message::archive_dir(agent_dir), filename))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`atomic_create`]'s create-once contract. The idempotency record IS the deduplication: a
+    /// second publication of the same key must report `false` rather than replace the record the
+    /// first request registered, because the caller reads that boolean to decide whether it is
+    /// replaying or racing.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — these records used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask).
+    #[test]
+    fn a_create_once_state_record_keeps_the_first_bytes_and_reports_the_duplicate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = record_path(&tmp.path().join("state"), "key");
+        assert!(atomic_create(&path, b"first").unwrap());
+        assert!(!atomic_create(&path, b"second").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the state record is published owner-only"
+        );
+
+        let residue = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".request-state.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
 }

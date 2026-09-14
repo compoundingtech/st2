@@ -8,6 +8,7 @@ pub mod agent_author;
 pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
+pub mod catalog_archive;
 pub mod catalog_graph;
 pub mod catalog_lock;
 pub mod catalog_transaction;
@@ -16,6 +17,7 @@ pub mod claude_mcp;
 pub mod claude_session;
 pub mod codex_app_server;
 pub mod context;
+pub mod delivery_ledger;
 pub mod ding;
 pub mod driver;
 pub mod driver_diagnostic;
@@ -25,19 +27,32 @@ pub mod event;
 pub mod exec_backend;
 pub mod expand;
 pub mod flapping;
+/// Private on purpose: every consumer is a sibling module in this crate, and the one site that
+/// deliberately keeps its own `flock` is documented in the module itself.
+mod flock;
+/// Private on purpose: every consumer is a sibling module in this crate, and the publishers that
+/// deliberately keep their own primitive are documented in the module itself.
+mod fsatomic;
 pub mod harness_context;
 pub mod harness_state;
 pub mod harness_version;
 pub mod hooks;
 pub mod host_lock;
+pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
-pub mod metrics;
+/// The stdio framing shared by the native channels; crate-internal.
+mod native_channel;
 pub mod omp_session;
+pub mod metrics;
+pub mod migrations;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
+/// The launch body shared by the pi-family wrappers; crate-internal, reached through
+/// `pi_session::run` and `omp_session::run`.
+mod pi_family_session;
 pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
@@ -61,9 +76,9 @@ mod watch;
 // reader of the same catalog share one implementation. Re-exported under their original paths:
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
 pub use agent_spec::{discovery, spec};
+pub use agent_spec::kdl_version;
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
-pub use agent_spec::kdl_version;
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
     OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, SessionDriver, Task,

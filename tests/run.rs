@@ -226,6 +226,8 @@ fn selected_one_shot_unknown_refuses_before_runner_list() {
 
 fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
     AgentSpec {
+        id: None,
+        address: None,
         identity: identity.into(),
         name: None,
         description: None,
@@ -1708,6 +1710,92 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
     assert!(
         m.body.contains("hetz.demo-claude"),
         "body names the parked task"
+    );
+}
+
+/// A park whose cause is structural must not advise `st2 unpark`.
+///
+/// `unpark` relaunches the task, and a session socket path over the portable `sun_path` bound
+/// fails the identical bind every time, so acting on that advice restarts the storm rather than
+/// recovering anything. The notice says what has to change instead. The recoverable case keeps
+/// the recovery verb, which is what makes this a distinction rather than a removal.
+///
+/// Both notices land in one inbox, and two sends inside the same millisecond are ordered by their
+/// random filename suffix, so the notice under test is selected by which file is NEW rather than
+/// by position. Reading the last entry made this test a coin flip that failed roughly a third of
+/// the time.
+#[test]
+fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"cos\"\n[pty.agent]\nid=\"hetz.demo\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/cos/agent.toml",
+        "identity=\"cos\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
+    );
+
+    // The recoverable case must be UNABLE to cross the bound under any resolved pty root, not
+    // merely short enough under this one. Asserting it with the shipped predicate keeps the
+    // control from being contaminated by the very condition under test: a root long enough to
+    // blow even this id would otherwise make the control silently structural.
+    let resolved_root = st2::run::effective_pty_root(tmp.path());
+    assert!(
+        st2::run::session_socket_overage(&resolved_root, "hetz.demo").is_none(),
+        "fixture precondition: the recoverable task must be bindable under the resolved pty root \
+         {}, or this test cannot tell the two notices apart",
+        resolved_root.display()
+    );
+
+    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos"));
+    let notify = |pty_id: &str| {
+        let before = message::list_dir(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<Vec<_>>();
+        surface_crash_loop(
+            tmp.path(),
+            "hetz",
+            &CrashLoop {
+                pty_id: pty_id.to_string(),
+                identity: "demo".to_string(),
+                host: Some("hetz".to_string()),
+                supervisor: Some("cos".to_string()),
+            },
+        );
+        let mut fresh = message::list_dir(&inbox)
+            .unwrap()
+            .into_iter()
+            .filter(|message| !before.contains(&message.filename))
+            .collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 1, "one park sends exactly one notice");
+        fresh.pop().expect("the notice was just counted").body
+    };
+
+    // Long enough that no resolved pty root can bring it under the limit.
+    let unbindable = format!("hetz.{}", "a".repeat(200));
+    let structural = notify(&unbindable);
+    assert!(
+        !structural.contains(&format!("st2 unpark {unbindable}")),
+        "a structural park must not offer a recovery verb that reproduces it: {structural}"
+    );
+    assert!(
+        structural.contains("`st2 unpark` cannot recover it"),
+        "the notice must say why the recovery verb is not offered: {structural}"
+    );
+    assert!(
+        structural.contains("exceeding the 104-byte portable limit by"),
+        "the notice must state the overage: {structural}"
+    );
+
+    let recoverable = notify("hetz.demo");
+    assert!(
+        recoverable.contains("st2 unpark hetz.demo"),
+        "an ordinary crash-loop keeps its recovery verb: {recoverable}"
     );
 }
 

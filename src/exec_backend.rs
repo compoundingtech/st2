@@ -58,6 +58,7 @@ pub enum ExecGenerationObservation {
         pid: u32,
         created_at: String,
         generation_id: String,
+        start_time_ticks: u64,
     },
     Exited {
         pid: u32,
@@ -258,6 +259,7 @@ impl ExecBackend {
                 pid,
                 created_at,
                 generation_id,
+                ..
             } => (pid, created_at, generation_id),
             ExecGenerationObservation::Exited { .. } => {
                 self.remove(id)?;
@@ -296,6 +298,7 @@ impl ExecBackend {
                 pid,
                 created_at,
                 generation_id,
+                ..
             } if pid == expected.0 && created_at == expected.1 && generation_id == expected.2 => {}
             ExecGenerationObservation::Exited {
                 pid,
@@ -660,6 +663,7 @@ fn observe_open_strict_generation(
             pid: generation.pid,
             created_at: generation.created_at,
             generation_id: generation.generation_id,
+            start_time_ticks: generation.start_time_ticks,
         },
         GenerationProcessState::Exited => ExecGenerationObservation::Exited {
             pid: generation.pid,
@@ -785,6 +789,7 @@ fn observe_open_legacy_generation(
         pid: pid as u32,
         created_at,
         generation_id,
+        start_time_ticks,
     }
 }
 
@@ -934,8 +939,18 @@ fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks:
 
 #[cfg(target_os = "linux")]
 pub(crate) fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
-    let pid = u32::try_from(pid).context("a process ID cannot be negative")?;
-    st_runtime::process_start_token(pid)
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_comm = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat"))?
+        .1;
+    // Fields after comm begin at field 3 (state); starttime is field 22, therefore index 19.
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("missing starttime in /proc/{pid}/stat"))?
+        .parse()
+        .with_context(|| format!("parsing starttime in /proc/{pid}/stat"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1353,6 +1368,7 @@ mod generation_observation_tests {
                 pid: observed,
                 ref created_at,
                 ref generation_id,
+                ..
             }) if observed == pid
                 && crate::task_inventory::is_rfc3339_utc_millis(created_at)
                 && generation_id.starts_with("sha256:")

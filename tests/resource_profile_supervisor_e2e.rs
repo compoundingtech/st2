@@ -27,20 +27,20 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
     let executable = temporary.path().join("fixture-pty");
     write_executable(
         &executable,
-        "#!/bin/sh\nprintf '%s\\n' '{\"sessions\":1}'\n",
+        "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"subject\",\"status\":\"exited\",\"generation\":1}]'\n",
     );
     let pty = ProviderFixture::new(
         temporary.path().join("pty"),
-        "dev.st2.pty-stats",
+        "pty",
         component("ST2_PTY_STATS_COMPONENT"),
-        r#"{"topics":["stats"]}"#,
+        r#"{"topics":["lifecycle","metadata"]}"#,
         &format!(
-            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            "pty-stats executable={:?} cwd={:?} deadline-ms=10000",
             executable,
             temporary.path()
         ),
-        "st2.resource.pty-stats.v1",
-        "stats",
+        "dev.schickling.pty.snapshot.v1",
+        &["lifecycle", "metadata", "runtime"],
     );
     let first = pty.observe(None);
     assert_eq!(
@@ -49,6 +49,19 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
         "{first:?}"
     );
     let first_bytes = fs::read(pty.snapshot()).unwrap();
+    let first_snapshot: serde_json::Value = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(
+        first_snapshot
+            .get("schema")
+            .and_then(serde_json::Value::as_str),
+        Some("dev.schickling.pty.snapshot.v1")
+    );
+    assert_eq!(
+        first_snapshot
+            .get("uri")
+            .and_then(serde_json::Value::as_str),
+        Some("pty:subject")
+    );
     let replay = pty.observe(first.digest);
     assert_eq!(replay.status, ObserveReceiptStatus::SettledUnchanged);
     assert_eq!(fs::read(pty.snapshot()).unwrap(), first_bytes);
@@ -67,7 +80,7 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
 
     write_executable(
         &executable,
-        "#!/bin/sh\nprintf '%s\\n' '{\"sessions\":2}'\n",
+        "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"subject\",\"status\":\"exited\",\"generation\":2}]'\n",
     );
     let recovered = pty.observe(first.digest);
     assert_eq!(recovered.status, ObserveReceiptStatus::SettledChanged);
@@ -83,23 +96,79 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
 
     let restarted = ProviderFixture::new(
         temporary.path().join("pty"),
-        "dev.st2.pty-stats",
+        "pty",
         component("ST2_PTY_STATS_COMPONENT"),
-        r#"{"topics":["stats"]}"#,
+        r#"{"topics":["lifecycle","metadata"]}"#,
         &format!(
-            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            "pty-stats executable={:?} cwd={:?} deadline-ms=10000",
             executable,
             temporary.path()
         ),
-        "st2.resource.pty-stats.v1",
-        "stats",
+        "dev.schickling.pty.snapshot.v1",
+        &["lifecycle", "metadata", "runtime"],
     );
-    let unchanged_after_restart = restarted.observe(recovered.digest);
+    let observed_after_restart = restarted.observe(recovered.digest);
     assert_eq!(
-        unchanged_after_restart.status,
-        ObserveReceiptStatus::SettledUnchanged
+        observed_after_restart.status,
+        ObserveReceiptStatus::SettledChanged
     );
-    assert_eq!(fs::read(restarted.snapshot()).unwrap(), recovered_bytes);
+    let restarted_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(restarted.snapshot()).unwrap()).unwrap();
+    assert_eq!(
+        restarted_snapshot
+            .get("schema")
+            .and_then(serde_json::Value::as_str),
+        Some("dev.schickling.pty.snapshot.v1")
+    );
+}
+
+#[test]
+fn supervisor_spawns_vista_capability_and_preserves_stable_snapshot() {
+    let _guard = STATE_ENV.lock();
+    let temporary = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
+    let executable = temporary.path().join("vista");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+if [ "$#" -ne 6 ] || [ "$1" != artifact ] || [ "$2" != get ] || [ "$3" != release-notes ] || [ "$4" != v7 ] || [ "$5" != --output ] || [ "$6" != json ]; then
+  exit 64
+fi
+printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"release-notes","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"created","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/release-notes/v7"}'
+"#,
+    );
+    let selector = r#"{"topics":["ready","updated","failed","expired"]}"#;
+    let vista = ProviderFixture::new_with_uri(
+        temporary.path().join("catalog"),
+        "vista",
+        "vista://release-notes/v7",
+        component("ST2_VISTA_COMPONENT"),
+        selector,
+        &format!(
+            "vista executable={:?} cwd={:?} deadline-ms=10000",
+            executable,
+            temporary.path()
+        ),
+        "dev.schickling.vista.snapshot.v1",
+        &["ready", "updated", "failed", "expired"],
+    );
+
+    let first = vista.observe(None);
+    assert_eq!(
+        first.status,
+        ObserveReceiptStatus::SettledChanged,
+        "{first:?}"
+    );
+    let first_bytes = fs::read(vista.snapshot()).unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(
+        snapshot.get("schema").and_then(serde_json::Value::as_str),
+        Some("dev.schickling.vista.snapshot.v1")
+    );
+    assert!(snapshot.get("observedAt").is_some());
+    let replay = vista.observe(first.digest);
+    assert_eq!(replay.status, ObserveReceiptStatus::SettledUnchanged);
+    assert_eq!(fs::read(vista.snapshot()).unwrap(), first_bytes);
 }
 
 #[test]
@@ -111,7 +180,11 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     let primary_control = temporary.path().join("primary-control");
     fs::create_dir_all(&primary_control).unwrap();
     let primary_payload = primary_control.join("payload.json");
-    fs::write(&primary_payload, r#"{"sessions":1}"#).unwrap();
+    fs::write(
+        &primary_payload,
+        r#"[{"name":"subject","status":"exited","generation":1}]"#,
+    )
+    .unwrap();
     let primary_executable = primary_control.join("fixture-pty");
     write_executable(
         &primary_executable,
@@ -119,15 +192,15 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     );
     let primary = ProviderFixture::new(
         temporary.path().join("primary"),
-        "dev.st2.pty-stats",
+        "pty",
         component("ST2_PTY_STATS_COMPONENT"),
-        r#"{"topics":["stats"]}"#,
+        r#"{"topics":["lifecycle"]}"#,
         &format!(
-            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            "pty-stats executable={:?} cwd={:?} deadline-ms=10000",
             primary_executable, primary_control
         ),
-        "st2.resource.pty-stats.v1",
-        "stats",
+        "dev.schickling.pty.snapshot.v1",
+        &["lifecycle", "metadata", "runtime"],
     );
     let first = primary.observe(None);
     assert_eq!(
@@ -141,16 +214,24 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
         (!inbox.is_empty()).then_some(inbox)
     });
     assert_eq!(first_inbox.len(), 1);
-    assert!(first_inbox[0].contains("subject: observed · scope=all [stats]"));
-    assert!(first_inbox[0].contains(r#""facts":[{"key":"scope","after":"all"}]"#));
+    assert!(
+        first_inbox[0].contains("subject: observed · session=subject; state=exited [lifecycle]")
+    );
+    assert!(first_inbox[0].contains(
+        r#""facts":[{"key":"session","after":"subject"},{"key":"state","after":"exited"}]"#
+    ));
 
     let equal = primary.observe(first.digest);
     assert_eq!(equal.status, ObserveReceiptStatus::SettledUnchanged);
     assert_eq!(fs::read(primary.snapshot()).unwrap(), first_snapshot);
     assert_eq!(resync_inbox(&primary.agent), first_inbox);
 
-    fs::write(&primary_payload, r#"{"sessions":2}"#).unwrap();
-    primary.rewrite_selector(r#"{"topics":["ignored"]}"#);
+    fs::write(
+        &primary_payload,
+        r#"[{"name":"subject","status":"exited","generation":2}]"#,
+    )
+    .unwrap();
+    primary.rewrite_selector(r#"{"topics":["metadata"]}"#);
     primary.refresh();
     let filtered = primary.observe(first.digest);
     assert_eq!(filtered.status, ObserveReceiptStatus::SettledChanged);
@@ -158,12 +239,16 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     assert_eq!(
         resync_inbox(&primary.agent),
         first_inbox,
-        "an unselected topic updates the snapshot without invalidation"
+        "a selector-excluded lifecycle transition does not invalidate the binding"
     );
 
-    primary.rewrite_selector(r#"{"topics":["stats"]}"#);
+    primary.rewrite_selector(r#"{"topics":["lifecycle"]}"#);
     primary.refresh();
-    fs::write(&primary_payload, r#"{"sessions":3}"#).unwrap();
+    fs::write(
+        &primary_payload,
+        r#"[{"name":"subject","status":"exited","generation":3}]"#,
+    )
+    .unwrap();
     let catch_up_fifo = primary_control.join("catch-up.fifo");
     let fifo_c = CString::new(catch_up_fifo.as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo_c` is a live NUL-terminated pathname for this call.
@@ -206,7 +291,11 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     let isolated_control = temporary.path().join("isolated-control");
     fs::create_dir_all(&isolated_control).unwrap();
     let isolated_payload = isolated_control.join("payload.json");
-    fs::write(&isolated_payload, r#"{"sessions":10}"#).unwrap();
+    fs::write(
+        &isolated_payload,
+        r#"[{"name":"subject","status":"exited","generation":10}]"#,
+    )
+    .unwrap();
     let isolated_executable = isolated_control.join("fixture-pty");
     write_executable(
         &isolated_executable,
@@ -214,15 +303,15 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     );
     let isolated = ProviderFixture::new(
         temporary.path().join("isolated"),
-        "dev.st2.pty-stats",
+        "pty",
         component("ST2_PTY_STATS_COMPONENT"),
-        r#"{"topics":["stats"]}"#,
+        r#"{"topics":["lifecycle"]}"#,
         &format!(
-            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            "pty-stats executable={:?} cwd={:?} deadline-ms=10000",
             isolated_executable, isolated_control
         ),
-        "st2.resource.pty-stats.v1",
-        "stats",
+        "dev.schickling.pty.snapshot.v1",
+        &["lifecycle", "metadata", "runtime"],
     );
     let isolated_first = isolated.observe(None);
     assert_eq!(isolated_first.status, ObserveReceiptStatus::SettledChanged);
@@ -233,7 +322,11 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
         isolated_before,
         "dropping one catalog scope must not mutate another"
     );
-    fs::write(&isolated_payload, r#"{"sessions":11}"#).unwrap();
+    fs::write(
+        &isolated_payload,
+        r#"[{"name":"subject","status":"exited","generation":11}]"#,
+    )
+    .unwrap();
     let isolated_second = isolated.observe(isolated_first.digest);
     assert_eq!(isolated_second.status, ObserveReceiptStatus::SettledChanged);
     assert_ne!(
@@ -250,7 +343,11 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
     unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
     let control = temporary.path().join("control");
     fs::create_dir_all(&control).unwrap();
-    fs::write(control.join("payload.json"), r#"{"sessions":1}"#).unwrap();
+    fs::write(
+        control.join("payload.json"),
+        r#"[{"name":"subject","status":"exited","generation":1}]"#,
+    )
+    .unwrap();
     let fifo = control.join("release.fifo");
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo_c` is a live NUL-terminated pathname for this call.
@@ -262,15 +359,15 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
     );
     let fixture = ProviderFixture::new(
         temporary.path().join("catalog"),
-        "dev.st2.pty-stats",
+        "pty",
         component("ST2_PTY_STATS_COMPONENT"),
-        r#"{"topics":["stats"]}"#,
+        r#"{"topics":["lifecycle"]}"#,
         &format!(
-            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            "pty-stats executable={:?} cwd={:?} deadline-ms=10000",
             executable, control
         ),
-        "st2.resource.pty-stats.v1",
-        "stats",
+        "dev.schickling.pty.snapshot.v1",
+        &["lifecycle", "metadata", "runtime"],
     );
 
     let leading = fixture.request(1, None);
@@ -356,14 +453,19 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
     fixture.refresh_generation(2);
     wait_receipt_status(&fixture, &future.request_id, ObserveReceiptStatus::Accepted);
     release_fifo(&fifo);
-    assert_eq!(
-        future_client
-            .wait_for_terminal(WAIT)
-            .unwrap()
-            .receipt
-            .unwrap()
-            .status,
-        ObserveReceiptStatus::SettledUnchanged
+    // A generation change discards the provider's semantic cache, so the fenced request may
+    // republish the same source with a new observation timestamp.
+    let future_receipt = future_client
+        .wait_for_terminal(WAIT)
+        .unwrap()
+        .receipt
+        .unwrap();
+    assert!(
+        matches!(
+            future_receipt.status,
+            ObserveReceiptStatus::SettledChanged | ObserveReceiptStatus::SettledUnchanged
+        ),
+        "{future_receipt:?}"
     );
 
     let stale = fixture.request(2, None);
@@ -526,7 +628,7 @@ struct ProviderFixture {
     root: PathBuf,
     agent: PathBuf,
     host: String,
-    scheme: String,
+    uri: String,
     selector: Mutex<String>,
     supervisor: ResourceProfileSupervisor,
 }
@@ -540,7 +642,30 @@ impl ProviderFixture {
         selector: &str,
         capability: &str,
         schema_id: &str,
-        topic: &str,
+        topics: &[&str],
+    ) -> Self {
+        Self::new_with_uri(
+            root,
+            scheme,
+            &format!("{scheme}:subject"),
+            component,
+            selector,
+            capability,
+            schema_id,
+            topics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_uri(
+        root: PathBuf,
+        scheme: &str,
+        uri: &str,
+        component: PathBuf,
+        selector: &str,
+        capability: &str,
+        schema_id: &str,
+        topics: &[&str],
     ) -> Self {
         let host = "e2e".to_owned();
         let agent = root.join("agents/e2e/worker");
@@ -553,7 +678,7 @@ impl ProviderFixture {
         fs::copy(component, installed_component).unwrap();
         fs::write(
             root.join("resolver.wasm"),
-            observable_resolver_wasm(schema_id, topic, selector),
+            observable_resolver_wasm(schema_id, topics, selector),
         )
         .unwrap();
         fs::write(
@@ -563,14 +688,14 @@ impl ProviderFixture {
             ),
         )
         .unwrap();
-        write_agent(&agent, &host, scheme, selector);
+        write_agent(&agent, &host, uri, selector);
         st2::event::publish_owner_binding_for_test(&root, &host).unwrap();
         let supervisor = ResourceProfileSupervisor::new(root.clone(), host.clone()).unwrap();
         let fixture = Self {
             root,
             agent,
             host,
-            scheme: scheme.to_owned(),
+            uri: uri.to_owned(),
             selector: Mutex::new(selector.to_owned()),
             supervisor,
         };
@@ -594,7 +719,7 @@ impl ProviderFixture {
 
     fn rewrite_selector(&self, selector: &str) {
         *self.selector.lock() = selector.to_owned();
-        write_agent(&self.agent, &self.host, &self.scheme, selector);
+        write_agent(&self.agent, &self.host, &self.uri, selector);
     }
 
     fn observe(&self, prior: Option<st2::resource_profile::SnapshotDigest>) -> ObserveReceipt {
@@ -667,24 +792,24 @@ impl ProviderFixture {
     }
 }
 
-fn write_agent(agent: &Path, host: &str, scheme: &str, selector: &str) {
+fn write_agent(agent: &Path, host: &str, uri: &str, selector: &str) {
     fs::write(
         agent.join("agent.kdl"),
         format!(
-            "agent \"worker\" {{\n  host {host:?}\n  command \"true\"\n  resource \"observed\" uri=\"{scheme}://subject\" reason=\"Observed state.\" selector=#\"{selector}\"#\n}}\n"
+            "agent \"worker\" {{\n  host {host:?}\n  command \"true\"\n  resource \"observed\" uri={uri:?} reason=\"Observed state.\" selector=#\"{selector}\"#\n}}\n"
         ),
     )
     .unwrap();
 }
 
-fn observable_resolver_wasm(schema_id: &str, topic: &str, selector: &str) -> Vec<u8> {
+fn observable_resolver_wasm(schema_id: &str, topics: &[&str], selector: &str) -> Vec<u8> {
     let selector_value: serde_json::Value = serde_json::from_str(selector).unwrap();
     let descriptor = serde_json::to_vec(&serde_json::json!({
         "abiVersion": 3,
         "capabilities": ["resolve", "read", "observe"],
         "selectorSchema": { "type": "object", "additionalProperties": true },
         "defaultSelector": selector_value,
-        "topics": [{"name": topic}, {"name": "ignored"}],
+        "topics": topics.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
         "runtime": {"topology": "shared"},
         "snapshot": {"mediaType": "application/json", "schemaId": schema_id}
     }))

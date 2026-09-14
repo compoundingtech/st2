@@ -1,11 +1,13 @@
 //! The catalog's own declaration — `<catalog>/catalog.kdl`.
 //!
-//! Every other file in a catalog describes an agent; this one describes the folder. Two things
-//! are declarable today: the session registry and resource profiles —
+//! Every other file in a catalog describes an agent; this one describes the folder. Three things
+//! are declarable today: the session registry, how long a retired seat is kept in the live
+//! catalog, and resource profiles —
 //!
 //! ```kdl
 //! catalog {
 //!   pty-root "/run/agents/pty"
+//!   archive-after "7d"
 //! }
 //!
 //! // One wasm resolver per URI scheme; `class` (optional, default coalesced) decides how
@@ -23,6 +25,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(feature = "wasm-resolver")]
 use agent_spec::profile::ProfileCapability;
@@ -59,24 +62,25 @@ pub struct DeclaredProfileRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredProviderCapability {
     GitHubIssue {
-        owner: String,
-        repo: String,
-        number: u64,
+        auth_executable: String,
+        connect_timeout_ms: u64,
+        total_timeout_ms: u64,
+    },
+    GitHubPr {
+        auth_executable: String,
         connect_timeout_ms: u64,
         total_timeout_ms: u64,
     },
     PtyStats {
         executable: String,
         cwd: String,
-        scope: DeclaredPtyStatsScope,
         deadline_ms: u64,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeclaredPtyStatsScope {
-    All,
-    Session(String),
+    Vista {
+        executable: String,
+        cwd: String,
+        deadline_ms: u64,
+    },
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -85,8 +89,23 @@ pub struct CatalogConfig {
     /// The `pty` session registry holding this catalog's tasks. Relative values anchor at the
     /// catalog root; `$VAR`/`$CATALOG` are expanded at use.
     pub pty_root: Option<String>,
+    /// How long a retired seat stays in the live catalog before the supervisor archives it.
+    /// Absent means [`DEFAULT_ARCHIVE_AFTER`]; `Duration::ZERO` disables auto-archive.
+    pub archive_after: Option<Duration>,
     /// Resource profiles in declaration order.
     pub profiles: Vec<DeclaredProfile>,
+}
+
+/// The grace period an undeclared `archive-after` means: a week of hindsight before a retired seat
+/// leaves the live catalog, which is long enough that un-retiring stays a normal edit.
+pub const DEFAULT_ARCHIVE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The declared retirement grace period, or the default when `catalog.kdl` says nothing.
+///
+/// `Duration::ZERO` is the operator's off switch, so it is preserved rather than defaulted: an
+/// explicit `archive-after "0"` disables auto-archive without disabling `st2 catalog archive`.
+pub fn archive_after(config: &CatalogConfig) -> Duration {
+    config.archive_after.unwrap_or(DEFAULT_ARCHIVE_AFTER)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,28 +142,7 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                     anyhow::bail!("catalog block declared more than once");
                 }
                 seen_catalog = true;
-                let Some(children) = node.children() else {
-                    continue;
-                };
-                for child in children.nodes() {
-                    match child.name().value() {
-                        "pty-root" => {
-                            let value = child
-                                .get(0)
-                                .and_then(|v| v.as_string())
-                                .filter(|v| !v.is_empty())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
-                                    )
-                                })?;
-                            config.pty_root = Some(value.to_string());
-                        }
-                        other => {
-                            anyhow::bail!("unknown catalog field '{other}' (expected pty-root)")
-                        }
-                    }
-                }
+                parse_catalog_node(node, &mut config)?;
             }
             "profile" => {
                 let profile = parse_profile(node)?;
@@ -160,6 +158,57 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
         }
     }
     Ok(config)
+}
+
+fn parse_catalog_node(node: &kdl::KdlNode, config: &mut CatalogConfig) -> anyhow::Result<()> {
+    let Some(children) = node.children() else {
+        return Ok(());
+    };
+    for child in children.nodes() {
+        match child.name().value() {
+            "pty-root" => {
+                anyhow::ensure!(
+                    config.pty_root.is_none(),
+                    "pty-root declared more than once"
+                );
+                let value = child
+                    .get(0)
+                    .and_then(|v| v.as_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
+                        )
+                    })?;
+                config.pty_root = Some(value.to_string());
+            }
+            // A malformed grace period refuses the whole declaration rather than falling back to
+            // the default: silently archiving on a 7-day clock the operator did not write is the
+            // one outcome this setting exists to prevent.
+            "archive-after" => {
+                anyhow::ensure!(
+                    config.archive_after.is_none(),
+                    "archive-after declared more than once"
+                );
+                let value = child
+                    .get(0)
+                    .and_then(|v| v.as_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "archive-after needs a quoted duration, e.g. archive-after \"7d\" (\"0\" disables auto-archive)"
+                        )
+                    })?;
+                let parsed = agent_spec::spec::parse_duration(value)
+                    .map_err(|error| anyhow::anyhow!("archive-after: {error}"))?;
+                config.archive_after = Some(parsed);
+            }
+            other => anyhow::bail!(
+                "unknown catalog field '{other}' (expected pty-root or archive-after)"
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
@@ -260,6 +309,13 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_github_issue_capability(scheme, runtime_child)?);
                     }
+                    "github-pr" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_github_pr_capability(scheme, runtime_child)?);
+                    }
                     "pty-stats" => {
                         anyhow::ensure!(
                             capability.is_none() && runtime_child.children().is_none(),
@@ -267,9 +323,16 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_pty_stats_capability(scheme, runtime_child)?);
                     }
+                    "vista" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_vista_capability(scheme, runtime_child)?);
+                    }
                     other => anyhow::bail!(
                         "profile '{scheme}': runtime field '{other}' is unknown \
-                         (expected component, demand, github-issue, or pty-stats)"
+                         (expected component, demand, github-issue, github-pr, pty-stats, or vista)"
                     ),
                 }
             }
@@ -362,19 +425,17 @@ fn parse_github_issue_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': github-issue requires owner, repo, number, \
-         connect-timeout-ms, and total-timeout-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-issue requires auth-executable, connect-timeout-ms, and \
+         total-timeout-ms properties"
     );
-    let owner = required_string_property(scheme, node, "owner")?;
-    let repo = required_string_property(scheme, node, "repo")?;
-    let number = required_u64_property(scheme, node, "number")?;
+    let auth_executable = required_string_property(scheme, node, "auth-executable")?;
+    anyhow::ensure!(
+        Path::new(&auth_executable).is_absolute(),
+        "profile '{scheme}': GitHub authentication executable must be absolute"
+    );
     let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
     let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
-    anyhow::ensure!(
-        number > 0,
-        "profile '{scheme}': GitHub issue number must be positive"
-    );
     anyhow::ensure!(
         connect_timeout_ms > 0
             && connect_timeout_ms <= total_timeout_ms
@@ -382,9 +443,36 @@ fn parse_github_issue_capability(
         "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
     );
     Ok(DeclaredProviderCapability::GitHubIssue {
-        owner,
-        repo,
-        number,
+        auth_executable,
+        connect_timeout_ms,
+        total_timeout_ms,
+    })
+}
+
+fn parse_github_pr_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-pr requires auth-executable, connect-timeout-ms, and \
+         total-timeout-ms properties"
+    );
+    let auth_executable = required_string_property(scheme, node, "auth-executable")?;
+    anyhow::ensure!(
+        Path::new(&auth_executable).is_absolute(),
+        "profile '{scheme}': GitHub authentication executable must be absolute"
+    );
+    let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
+    let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
+    anyhow::ensure!(
+        connect_timeout_ms > 0
+            && connect_timeout_ms <= total_timeout_ms
+            && total_timeout_ms <= 60_000,
+        "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
+    );
+    Ok(DeclaredProviderCapability::GitHubPr {
+        auth_executable,
         connect_timeout_ms,
         total_timeout_ms,
     })
@@ -395,8 +483,8 @@ fn parse_pty_stats_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 4 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': pty-stats requires executable, cwd, scope, and deadline-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': pty-stats requires executable, cwd, and deadline-ms properties"
     );
     let executable = required_string_property(scheme, node, "executable")?;
     let cwd = required_string_property(scheme, node, "cwd")?;
@@ -405,21 +493,31 @@ fn parse_pty_stats_capability(
         deadline_ms > 0 && deadline_ms <= 60_000,
         "profile '{scheme}': PTY deadline must be between 1ms and 60000ms"
     );
-    let scope = required_string_property(scheme, node, "scope")?;
-    let scope = if scope == "all" {
-        DeclaredPtyStatsScope::All
-    } else if let Some(session) = scope
-        .strip_prefix("session:")
-        .filter(|value| !value.is_empty())
-    {
-        DeclaredPtyStatsScope::Session(session.to_owned())
-    } else {
-        anyhow::bail!("profile '{scheme}': PTY scope must be 'all' or 'session:<id>'");
-    };
     Ok(DeclaredProviderCapability::PtyStats {
         executable,
         cwd,
-        scope,
+        deadline_ms,
+    })
+}
+
+fn parse_vista_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': vista requires executable, cwd, and deadline-ms properties"
+    );
+    let executable = required_string_property(scheme, node, "executable")?;
+    let cwd = required_string_property(scheme, node, "cwd")?;
+    let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
+    anyhow::ensure!(
+        deadline_ms > 0 && deadline_ms <= 60_000,
+        "profile '{scheme}': Vista deadline must be between 1ms and 60000ms"
+    );
+    Ok(DeclaredProviderCapability::Vista {
+        executable,
+        cwd,
         deadline_ms,
     })
 }
@@ -461,6 +559,7 @@ pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
         Err(e) => Err(e.into()),
     }
 }
+
 /// Resolve one declared module using the same expansion as runtime registry construction while
 /// preserving whether the module belongs to the catalog transaction.
 pub(crate) fn resolve_profile_module(
@@ -542,7 +641,7 @@ pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> 
             matches!(
                 *name,
                 ".workspace" | "resources" | "archive" | "inbox" | "status"
-            ) || name.starts_with(".status.tmp-")
+            ) || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         });
     let reserved_template_subtree = first == "_templates"
         && components.iter().skip(1).any(|name| {
@@ -558,7 +657,7 @@ pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> 
                     | "archive"
                     | "inbox"
                     | "status"
-            ) || name.starts_with(".status.tmp-")
+            ) || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         });
     anyhow::ensure!(
         !(reserved_control || reserved_root || reserved_agent_state || reserved_template_subtree),
@@ -886,7 +985,7 @@ mod tests {
               runtime {
                 component "components/github-issue.wasm"
                 demand #true
-                github-issue owner="rust-lang" repo="rust" number=1 connect-timeout-ms=3000 total-timeout-ms=10000
+                github-issue auth-executable="/nix/store/example/bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
               }
             }
             "#,
@@ -897,9 +996,7 @@ mod tests {
             Some(DeclaredProfileRuntime {
                 component: "components/github-issue.wasm".into(),
                 capability: DeclaredProviderCapability::GitHubIssue {
-                    owner: "rust-lang".into(),
-                    repo: "rust".into(),
-                    number: 1,
+                    auth_executable: "/nix/store/example/bin/gh".into(),
                     connect_timeout_ms: 3000,
                     total_timeout_ms: 10000,
                 },
@@ -911,12 +1008,85 @@ mod tests {
             r#"profile "dev.x" { wasm "x.wasm"; runtime "shell" { component "x.wasm" } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x.wasm" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component ""; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; component "y"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component ""; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; component "y"; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000; github-issue owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="shell" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" deadline-ms=1000; github-issue auth-executable="/bin/gh" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" deadline-ms=1000 extra="no" } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn github_pr_runtime_capability_authorizes_dynamic_resources_with_bounded_transport() {
+        let config = parse(
+            r#"
+            profile "github-pr" {
+              wasm "github-pr-resolver.wasm"
+              runtime {
+                component "components/github-pr.component.wasm"
+                demand #true
+                github-pr auth-executable="/nix/store/example/bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/github-pr.component.wasm".into(),
+                capability: DeclaredProviderCapability::GitHubPr {
+                    auth_executable: "/nix/store/example/bin/gh".into(),
+                    connect_timeout_ms: 3000,
+                    total_timeout_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" owner="o" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="gh" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" connect-timeout-ms=3 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn vista_runtime_capability_authorizes_dynamic_artifacts_with_bounded_execution() {
+        let config = parse(
+            r#"
+            profile "vista" {
+              wasm "vista-resolver.wasm"
+              runtime {
+                component "components/vista.component.wasm"
+                demand #true
+                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" deadline-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/vista.component.wasm".into(),
+                capability: DeclaredProviderCapability::Vista {
+                    executable: "/nix/store/example/bin/vista".into(),
+                    cwd: "/var/empty".into(),
+                    deadline_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=0 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=60001 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=1 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }

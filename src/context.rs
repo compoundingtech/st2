@@ -16,7 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use crate::message;
+
+const NOW_LOCK: &str = ".now.lock";
 
 /// `<agent_dir>/resources/context`.
 pub fn context_dir(agent_dir: &Path) -> PathBuf {
@@ -84,16 +88,38 @@ pub fn read_now_fresh(context_dir: &Path, max_age: Duration) -> String {
 }
 
 /// Overwrite `now.md` with `content` (atomic). Creates the context dir.
+///
+/// Every writer takes the same lock used by [`write_now_if_blank`], so a conditional recovery
+/// write cannot pass its predicate and then overwrite authored state that landed in between.
 pub fn write_now(context_dir: &Path, content: &str) -> anyhow::Result<()> {
-    fs::create_dir_all(context_dir)?;
+    let _lock = lock_now(context_dir)?;
     write_atomic(&now_file(context_dir), content)
 }
 
-/// Append one decision to the log. `decision` and `why` must be single non-empty lines (the log is a
-/// scannable list; multi-line reasoning belongs in a doc). Renders `- <ISO> <decision>. why: <why>.`
-/// into a fresh `decisions/<unix-ms>-<rand6>.md`. Returns the entry's filename.
-pub fn append_decision(context_dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
-    append_decision_to_dir(&decisions_dir(context_dir), decision, why)
+/// Atomically replace an absent or successfully decoded whitespace-only `now.md`.
+///
+/// Read errors other than `NotFound` are preserved. Treating an unreadable file as empty would
+/// overwrite state precisely when its contents cannot be proven blank.
+pub fn write_now_if_blank(context_dir: &Path, content: &str) -> anyhow::Result<bool> {
+    let _lock = lock_now(context_dir)?;
+    let path = now_file(context_dir);
+    match fs::read_to_string(&path) {
+        Ok(current) if !current.trim().is_empty() => Ok(false),
+        Ok(_) => {
+            write_atomic(&path, content)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic(&path, content)?;
+            Ok(true)
+        }
+        Err(error) => Err(error).context("read current now.md before conditional write"),
+    }
+}
+
+fn lock_now(context_dir: &Path) -> anyhow::Result<crate::flock::FileLock> {
+    crate::harness_state::lock_exclusive(&context_dir.join(NOW_LOCK))
+        .context("acquire now.md writer lock")
 }
 
 pub fn append_decision_to_dir(dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
@@ -155,20 +181,19 @@ fn trim_trailing_period(s: &str) -> &str {
     s.strip_suffix('.').unwrap_or(s)
 }
 
-/// Atomic write: tmp sibling + rename.
+/// Atomic write: staged sibling + rename.
+///
+/// The staging name used to end in `now_ms()`, so two writers in the same millisecond shared one
+/// staging path and the second truncated the first's staged bytes before renaming it. The shared
+/// primitive names the sibling with a counter and creates it exclusively, which turns that race
+/// into an impossible `AlreadyExists`.
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".ctx.tmp-{}-{}",
-        std::process::id(),
-        message::now_ms()
-    ));
-    fs::write(&tmp, content)?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        content.as_bytes(),
+        crate::fsatomic::Staging::new(".ctx"),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
 }
 
@@ -196,6 +221,37 @@ fn iso_utc_now() -> String {
 mod tests {
     use super::*;
 
+    /// [`write_atomic`]'s publication contract: the target ends up carrying the complete new
+    /// bytes, no staged sibling survives a successful write, and the record is owner-only.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — this record used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask), and the
+    /// shared primitive stages exclusively at `0600`. An agent's context is its own working
+    /// notes; nothing but st2 and that agent has ever read it.
+    #[test]
+    fn a_context_write_replaces_the_target_and_leaves_no_staged_sibling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+        let path = now_file(&dir);
+        write_atomic(&path, "first\n").unwrap();
+        write_atomic(&path, "second\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the context record is published owner-only"
+        );
+
+        let staged = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ctx"))
+            .collect::<Vec<_>>();
+        assert!(staged.is_empty(), "staging residue left behind: {staged:?}");
+    }
+
     #[test]
     fn missing_context_reads_empty() {
         let tmp = tempfile::tempdir().unwrap();
@@ -219,17 +275,47 @@ mod tests {
     }
 
     #[test]
+    fn conditional_write_replaces_only_decoded_blank_state_and_preserves_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+
+        assert!(write_now_if_blank(&dir, "stub\n").unwrap());
+        assert_eq!(read(&dir, View::Now), "stub\n");
+
+        write_now(&dir, "authored\n").unwrap();
+        assert!(!write_now_if_blank(&dir, "replacement\n").unwrap());
+        assert_eq!(read(&dir, View::Now), "authored\n");
+
+        std::fs::remove_file(now_file(&dir)).unwrap();
+        std::fs::write(now_file(&dir), [0xff]).unwrap();
+        let error = write_now_if_blank(&dir, "replacement\n")
+            .expect_err("an undecodable now.md must not be classified as blank");
+        assert!(
+            error
+                .to_string()
+                .contains("read current now.md before conditional write"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(now_file(&dir)).unwrap(),
+            [0xff],
+            "undecodable state stays byte-for-byte intact"
+        );
+
+    }
+
+    #[test]
     fn append_decisions_are_ordered_bullets() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = context_dir(tmp.path());
-        append_decision(
-            &dir,
+        append_decision_to_dir(
+            &decisions_dir(&dir),
             "use hook-enforced perms",
             "never prompts an autonomous pty",
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        append_decision(&dir, "defer shims", "scope enforcement is follow-on").unwrap();
+        append_decision_to_dir(&decisions_dir(&dir), "defer shims", "scope enforcement is follow-on").unwrap();
 
         let dec = read(&dir, View::Decisions);
         let lines: Vec<&str> = dec.lines().collect();
@@ -252,8 +338,31 @@ mod tests {
     fn append_rejects_empty_or_multiline() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = context_dir(tmp.path());
-        assert!(append_decision(&dir, "", "why").is_err());
-        assert!(append_decision(&dir, "d", "").is_err());
-        assert!(append_decision(&dir, "line1\nline2", "why").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "", "why").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "d", "").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "line1\nline2", "why").is_err());
+    }
+
+    /// `now.md` writes serialize on a lock file the transport hardened with `O_NOFOLLOW`;
+    /// nothing pinned that before, and this module had no lock test at all.
+    #[test]
+    fn a_symlinked_now_lock_refuses_the_write_instead_of_locking_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(NOW_LOCK)).unwrap();
+
+        let error = write_now(&dir, "fresh").unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "a symlinked now.md lock must refuse the write, got {error:#}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+        assert!(!now_file(&dir).exists(), "a refused lock must publish nothing");
     }
 }

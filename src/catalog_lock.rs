@@ -5,11 +5,12 @@
 //! deliberately does not use this lock.
 
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::flock::{FileLock, Mode, Open, Wait};
 
 pub const CONTROL_DIR: &str = ".st2";
 pub const LOCK_FILE: &str = "catalog-authoring.lock";
@@ -135,44 +136,59 @@ fn retained_control(catalog: &Path) -> Result<Option<(File, PathBuf)>> {
     Ok(Some((file, path)))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Mode {
-    Shared,
-    Exclusive,
-}
-
 /// An advisory catalog-authoring lock. Dropping the guard releases the kernel lock.
 #[derive(Debug)]
 pub struct CatalogLock {
-    file: File,
+    // Read only by `Drop`: the guard's whole job is to outlive the acquisition and release on
+    // close, so nothing above the transport ever touches the descriptor.
+    _held: FileLock,
     control: File,
     root: File,
 }
 
 impl CatalogLock {
     pub fn shared(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, false, true)
-    }
-
-    /// Read the stable control identity for state-plane ownership during an incomplete apply.
-    pub(crate) fn shared_for_state_plane(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, true, true)
+        Self::blocking(catalog, Mode::Shared, false, true)
     }
 
     /// Acquire the existing catalog lock without initializing missing control state.
     pub(crate) fn shared_existing(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, false, false)
+        Self::blocking(catalog, Mode::Shared, false, false)
     }
 
     pub fn exclusive(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, false, true)
+        Self::blocking(catalog, Mode::Exclusive, false, true)
+    }
+
+    /// Acquire the exclusive lock only if it is free right now.
+    ///
+    /// `Ok(None)` means another holder has it, and the caller must skip its work rather than queue.
+    pub fn try_exclusive(catalog: &Path) -> Result<Option<Self>> {
+        Self::acquire(catalog, Mode::Exclusive, false, true, Wait::Now)
     }
 
     /// The whole-catalog transaction is the only operation allowed to inspect and recover an
     /// incomplete apply. Every other declaration reader/writer must keep using `shared` or
     /// `exclusive`, which fail closed while the marker exists.
     pub(crate) fn exclusive_for_catalog_apply(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, true, true)
+        Self::blocking(catalog, Mode::Exclusive, true, true)
+    }
+
+    /// A blocking acquisition returns the guard or an error — never contention.
+    fn blocking(
+        catalog: &Path,
+        mode: Mode,
+        allow_incomplete_apply: bool,
+        initialize: bool,
+    ) -> Result<Self> {
+        Self::acquire(
+            catalog,
+            mode,
+            allow_incomplete_apply,
+            initialize,
+            Wait::Block,
+        )?
+        .context("blocking catalog-authoring acquisition reported contention")
     }
 
     fn acquire(
@@ -180,7 +196,8 @@ impl CatalogLock {
         mode: Mode,
         allow_incomplete_apply: bool,
         initialize: bool,
-    ) -> Result<Self> {
+        wait: Wait,
+    ) -> Result<Option<Self>> {
         let catalog = catalog
             .canonicalize()
             .with_context(|| format!("canonicalize catalog root {}", catalog.display()))?;
@@ -258,22 +275,15 @@ impl CatalogLock {
         .context("catalog control directory disappeared while acquiring its lock")?;
         let control = crate::catalog_transaction::retained_dir_path(&control_file)?;
         let path = control.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        if initialize {
-            options.create(true);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("open catalog authoring lock {}", path.display()))?;
-        let operation = match mode {
-            Mode::Shared => libc::LOCK_SH,
-            Mode::Exclusive => libc::LOCK_EX,
-        };
+        let file = crate::flock::open(
+            &path,
+            if initialize {
+                Open::Create
+            } else {
+                Open::Existing
+            },
+        )
+        .with_context(|| format!("open catalog authoring lock {}", path.display()))?;
         #[cfg(debug_assertions)]
         if let Ok(path) = std::env::var("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT") {
             let value = match mode {
@@ -288,13 +298,11 @@ impl CatalogLock {
         {
             let _ = fs::write(path, b"exclusive");
         }
-        // SAFETY: `file` owns a valid descriptor for the duration of this call and the returned
-        // guard. flock does not access Rust memory.
-        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("lock catalog authoring lock {}", path.display()));
-        }
+        let Some(held) = FileLock::hold(file, mode, wait)
+            .with_context(|| format!("lock catalog authoring lock {}", path.display()))?
+        else {
+            return Ok(None);
+        };
         if !allow_incomplete_apply {
             let marker = control.join(APPLY_MARKER);
             match fs::symlink_metadata(&marker) {
@@ -318,7 +326,7 @@ impl CatalogLock {
             }
         }
         let lock = Self {
-            file,
+            _held: held,
             control: control_file,
             root,
         };
@@ -326,7 +334,7 @@ impl CatalogLock {
             lock.recover_generation_intent()?;
             test_lock_held_checkpoint();
         }
-        Ok(lock)
+        Ok(Some(lock))
     }
 
     pub(crate) fn advance_generation(&self) -> Result<()> {
@@ -455,15 +463,6 @@ fn test_control_created_checkpoint() {
 
 #[cfg(not(debug_assertions))]
 fn test_control_created_checkpoint() {}
-
-impl Drop for CatalogLock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor remains valid until after Drop returns.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
 
 pub fn lock_path(catalog: &Path) -> PathBuf {
     catalog.join(CONTROL_DIR).join(LOCK_FILE)

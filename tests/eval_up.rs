@@ -5,11 +5,13 @@
 //! Needs `pty` on PATH (the runner lists pty sessions) — HARD failure if absent unless
 //! `ST2_ALLOW_PTY_SKIP` is set (a gate must not silently skip).
 
+mod support;
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const HOST: &str = "evalhost";
+use support::CommandOwnedChildGroupExt as _;
 
 fn pty_available() -> bool {
     Command::new("pty")
@@ -45,6 +47,113 @@ fn pty_ids(pty_root: &Path) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn owned_test_child_group_dies_after_hard_parent_death() {
+    const TEST_NAME: &str = "owned_test_child_group_dies_after_hard_parent_death";
+    const ROLE: &str = "ST2_OWNED_CHILD_TEST_ROLE";
+    const LEADER_PATH: &str = "ST2_OWNED_CHILD_TEST_LEADER";
+    const DESCENDANT_PATH: &str = "ST2_OWNED_CHILD_TEST_DESCENDANT";
+    const READY_PATH: &str = "ST2_OWNED_CHILD_TEST_READY";
+
+    match std::env::var(ROLE).as_deref() {
+        Ok("owner") => {
+            let leader_path = std::path::PathBuf::from(std::env::var_os(LEADER_PATH).unwrap());
+            let descendant_path =
+                std::path::PathBuf::from(std::env::var_os(DESCENDANT_PATH).unwrap());
+            let ready_path = std::path::PathBuf::from(std::env::var_os(READY_PATH).unwrap());
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(
+                    "printf '%s' \"$$\" > \"$LEADER_PATH\"; sleep 60 & \
+                     printf '%s' \"$!\" > \"$DESCENDANT_PATH\"; wait",
+                )
+                .env("LEADER_PATH", &leader_path)
+                .env("DESCENDANT_PATH", &descendant_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _owned_child = command.spawn_owned().unwrap();
+            wait_for_file(&leader_path);
+            wait_for_file(&descendant_path);
+            std::fs::write(ready_path, b"ready").unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        Ok(role) => panic!("unknown owned-child test role {role}"),
+        Err(_) => {}
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let leader_path = temp.path().join("leader.pid");
+    let descendant_path = temp.path().join("descendant.pid");
+    let ready_path = temp.path().join("ready");
+    let mut owner_command = Command::new(std::env::current_exe().unwrap());
+    owner_command
+        .arg("--exact")
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .env(ROLE, "owner")
+        .env(LEADER_PATH, &leader_path)
+        .env(DESCENDANT_PATH, &descendant_path)
+        .env(READY_PATH, &ready_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut owner = owner_command.spawn_owned().unwrap();
+    wait_for_file(&ready_path);
+
+    let leader_pid = std::fs::read_to_string(&leader_path)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let descendant_pid = std::fs::read_to_string(&descendant_path)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert!(st2::host_lock::process_alive(leader_pid));
+    assert!(st2::host_lock::process_alive(descendant_pid));
+
+    unsafe {
+        libc::kill(owner.id() as i32, libc::SIGKILL);
+    }
+    owner.terminate();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while (st2::host_lock::process_alive(leader_pid)
+        || st2::host_lock::process_alive(descendant_pid))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let survivors = [leader_pid, descendant_pid]
+        .into_iter()
+        .filter(|pid| st2::host_lock::process_alive(*pid))
+        .collect::<Vec<_>>();
+    for pid in &survivors {
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "owned child group survived hard parent death: {survivors:?}"
+    );
 }
 
 #[test]
@@ -86,7 +195,6 @@ team "t" {
         .args(["up"])
         .arg(&spec_dir)
         .arg("--once") // spec-up now SUPERVISES by default; --once does a single boot pass for the test
-        .args(["--host", HOST])
         .env("PATH", path)
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .env("PTY_ROOT", &pty_root)
@@ -112,16 +220,16 @@ team "t" {
         .map(|(n, _)| n.as_str())
         .collect();
     assert!(
-        running.contains(&"evalhost.t.a"),
+        running.contains(&"t.a"),
         "t.a not running; sessions={ids:?}"
     );
     assert!(
-        running.contains(&"evalhost.t.b"),
+        running.contains(&"t.b"),
         "t.b not running; sessions={ids:?}"
     );
 
     // Teardown — the team persists after st2 exits (nomad-decoupled), so clean it up ourselves.
-    for id in ["evalhost.t.a", "evalhost.t.b"] {
+    for id in ["t.a", "t.b"] {
         let _ = Command::new("pty")
             .args(["kill", id])
             .env("PTY_ROOT", &pty_root)
@@ -133,7 +241,7 @@ team "t" {
     }
     // Stop any lingering per-task scopes (this spec's ids only).
     if let Ok(o) = Command::new("systemctl")
-        .args(["--user", "list-units", "--no-legend", "st2-evalhost.t.*"])
+        .args(["--user", "list-units", "--no-legend", "st2-t.*"])
         .output()
     {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -215,7 +323,6 @@ team "down" {
         Command::new(bin)
             .args(args)
             .arg(&spec_dir)
-            .args(["--host", HOST])
             .env("PATH", &path)
             .env("XDG_STATE_HOME", tmp.path().join("xdg"))
             .env("PTY_ROOT", &pty_root)
@@ -239,11 +346,11 @@ team "down" {
     };
     let before = running(&pty_ids(&pty_root));
     assert!(
-        before.contains(&"evalhost.down.a".to_string()),
+        before.contains(&"down.a".to_string()),
         "t.a not running before down; {before:?}"
     );
     assert!(
-        before.contains(&"evalhost.down.b".to_string()),
+        before.contains(&"down.b".to_string()),
         "t.b not running before down; {before:?}"
     );
 
@@ -260,7 +367,7 @@ team "down" {
         "no spec-teardown line:\n{dstdout}"
     );
     assert!(
-        dstdout.contains("evalhost.down.a") && dstdout.contains("evalhost.down.b"),
+        dstdout.contains("down.a") && dstdout.contains("down.b"),
         "down did not report tearing down down.a/down.b:\n{dstdout}"
     );
 
@@ -268,23 +375,23 @@ team "down" {
     std::thread::sleep(Duration::from_millis(500));
     let after = running(&pty_ids(&pty_root));
     assert!(
-        !after.contains(&"evalhost.down.a".to_string()),
+        !after.contains(&"down.a".to_string()),
         "t.a still running after down; {after:?}"
     );
     assert!(
-        !after.contains(&"evalhost.down.b".to_string()),
+        !after.contains(&"down.b".to_string()),
         "t.b still running after down; {after:?}"
     );
 
     // Clean up the (now-stopped) sessions + any per-task scopes.
-    for id in ["evalhost.down.a", "evalhost.down.b"] {
+    for id in ["down.a", "down.b"] {
         let _ = Command::new("pty")
             .args(["rm", id])
             .env("PTY_ROOT", &pty_root)
             .status();
     }
     if let Ok(o) = Command::new("systemctl")
-        .args(["--user", "list-units", "--no-legend", "st2-evalhost.down.*"])
+        .args(["--user", "list-units", "--no-legend", "st2-down.*"])
         .output()
     {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -331,7 +438,6 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
         Command::new(bin)
             .args(["up", "--once"])
             .arg(&spec_dir)
-            .args(["--host", HOST])
             .env("PATH", &path)
             .env("XDG_STATE_HOME", tmp.path().join("xdg"))
             .env("PTY_ROOT", &pty_root)
@@ -357,8 +463,7 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
     // Boot, grab the pid, hard-kill the PROCESS (not `pty kill`) so the corpse lingers in the registry.
     assert!(once().status.success(), "initial boot failed");
     std::thread::sleep(Duration::from_millis(700));
-    let pid1 = pid_of("evalhost.raceonce")
-        .expect("agent 'evalhost.raceonce' should be running after boot");
+    let pid1 = pid_of("raceonce").expect("agent 'raceonce' should be running after boot");
     let _ = Command::new("kill")
         .args(["-9", &pid1.to_string()])
         .status();
@@ -375,26 +480,21 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
         "respawn hit the reap race:\n{stderr}"
     );
     std::thread::sleep(Duration::from_millis(500));
-    let pid2 = pid_of("evalhost.raceonce")
-        .expect("agent 'evalhost.raceonce' should be respawned by the same --once pass");
+    let pid2 =
+        pid_of("raceonce").expect("agent 'raceonce' should be respawned by the same --once pass");
     assert_ne!(pid1, pid2, "respawn must be a NEW process");
 
     // Clean up.
     let _ = Command::new("pty")
-        .args(["kill", "evalhost.raceonce"])
+        .args(["kill", "raceonce"])
         .env("PTY_ROOT", &pty_root)
         .status();
     let _ = Command::new("pty")
-        .args(["rm", "evalhost.raceonce"])
+        .args(["rm", "raceonce"])
         .env("PTY_ROOT", &pty_root)
         .status();
     if let Ok(o) = Command::new("systemctl")
-        .args([
-            "--user",
-            "list-units",
-            "--no-legend",
-            "st2-evalhost.raceonce*",
-        ])
+        .args(["--user", "list-units", "--no-legend", "st2-raceonce*"])
         .output()
     {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -442,13 +542,12 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
         .args(["up"])
         .arg(&spec_dir)
         .args(["--interval", "1"])
-        .args(["--host", HOST])
         .env("PATH", &path)
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .env("PTY_ROOT", &pty_root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_owned()
         .unwrap();
 
     let pid_of = |id: &str| -> Option<i64> {
@@ -479,32 +578,35 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
         }
     };
 
-    let pid1 =
-        wait_for("evalhost.a", 15).expect("agent 'evalhost.a' should boot under supervision");
+    let pid1 = wait_for("a", 15).expect("agent 'a' should boot under supervision");
     // Kill it out from under the supervisor.
     let _ = std::process::Command::new("pty")
-        .args(["kill", "evalhost.a"])
+        .args(["kill", "a"])
         .env("PTY_ROOT", &pty_root)
         .status();
     // The supervise loop must bring it back (new pid) within a few reconcile intervals.
-    let pid2 = wait_for("evalhost.a", 15).expect("supervisor should RESPAWN the killed agent");
+    let pid2 = wait_for("a", 15).expect("supervisor should RESPAWN the killed agent");
     assert_ne!(
         pid1, pid2,
         "respawn must be a NEW process, not the killed one"
     );
 
-    // Stop the supervisor; the session persists (nomad-decoupled). Clean up.
-    let _ = child.kill();
-    let _ = child.wait();
+    // The parent-bound supervisor is cleaned up, while its detached production task stays alive.
+    child.terminate();
+    assert_eq!(
+        pid_of("a"),
+        Some(pid2),
+        "owned test-child cleanup crossed into the detached production task"
+    );
     let _ = std::process::Command::new("pty")
-        .args(["kill", "evalhost.a"])
+        .args(["kill", "a"])
         .env("PTY_ROOT", &pty_root)
         .status();
     let _ = std::process::Command::new("pty")
-        .args(["rm", "evalhost.a"])
+        .args(["rm", "a"])
         .env("PTY_ROOT", &pty_root)
         .status();
-    for u in ["st2-evalhost.a"] {
+    for u in ["st2-a"] {
         if let Ok(o) = std::process::Command::new("systemctl")
             .args(["--user", "list-units", "--no-legend", &format!("{u}*")])
             .output()

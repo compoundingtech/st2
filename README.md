@@ -76,6 +76,32 @@ systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit withou
 (`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old
 registry while everything else follows the catalog.
 
+### A catalog may declare how long retirement is kept
+
+`st2 up` archives retired, quiescent seats itself, so a long-lived catalog stays bounded without
+anyone remembering the chore. The grace period is `archive-after`, declared beside the registry:
+
+```kdl
+catalog {
+  pty-root "/run/agents/pty"
+  archive-after "7d"
+}
+```
+
+It accepts the usual duration spellings (`90`, `30m`, `12h`, `7d`; a bare number is seconds) and
+defaults to `7d`. `archive-after "0"` disables the automatic step without disabling
+`st2 catalog archive`. A value st2 cannot parse fails `st2 validate` rather than falling back to the
+default: archiving on a clock the operator did not write is the one outcome this setting exists to
+prevent.
+
+Each pass archives at most 25 seats, so a catalog holding hundreds of retirements drains over
+several passes, and it never queues for the authoring lock — a pass blocked behind
+`st2 catalog apply` would stall every live agent's reconciliation, and a due seat is still due next
+pass. Because st2 records no timestamp for a desired-state edit, the clock starts when the
+supervisor first observes the retirement; it keeps that observation in
+`<catalog>/.st2/retired-observed.json`, never in the spec, and drops a seat's row as soon as it
+stops being retired — so un-retiring and retiring again serves a fresh grace period.
+
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
 verifies its own immutable set for Codex launches; any local workspace render that actually
@@ -156,8 +182,8 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --input-sha256 <afterRootSha256> --expect-sha256 <rootSha256> --json
 ```
 
-If the incumbent Agent Specs cannot be parsed, bind a one-time repair to their
-exact structural declaration bytes instead:
+If the incumbent declarations cannot be parsed or must remain opaque to the
+current parser, bind a one-time repair to their exact structural bytes instead:
 
 ```sh
 st2 catalog snapshot --catalog "$CATALOG" --output ./invalid-preimage \
@@ -169,11 +195,12 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --raw-preimage --json
 ```
 
-Raw-preimage mode has its own hash and receipt schemas. It refuses a
-strictly-valid incumbent, still fully validates the prepared and applied
-catalogs, and requires a readable external PTY-root declaration that remains
-unchanged. It is a generic invalid-preimage transaction, not a validation
-bypass or migration-policy engine.
+Raw-preimage mode has its own hash and receipt schemas. It makes no semantic
+assertion about the live bytes—including validity, profiles, the catalog
+envelope, or effective PTY root—while still fully validating the prepared and
+applied catalogs. The caller-supplied raw-domain digest is the exact live
+precondition. This is a byte-oriented transaction, not a validation bypass or
+migration-policy engine.
 
 To publish that exact snapshot as a new, absent catalog:
 
@@ -182,18 +209,47 @@ st2 catalog bootstrap --catalog "$NEW_CATALOG" --prepared ./prepared \
   --input-sha256 <rootSha256> --json
 ```
 
-`catalog apply` is policy-free. It rejects state/control content, symlinks,
-unprojected workspace facts, catalog-local/default PTY roots, and effective
-PTY-root changes. Bootstrap is a separate create-only declaration transaction,
-not an apply mode. It atomically publishes absence or the complete catalog,
-initializes its persistent lock and generation before visibility, and never
-reads or writes the external PTY registry. Process adoption and PTY-root
-migration remain separate because that registry has independent producers. A
-crash during apply leaves a durable marker and content-addressed stage;
-`st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
-original prepared source. Snapshots own the complete bounded `_templates`
-library and empty canonical per-agent `.workspace` directory facts, but never
-traverse, hash, copy, or delete workspace content.
+Ordinary `catalog apply` is policy-free. It rejects state/control content,
+symlinks, unprojected workspace facts, catalog-local/default PTY roots, and
+effective PTY-root changes. Raw-preimage apply replaces those live semantic
+checks with its exact byte-domain CAS. Bootstrap is a separate create-only
+declaration transaction, not an apply mode. It atomically publishes absence or
+the complete catalog, initializes its persistent lock and generation before
+visibility, and never reads or writes the external PTY registry. Process
+adoption and PTY-root migration remain separate because that registry has
+independent producers. A crash during apply leaves a durable marker and
+content-addressed stage. `st2 catalog apply --catalog "$CATALOG" --resume --json`
+resumes without the original prepared source. Snapshots own the complete
+bounded `_templates` library and empty canonical per-agent `.workspace`
+directory facts, but never traverse, hash, copy, or delete workspace content.
+
+A retired declaration is runtime teardown only: it keeps its spec and `resources/` byte-identical
+and stays reversible, so a long-lived catalog accumulates retired identities. Archival is the
+pressure valve that keeps the live plane bounded:
+
+```sh
+st2 catalog archive --catalog "$CATALOG" --all-retired --dry-run --json
+st2 catalog archive --catalog "$CATALOG" --identity <identity> --json
+st2 catalog unarchive --catalog "$CATALOG" <identity> --json
+```
+
+Archival moves the whole identity directory from `agents/<host>/<identity>` to
+`.st2/archive/<host>/<identity>` under the exclusive catalog-authoring lock, in one generation
+commit, as a same-filesystem rename — the archive root is a child of the catalog root, so no bytes
+are copied and no partial bundle can exist. `.st2` is control space at any depth, so an archived
+declaration is undiscoverable rather than filtered, and the whole-catalog transaction never projects
+it. A tombstone beside the moved directory keeps the identity traceable as one `archived` row in
+`st2 catalog graph --json`.
+
+Eligibility fails closed against the local host only, because another host's runtime records are not
+observable from here: the declaration must sit at its canonical path, be retired in either spelling,
+have no live or dead record for any declared task (the rule `st2 doctor` already applies to
+retirement), and be named as `supervisor` by no declaration that stays behind. `--identity` refuses
+the whole run if any named identity is ineligible; `--all-retired` reports the ineligible ones and
+archives the rest. `st2 catalog unarchive` is the exact reverse move.
+
+`st2 up` applies exactly this gate on its own once a retirement outlives `archive-after`, so these
+verbs are for the seats you do not want to wait out and for putting one back.
 
 The compact declaration shape is:
 
@@ -443,12 +499,21 @@ Use the typed inventory instead of parsing `doctor` prose:
 st2 tasks --catalog "$CATALOG" --host <host> --json
 ```
 
-The `st2.task-inventory.v1` envelope joins the selected host's desired PTY and exec tasks to
+The `st2.task-inventory.v2` envelope joins the selected host's desired PTY and exec tasks to
 read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
 drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
 otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
 become `absent` only when the corresponding backend observation is complete; uncertainty remains
 `indeterminate`.
+
+Every runtime has a tagged `resourceTarget`. A live Linux process reports
+`{"type":"linuxCgroupV2","path":"/..."}` from its exact unified
+`/proc/<pid>/cgroup` membership; a live Darwin process reports
+`{"type":"darwinProcessTree","rootPid":...}` as a best-effort tree root. All
+other cases report `{"type":"unavailable","reason":"..."}` from a bounded
+reason set. These are per-observation locators, not identity: consumers keep
+using `runtimeId` as the stable task key and rediscover the target on each
+sample.
 
 A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
 state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is
@@ -621,7 +686,7 @@ message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, claude-channel, eval
 agent digest, agent publish
-catalog bootstrap, catalog snapshot, catalog apply
+catalog bootstrap, catalog snapshot, catalog apply, catalog archive, catalog unarchive
 completions
 ```
 
@@ -645,6 +710,11 @@ Run the complete local gate with:
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
+
+The linker can exhaust a small temporary filesystem during a complete gate. A space or quota error
+is an environment failure, not a compile failure. Set `CARGO_TARGET_DIR` to a filesystem with enough
+space, reduce parallel jobs or debug information if necessary, and rerun the same gate. Use
+`cargo clean --target-dir <path>` to remove the temporary build artifacts after the run.
 
 ## Eval contract
 
@@ -682,15 +752,20 @@ verdict. Without the directive, Agent Spec-shaped files inside a fixture remain 
 evals retain their flat bus and completion semantics.
 
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
-(--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
+(--expect-absent | --expect-sha256 HEX) [--managed-by MARKER]` is the single-agent declaration
+writer. Replacing an incumbent that carries `meta { managed-by "nix" }` requires
+`--managed-by nix`, because that publication rewrites bytes the Nix projection owns; an assertion
+is admitted only when it names exactly the marker the incumbent carries. Creating a declaration
+and republishing byte-identical bytes need no assertion.
 `st2 catalog apply --catalog ROOT
 (--prepared DIR --input-sha256 INPUT_HEX --expect-sha256 ROOT_HEX [--raw-preimage] | --resume)` is the complete
 declaration-plane writer. Each admits the complete prospective catalog under a
 compare-and-swap lock before making one atomic change.
 `st2 catalog digest --catalog ROOT --prepared DIR` computes the exact desired
-projection digest consumed by apply, including for raw-preimage repair where the
-invalid incumbent cannot support semantic diff. Ordinary valid-catalog workflows
-reuse `afterRootSha256` from the required policy-inspection diff instead.
+projection digest consumed by apply. Raw-preimage repair uses it for the fully
+validated successor while binding the opaque incumbent through the separate
+raw-domain digest. Ordinary valid-catalog workflows reuse `afterRootSha256`
+from the required policy-inspection diff instead.
 `st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`
 is the create-only writer for an absent catalog. An exact completed replay is
 `unchanged`; any different or incomplete existing target fails closed.

@@ -16,13 +16,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
+
+use crate::flock::{self, FileLock};
+use crate::identity::{AgentSelector, ResolveError};
 
 const SENT_VERSION: u32 = 1;
 const SENT_DIR: &str = "sent";
@@ -398,14 +400,16 @@ pub fn materialize_message_once(
     result
 }
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// The staging-name prefix for everything this module stages.
+const TMP_PREFIX: &str = ".message";
+
+/// The full staged-name prefix four inbox and sent-record walkers skip by prefix, spelled ONCE so
+/// a walker cannot drift from the writer. Tied to [`TMP_PREFIX`] by
+/// `the_staging_prefix_is_the_one_the_inbox_walkers_skip`.
+const TMP_STAGING_PREFIX: &str = ".message.tmp-";
 
 fn tmp_name() -> String {
-    format!(
-        ".message.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    crate::fsatomic::staging_name(TMP_PREFIX)
 }
 
 /// Read a canonical entry that was already returned by `read_dir`. Removing a message concurrently
@@ -502,6 +506,23 @@ pub fn list_sent(agent_dir: &Path, include_body: bool) -> anyhow::Result<SentMes
     list_sent_unlocked(&root, include_body)
 }
 
+/// Inspect one sender's ledger without creating sender state.
+///
+/// Doctor uses this read-only path. If a sender starts its first publication during the initial
+/// unlocked read, the second lock check repeats the read under that sender's persistent lock.
+pub fn inspect_sent(agent_dir: &Path, include_body: bool) -> anyhow::Result<SentMessages> {
+    let root = sent_dir(agent_dir);
+    if let Some(_lock) = SentLock::shared_existing(&root)? {
+        return list_sent_unlocked(&root, include_body);
+    }
+    let snapshot = list_sent_unlocked(&root, include_body);
+    if let Some(_lock) = SentLock::shared_existing(&root)? {
+        list_sent_unlocked(&root, include_body)
+    } else {
+        snapshot
+    }
+}
+
 fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMessages> {
     let head_path = root.join(SENT_HEAD);
     let head: SentHead = match fs::read(&head_path) {
@@ -536,14 +557,18 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         (Some(_), []) => {}
         _ => unreachable!(),
     }
-    if active.is_none()
+    let committed_pending_cleanup = if active.is_none()
         && let [record] = pending.as_slice()
+        && sent_record_exists(root, &record.filename)?
     {
         anyhow::ensure!(
-            !sent_record_exists(root, &record.filename)?,
+            head_tip_commits_record(root, &head, record)?,
             "committed pending intent is missing its active marker"
         );
-    }
+        true
+    } else {
+        false
+    };
 
     let rows = read_sent_records(&root.join(SENT_MESSAGES))?
         .into_iter()
@@ -644,7 +669,11 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
                 anyhow::ensure!(
                     active
                         .as_ref()
-                        .is_some_and(|active| active.filename == *filename),
+                        .is_some_and(|active| active.filename == *filename)
+                        || (committed_pending_cleanup
+                            && pending
+                                .first()
+                                .is_some_and(|record| record.filename == *filename)),
                     "committed sent row is missing its idempotency receipt"
                 );
             }
@@ -661,7 +690,8 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
             .cmp(&right.ts)
             .then_with(|| left.filename.cmp(&right.filename))
     });
-    let incomplete = usize::from(!pending.is_empty() || active.is_some());
+    let incomplete =
+        usize::from((!pending.is_empty() && !committed_pending_cleanup) || active.is_some());
     let coverage = if incomplete == 0 {
         SentCoverage::Since { since: head.since }
     } else {
@@ -686,7 +716,7 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent record filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         anyhow::ensure!(name.ends_with(".json"), "unexpected sent record entry");
@@ -719,7 +749,7 @@ fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         let Some(name) = name.to_str() else {
             anyhow::bail!("pending sent record filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -779,7 +809,7 @@ fn read_sent_commits(directory: &Path) -> anyhow::Result<BTreeMap<String, SentCo
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent commit filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -820,7 +850,7 @@ fn read_sent_keys(directory: &Path) -> anyhow::Result<BTreeMap<String, SentKey>>
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent key filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -933,7 +963,7 @@ pub fn resolve_list_box(
         return Ok(flat());
     }
     if apply_incomplete(root) {
-        return resolve_agent_dir(root, id, host)?
+        return resolve_agent_dir(root, &AgentSelector::Address(id.to_owned()), host)?
             .map(|agent_dir| {
                 if archive {
                     archive_dir(&agent_dir)
@@ -946,17 +976,22 @@ pub fn resolve_list_box(
             });
     }
     let discovered = crate::discover(root);
-    if let Some(agent_dir) = discovered
-        .specs
-        .iter()
-        .find(|spec| spec.bus_id(host) == id || spec.identity == id)
-        .and_then(|spec| spec.path.parent())
-    {
-        return Ok(if archive {
-            archive_dir(agent_dir)
-        } else {
-            inbox_dir(agent_dir)
-        });
+    match select_spec(
+        &discovered.specs,
+        &AgentSelector::Address(id.to_owned()),
+        host,
+    ) {
+        Ok(spec) => {
+            if let Some(agent_dir) = spec.path.parent() {
+                return Ok(if archive {
+                    archive_dir(agent_dir)
+                } else {
+                    inbox_dir(agent_dir)
+                });
+            }
+        }
+        Err(ResolveError::Unknown { .. }) => {}
+        Err(error) => return Err(error.into()),
     }
 
     if discovered.specs.is_empty() && discovered.errors.is_empty() {
@@ -965,35 +1000,98 @@ pub fn resolve_list_box(
     anyhow::bail!("no agent '{id}' found in catalog {}", root.display())
 }
 
-/// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
-/// catalog, via content discovery. Returns `None` if no agent matches.
+/// Resolve one selected agent — an ordinary bare or host-qualified address reference, or an exact
+/// immutable agent ID — to its agent folder in the catalog, via content discovery. `None` when no
+/// subject answers; an ambiguous reference is an error, never a silent absence.
 pub fn resolve_agent_dir(
     catalog_root: &Path,
-    recipient: &str,
+    selector: &AgentSelector,
     this_host: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    Ok(resolve_agent_handle(catalog_root, recipient, this_host)?.map(|agent| agent.path))
+    Ok(optional_agent_handle(catalog_root, selector, this_host)?.map(|agent| agent.path))
+}
+
+/// The admitted readings of a *declaration-key* reference, in order.
+///
+/// Two kinds of reference are declaration keys rather than routes: a runtime's own
+/// `st2 driver … --identity`, and the `supervisor` value a declaration carries. Both have always
+/// accepted the positional identity as well as the `<host>.<identity>` bus identity, and an
+/// identity may itself contain dots — so rather than guessing which dot is a separator, both
+/// readings are tried in the order today's resolution used: the reference as a whole key first,
+/// then the same reference qualified by this host. That is exactly the pair
+/// [`crate::supervisor_chain::resolve_spec`] matches, so the org chart and the notifications it
+/// carries read one namespace.
+///
+/// Both readings are exact keys. Neither a runtime nor a supervisor edge selects through the
+/// mutable address, so an address cutover cannot disconnect a seat from its own directories,
+/// workspace, or message boxes, and cannot break a parent's notification path.
+fn declaration_readings(reference: &str, this_host: &str) -> Vec<AgentSelector> {
+    let qualified = format!("{this_host}.{reference}");
+    if qualified == reference {
+        return vec![AgentSelector::Id(reference.to_owned())];
+    }
+    vec![
+        AgentSelector::Id(reference.to_owned()),
+        AgentSelector::Id(qualified),
+    ]
+}
+
+/// [`resolve_agent_dir`] for a declaration key: a runtime's own agent, or a declared `supervisor`.
+pub fn resolve_declared_dir(
+    catalog_root: &Path,
+    reference: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    for selector in declaration_readings(reference, this_host) {
+        if let Some(agent) = optional_agent_handle(catalog_root, &selector, this_host)? {
+            return Ok(Some(agent.path));
+        }
+    }
+    Ok(None)
+}
+
+/// The exact selector for a declaration key used as a message endpoint — a runtime naming itself
+/// as the sender, or a declared `supervisor` as the recipient.
+///
+/// An unresolvable reference keeps its own bytes, so a caller that is not a declared subject — a
+/// flat compat box, an external requester — still fails with today's diagnostic.
+pub fn declared_selector(
+    catalog_root: &Path,
+    reference: &str,
+    this_host: &str,
+) -> anyhow::Result<AgentSelector> {
+    for selector in declaration_readings(reference, this_host) {
+        if optional_agent_handle(catalog_root, &selector, this_host)?.is_some() {
+            return Ok(selector);
+        }
+    }
+    Ok(AgentSelector::Id(reference.to_owned()))
 }
 
 pub fn with_resolved_agent_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    with_resolved_state_dir(catalog_root, identity, this_host, &[], true, operation)
+    with_resolved_state_dir(catalog_root, selector, this_host, &[], true, operation)
 }
 
+/// Run an operation against one selected agent's state directory.
+///
+/// An exact-ID selector performs only ID lookup, so a subject whose address differs from its ID
+/// still reaches its own state; an ordinary reference answers on the current address.
 pub fn with_resolved_state_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     components: &[&str],
     create: bool,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    match resolve_agent_handle(catalog_root, identity, this_host)? {
-        Some(agent) => {
+    let identity = selector_reference(selector);
+    match find_agent_handle(catalog_root, selector, this_host)? {
+        Ok(agent) => {
             test_capability_checkpoint();
             let path = match agent.capability.as_ref() {
                 Some(capability) if components.is_empty() => {
@@ -1011,14 +1109,18 @@ pub fn with_resolved_state_dir<T>(
             };
             operation(&path)
         }
-        None => {
+        Err(error) => {
+            // The one caller that reads absence as a decision rather than a fault: a provably
+            // fresh root is the legacy flat bus, whose state directory is created on first use.
+            // Ambiguity is never that decision, so it keeps the address diagnostic.
             let discovered = crate::discover(catalog_root);
             anyhow::ensure!(
-                crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                matches!(error, ResolveError::Unknown { .. })
+                    && crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
                     && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
                     && discovered.specs.is_empty()
                     && discovered.errors.is_empty(),
-                "no agent '{identity}' found in catalog {}",
+                "no agent '{identity}' found in catalog {}: {error}",
                 catalog_root.display()
             );
             operation(
@@ -1039,16 +1141,11 @@ pub fn with_resolved_state_dir<T>(
 /// operation outside the catalog after recipient resolution.
 pub(crate) fn with_resolved_message_boxes<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     operation: impl FnOnce(&Path, &Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let agent = resolve_agent_handle(catalog_root, identity, this_host)?.with_context(|| {
-        format!(
-            "no agent '{identity}' found in catalog {}",
-            catalog_root.display()
-        )
-    })?;
+    let agent = require_agent_handle(catalog_root, selector, this_host)?;
     let capability = agent
         .capability
         .as_ref()
@@ -1063,26 +1160,152 @@ pub(crate) fn with_resolved_message_boxes<T>(
     )
 }
 
-fn resolve_agent_handle(
+/// Locate one agent on a single coherent address book, reporting why an ordinary reference did not
+/// name exactly one subject (R24).
+///
+/// The catalog-generation and transition fence is sampled before and after the walk, and the walk
+/// is retried when it moved, so the answer always comes from one before-or-after snapshot of the
+/// address book. That is exactly what an atomic address cutover needs: a lookup sees the old
+/// address book or the new one, never a torn mixture in which a cut-over address resolves twice or
+/// not at all.
+fn find_agent_handle(
     catalog_root: &Path,
-    recipient: &str,
+    selector: &AgentSelector,
     this_host: &str,
-) -> anyhow::Result<Option<AddressableAgent>> {
+) -> anyhow::Result<std::result::Result<AddressableAgent, ResolveError>> {
     for _ in 0..3 {
         let before = address_fence(catalog_root)?;
-        let mut candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?
-            .into_iter()
-            .filter(|candidate| candidate.bus_id == recipient || candidate.identity == recipient)
-            .collect::<Vec<_>>();
+        let candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?;
         let after = address_fence(catalog_root)?;
         if before != after {
             continue;
         }
-        candidates.sort_by(|left, right| left.path.cmp(&right.path));
-        candidates.dedup_by(|left, right| left.path == right.path);
-        return Ok((candidates.len() == 1).then(|| candidates.remove(0)));
+        return Ok(select_agent(candidates, selector, this_host));
     }
-    anyhow::bail!("catalog address book changed repeatedly while resolving {recipient:?}")
+    anyhow::bail!("catalog address book changed repeatedly while resolving {selector:?}")
+}
+
+/// Resolve or fail with the address-specific diagnostic attached to the caller's own message.
+fn require_agent_handle(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> anyhow::Result<AddressableAgent> {
+    find_agent_handle(catalog_root, selector, this_host)?
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "no agent '{}' found in catalog {}",
+                selector_reference(selector),
+                catalog_root.display()
+            )
+        })
+}
+
+/// Absence-tolerant lookup for callers whose next step depends on "no such subject" — an external
+/// requester mailbox, a flat compat box. An ambiguous reference is not absence and stays an error.
+fn optional_agent_handle(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> anyhow::Result<Option<AddressableAgent>> {
+    match find_agent_handle(catalog_root, selector, this_host)? {
+        Ok(agent) => Ok(Some(agent)),
+        Err(ResolveError::Unknown { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The literal bytes a caller named, for diagnostics only.
+fn selector_reference(selector: &AgentSelector) -> &str {
+    match selector {
+        AgentSelector::Id(id) => id,
+        AgentSelector::Address(reference) => reference,
+    }
+}
+
+fn select_agent(
+    candidates: Vec<AddressableAgent>,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<AddressableAgent, ResolveError> {
+    let index = select_index(
+        &candidates,
+        selector,
+        this_host,
+        AddressableAgent::entry,
+        |candidate| candidate.retired,
+    )?;
+    Ok(candidates.into_iter().nth(index).expect("selected index"))
+}
+
+/// Resolve a selector against a discovered catalog's specs.
+fn select_spec<'a>(
+    specs: &'a [crate::AgentSpec],
+    selector: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<&'a crate::AgentSpec, ResolveError> {
+    let index = select_index(
+        specs,
+        selector,
+        this_host,
+        |spec| crate::identity::AddressBookEntry::of(spec, this_host),
+        |spec| spec.desired_state.is_retired(),
+    )?;
+    Ok(&specs[index])
+}
+
+/// Pick the one candidate a selector names, through the address algorithm rather than a precedence
+/// rule (R24).
+///
+/// Two books, not a tie-break: retirement releases the address, so a retired subject must not make
+/// a live claimant's reference ambiguous. It answers to its own declaration address only when no
+/// routable subject answers at all, which keeps its retained state — status, context, message
+/// boxes — reachable by name exactly as it is today.
+///
+/// The local host is the pin, so this plane and stream ingress decide one reference identically.
+fn select_index<T>(
+    candidates: &[T],
+    selector: &AgentSelector,
+    this_host: &str,
+    entry: impl Fn(&T) -> crate::identity::AddressBookEntry,
+    retired: impl Fn(&T) -> bool,
+) -> std::result::Result<usize, ResolveError> {
+    let book = candidates.iter().map(&entry).collect::<Vec<_>>();
+    let routable = candidates
+        .iter()
+        .zip(&book)
+        .filter(|(candidate, _)| !retired(candidate))
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    let resolved = match crate::identity::resolve_local_first(&routable, selector, this_host) {
+        Err(ResolveError::Unknown { .. }) if routable.len() != book.len() => {
+            crate::identity::resolve_local_first(&book, selector, this_host)
+        }
+        other => other,
+    };
+    let id = &resolved?.id;
+    // Resolution deduplicates by agent ID, so two declarations sharing one effective ID collapse
+    // into one surviving entry — and then a positional lookup could hand back the other one. Two
+    // candidates under one ID are two subjects, not a first match.
+    let mut positions = book
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| &candidate.id == id);
+    let (index, _) = positions
+        .next()
+        .expect("the resolved entry came from this candidate set");
+    if positions.next().is_some() {
+        return Err(ResolveError::Ambiguous {
+            reference: selector_reference(selector).to_owned(),
+            ids: book
+                .iter()
+                .filter(|candidate| &candidate.id == id)
+                .map(|candidate| candidate.bus_identity.clone())
+                .collect(),
+        });
+    }
+    Ok(index)
 }
 
 fn address_fence(
@@ -1128,10 +1351,30 @@ fn test_address_fence_checkpoint() {}
 
 #[derive(Debug)]
 struct AddressableAgent {
+    /// The immutable catalog-global agent ID: the explicit `id`, else the `<host>.<identity>` bus
+    /// identity a later ID migration would freeze.
+    id: String,
+    /// The legacy `<host>.<identity>` bus identity, which is the canonical endpoint of every
+    /// durable record and is never moved by an address cutover.
     bus_id: String,
-    identity: String,
+    host: String,
+    /// The effective mutable address: declared `address`, else the positional identity.
+    address: String,
+    /// A retired subject is non-routable and has released its address.
+    retired: bool,
     path: PathBuf,
     capability: Option<File>,
+}
+
+impl AddressableAgent {
+    fn entry(&self) -> crate::identity::AddressBookEntry {
+        crate::identity::AddressBookEntry {
+            id: self.id.clone(),
+            bus_identity: self.bus_id.clone(),
+            host: self.host.clone(),
+            address: self.address.clone(),
+        }
+    }
 }
 
 fn addressable_agent_dirs(
@@ -1151,8 +1394,11 @@ fn addressable_agent_dirs(
                     .to_path_buf();
                 let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
                 Ok(AddressableAgent {
+                    id: spec.effective_id(this_host),
                     bus_id: spec.bus_id(this_host),
-                    identity: spec.identity,
+                    host: spec.resolved_host(this_host).to_owned(),
+                    address: spec.effective_address().to_owned(),
+                    retired: spec.desired_state.is_retired(),
                     path,
                     capability: Some(capability),
                 })
@@ -1173,7 +1419,7 @@ fn addressable_agent_dirs(
     let mut result = Vec::new();
     for host in sorted_real_entries(&agents, "host")? {
         let host_name = safe_entry_name(&host, "host")?;
-        for identity in sorted_real_entries(&host.path(), "identity")? {
+        for identity in sorted_real_identity_entries(&host.path())? {
             let identity_name = safe_entry_name(&identity, "identity")?;
             let key = crate::catalog_transaction::AgentKey {
                 host: host_name.clone(),
@@ -1186,9 +1432,18 @@ fn addressable_agent_dirs(
             let retained_state =
                 transition.original_agents.contains(&key) && marker_state_exists(&retained)?;
             if current_spec || retained_state {
+                // Keyed on the legacy `<host>/<identity>` pair, not on a declared address: mid
+                // transition the declaration bytes under this directory are not readable, so the
+                // positional pair is the only coherent key available. This branch locates a
+                // retained *state* directory for a catalog being applied; it is not a route being
+                // resolved, and a subject whose declaration is mid-apply has no observable
+                // desired state to call retired.
                 result.push(AddressableAgent {
+                    id: format!("{}.{}", key.host, key.identity),
                     bus_id: format!("{}.{}", key.host, key.identity),
-                    identity: key.identity,
+                    host: key.host,
+                    address: key.identity,
+                    retired: false,
                     path,
                     capability: Some(capability),
                 });
@@ -1210,6 +1465,25 @@ fn sorted_real_entries(dir: &Path, label: &str) -> anyhow::Result<Vec<fs::DirEnt
         );
     }
     Ok(entries)
+}
+
+fn sorted_real_identity_entries(dir: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    let mut identities = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if crate::harness_context::is_legacy_harness_context_staging_file(&entry)? {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "canonical identity path is not a real directory: {}",
+            entry.path().display()
+        );
+        identities.push(entry);
+    }
+    Ok(identities)
 }
 
 fn safe_entry_name(entry: &fs::DirEntry, label: &str) -> anyhow::Result<String> {
@@ -1442,13 +1716,14 @@ fn catalogless(root: &Path) -> bool {
 
 fn resolve_delivery_endpoint(
     root: &Path,
-    recipient: &str,
+    recipient: &AgentSelector,
     host: &str,
     external: Option<&ExternalInbox>,
 ) -> anyhow::Result<DeliveryEndpoint> {
-    if let Some(agent) = resolve_agent_handle(root, recipient, host)? {
+    if let Some(agent) = optional_agent_handle(root, recipient, host)? {
         return Ok(DeliveryEndpoint::Agent(agent));
     }
+    let recipient = selector_reference(recipient);
     if let Some(external) = external
         && external.root == root
         && external.identity == recipient
@@ -1470,12 +1745,16 @@ fn resolve_delivery_endpoint(
     anyhow::bail!("no agent '{recipient}' found in catalog {}", root.display())
 }
 
+/// Send one message between two selected endpoints.
+///
+/// Both endpoints are selectors, not bare strings: an exact-ID endpoint is the form an
+/// `ST_AGENT`-defaulted sender uses, and it must not be re-resolved through a mutable address.
 #[allow(clippy::too_many_arguments)]
 pub fn send_to_resolved_inbox(
     catalog_root: &Path,
-    recipient: &str,
+    recipient: &AgentSelector,
     this_host: &str,
-    from: &str,
+    sender: &AgentSelector,
     subject: Option<&str>,
     in_reply_to: Option<&str>,
     tags: &[String],
@@ -1486,8 +1765,9 @@ pub fn send_to_resolved_inbox(
     if let Some(key) = idempotency_key {
         validate_idempotency_key(key)?;
     }
+    let from = selector_reference(sender);
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
-    let sender = resolve_agent_handle(catalog_root, from, this_host)?;
+    let sender = optional_agent_handle(catalog_root, sender, this_host)?;
     let external_sender =
         external.is_some_and(|external| external.root == catalog_root && external.identity == from);
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
@@ -1499,8 +1779,11 @@ pub fn send_to_resolved_inbox(
             .as_ref()
             .map(|agent| agent.bus_id.as_str())
             .unwrap_or(from);
-        // The eval injects this capability into an already admitted seat. Keep its frozen sender
-        // spelling usable if the declaration disappears after boot.
+        anyhow::ensure!(
+            sender.is_some() || external_sender,
+            "no agent '{from}' found in catalog {}",
+            catalog_root.display()
+        );
         let (inbox, _) = recipient.boxes()?;
         return send_to_inbox(&inbox, canonical_from, subject, in_reply_to, tags, body);
     }
@@ -1708,6 +1991,18 @@ fn recover_active(
         remove_if_exists(&root.join(SENT_ACTIVE))?;
         return Ok(Vec::new());
     }
+    if active.is_none()
+        && let [record] = pending.as_slice()
+        && sent_record_exists(root, &record.filename)?
+    {
+        anyhow::ensure!(
+            head_tip_commits_record(root, head, record)?,
+            "committed pending intent is missing its active marker"
+        );
+        publish_key(root, record)?;
+        remove_if_exists(&root.join(SENT_PENDING).join(pending_record_name(record)?))?;
+        return Ok(Vec::new());
+    }
     let record = match (active, pending.as_slice()) {
         (None, []) => return Ok(Vec::new()),
         (None, [record]) => {
@@ -1728,7 +2023,15 @@ fn recover_active(
         (Some(_), []) => anyhow::bail!("active sent intent has no recoverable pending record"),
         _ => unreachable!(),
     };
-    let recipient = resolve_delivery_endpoint(catalog_root, &record.to, this_host, external)?;
+    // A durable record's `to` is the canonical endpoint — the legacy bus identity, which is also
+    // the subject's effective immutable ID — so recovery selects by ID. An address cutover between
+    // the pending write and the retry is a nondisruptive route change, not a changed recipient.
+    let recipient = resolve_delivery_endpoint(
+        catalog_root,
+        &AgentSelector::Id(record.to.clone()),
+        this_host,
+        external,
+    )?;
     anyhow::ensure!(
         recipient.bus_id() == record.to,
         "pending recipient identity changed"
@@ -1852,10 +2155,7 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
         };
         if !same {
             crate::metrics::record_message_delivery(true);
-            anyhow::bail!(
-                "archived message differs from pending send {}",
-                record.filename
-            );
+            anyhow::bail!("archived message differs from pending send {}", record.filename);
         }
         crate::metrics::record_message_delivery(false);
         return Ok(());
@@ -1943,9 +2243,9 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
     Ok(Some(record))
 }
 
-fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Result<bool> {
+fn head_tip_commit(root: &Path, head: &SentHead) -> anyhow::Result<Option<SentCommit>> {
     let Some(digest) = &head.tip else {
-        return Ok(false);
+        return Ok(None);
     };
     let path = root.join(SENT_COMMITS).join(format!("{digest}.json"));
     let node: SentCommit = serde_json::from_slice(&fs::read(path)?)?;
@@ -1962,7 +2262,36 @@ fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Res
         "sent commit digest mismatch"
     );
     anyhow::ensure!(node.ordinal == head.count, "sent commit ordinal mismatch");
-    Ok(node.filename == filename)
+    Ok(Some(node))
+}
+
+fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Result<bool> {
+    Ok(head_tip_commit(root, head)?.is_some_and(|node| node.filename == filename))
+}
+
+fn head_tip_commits_record(
+    root: &Path,
+    head: &SentHead,
+    record: &SentRecord,
+) -> anyhow::Result<bool> {
+    let Some(node) = head_tip_commit(root, head)? else {
+        return Ok(false);
+    };
+    if node.filename != record.filename {
+        return Ok(false);
+    }
+    let pending_digest = digest_json(record)?;
+    anyhow::ensure!(
+        node.row_digest == pending_digest,
+        "committed pending intent differs from head tip"
+    );
+    let committed = read_sent_record(root, &record.filename)
+        .context("committed pending intent has no sender row")?;
+    anyhow::ensure!(
+        digest_json(&committed)? == pending_digest,
+        "committed pending intent differs from sender row"
+    );
+    Ok(true)
 }
 
 fn digest_json(value: &impl Serialize) -> anyhow::Result<String> {
@@ -1979,29 +2308,24 @@ fn write_sent_head(root: &Path, head: &SentHead) -> anyhow::Result<()> {
     atomic_replace_file(&root.join(SENT_HEAD), &serde_json::to_vec(head)?)
 }
 
+/// Publish `bytes` at `path` unless the name is already taken, reporting whether this call
+/// created it. The staged sibling is hardlinked rather than renamed, so the name being taken is an
+/// answer instead of a failure — that boolean is how a caller tells a replay from a first send.
 fn atomic_create_file(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
-    let parent = path.parent().context("atomic file has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(tmp_name());
-    fs::write(&temporary, bytes)?;
-    let result = match fs::hard_link(&temporary, path) {
-        Ok(()) => Ok(true),
-        Err(_) if path.is_file() => Ok(false),
-        Err(error) => Err(error.into()),
-    };
-    let _ = fs::remove_file(temporary);
-    result
+    Ok(crate::fsatomic::create_once(
+        path,
+        bytes,
+        crate::fsatomic::Staging::new(TMP_PREFIX),
+    )?)
 }
 
 fn atomic_replace_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("atomic file has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(tmp_name());
-    fs::write(&temporary, bytes)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        bytes,
+        crate::fsatomic::Staging::new(TMP_PREFIX),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
 }
 
@@ -2021,41 +2345,48 @@ fn validate_idempotency_key(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One sender's ledger lock. Read only by `Drop`: the guard's job is to outlive the read-decide-
+/// publish cycle, and closing the descriptor is what releases it.
 struct SentLock {
-    file: Option<File>,
+    _held: FileLock,
 }
 
 impl SentLock {
     fn shared(root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
-        Self::acquire(root, libc::LOCK_SH)
+        Self::acquire(root, flock::Mode::Shared)
     }
 
     fn exclusive(root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
-        Self::acquire(root, libc::LOCK_EX)
+        Self::acquire(root, flock::Mode::Exclusive)
     }
 
-    fn acquire(root: &Path, operation: libc::c_int) -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join(SENT_LOCK))?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-        anyhow::ensure!(result == 0, "locking sent-message ledger failed");
-        Ok(Self { file: Some(file) })
+    /// The read-only path: `Ok(None)` means this sender has never published, which a reader
+    /// answers without creating the sender's ledger directory or its lock file.
+    ///
+    /// It opens the lock file `O_RDWR` rather than `O_RDONLY`, because the transport has one open
+    /// shape. That is a real narrowing — a reader who may read the lock file but not write it now
+    /// fails here — and it is admissible only because every ledger is single-uid: its owner and
+    /// root are the only readers, and a lock file this build creates is `0600` anyway.
+    fn shared_existing(root: &Path) -> anyhow::Result<Option<Self>> {
+        let file = match flock::open(&root.join(SENT_LOCK), flock::Open::Existing) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(Self {
+            _held: FileLock::hold_blocking(file, flock::Mode::Shared)
+                .context("locking sent-message ledger failed")?,
+        }))
     }
-}
 
-impl Drop for SentLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        if let Some(file) = &self.file {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
+    fn acquire(root: &Path, mode: flock::Mode) -> anyhow::Result<Self> {
+        let file = flock::open(&root.join(SENT_LOCK), flock::Open::Create)?;
+        Ok(Self {
+            _held: FileLock::hold_blocking(file, mode)
+                .context("locking sent-message ledger failed")?,
+        })
     }
 }
 
@@ -2091,7 +2422,7 @@ fn test_capability_checkpoint() {}
 
 pub fn archive_resolved_message(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     filename: &str,
 ) -> anyhow::Result<()> {
@@ -2099,7 +2430,8 @@ pub fn archive_resolved_message(
         is_message_filename(filename),
         "invalid message filename {filename:?}"
     );
-    let agent = match resolve_agent_handle(catalog_root, identity, this_host)? {
+    let identity = selector_reference(selector);
+    let agent = match optional_agent_handle(catalog_root, selector, this_host)? {
         Some(agent) => agent,
         None => {
             let discovered = crate::discover(catalog_root);
@@ -2228,6 +2560,68 @@ fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The staged name is a contract with four walkers that skip it by prefix (`inbox_dir` and the
+    /// three sent-record scans), all of which now match [`TMP_STAGING_PREFIX`] so none can drift
+    /// from the writer. What a shared const cannot catch is both sides being renamed together,
+    /// which would leave every already-staged file on the fleet unrecognized — hence the value
+    /// assertion.
+    #[test]
+    fn the_staging_prefix_is_the_one_the_inbox_walkers_skip() {
+        assert_eq!(TMP_PREFIX, ".message");
+        assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
+        assert!(!is_message_filename(&tmp_name()), "a staged name must never look like a message");
+    }
+
+    /// [`atomic_create_file`]'s create-once contract. It is a hardlink, not a rename, and that is
+    /// the whole point: the first publication wins, a second reports `false` instead of replacing
+    /// the winner's bytes, and neither leaves a staged sibling behind for the four `.message.tmp-`
+    /// walkers to trip over.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — these records used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask). Bus
+    /// records are per-agent state in the agent's own directory; a reader that is not st2 or that
+    /// agent was never a supported reader.
+    #[test]
+    fn a_create_once_message_write_keeps_the_first_bytes_and_reports_the_duplicate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/record.json");
+        assert!(atomic_create_file(&path, b"first").unwrap());
+        assert!(!atomic_create_file(&path, b"second").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the record is published owner-only"
+        );
+
+        let residue = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+
+    /// [`atomic_replace_file`]'s contract, pinned for the same fold: replacement is unconditional
+    /// and complete, and the staged sibling never survives it.
+    #[test]
+    fn a_replacing_message_write_lands_the_complete_bytes_and_leaves_no_staged_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(SENT_HEAD);
+        atomic_replace_file(&path, b"first").unwrap();
+        atomic_replace_file(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+
+        let residue = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
 
     #[test]
     fn filename_grammar() {
@@ -2382,13 +2776,29 @@ mod tests {
         fs::create_dir_all(&inbox).unwrap();
         let victim = tmp.path().join("victim");
         fs::write(&victim, "must remain unchanged").unwrap();
-        let start = TMP_COUNTER.load(Ordering::Relaxed);
-        for counter in start..start + 4096 {
-            symlink(
-                &victim,
-                inbox.join(format!(".message.tmp-{}-{counter}", std::process::id())),
-            )
-            .unwrap();
+        // The counter lives in `fsatomic` and is shared with every other staging site, so a
+        // sibling test running in parallel advances it too. Plant a window, then PROBE again: the
+        // loop only exits once the very next name is one this test has already blocked, so the
+        // assertion below cannot become "the call happened to pick a free name".
+        let counter_of = |name: &str| {
+            name.rsplit_once('-')
+                .and_then(|(_, counter)| counter.parse::<u64>().ok())
+                .expect("the staging grammar ends in the counter")
+        };
+        let mut planted_through = 0;
+        loop {
+            let probe = counter_of(&tmp_name());
+            if probe < planted_through {
+                break;
+            }
+            for counter in probe + 1..=probe + 512 {
+                symlink(
+                    &victim,
+                    inbox.join(format!("{TMP_PREFIX}.tmp-{}-{counter}", std::process::id())),
+                )
+                .unwrap();
+            }
+            planted_through = probe + 512;
         }
 
         let error = materialize_message_once(&inbox, "1784649988123-symlnk.md", "must not escape")
@@ -2438,6 +2848,76 @@ mod tests {
         assert!(resolve_inbox_with_external(root, "missing", "h", Some(&external)).is_err());
     }
 
+    fn addressable_catalog(root: &Path) -> PathBuf {
+        let agent = root.join("agents/host/worker");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" { identity \"worker\"; host \"host\"; command \"true\" }\n",
+        )
+        .unwrap();
+        agent
+    }
+
+    #[test]
+    fn transition_addressability_ignores_and_preserves_exact_legacy_staging_files() {
+        let root = tempfile::tempdir().unwrap();
+        addressable_catalog(root.path());
+        let legacy = root
+            .path()
+            .join("agents/host/.harness-context.tmp-123-456");
+        fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+        let transition = crate::catalog_transaction::CatalogTransition {
+            original_agents: BTreeSet::new(),
+        };
+
+        let agents = addressable_agent_dirs(root.path(), "host", Some(&transition)).unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].bus_id, "host.worker");
+        assert_eq!(
+            fs::read(&legacy).unwrap(),
+            b"stale legacy staging bytes",
+            "address resolution must not clean another process's file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_addressability_rejects_legacy_type_confusion_and_near_misses() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["directory", "symlink", "near-miss"] {
+            let root = tempfile::tempdir().unwrap();
+            addressable_catalog(root.path());
+            let host = root.path().join("agents/host");
+            match kind {
+                "directory" => {
+                    fs::create_dir(host.join(".harness-context.tmp-123-456")).unwrap();
+                }
+                "symlink" => {
+                    symlink(
+                        host.join("worker"),
+                        host.join(".harness-context.tmp-123-456"),
+                    )
+                    .unwrap();
+                }
+                "near-miss" => {
+                    fs::write(host.join(".harness-context.tmp-123-nope"), b"stale").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let transition = crate::catalog_transaction::CatalogTransition {
+                original_agents: BTreeSet::new(),
+            };
+            assert!(
+                addressable_agent_dirs(root.path(), "host", Some(&transition)).is_err(),
+                "{kind} must not enter the reserved compatibility exception"
+            );
+        }
+    }
+
+
     #[test]
     fn external_inbox_rejects_unsafe_or_nested_identities() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2456,35 +2936,78 @@ mod tests {
         }
     }
 
+    /// The transport hardened this lock file with `O_NOFOLLOW`; nothing pinned it before.
     #[test]
-    fn an_external_eval_inbox_accepts_a_frozen_sender_after_declaration_removal() {
+    fn a_symlinked_ledger_lock_is_refused_instead_of_locking_its_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let peer = root.join("agents/h/peer");
-        fs::create_dir_all(&peer).unwrap();
-        fs::write(
-            peer.join("agent.kdl"),
-            r#"agent "peer" { host "h"; command "true" }"#,
-        )
-        .unwrap();
-        let external = ExternalInbox::provision(root, "requester").unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        let root = sent_dir(tmp.path());
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(SENT_LOCK)).unwrap();
 
-        let filename = send_to_resolved_inbox(
-            root,
-            "requester",
-            "h",
-            "h.removed",
-            None,
-            None,
-            &[],
-            "done",
-            None,
-            Some(&external),
-        )
-        .unwrap();
+        for error in [
+            list_sent(tmp.path(), false).unwrap_err(),
+            inspect_sent(tmp.path(), false).unwrap_err(),
+        ] {
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(libc::ELOOP),
+                "a symlinked ledger lock must be refused, got {error:#}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+    }
 
-        let message = read_msg(&external.inbox, &filename).unwrap();
-        assert_eq!(message.from.as_deref(), Some("h.removed"));
-        assert_eq!(message.body.trim_end(), "done");
+    /// `flock` locks the open file description rather than the process, so a second open of the
+    /// same lock file observes a live holder without a second thread or process.
+    fn ledger_lock_is_free(root: &Path, mode: crate::flock::Mode) -> bool {
+        let file = crate::flock::open(&root.join(SENT_LOCK), crate::flock::Open::Existing).unwrap();
+        FileLock::hold(file, mode, crate::flock::Wait::Now)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_ledger_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sent_dir(tmp.path());
+        let held = SentLock::exclusive(&root).unwrap();
+        assert!(
+            !ledger_lock_is_free(&root, crate::flock::Mode::Shared),
+            "an exclusive ledger holder must exclude a reader"
+        );
+        drop(held);
+        assert!(
+            ledger_lock_is_free(&root, crate::flock::Mode::Shared),
+            "dropping the guard must release the ledger lock"
+        );
+    }
+
+    /// `inspect_sent` takes up to two sequential guards around one unlocked read, and neither may
+    /// outlive the call, or the doctor read would block every subsequent publication by that
+    /// sender. This pins the *first* guard only: once the lock file exists, `shared_existing`
+    /// answers `Some` and the function early-returns on that first guard, which is the guard held
+    /// on this path. Reaching the second guard needs `shared_existing` to answer `None` and then
+    /// `Some` — a race a single-threaded test cannot arrange — so it stays unpinned rather than
+    /// fake-covered.
+    #[test]
+    fn inspect_sent_leaves_no_guard_held_and_creates_no_sender_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sent_dir(tmp.path());
+        inspect_sent(tmp.path(), false).unwrap();
+        assert!(
+            !root.exists(),
+            "the read-only path must not create sender state"
+        );
+
+        drop(SentLock::exclusive(&root).unwrap());
+        inspect_sent(tmp.path(), false).unwrap();
+        assert!(
+            ledger_lock_is_free(&root, crate::flock::Mode::Exclusive),
+            "inspect_sent must release the shared guard it early-returns on"
+        );
     }
 }

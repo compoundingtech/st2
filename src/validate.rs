@@ -232,9 +232,16 @@ pub(crate) fn validate_discovered(root: &Path, this_host: Option<&str>, d: &Disc
 
     // 4. Resolved pass: cross-spec + field checks over each agent.
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
-    // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
-    // makes two unset-host same-identity specs collide (which is the real bug).
-    let collision_host = "";
+    // Effective addresses live in their own typed namespace, host-local: the same address on two
+    // hosts is legal, and equal bytes in the ID namespace never collide with it. Keyed by
+    // (resolved logical host, effective address).
+    let mut seen_addresses: HashMap<(String, String), PathBuf> = HashMap::new();
+    // One host key for both namespaces, so the two rules judge the same physical subject: under
+    // `--host h` a host-less declaration and an explicit `host "h"` one resolve to one agent and
+    // collide on both keys. Without a selected host the key is the empty placeholder, which still
+    // makes two unset-host same-identity specs collide (the real bug) while keeping an explicit
+    // host's own bytes.
+    let collision_host = this_host.unwrap_or_default();
 
     for s in &d.specs {
         let rp = rel(root, &s.path);
@@ -255,9 +262,40 @@ pub(crate) fn validate_discovered(root: &Path, this_host: Option<&str>, d: &Disc
             .map_err(|error| format!("{error:#}"))
         });
 
-        // Duplicate bus id — the runner cannot run two agents under one <host>.<identity>.
-        let bid = s.bus_id(collision_host);
-        if let Some(prev) = seen.insert(bid.clone(), s.path.clone()) {
+        // Duplicate agent ID — an ID is catalog-global and immutable, so two declarations cannot
+        // share one. `effective_id` is the explicit `id` once a declaration is migrated and the
+        // frozen legacy `<host>.<identity>` bus identity until then, so this single check covers
+        // legacy/legacy, explicit/explicit across different hosts, and an explicit `id` that
+        // collides with another subject's still-unmigrated frozen identity.
+        //
+        // Duplicate effective address, inside one resolved logical host. A retired subject does
+        // not resolve, so it releases its address and neither claims nor collides; a suspended
+        // subject still occupies the namespace. Explicit-vs-explicit and
+        // explicit-vs-identity-fallback collisions are the same collision here, because both
+        // sides are read through `effective_address`.
+        //
+        // Both keys register in one pass, before either is reported: a declaration refused for a
+        // duplicate ID still claims its address, so the authoring gate — `refuse_address_collision`
+        // re-runs exactly this rule over a prospective catalog — cannot admit a second claim on an
+        // address an already-duplicated declaration holds. Only the first fault is reported: an
+        // unmigrated duplicate identity is one authoring fault in one place, and reporting it
+        // twice would only inflate a legacy catalog's diagnostics.
+        //
+        // DELTA-003: the structurally archived subject set joins the ID check once
+        // `st2 catalog migrate-ids` lands (PR D2) — migration may freeze an archived subject's
+        // legacy bytes only while they remain unique across the combined live-and-archived set,
+        // and `st2 catalog unarchive` validates ID uniqueness against that prospective
+        // live-and-archived set rather than the live catalog alone.
+        let bid = s.effective_id(collision_host);
+        let duplicate_id = seen.insert(bid.clone(), s.path.clone());
+        let address_host = s.resolved_host(collision_host).to_string();
+        let address = s.effective_address().to_string();
+        let duplicate_address = (!s.desired_state.is_retired())
+            .then(|| {
+                seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone())
+            })
+            .flatten();
+        if let Some(prev) = &duplicate_id {
             issues.push(Issue::error(
                 "dup-id",
                 rp.clone(),
@@ -265,7 +303,22 @@ pub(crate) fn validate_discovered(root: &Path, this_host: Option<&str>, d: &Disc
                 format!(
                     "duplicate agent id '{}' (also declared in {})",
                     bid,
-                    rel(root, &prev)
+                    rel(root, prev)
+                ),
+            ));
+        } else if let Some(prev) = &duplicate_address {
+            issues.push(Issue::error(
+                "dup-address",
+                rp.clone(),
+                ag.clone(),
+                format!(
+                    "duplicate agent address '{address}' on host '{}' (also declared in {})",
+                    if address_host.is_empty() {
+                        "<default>"
+                    } else {
+                        &address_host
+                    },
+                    rel(root, prev)
                 ),
             ));
         }
@@ -382,6 +435,40 @@ pub(crate) fn validate_discovered(root: &Path, this_host: Option<&str>, d: &Disc
                 "service agent has no task with `command` or `argv` (unrendered, or the renderer emitted none)"
                     .to_string(),
             ));
+        }
+
+        // A pty task whose session socket path exceeds the portable `sun_path` bound can never
+        // spawn: `pty` refuses the bind, so the failure repeats on every reconcile pass forever
+        // and makes the pass result useless as a health signal. Admission is the only place where
+        // it is cheap, attributable, and fixable by the author. Host-scoped, because the bound
+        // comes from the pty root resolved on the host that would run the task.
+        if let (Some(host), Some(Ok(compiled))) = (this_host, &compiled)
+            && runs_on_selected_host
+        {
+            let pty_root = crate::run::effective_pty_root(root);
+            let bus_id = compiled.bus_id(host);
+            for task in &compiled.tasks {
+                if task.kind != agent_spec::spec::TaskKind::Pty {
+                    continue;
+                }
+                let id = crate::reconcile::resolve_task_id(&bus_id, &task.name, task.id.as_deref());
+                if let Some((socket, over)) = crate::run::session_socket_overage(&pty_root, &id) {
+                    issues.push(Issue::error(
+                        "socket-path-too-long",
+                        rp.clone(),
+                        ag.clone(),
+                        format!(
+                            "task '{id}' would bind a {bytes}-byte session socket at {socket}, \
+                             exceeding the {limit}-byte portable limit by {over}; shorten the \
+                             identity or task id by at least {over} bytes, or declare a shorter \
+                             pty root",
+                            bytes = crate::run::PORTABLE_SOCKET_PATH_LIMIT + over,
+                            socket = socket.display(),
+                            limit = crate::run::PORTABLE_SOCKET_PATH_LIMIT,
+                        ),
+                    ));
+                }
+            }
         }
 
         // Path fields must be absolute, $CATALOG-rooted, or the one canonical relative workspace.

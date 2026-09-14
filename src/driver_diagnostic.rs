@@ -7,7 +7,6 @@
 
 use std::array;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +23,7 @@ pub enum Stage {
     ApiGate,
     Sse,
     Seed,
+    ProviderAuth,
     Delivery,
     ReadBack,
     #[serde(other)]
@@ -31,11 +31,12 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::VersionGate,
         Self::ApiGate,
         Self::Sse,
         Self::Seed,
+        Self::ProviderAuth,
         Self::Delivery,
         Self::ReadBack,
     ];
@@ -46,20 +47,27 @@ impl Stage {
             Self::ApiGate => "apiGate",
             Self::Sse => "sse",
             Self::Seed => "seed",
+            Self::ProviderAuth => "providerAuth",
             Self::Delivery => "delivery",
             Self::ReadBack => "readBack",
             Self::Unknown => "unknown",
         }
     }
 
+    /// Projection order, earliest boundary first. `ProviderAuth` sits between the four gates st2
+    /// owns and the two it can only observe through them: the gates are st2↔producer contract
+    /// facts that must hold before any provider-side reading means anything, while a rejected
+    /// credential is the CAUSE whose symptoms are delivery and read-back failures — so it must
+    /// outrank both rather than hide behind them.
     const fn index(self) -> Option<usize> {
         match self {
             Self::VersionGate => Some(0),
             Self::ApiGate => Some(1),
             Self::Sse => Some(2),
             Self::Seed => Some(3),
-            Self::Delivery => Some(4),
-            Self::ReadBack => Some(5),
+            Self::ProviderAuth => Some(4),
+            Self::Delivery => Some(5),
+            Self::ReadBack => Some(6),
             Self::Unknown => None,
         }
     }
@@ -70,16 +78,22 @@ impl Stage {
 pub enum Driver {
     #[serde(rename = "opencode")]
     OpenCode,
+    Claude,
+    Codex,
+    Omp,
     #[serde(other)]
     Unknown,
 }
 
 impl Driver {
-    pub const ALL: [Self; 1] = [Self::OpenCode];
+    pub const ALL: [Self; 4] = [Self::OpenCode, Self::Claude, Self::Codex, Self::Omp];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Omp => "omp",
             Self::Unknown => "unknown",
         }
     }
@@ -107,12 +121,13 @@ pub enum Reason {
     DeliveryRejected,
     ReadBackUnavailable,
     NotDurable,
+    ProviderAuthRejected,
     #[serde(other)]
     Unknown,
 }
 
 impl Reason {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -132,6 +147,7 @@ impl Reason {
         Self::DeliveryRejected,
         Self::ReadBackUnavailable,
         Self::NotDurable,
+        Self::ProviderAuthRejected,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -155,6 +171,7 @@ impl Reason {
             Self::DeliveryRejected => "deliveryRejected",
             Self::ReadBackUnavailable => "readBackUnavailable",
             Self::NotDurable => "notDurable",
+            Self::ProviderAuthRejected => "providerAuthRejected",
             Self::Unknown => "unknown",
         }
     }
@@ -172,6 +189,7 @@ impl Reason {
             | Self::QuestionUnavailable
             | Self::MalformedQuestions
             | Self::MissingAskId => Stage::Seed,
+            Self::ProviderAuthRejected => Stage::ProviderAuth,
             Self::DeliveryUnavailable | Self::DeliveryRejected => Stage::Delivery,
             Self::ReadBackUnavailable | Self::NotDurable => Stage::ReadBack,
             Self::Unknown => Stage::Unknown,
@@ -199,11 +217,9 @@ impl Reason {
                 matches!(source, Source::QuestionSnapshot)
             }
             Self::MissingAskId => {
-                matches!(
-                    source,
-                    Source::PermissionSnapshot | Source::QuestionSnapshot
-                )
+                matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
             }
+            Self::ProviderAuthRejected => matches!(source, Source::TurnResult),
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
                 matches!(source, Source::PromptTransport)
             }
@@ -226,12 +242,13 @@ pub enum Source {
     QuestionSnapshot,
     PromptTransport,
     MessageReadBack,
+    TurnResult,
     #[serde(other)]
     Unknown,
 }
 
 impl Source {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::VersionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
@@ -240,6 +257,7 @@ impl Source {
         Self::QuestionSnapshot,
         Self::PromptTransport,
         Self::MessageReadBack,
+        Self::TurnResult,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -252,6 +270,7 @@ impl Source {
             Self::QuestionSnapshot => "questionSnapshot",
             Self::PromptTransport => "promptTransport",
             Self::MessageReadBack => "messageReadBack",
+            Self::TurnResult => "turnResult",
             Self::Unknown => "unknown",
         }
     }
@@ -364,15 +383,14 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::VersionGate => "install a supported producer version and restart the seat",
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
-            Stage::Seed => {
-                "restore readable producer state snapshots; recovery clears this advisory"
-            }
-            Stage::Delivery => {
-                "restore the native prompt transport; the queued message remains retryable"
-            }
-            Stage::ReadBack => {
-                "restore message read-back; st2 will reconcile without duplicating the prompt"
-            }
+            Stage::Seed => "restore readable producer state snapshots; recovery clears this advisory",
+            // The one boundary whose repair is neither an st2-side nor a producer-side restore:
+            // nothing in the seat is broken, the account's credential was refused. The text stays
+            // generic on purpose — which client owns which credential home is declared outside
+            // st2, and no credential knowledge enters this crate (Q12).
+            Stage::ProviderAuth => "the seat's provider credential was rejected; re-login with the account's own client and unpark",
+            Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
+            Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
         },
     }
@@ -382,10 +400,30 @@ pub fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("driver-diagnostic")
 }
 
-/// Whether this declaration has a native driver that currently publishes this record.
+/// Whether this declaration has a native driver that publishes this record at all.
 pub fn expected_for(spec: &crate::AgentSpec) -> bool {
+    matches!(
+        spec.driver.as_ref(),
+        Some(
+            crate::Driver::OpenCode(_)
+                | crate::Driver::Claude(_)
+                | crate::Driver::Codex(_)
+                | crate::Driver::Omp(_)
+        )
+    )
+}
+
+/// Whether a missing record is itself a fault for this declaration.
+///
+/// Only a driver that publishes a boundary result on EVERY launch can be missing one: OpenCode's
+/// version gate publishes or clears before the provider spawns, so absence there means the native
+/// driver never ran. Claude, Codex, and omp publish this record only when the provider's own typed
+/// turn result names a rejected credential, so absence is their healthy steady state and advising
+/// on it would put a warning under every seat in the fleet.
+pub fn absence_is_a_fault(spec: &crate::AgentSpec) -> bool {
     matches!(spec.driver.as_ref(), Some(crate::Driver::OpenCode(_)))
 }
+
 pub fn read(path: &Path) -> Observed {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
@@ -435,7 +473,7 @@ pub struct Publisher {
     driver: Driver,
     producer_version: Option<String>,
     support: Support,
-    failures: [Option<Record>; 6],
+    failures: [Option<Record>; 7],
 }
 
 impl Publisher {
@@ -491,15 +529,8 @@ impl Publisher {
             recovery: RECOVERY.to_string(),
         };
         self.failures[index] = Some(record);
-        crate::metrics::record_driver_diagnostic(stage, reason, source, self.support, false);
-        emit(
-            stage,
-            reason,
-            source,
-            self.support,
-            "failure",
-            self.producer_version.as_deref(),
-        );
+        crate::metrics::record_driver_diagnostic(self.driver, stage, reason, source, self.support, false);
+        emit(self.driver, stage, reason, source, self.support, "failure", self.producer_version.as_deref());
         self.persist();
     }
 
@@ -520,6 +551,7 @@ impl Publisher {
             return;
         };
         crate::metrics::record_driver_diagnostic(
+            self.driver,
             stage,
             cleared.reason,
             cleared.source,
@@ -527,6 +559,7 @@ impl Publisher {
             true,
         );
         emit(
+            self.driver,
             stage,
             cleared.reason,
             cleared.source,
@@ -555,7 +588,48 @@ impl Publisher {
     }
 }
 
+/// What one observation — a Claude hook event, a pi-family typed turn result — proves about the
+/// seat's provider credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAuthEdge {
+    Rejected,
+    Accepted,
+}
+
+/// Record one credential edge on the seat's native-driver diagnostic.
+///
+/// A fresh publisher per edge on purpose, and every producer of these edges is short-lived: each
+/// Claude hook invocation is its own process, so the publisher's stage set starts empty and its
+/// on-disk fallback is what lets a later `Stop` clear a rejection an earlier `StopFailure` wrote
+/// from a different process; a channel that restarted mid-session inherits the predecessor's
+/// record the same way rather than silently starting clean. Fail-open like every other
+/// observation: the publisher only warns on a write it cannot land, and neither delivery nor
+/// launch depends on it.
+pub(crate) fn publish_provider_auth(agent_dir: &Path, driver: Driver, edge: ProviderAuthEdge) {
+    let mut publisher = Publisher::new(
+        agent_dir,
+        driver,
+        // No producer version and no support verdict is knowable at either edge. A Claude hook
+        // payload carries no version — the common hook input is session id, transcript path, cwd,
+        // prompt id, permission mode, agent identity and effort, and nothing else (2.1.259) — and
+        // st2 gates no Claude version at all. On the pi family the WRAPPER, not the channel, owns
+        // the version gate and refuses the launch on an unadmitted MINOR (OMP-R05), so a running
+        // channel has no version fact of its own to publish and no verdict to restate.
+        None,
+        Support::Unknown,
+    );
+    match edge {
+        ProviderAuthEdge::Rejected => publisher.publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        ),
+        ProviderAuthEdge::Accepted => publisher.clear(Stage::ProviderAuth),
+    }
+}
+
 fn emit(
+    driver: Driver,
     stage: Stage,
     reason: Reason,
     source: Source,
@@ -567,6 +641,7 @@ fn emit(
         tracing::info_span!(
             "st2.driver.diagnostic",
             "span.label" = stage.as_str(),
+            "st2.driver.name" = driver.as_str(),
             "st2.driver.stage" = stage.as_str(),
             "st2.driver.reason" = reason.as_str(),
             "st2.driver.source" = source.as_str(),
@@ -577,6 +652,7 @@ fn emit(
     });
     let _guard = span.as_ref().map(tracing::Span::enter);
     tracing::info!(
+        driver = driver.as_str(),
         stage = stage.as_str(),
         reason = reason.as_str(),
         source = source.as_str(),
@@ -587,24 +663,22 @@ fn emit(
     );
 }
 
+/// Durable replacement: the record's bytes reach disk before the rename and the directory entry is
+/// synced after it.
+///
+/// The directory sync is now STRICT — a parent that cannot be opened for it makes this fail, where
+/// it used to be swallowed. [`Publisher::persist`] already logs a failed publication and carries
+/// on, so the visible consequence is one warning line, and the alternative was keeping a
+/// durability level nothing can be made to fail.
 fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "diagnostic path has no parent",
-        ));
-    };
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".driver-diagnostic.{}.tmp", std::process::id()));
-    let mut file = fs::File::create(&tmp)?;
-    serde_json::to_writer(&mut file, value).map_err(std::io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error);
-    }
-    Ok(())
+    let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    crate::fsatomic::replace(
+        path,
+        &bytes,
+        crate::fsatomic::Staging::new(".driver-diagnostic"),
+        crate::fsatomic::Durability::FsyncFileAndDir,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -657,15 +731,9 @@ mod tests {
         };
         assert_eq!(failure.evidence_age_ms, 25);
         assert_eq!(failure.stage, Stage::Seed);
+        assert_eq!(read_at(b"not json", 0), Observed::Indeterminate(InvalidReason::MalformedRecord));
         assert_eq!(
-            read_at(b"not json", 0),
-            Observed::Indeterminate(InvalidReason::MalformedRecord)
-        );
-        assert_eq!(
-            read_at(
-                &valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"),
-                0
-            ),
+            read_at(&valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"), 0),
             Observed::Indeterminate(InvalidReason::UnsupportedSchema)
         );
         assert_eq!(
@@ -694,6 +762,93 @@ mod tests {
         );
     }
 
+    /// The credential boundary is the one record a Claude hook, a Codex control pump, or an omp
+    /// channel writes, so its wire pairing is pinned on its own: a rejection is evidence only when
+    /// it came from the harness's typed turn result, and only on the stage whose repair text says
+    /// "re-login".
+    #[test]
+    fn a_credential_rejection_is_evidence_only_from_a_typed_turn_result() {
+        let valid = br#"{
+          "schema":"st2.driver-diagnostic.v1","driver":"claude","stage":"providerAuth",
+          "reason":"providerAuthRejected","source":"turnResult","support":"unknown",
+          "observedAt":100,"recovery":"clearsOnStageRecovery"
+        }"#;
+        let observed = read_at(valid, 100);
+        let Observed::Failure(failure) = &observed else {
+            panic!("a credential rejection must read as a failure")
+        };
+        assert_eq!(failure.driver, Driver::Claude);
+        assert_eq!(failure.support, Support::Unknown);
+        assert!(failure.producer_version.is_none());
+        assert!(
+            repair_text(&observed).contains("re-login"),
+            "{}",
+            repair_text(&observed)
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"turnResult", b"eventStream"), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "a rejection attributed to a channel that cannot carry a turn result is not evidence"
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"\"providerAuth\"", b"\"delivery\""), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "the credential reason belongs to exactly one stage"
+        );
+        for (word, driver) in [
+            (&b"\"codex\""[..], Driver::Codex),
+            (b"\"omp\"", Driver::Omp),
+        ] {
+            let Observed::Failure(other) = read_at(&valid.replace(b"\"claude\"", word), 100) else {
+                panic!("{driver:?} is an admitted driver word")
+            };
+            assert_eq!(other.driver, driver);
+        }
+    }
+
+    /// Projection order is load-bearing: a rejected credential is the CAUSE of the delivery and
+    /// read-back failures it produces, so it must outrank them — while the gates that prove st2
+    /// can read the producer at all still outrank it.
+    #[test]
+    fn a_rejected_credential_outranks_its_symptoms_but_not_the_producer_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::new(
+            tmp.path(),
+            Driver::Codex,
+            Some("codex-cli 0.153.0".to_string()),
+            Support::Supported,
+        );
+        publisher.publish(Stage::ReadBack, Reason::ReadBackUnavailable, Source::MessageReadBack);
+        publisher.publish(Stage::Delivery, Reason::DeliveryUnavailable, Source::PromptTransport);
+        publisher.publish(Stage::ProviderAuth, Reason::ProviderAuthRejected, Source::TurnResult);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!("the credential boundary must be the projected failure")
+        };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+        assert_eq!(failure.driver, Driver::Codex);
+        assert_eq!(failure.producer_version.as_deref(), Some("codex-cli 0.153.0"));
+
+        publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(
+            failure.stage,
+            Stage::Sse,
+            "an unreadable producer stream makes any credential reading untrustworthy"
+        );
+
+        publisher.clear(Stage::Sse);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+
+        publisher.clear(Stage::ProviderAuth);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(
+            failure.stage,
+            Stage::Delivery,
+            "clearing the cause reveals the symptom it was hiding"
+        );
+    }
+
     #[test]
     fn recovery_clears_only_its_stage_and_reveals_the_next_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -705,20 +860,12 @@ mod tests {
         );
         publisher.publish(Stage::ReadBack, Reason::NotDurable, Source::MessageReadBack);
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else {
-            panic!()
-        };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
         assert_eq!(failure.stage, Stage::Sse, "earliest boundary wins");
 
         publisher.clear(Stage::ReadBack);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else {
-            panic!()
-        };
-        assert_eq!(
-            failure.stage,
-            Stage::Sse,
-            "unrelated recovery cannot clear SSE"
-        );
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(failure.stage, Stage::Sse, "unrelated recovery cannot clear SSE");
 
         publisher.clear(Stage::Sse);
         assert_eq!(read(&path(tmp.path())), Observed::Absent);
@@ -747,15 +894,115 @@ mod tests {
 
     impl ReplaceBytes for [u8] {
         fn replace(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
-            let at = self
-                .windows(from.len())
-                .position(|window| window == from)
-                .unwrap();
+            let at = self.windows(from.len()).position(|window| window == from).unwrap();
             let mut out = Vec::with_capacity(self.len() - from.len() + to.len());
             out.extend_from_slice(&self[..at]);
             out.extend_from_slice(to);
             out.extend_from_slice(&self[at + from.len()..]);
             out
         }
+    }
+
+    /// The publication path writes into an agent-writable directory, so its staging file is the
+    /// one place an agent could aim st2's own privilege at a file it does not own. Refusing an
+    /// existing path is what stops that, and `0600` is what stops the diagnostic being readable
+    /// by anyone who can reach the directory.
+    #[test]
+    fn a_planted_staging_symlink_is_refused_and_the_record_is_owner_only() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agents/h/worker");
+        fs::create_dir_all(&agent).unwrap();
+
+        let victim = tmp.path().join("authored");
+        fs::write(&victim, b"authored bytes").unwrap();
+        let planted = agent.join(".driver-diagnostic.tmp-planted");
+        symlink(&victim, &planted).unwrap();
+
+        let refused = crate::fsatomic::create_staging(&planted).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a planted symlink at the staging path must be refused, not followed"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"authored bytes",
+            "the planted symlink was followed and its target was truncated"
+        );
+
+        let record = Record {
+            schema: SCHEMA.to_owned(),
+            driver: Driver::OpenCode,
+            stage: Stage::Seed,
+            reason: Reason::UnknownStatus,
+            source: Source::StatusSnapshot,
+            producer_version: None,
+            support: Support::Supported,
+            observed_at: 100,
+            recovery: RECOVERY.to_owned(),
+        };
+        let path = agent.join("driver-diagnostic");
+        atomic_json(&path, &record).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the diagnostic is readable by anyone who can reach the agent directory"
+        );
+        let residue = fs::read_dir(&agent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(".driver-diagnostic.tmp-") && name != ".driver-diagnostic.tmp-planted"
+            })
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+
+    /// The directory sync is strict since the fold onto `fsatomic`: a parent that cannot be opened
+    /// for it fails the publication, where it used to be swallowed. This is the deliberate
+    /// behaviour change of that fold on this caller — [`Publisher::persist`] already logs a failed
+    /// publication and carries on, so the visible consequence is one warning line for a record
+    /// whose bytes did land.
+    ///
+    /// Real only for a non-root uid; the hermetic gate runs as the sandbox's unprivileged build
+    /// user, and a local root run skips the edge instead of asserting what root cannot observe.
+    #[test]
+    fn a_directory_that_cannot_be_synced_fails_the_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agents/h/worker");
+        fs::create_dir_all(&agent).unwrap();
+        let path = path(&agent);
+        let record = Record {
+            schema: SCHEMA.to_owned(),
+            driver: Driver::OpenCode,
+            stage: Stage::Seed,
+            reason: Reason::UnknownStatus,
+            source: Source::StatusSnapshot,
+            producer_version: None,
+            support: Support::Supported,
+            observed_at: 100,
+            recovery: RECOVERY.to_owned(),
+        };
+
+        // Write and traverse, but not read: staging and renaming still work, opening the
+        // directory to sync it does not.
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o300)).unwrap();
+        let published = atomic_json(&path, &record);
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            published.is_err(),
+            "the diagnostic's directory sync is strict: {published:?}"
+        );
+        // The bytes did land — the rename happens before the sync — so the failure is a report
+        // about durability, not about the record's contents.
+        assert!(path.exists(), "the record still landed");
     }
 }

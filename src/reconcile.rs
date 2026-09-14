@@ -820,8 +820,10 @@ fn session_state(by_id: &HashMap<&str, bool>, pty_id: &str) -> SessionState {
     }
 }
 
-/// Resolve a task's on-disk id: the explicit `id`, else `<bus_id>.<name>`.
-fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
+/// Resolve a task's on-disk id: the explicit `id`, else `<bus_id>.<name>`. This is the session
+/// name `pty` binds a socket for, so admission checks resolve it through here rather than
+/// re-deriving the format.
+pub(crate) fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
     match explicit {
         Some(id) => id.to_string(),
         None => format!("{bus_id}.{name}"),

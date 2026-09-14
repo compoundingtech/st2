@@ -1,8 +1,8 @@
 # Doctor requirements
 
 Doctor checks one catalog from one host. It follows the root
-[vision](../vision.md). It refines [R03](../requirements.md#L46-L47),
-[R04](../requirements.md#L51-L54), and [R08](../requirements.md#L92-L95).
+[vision](../vision.md). It refines [R03](../requirements.md),
+[R04](../requirements.md), and [R08](../requirements.md).
 It does not define fleet health.
 
 ## Requirements
@@ -29,7 +29,11 @@ It does not define fleet health.
   explicitly keep-pinned. It does not require presence or active-declaration
   checks. A dead non-keep record is unhealthy because ordinary reconciliation
   still owes its collection. This weaker predicate does not satisfy retirement.
+- **DOCTOR-R08 Outbound message health:** Doctor validates each local agent's
+  sender ledger without creating or repairing sender state. An invalid ledger
+  is a failed check that says the agent cannot send. An unavailable ledger is
+  healthy because no sender history exists.
 
-The [Retirement health invariant](../../../INVARIANTS.md#L20) and its tests prove
+The [Retirement health invariant](../../../INVARIANTS.md) and its tests prove
 the retirement rule. The [specification](spec.md) owns the mechanism, check
 groups, and known gaps.

@@ -953,3 +953,367 @@ fn a_hand_authored_native_catalog_validates_without_errors() {
         result.issues
     );
 }
+
+/// A pty task whose session socket path exceeds the portable `sun_path` bound is rejected when the
+/// declaration is admitted, not on every reconcile pass forever.
+///
+/// The identity here is long enough that no resolved pty root can bring it under the limit, so the
+/// assertion does not depend on where this catalog happens to live. The byte arithmetic itself,
+/// including both sides of the boundary, is covered by
+/// `src/run.rs::session_socket_overage_is_derived_from_the_resolved_root`.
+#[test]
+fn an_unbindable_session_socket_path_is_rejected_at_admission() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("hetz/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "hetz"; pty "agent" {{ command "x" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        has(&r, "socket-path-too-long", Severity::Error),
+        "unbindable socket path must fail admission: {:?}",
+        r.issues
+    );
+    let issue = r
+        .issues
+        .iter()
+        .find(|issue| issue.code == "socket-path-too-long")
+        .expect("the issue was just asserted");
+    assert!(
+        issue.message.contains(".sock") && issue.message.contains("exceeding the 104-byte"),
+        "the diagnostic must name the resolved path and the overage: {}",
+        issue.message
+    );
+}
+
+/// An exec task binds no session socket, so its id is not subject to the bound.
+#[test]
+fn a_long_exec_task_id_is_not_a_socket_path_issue() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("hetz/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "hetz"; exec "job" {{ command "true" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        !has(&r, "socket-path-too-long", Severity::Error),
+        "an exec task never binds a session socket: {:?}",
+        r.issues
+    );
+}
+
+/// The bound comes from the pty root resolved on the host that would run the task, so a synced
+/// multi-host catalog must not fail admission for another machine's task against this host's root.
+#[test]
+fn another_hosts_long_identity_is_not_judged_against_this_hosts_pty_root() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("elsewhere/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        !has(&r, "socket-path-too-long", Severity::Error),
+        "only the selected host's tasks are judged against its pty root: {:?}",
+        r.issues
+    );
+}
+
+// ---- DELTA-003 agent ID and agent address uniqueness -----------------------------------------
+
+/// IDs are catalog-global, not per-host: two hosts cannot share one explicit `id`.
+#[test]
+fn two_hosts_may_not_share_one_explicit_agent_id() {
+    let c = catalog(&[
+        (
+            "a/root/agent.kdl",
+            r#"agent "root" { host "a"; id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"; command "x" }"#,
+        ),
+        (
+            "b/root/agent.kdl",
+            r#"agent "root" { host "b"; id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    let issue = r
+        .issues
+        .iter()
+        .find(|i| i.code == "dup-id")
+        .unwrap_or_else(|| panic!("catalog-global id collision must fail: {:?}", r.issues));
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(
+        issue
+            .message
+            .contains("duplicate agent id '0199b8f4-8d3a-7c21-9a44-6f85b7320ea1' (also declared in")
+            && issue.message.contains("agent.kdl"),
+        "the diagnostic must name the id and the other declaration: {}",
+        issue.message
+    );
+}
+
+/// A migrated subject's frozen ID is exactly the legacy `<host>.<identity>` bytes, so an explicit
+/// `id` claiming another subject's still-unmigrated identity is the same collision.
+#[test]
+fn an_explicit_id_may_not_claim_another_subjects_legacy_bus_identity() {
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/impostor/agent.kdl",
+            r#"agent "impostor" { host "h"; id "h.root"; supervisor "h.root"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("duplicate agent id 'h.root'")),
+        "an explicit id colliding with a frozen legacy identity must fail: {:?}",
+        r.issues
+    );
+}
+
+/// ID and address are separate typed namespaces: equal bytes across them do not collide.
+#[test]
+fn an_agent_id_equal_to_another_agents_address_is_not_a_collision() {
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; address "reviewer"; command "x" }"#,
+        ),
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; id "reviewer"; supervisor "h.root"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert_eq!(
+        r.errors(),
+        0,
+        "id and address are separate namespaces: {:?}",
+        r.issues
+    );
+}
+
+/// An effective address is unique inside its resolved logical host.
+#[test]
+fn two_explicit_addresses_may_not_collide_on_one_host() {
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; address "reviewer"; command "x" }"#,
+        ),
+        (
+            "h/second/agent.kdl",
+            r#"agent "second" { host "h"; address "reviewer"; supervisor "h.root"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    let issue = r
+        .issues
+        .iter()
+        .find(|i| i.code == "dup-address")
+        .unwrap_or_else(|| panic!("host-local address collision must fail: {:?}", r.issues));
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(
+        issue
+            .message
+            .contains("duplicate agent address 'reviewer' on host 'h' (also declared in")
+            && issue.message.contains("agent.kdl"),
+        "the diagnostic must name the address, host, and other declaration: {}",
+        issue.message
+    );
+}
+
+/// Addresses are host-local, so the same address on two hosts is legal.
+#[test]
+fn the_same_address_on_two_hosts_is_legal() {
+    let c = catalog(&[
+        (
+            "a/root/agent.kdl",
+            r#"agent "root" { host "a"; address "reviewer"; command "x" }"#,
+        ),
+        (
+            "b/root/agent.kdl",
+            r#"agent "root-b" { host "b"; address "reviewer"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert_eq!(
+        r.errors(),
+        0,
+        "one address per host is the bound, not per catalog: {:?}",
+        r.issues
+    );
+}
+
+/// An addressless declaration still occupies its positional identity in the address namespace.
+#[test]
+fn an_explicit_address_may_not_collide_with_an_addressless_identity_fallback() {
+    let c = catalog(&[
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/renamed/agent.kdl",
+            r#"agent "renamed" { host "h"; address "worker"; supervisor "h.worker"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-address"
+            && i.severity == Severity::Error
+            && i.message
+                .contains("duplicate agent address 'worker' on host 'h' (also declared in")),
+        "an explicit address must collide with an identity fallback: {:?}",
+        r.issues
+    );
+}
+
+/// A retired subject does not resolve, so it releases its address; a suspended one keeps it.
+#[test]
+fn retirement_releases_an_address_but_suspension_still_occupies_it() {
+    let retired = catalog(&[
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; desired-state "retired" reason="Replaced by renamed"; command "x" }"#,
+        ),
+        (
+            "h/renamed/agent.kdl",
+            r#"agent "renamed" { host "h"; address "worker"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(retired.path());
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "a retired subject must release its address: {:?}",
+        r.issues
+    );
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+
+    let suspended = catalog(&[
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
+        ),
+        (
+            "h/renamed/agent.kdl",
+            r#"agent "renamed" { host "h"; address "worker"; supervisor "h.worker"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(suspended.path());
+    assert!(
+        has(&r, "dup-address", Severity::Error),
+        "a suspended subject still occupies its address: {:?}",
+        r.issues
+    );
+}
+
+/// The legacy diagnostic text is a stable automation surface: a catalog with no `id` or `address`
+/// anywhere must produce byte-identical messages to before the two fields existed.
+#[test]
+fn a_legacy_catalog_produces_byte_identical_duplicate_diagnostics() {
+    let c = catalog(&[
+        (
+            "h/one/agent.kdl",
+            r#"agent "worker" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/two/agent.kdl",
+            r#"agent "worker" { host "h"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    let messages = r
+        .issues
+        .iter()
+        .filter(|i| i.code == "dup-id")
+        .map(|i| i.message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec!["duplicate agent id 'h.worker' (also declared in h/one/agent.kdl)".to_string()],
+        "legacy duplicate-identity prose must not drift: {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "one legacy duplicate is one diagnostic, not two: {:?}",
+        r.issues
+    );
+}
+
+/// Both duplicate rules read the same host key, so one physical subject declared twice — once
+/// host-less, once with an explicit `host "h"` — is a duplicate ID under `--host h`, not a
+/// conflict reported only under the address code.
+#[test]
+fn a_host_less_and_an_explicit_host_declaration_collide_as_one_duplicate_id() {
+    let c = catalog(&[
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; command "x" }"#,
+        ),
+        ("worker.kdl", r#"agent "worker" { command "x" }"#),
+    ]);
+
+    let r = validate_for_host(c.path(), "h");
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("duplicate agent id 'h.worker'")),
+        "one resolved subject declared twice must collide on the id key: {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "one physical conflict is one diagnostic: {:?}",
+        r.issues
+    );
+}
+
+/// A declaration refused for a duplicate ID still claims its address. Otherwise a third subject
+/// could take that address undetected — and `st2 agent address` admits exactly what this rule
+/// admits, so the writer's gate would hand out a second claim on one route.
+#[test]
+fn a_declaration_refused_for_a_duplicate_id_still_claims_its_address() {
+    let c = catalog(&[
+        ("h/a/agent.kdl", r#"agent "x" { host "h"; command "x" }"#),
+        (
+            "h/b/agent.kdl",
+            r#"agent "x" { host "h"; address "ops"; command "x" }"#,
+        ),
+        (
+            "h/c/agent.kdl",
+            r#"agent "c" { host "h"; address "ops"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        has(&r, "dup-id", Severity::Error),
+        "the duplicate identity must still be reported: {:?}",
+        r.issues
+    );
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-address"
+            && i.severity == Severity::Error
+            && i.message
+                .contains("duplicate agent address 'ops' on host 'h'")
+            && i.message.contains("h/b/agent.kdl")),
+        "the address a duplicated-id declaration holds must still collide: {:?}",
+        r.issues
+    );
+}

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
@@ -278,6 +278,33 @@ impl DeclarationProjection {
     pub(crate) fn entries(&self) -> usize {
         self.files.len()
     }
+}
+
+fn raw_declarations_match(
+    catalog: &Path,
+    current: &DeclarationProjection,
+    desired: &DeclarationProjection,
+) -> bool {
+    if !current
+        .files
+        .iter()
+        .all(|(path, file)| desired.files.get(path) == Some(file))
+    {
+        return false;
+    }
+
+    let mut live_profile_modules = BTreeMap::new();
+    for path in &desired.profile_modules {
+        if current.files.contains_key(path) {
+            continue;
+        }
+        if add_profile_module(catalog, Path::new(path), &mut live_profile_modules).is_err() {
+            return false;
+        }
+    }
+    desired.files.iter().all(|(path, file)| {
+        current.files.get(path) == Some(file) || live_profile_modules.get(path) == Some(file)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1167,13 +1194,7 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 
     let _lock = CatalogLock::shared(&catalog)?;
     let projection = if request.raw_preimage {
-        anyhow::ensure!(
-            !catalog_is_strictly_valid(&catalog),
-            "raw-preimage snapshot refuses an already-valid catalog"
-        );
-        let incumbent_config = crate::catalog::load(&catalog)
-            .context("raw-preimage snapshot requires a valid incumbent catalog envelope")?;
-        validate_external_pty_root(&catalog, &incumbent_config, "raw-preimage snapshot v1")?;
+
         let projection = project_raw_current(&catalog)?;
         validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
         projection
@@ -1278,7 +1299,11 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
     materialize_projection(&desired, admission.path())?;
     validate_full_catalog(admission.path())?;
     let desired_config = crate::catalog::load(admission.path())?;
-    validate_external_pty_root(&catalog, &desired_config, "catalog bootstrap v1")?;
+    validate_external_pty_root(
+        &catalog,
+        desired_config.pty_root.as_deref(),
+        "catalog bootstrap v1",
+    )?;
 
     match fs::symlink_metadata(&catalog) {
         Ok(_) => {
@@ -1303,7 +1328,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
         .file_name()
         .context("bootstrap stage has no name")?
         .to_os_string();
-    let staged_lock = match (|| -> Result<File> {
+    let staged_lock = match (|| -> Result<crate::flock::FileLock> {
         materialize_projection(&desired, &stage)?;
         let staged = project(&stage, ProjectionSource::Prepared, &catalog)?;
         anyhow::ensure!(
@@ -1411,26 +1436,18 @@ fn inspect_existing_bootstrap(
     })
 }
 
-fn initialize_bootstrap_control(stage: &Path) -> Result<File> {
+fn initialize_bootstrap_control(stage: &Path) -> Result<crate::flock::FileLock> {
     let control = stage.join(CONTROL_DIR);
     fs::create_dir(&control)
         .with_context(|| format!("create bootstrap control directory {}", control.display()))?;
     fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
     let control_file = File::open(&control)?;
     let lock_path = control.join(crate::catalog_lock::LOCK_FILE);
-    let lock = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&lock_path)
+    let lock = crate::flock::open(&lock_path, crate::flock::Open::CreateNew)
         .with_context(|| format!("create bootstrap authoring lock {}", lock_path.display()))?;
-    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("lock staged bootstrap catalog");
-    }
-    lock.sync_all()?;
+    let lock = crate::flock::FileLock::hold_blocking(lock, crate::flock::Mode::Exclusive)
+        .context("lock staged bootstrap catalog")?;
+    lock.file().sync_all()?;
     let generation_path = control.join(crate::catalog_lock::GENERATION_FILE);
     let mut generation = OpenOptions::new()
         .create_new(true)
@@ -1593,7 +1610,11 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     materialize_projection(&desired, admission.path())?;
     validate_full_catalog(admission.path())?;
     let desired_config = crate::catalog::load(admission.path())?;
-    validate_external_pty_root(&catalog, &desired_config, "catalog apply v1")?;
+    validate_external_pty_root(
+        &catalog,
+        desired_config.pty_root.as_deref(),
+        "catalog apply v1",
+    )?;
 
     let stage_name = stage_name(&desired.root_sha256);
     let stage_path = control.join(&stage_name);
@@ -1604,20 +1625,13 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         );
         (expect_sha256.clone(), marker.original_paths, None)
     } else {
-        if raw_preimage {
-            anyhow::ensure!(
-                !catalog_is_strictly_valid(&catalog),
-                "raw-preimage apply refuses an already-valid catalog"
-            );
-        }
-        let live_config = if raw_preimage {
-            crate::catalog::load(&catalog)
-                .context("raw-preimage apply requires a valid incumbent catalog envelope")?
+        let same_pty_root = if raw_preimage {
+            true
         } else {
-            crate::catalog::load(&catalog)?
+            let live_config = crate::catalog::load(&catalog)?;
+            effective_pty_root(&catalog, live_config.pty_root.as_deref())
+                == effective_pty_root(&catalog, desired_config.pty_root.as_deref())
         };
-        let same_pty_root = effective_pty_root(&catalog, &live_config)
-            == effective_pty_root(&catalog, &desired_config);
         if !raw_preimage {
             cleanup_writer_temporaries(&catalog)?;
         }
@@ -1633,7 +1647,12 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
                 &desired.workspace_dirs,
             )?
         };
-        if current.root_sha256 == desired.root_sha256 && same_pty_root {
+        let same_declarations = if raw_preimage {
+            raw_declarations_match(&catalog, &current, &desired)
+        } else {
+            current.root_sha256 == desired.root_sha256
+        };
+        if same_declarations && same_pty_root {
             return Ok(ApplyResult {
                 schema: if raw_preimage {
                     RAW_APPLY_SCHEMA
@@ -1768,26 +1787,16 @@ pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
 fn format_issue(issue: &crate::validate::Issue) -> String {
     format!("{} [{}]: {}", issue.path, issue.code, issue.message)
 }
-
-fn catalog_is_strictly_valid(root: &Path) -> bool {
-    project(root, ProjectionSource::Current, root)
-        .and_then(|projection| {
-            validate_live_workspace_facts(root, &projection.workspace_dirs)?;
-            validate_full_catalog(root)
-        })
-        .is_ok()
-}
-
-/// Project the declaration plane without interpreting declaration bytes.
+/// Project the current declaration plane without interpreting declaration bytes.
 ///
-/// This exists solely to bind a repair transaction to the exact bytes of an invalid current
-/// catalog. It deliberately has no policy for why those bytes are invalid. Mutable agent state is
-/// excluded by the same structural boundaries as the strict projection; a prospective catalog is
-/// never admitted through this path.
+/// This exists solely to bind a repair transaction to an exact opaque preimage. It deliberately
+/// has no policy for whether or why those bytes are invalid. Mutable agent state is excluded by the
+/// same structural boundaries as the strict projection; a prospective catalog is never admitted
+/// through this path.
 ///
 /// In particular, `catalog.kdl` is captured as raw bytes but its profile module references are not
-/// resolved here. Module presence, kind, and size are prospective admission policy; requiring an
-/// invalid incumbent module to satisfy that policy would make its own repair preimage unreachable.
+/// resolved here. Module presence, kind, and size remain prospective admission policy; requiring
+/// incumbent bytes to satisfy that policy could make their own repair preimage unreachable.
 fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let metadata = fs::symlink_metadata(root)?;
     anyhow::ensure!(
@@ -1798,7 +1807,9 @@ fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let mut files = BTreeMap::new();
     add_optional_regular(root, &root.join(crate::catalog::CONFIG_FILE), &mut files)?;
     let spec_paths = collect_canonical_specs(root, ProjectionSource::Current, &mut files)?;
-    let workspace_dirs = raw_workspace_dirs(root, &spec_paths)?;
+    // Invalid declarations cannot establish typed workspace facts; canonical runtime directories
+    // are excluded structurally by the shared bundle collector instead.
+    let workspace_dirs = BTreeSet::new();
     for spec in &spec_paths {
         let bundle = spec.parent().context("canonical spec has no bundle")?;
         collect_bundle_files(
@@ -1818,30 +1829,6 @@ fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
         workspace_dirs,
         root_sha256,
     })
-}
-
-fn raw_workspace_dirs(root: &Path, spec_paths: &[PathBuf]) -> Result<BTreeSet<String>> {
-    let mut workspace_dirs = BTreeSet::new();
-    for spec in spec_paths {
-        let bundle = spec.parent().context("canonical spec has no bundle")?;
-        let workspace = bundle.join(".workspace");
-        match fs::symlink_metadata(&workspace) {
-            Ok(metadata) => {
-                anyhow::ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "canonical workspace fact is not a real directory: {}",
-                    workspace.display()
-                );
-                workspace_dirs.insert(normalized_relative(root, &workspace)?);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect workspace fact {}", workspace.display()));
-            }
-        }
-    }
-    Ok(workspace_dirs)
 }
 
 fn project(
@@ -1957,6 +1944,11 @@ fn collect_canonical_specs(
         ensure_safe_component(&host_entry.file_name(), "host")?;
         ensure_real_dir(&host_path, "canonical host directory")?;
         for identity_entry in sorted_entries(&host_path)? {
+            if source == ProjectionSource::Current
+                && crate::harness_context::is_legacy_harness_context_staging_file(&identity_entry)?
+            {
+                continue;
+            }
             let identity_path = identity_entry.path();
             ensure_safe_component(&identity_entry.file_name(), "identity")?;
             ensure_real_dir(&identity_path, "canonical identity directory")?;
@@ -2022,8 +2014,18 @@ fn collect_bundle_files(
         if canonical_workspace || workspace_dirs.contains(&relative) {
             continue;
         }
-        let state = matches!(name_text, "resources" | "archive" | "inbox" | "status")
-            || name_text.starts_with(".status.tmp-");
+        let state = matches!(
+            name_text,
+            "resources"
+                | "archive"
+                | "inbox"
+                | "status"
+                | "harness-context"
+                | "harness-state"
+                | ".harness-state.seq"
+                | ".harness-state.lock"
+                | ".harness-context.lock"
+        ) || name_text.starts_with(crate::status::TMP_STAGING_PREFIX);
         if first.is_some() && relative_to_bundle.components().count() == 1 && state {
             if source == ProjectionSource::Prepared {
                 anyhow::bail!(
@@ -2089,15 +2091,36 @@ fn catalog_workspace_dirs(
     Ok(facts)
 }
 
+/// Admit the prepared plane's canonical workspace facts.
+///
+/// `.workspace` is a runtime-only directory: the agent creates it, nothing declares its contents,
+/// and a raw preimage deliberately captures none of them. A prepared plane built from such a
+/// preimage therefore legitimately has no directory for a declared fact, and demanding one made
+/// every repair transaction over a raw preimage unreachable. The fact stays in the projection
+/// either way — `materialize_projection` publishes it as an empty directory — so the applied
+/// catalog still satisfies the live invariant that a declared workspace fact is present.
+///
+/// A directory that IS there still has to be a real, empty one: prepared state may not smuggle
+/// runtime bytes through the declaration plane.
 fn validate_prepared_workspace_facts(root: &Path, facts: &BTreeSet<String>) -> Result<()> {
     for relative in facts {
         let path = root.join(relative);
-        ensure_real_dir_chain_present(root, &path, "prepared workspace fact")?;
-        anyhow::ensure!(
-            sorted_entries(&path)?.is_empty(),
-            "prepared workspace fact must be an empty directory: {}",
-            path.display()
-        );
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure_real_dir_chain_present(root, &path, "prepared workspace fact")?;
+                anyhow::ensure!(
+                    sorted_entries(&path)?.is_empty(),
+                    "prepared workspace fact must be an empty directory: {}",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect prepared workspace fact {}", path.display())
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -2213,7 +2236,7 @@ fn reject_state_children(identity_path: &Path) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_str().context("identity path is not UTF-8")?;
         if matches!(name, "resources" | "archive" | "inbox" | "status")
-            || name.starts_with(".status.tmp-")
+            || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         {
             anyhow::bail!(
                 "prepared catalog contains state-plane path: {}",
@@ -2301,6 +2324,11 @@ fn add_profile_module(
     anyhow::ensure!(
         metadata.is_file(),
         "profile module is not a no-follow regular file: {}",
+        relative.display()
+    );
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "profile module is hard-linked: {}",
         relative.display()
     );
     let limit = agent_spec::profile::DEFAULT_MODULE_LIMIT_BYTES;
@@ -2537,6 +2565,9 @@ fn cleanup_writer_temporaries(catalog: &Path) -> Result<()> {
             ensure_safe_component(&host.file_name(), "host")?;
             ensure_real_dir(&host.path(), "canonical host directory")?;
             for identity in sorted_entries(&host.path())? {
+                if crate::harness_context::is_legacy_harness_context_staging_file(&identity)? {
+                    continue;
+                }
                 ensure_safe_component(&identity.file_name(), "identity")?;
                 ensure_real_dir(&identity.path(), "canonical identity directory")?;
                 cleanup_writer_temporaries_in(&identity.path(), true, true)?;
@@ -2895,15 +2926,15 @@ fn validate_declaration_leaf_path(path: &str) -> Result<()> {
             !matches!(
                 components[3],
                 ".workspace" | "resources" | "archive" | "inbox" | "status"
-            ) && !components[3].starts_with(".status.tmp-"),
+            ) && !components[3].starts_with(crate::status::TMP_STAGING_PREFIX),
             "catalog apply marker contains a workspace or state-plane path"
         );
     }
     Ok(())
 }
 
-fn effective_pty_root(live_catalog: &Path, config: &crate::catalog::CatalogConfig) -> PathBuf {
-    match &config.pty_root {
+fn effective_pty_root(live_catalog: &Path, declared_pty_root: Option<&str>) -> PathBuf {
+    match declared_pty_root {
         Some(declared) => live_catalog.join(crate::expand::expand_catalog(declared, live_catalog)),
         None => live_catalog.join("pty"),
     }
@@ -2919,14 +2950,14 @@ fn validate_live_workspace_facts(catalog: &Path, facts: &BTreeSet<String>) -> Re
 
 fn validate_external_pty_root(
     catalog: &Path,
-    config: &crate::catalog::CatalogConfig,
+    declared_pty_root: Option<&str>,
     operation: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        config.pty_root.is_some(),
+        declared_pty_root.is_some(),
         "{operation} requires an explicit external pty-root"
     );
-    let pty_root = lexical_absolute(&effective_pty_root(catalog, config))?;
+    let pty_root = lexical_absolute(&effective_pty_root(catalog, declared_pty_root))?;
     anyhow::ensure!(
         !pty_root.starts_with(catalog),
         "{operation} requires pty-root outside the catalog: {}",
@@ -3305,316 +3336,8 @@ fn is_canonical_workspace_fact(path: &Path) -> bool {
         && matches!(components[3], Component::Normal(name) if name == ".workspace")
 }
 
-fn openat_nofollow(parent: &File, name: &std::ffi::OsStr) -> Result<File> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let name = CString::new(name.as_bytes()).context("source entry name contains NUL")?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("open retained source entry");
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn capability_dir_entries(dir: &File) -> Result<Vec<std::ffi::OsString>> {
-    let path = retained_dir_path(dir)?;
-    let mut names = fs::read_dir(&path)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    names.sort();
-    Ok(names)
-}
-
-pub(crate) fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync directory {}", path.display()))
-}
-
-fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-}
-
-pub(crate) fn open_dir_beneath(catalog: &Path, target: &Path) -> std::io::Result<File> {
-    let relative = target.strip_prefix(catalog).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "directory escapes catalog",
-        )
-    })?;
-    let mut current = open_dir_nofollow(catalog)?;
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "directory has an unsafe component",
-            ));
-        };
-        current = openat_dir_nofollow(&current, name)?;
-    }
-    Ok(current)
-}
-
-pub(crate) fn openat_dir_nofollow(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<File> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-    let name = CString::new(name.as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "directory name contains NUL",
-        )
-    })?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn control_plane_rename_error(error: std::io::Error) -> anyhow::Error {
-    if error.raw_os_error() == Some(libc::EXDEV) {
-        anyhow::anyhow!(
-            "catalog control and declaration planes must share one filesystem for atomic publication"
-        )
-    } else {
-        error.into()
-    }
-}
-
-pub(crate) fn persist_tempfile_from_control(
-    control: &File,
-    catalog: &Path,
-    temp: tempfile::NamedTempFile,
-    target: &Path,
-) -> std::io::Result<()> {
-    let source = temp.path();
-    let target_parent = open_dir_beneath(
-        catalog,
-        target.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
-        })?,
-    )?;
-    let source_name = source.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "temporary file has no name",
-        )
-    })?;
-    let target_name = target.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no name")
-    })?;
-    renameat(control, source_name, &target_parent, target_name)
-}
-
-pub(crate) fn link_tempfile_from_control(
-    control: &File,
-    catalog: &Path,
-    temp: &tempfile::NamedTempFile,
-    target: &Path,
-) -> std::io::Result<()> {
-    let source = temp.path();
-    let target_parent = open_dir_beneath(
-        catalog,
-        target.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
-        })?,
-    )?;
-    let source_name = source.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "temporary file has no name",
-        )
-    })?;
-    let target_name = target.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no name")
-    })?;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-    let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
-    })?;
-    let target_name = CString::new(target_name.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target name contains NUL")
-    })?;
-    let result = unsafe {
-        libc::linkat(
-            control.as_raw_fd(),
-            source_name.as_ptr(),
-            target_parent.as_raw_fd(),
-            target_name.as_ptr(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-pub(crate) fn rename_noreplace_between_dirs(
-    control: &File,
-    catalog: &Path,
-    source: &Path,
-    target: &Path,
-) -> std::io::Result<()> {
-    let target_parent = open_dir_beneath(
-        catalog,
-        target.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
-        })?,
-    )?;
-    let source_name = source.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no name")
-    })?;
-    let target_name = target.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no name")
-    })?;
-    renameat_noreplace(control, source_name, &target_parent, target_name)
-}
-
-fn renameat_noreplace(
-    source_parent: &File,
-    source: &std::ffi::OsStr,
-    target_parent: &File,
-    target: &std::ffi::OsStr,
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let source = CString::new(source.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
-    })?;
-    let target = CString::new(target.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target name contains NUL")
-    })?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let result = unsafe {
-        libc::renameat2(
-            source_parent.as_raw_fd(),
-            source.as_ptr(),
-            target_parent.as_raw_fd(),
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::renameatx_np(
-            source_parent.as_raw_fd(),
-            source.as_ptr(),
-            target_parent.as_raw_fd(),
-            target.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    let result = {
-        let _ = (source_parent, source, target_parent, target);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "atomic no-replace directory rename is unsupported on this platform",
-        ));
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn renameat(
-    source_parent: &File,
-    source: &std::ffi::OsStr,
-    target_parent: &File,
-    target: &std::ffi::OsStr,
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let source = CString::new(source.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
-    })?;
-    let target = CString::new(target.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target name contains NUL")
-    })?;
-    let result = unsafe {
-        libc::renameat(
-            source_parent.as_raw_fd(),
-            source.as_ptr(),
-            target_parent.as_raw_fd(),
-            target.as_ptr(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source contains NUL")
-    })?;
-    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target contains NUL")
-    })?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    let result = {
-        let _ = (source, target);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "atomic no-replace directory rename is unsupported on this platform",
-        ));
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
+mod capability;
+pub(crate) use capability::*;
 
 #[cfg(debug_assertions)]
 fn bootstrap_checkpoint(point: &str) {
@@ -3727,4 +3450,81 @@ mod tests {
             joined.display()
         );
     }
+
+    fn catalog_with_worker(root: &Path) -> PathBuf {
+        let agent = root.join("agents/host/worker");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" { host \"host\"; command \"true\" }\n",
+        )
+        .unwrap();
+        agent
+    }
+
+    #[test]
+    fn current_projection_ignores_and_preserves_an_exact_legacy_staging_file() {
+        let root = tempfile::tempdir().unwrap();
+        catalog_with_worker(root.path());
+        let before = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+        let legacy = root
+            .path()
+            .join("agents/host/.harness-context.tmp-123-456");
+        fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+
+        let after = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+        cleanup_writer_temporaries(root.path()).unwrap();
+
+        assert_eq!(after, before, "runtime residue cannot alter the digest");
+        assert_eq!(
+            fs::read(&legacy).unwrap(),
+            b"stale legacy staging bytes",
+            "the compatibility reader must not clean another process's file"
+        );
+        assert!(
+            project(root.path(), ProjectionSource::Prepared, root.path()).is_err(),
+            "prepared topology remains strict"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_projection_rejects_legacy_shape_type_confusion_and_near_misses() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["directory", "symlink", "near-miss"] {
+            let root = tempfile::tempdir().unwrap();
+            catalog_with_worker(root.path());
+            let host = root.path().join("agents/host");
+            match kind {
+                "directory" => {
+                    fs::create_dir(host.join(".harness-context.tmp-123-456")).unwrap();
+                }
+                "symlink" => {
+                    symlink(
+                        host.join("worker"),
+                        host.join(".harness-context.tmp-123-456"),
+                    )
+                    .unwrap();
+                }
+                "near-miss" => {
+                    fs::write(host.join(".harness-context.tmp-123-nope"), b"stale").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                project(root.path(), ProjectionSource::Current, root.path()).is_err(),
+                "{kind} must not enter the reserved compatibility exception"
+            );
+            assert!(
+                cleanup_writer_temporaries(root.path()).is_err(),
+                "{kind} must remain strict during writer-temporary cleanup"
+            );
+        }
+    }
+
 }

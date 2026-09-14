@@ -419,7 +419,7 @@ Agent Spec KDL carries normalized selector JSON as a `selector` raw-string
 property:
 
 ```kdl
-resource "pr" uri="github-pr://example/1" reason="Review." \
+resource "pr" uri="github-pr://github.com/example/project/pull/42" reason="Review." \
   selector=#"{"topics":["ci.failure","review.requested"]}"#
 ```
 
@@ -479,6 +479,56 @@ process API. Every non-foundation import must:
 For example, a GitHub Issue source capability may accept a typed
 `{ owner, repository, number }` and return a bounded typed issue response while
 the host fixes HTTPS endpoint policy, authentication, redirects, and deadlines.
+
+The built-in GitHub capabilities authorize the fixed `github.com` read API,
+not one catalog-pinned Resource identity:
+
+```kdl
+github-pr auth-executable="/nix/store/.../bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
+github-issue auth-executable="/nix/store/.../bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
+```
+
+The catalog fixes an absolute GitHub CLI executable. The host uses that
+executable to resolve durable GitHub CLI authentication for `github.com`,
+retains the bearer value as sensitive host state, fixes API origin, operation,
+headers, response limits, redirect policy, deadlines, cancellation, and public
+DNS admission, and never places a token in catalog KDL or guest memory. A
+missing credential fails the authenticated PR GraphQL operation; issue REST
+reads may remain anonymous for public repositories. The component parses the
+Resource identity and passes only validated `{ owner, repo, number }` values to
+the typed capability. This lets one scheme profile observe every repository
+visible to that user credential without granting the guest a URL or generic
+HTTP capability.
+
+`github-pr` accepts only
+`github-pr://github.com/<owner>/<repo>/pull/<number>`. Its selector contains
+only optional `topics`; identity fields in selectors and the former short URI
+are rejected. It performs one fixed GraphQL query with bounded review-request
+and status-rollup connections. Snapshot schema
+`dev.schickling.github-pr.snapshot.v1` contains normalized repository,
+pull-request, CI, and facet data. Initial publications emit
+`ci.failure`, `mergeability.conflict`, `review.requested`, and `terminal`;
+later publications emit only changed facet topics. Ordered facts are `pr`,
+`state`, and `ci`.
+
+`github-issue` accepts only
+`github-issue://github.com/<owner>/<repo>/issues/<number>` with the same
+topics-only selector rule. It conditionally reads the issue and, when comments
+exist, exactly the latest comment page with `per_page=1`; only the comment
+`updated_at` metadata crosses into normalization. Snapshot schema
+`dev.schickling.github-issue.snapshot.v1` contains normalized issue,
+discussion, and facet data. Initial publications emit `body`, `state`,
+`labels`, `assignment`, and `discussion`; later publications emit only topics
+whose corresponding semantic fields changed. Ordered facts are `issue`,
+`state`, and `comments`.
+
+Both host adapters retain bounded source state by authoritative snapshot
+digest; the issue adapter additionally retains validated REST ETags. An issue
+source-level 304 or any snapshot differing only in `observedAt` produces
+`unchanged`; every other invocation produces exactly one atomic
+`published`, `unchanged`, or redacted `failed` result. Partial multi-request
+observations are never published.
+
 A local PTY statistics capability may accept a closed `scope` variant while the
 host fixes the executable, argument shape, empty environment, working
 directory, output caps, deadline, and process containment. An interface that

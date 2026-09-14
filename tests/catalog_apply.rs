@@ -1,13 +1,17 @@
+mod support;
+
 use std::ffi::CString;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+
+use support::{CommandOwnedChildGroupExt as _, OwnedChildGroup};
 
 fn st2() -> Command {
     Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -616,9 +620,10 @@ fn concurrent_bootstrap_has_one_publication_and_one_exact_replay() {
                     captured["rootSha256"].as_str().unwrap(),
                     "--json",
                 ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
+                .spawn_owned()
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -754,9 +759,10 @@ fn bootstrap_publishes_its_lock_before_readers_can_enter() {
             "--json",
         ])
         .env("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT", &lock_attempt)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     wait_for(&lock_attempt);
     assert!(
@@ -1077,7 +1083,7 @@ fn send(catalog: &Path, recipient: &str, body: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     child
         .stdin
@@ -1094,7 +1100,7 @@ fn run_with_stdin(args: &[&str], body: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     child
         .stdin
@@ -1112,7 +1118,7 @@ fn paused_apply(
     point: &str,
     ready: &Path,
     release: &Path,
-) -> Child {
+) -> OwnedChildGroup {
     let mut command = st2();
     let input_sha256 = prepared_root_sha256(catalog, prepared);
     command
@@ -1129,12 +1135,13 @@ fn paused_apply(
             expected,
             "--json",
         ])
+        .stdin(Stdio::null())
         .env("ST2_TEST_CATALOG_APPLY_PAUSE_AT", point)
         .env("ST2_TEST_CATALOG_APPLY_READY", ready)
         .env("ST2_TEST_CATALOG_APPLY_RELEASE", release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.spawn().unwrap()
+    command.spawn_owned().unwrap()
 }
 
 fn paused_bootstrap(
@@ -1144,7 +1151,7 @@ fn paused_bootstrap(
     point: &str,
     ready: &Path,
     release: &Path,
-) -> Child {
+) -> OwnedChildGroup {
     let mut command = st2();
     command
         .args([
@@ -1158,12 +1165,59 @@ fn paused_bootstrap(
             input_sha256,
             "--json",
         ])
+        .stdin(Stdio::null())
         .env("ST2_TEST_CATALOG_BOOTSTRAP_PAUSE_AT", point)
         .env("ST2_TEST_CATALOG_BOOTSTRAP_READY", ready)
         .env("ST2_TEST_CATALOG_BOOTSTRAP_RELEASE", release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.spawn().unwrap()
+    command.spawn_owned().unwrap()
+}
+
+#[test]
+fn paused_catalog_child_is_reaped_when_test_unwinds() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let child_pid = std::cell::Cell::new(0_i32);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = paused_apply(
+            &catalog,
+            &prepared,
+            before["rootSha256"].as_str().unwrap(),
+            "marker-created",
+            &ready,
+            &release,
+        );
+        child_pid.set(child.id() as i32);
+        wait_for(&ready);
+        panic!("exercise panic-safe owned-child cleanup");
+    }));
+    assert!(unwound.is_err());
+
+    let child_pid = child_pid.get();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while st2::host_lock::process_alive(child_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let survived = st2::host_lock::process_alive(child_pid);
+    if survived {
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+    }
+    assert!(!survived, "paused catalog child survived test unwind");
 }
 
 #[test]
@@ -1207,6 +1261,79 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
     assert_eq!(second["status"], "unchanged");
     assert_eq!(second["rootSha256"], first["rootSha256"]);
 }
+
+#[test]
+fn snapshot_ignores_and_preserves_an_exact_legacy_harness_context_staging_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let first_output = temp.path().join("snapshot-before-legacy-stage");
+    let first = snapshot(&catalog, &first_output);
+    let legacy = catalog
+        .join("agents/host")
+        .join(".harness-context.tmp-123-456");
+    fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+
+    let second_output = temp.path().join("snapshot-after-legacy-stage");
+    let second = snapshot(&catalog, &second_output);
+
+    assert_eq!(second["rootSha256"], first["rootSha256"]);
+    assert!(!second_output.join("agents/host/.harness-context.tmp-123-456").exists());
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        b"stale legacy staging bytes",
+        "snapshotting must not clean another process's file"
+    );
+}
+
+#[test]
+fn harness_runtime_records_never_change_the_declaration_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let agent = agent_dir(&catalog, "worker");
+    let baseline_output = temp.path().join("snapshot-before-runtime");
+    let baseline = snapshot(&catalog, &baseline_output);
+    let runtime_names = [
+        "harness-context",
+        "harness-state",
+        ".harness-state.seq",
+        ".harness-state.lock",
+        ".harness-context.lock",
+    ];
+
+    for name in runtime_names {
+        fs::write(agent.join(name), format!("first {name}\n")).unwrap();
+    }
+    let first_runtime_output = temp.path().join("snapshot-with-runtime");
+    let first_runtime = snapshot(&catalog, &first_runtime_output);
+    assert_eq!(first_runtime["rootSha256"], baseline["rootSha256"]);
+    for name in runtime_names {
+        assert!(
+            !first_runtime_output.join("agents/host/worker").join(name).exists(),
+            "{name} must not enter the declaration snapshot"
+        );
+        fs::write(agent.join(name), format!("changed {name}\n")).unwrap();
+    }
+
+    let changed_runtime = snapshot(&catalog, &temp.path().join("snapshot-changed-runtime"));
+    assert_eq!(changed_runtime["rootSha256"], baseline["rootSha256"]);
+
+    let near_miss = agent.join("harness-context.backup");
+    fs::write(&near_miss, b"declaration-owned bytes").unwrap();
+    let with_near_miss_output = temp.path().join("snapshot-with-near-miss");
+    let with_near_miss = snapshot(&catalog, &with_near_miss_output);
+    assert_ne!(with_near_miss["rootSha256"], baseline["rootSha256"]);
+    assert_eq!(
+        fs::read(
+            with_near_miss_output.join("agents/host/worker/harness-context.backup")
+        )
+        .unwrap(),
+        b"declaration-owned bytes"
+    );
+}
+
+
 #[test]
 fn snapshot_projects_relative_profile_modules_once_and_hashes_their_bytes() {
     let temp = tempfile::tempdir().unwrap();
@@ -1814,31 +1941,308 @@ fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
 }
 
 #[test]
-fn raw_preimage_refuses_valid_catalogs_and_wrong_cas_without_declaration_writes() {
+fn raw_preimage_repairs_a_catalog_whose_declared_workspace_fact_is_runtime_only() {
+    // The deployer's repair path: raw-snapshot the invalid live plane, publish valid declaration
+    // bytes into that snapshot, then bind the apply to the opaque preimage. A raw preimage
+    // captures no runtime directory, so the prepared plane it produces has none for a declared
+    // workspace fact — admission must not demand one.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    ensure_external_pty_config(&catalog);
+    let dir = agent_dir(&catalog, "worker");
+    fs::write(
+        dir.join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  desired-state \"running\" because=\"unsupported\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let workspace = dir.join(".workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("session.txt"), "live runtime state").unwrap();
+
+    let strict_snapshot = st2()
+        .args([
+            "catalog",
+            "snapshot",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--output",
+            temp.path().join("strict-invalid").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !strict_snapshot.status.success(),
+        "invalid live plane unexpectedly passed the strict projection"
+    );
+
+    let prepared = temp.path().join("raw-capture");
+    let raw_capture = raw_snapshot(&catalog, &prepared);
+    assert!(
+        raw_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw_capture.stderr)
+    );
+    let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+    assert_eq!(
+        raw_capture["schema"],
+        "st2.catalog-raw-preimage-snapshot.v1"
+    );
+    assert!(!prepared.join("agents/host/worker/.workspace").exists());
+
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  retired #false\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+
+    let repaired = raw_apply(
+        &catalog,
+        &prepared,
+        raw_capture["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(repaired["status"], "applied");
+    assert_eq!(repaired["beforeSha256"], raw_capture["rootSha256"]);
+    assert!(
+        !fs::read_to_string(dir.join("agent.kdl"))
+            .unwrap()
+            .contains("because=\"unsupported\"")
+    );
+    assert!(workspace.is_dir());
+    assert_eq!(
+        fs::read_to_string(workspace.join("session.txt")).unwrap(),
+        "live runtime state"
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+
+    // The repaired plane is strictly projectable again, workspace fact included.
+    let strict = snapshot(&catalog, &temp.path().join("strict-repaired"));
+    assert!(strict["rootSha256"].as_str().unwrap().len() == 64);
+}
+
+#[test]
+fn raw_preimage_migrates_legacy_argv_profile_to_a_component_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let pty_root = temp.path().join("shared-pty");
+    let pty_root = pty_root.to_str().unwrap();
+    let legacy_config = format!(
+        r#"catalog {{ pty-root {pty_root:?} }}
+profile "dev.example.observe" {{
+  wasm "resolvers/observe.wasm"
+  runtime {{
+    argv "legacy-provider" "--unsafe"
+  }}
+}}
+"#
+    );
+    fs::write(catalog.join("catalog.kdl"), &legacy_config).unwrap();
+    let legacy_error = st2::catalog::load(&catalog).unwrap_err();
+    assert!(
+        legacy_error
+            .to_string()
+            .contains("runtime field 'argv' is unknown"),
+        "{legacy_error:#}"
+    );
+
+    let agent = agent_dir(&catalog, "worker");
+    fs::create_dir_all(agent.join("resources/context")).unwrap();
+    fs::write(
+        agent.join("resources/context/now.md"),
+        "preserve mutable context",
+    )
+    .unwrap();
+    fs::write(agent.join("status"), "busy").unwrap();
+    fs::create_dir_all(agent.join(".workspace")).unwrap();
+    fs::write(
+        agent.join(".workspace/session.txt"),
+        "preserve live workspace",
+    )
+    .unwrap();
+
+    let raw_capture_dir = temp.path().join("raw-capture-legacy");
+    let captured = raw_snapshot(&catalog, &raw_capture_dir);
+    assert!(
+        captured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    assert_eq!(
+        fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
+        legacy_config
+    );
+    assert!(!raw_capture_dir.join("agents/host/worker/.workspace").exists());
+
+    let desired = temp.path().join("desired-component");
+    write_agent(&desired, "worker", false);
+    fs::create_dir_all(desired.join("resolvers")).unwrap();
+    fs::create_dir_all(desired.join("providers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, desired.join("resolvers/observe.wasm")).unwrap();
+    fs::copy(
+        DEMO_WASM_SRC,
+        desired.join("providers/observe.component.wasm"),
+    )
+    .unwrap();
+    fs::write(
+        desired.join("catalog.kdl"),
+        format!(
+            r#"catalog {{ pty-root {pty_root:?} }}
+profile "dev.example.observe" {{
+  wasm "resolvers/observe.wasm"
+  runtime {{
+    component "providers/observe.component.wasm"
+    pty-stats executable="/bin/true" cwd="/" deadline-ms=1000
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared-component");
+    snapshot(&desired, &prepared);
+
+    let repaired = raw_apply(
+        &catalog,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("resources/context/now.md")).unwrap(),
+        "preserve mutable context"
+    );
+    assert_eq!(fs::read_to_string(agent.join("status")).unwrap(), "busy");
+    assert_eq!(
+        fs::read_to_string(agent.join(".workspace/session.txt")).unwrap(),
+        "preserve live workspace"
+    );
+    let applied = st2::catalog::load(&catalog).unwrap();
+    assert_eq!(applied.pty_root.as_deref(), Some(pty_root));
+    assert_eq!(
+        applied.profiles[0]
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.component.as_str()),
+        Some("providers/observe.component.wasm")
+    );
+    assert!(
+        !fs::read_to_string(catalog.join("catalog.kdl"))
+            .unwrap()
+            .contains("argv")
+    );
+    assert_eq!(
+        fs::read(catalog.join("providers/observe.component.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+}
+
+#[test]
+fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     let temp = tempfile::tempdir().unwrap();
     let valid = temp.path().join("valid");
     write_agent(&valid, "worker", false);
+    fs::write(
+        agent_dir(&valid, "worker").join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let workspace = agent_dir(&valid, "worker").join(".workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(valid.join("resolvers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, valid.join("resolvers/observe.wasm")).unwrap();
+    fs::write(
+        valid.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.observe", "resolvers/observe.wasm")]),
+    )
+    .unwrap();
     let valid_prepared = temp.path().join("valid-prepared");
-    let valid_snapshot = snapshot(&valid, &valid_prepared);
+    snapshot(&valid, &valid_prepared);
     let valid_raw_snapshot = raw_snapshot(&valid, &temp.path().join("valid-raw"));
-    assert!(!valid_raw_snapshot.status.success());
     assert!(
+        valid_raw_snapshot.status.success(),
+        "{}",
         String::from_utf8_lossy(&valid_raw_snapshot.stderr)
-            .contains("refuses an already-valid catalog")
     );
+    let valid_raw_snapshot: Value = serde_json::from_slice(&valid_raw_snapshot.stdout).unwrap();
+    let generation_before = fs::read(valid.join(".st2/catalog-generation")).ok();
     let valid_raw_apply = raw_apply(
         &valid,
         &valid_prepared,
-        valid_snapshot["rootSha256"].as_str().unwrap(),
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
     );
-    assert!(!valid_raw_apply.status.success());
     assert!(
+        valid_raw_apply.status.success(),
+        "{}",
         String::from_utf8_lossy(&valid_raw_apply.stderr)
-            .contains("refuses an already-valid catalog")
+    );
+    let valid_raw_apply: Value = serde_json::from_slice(&valid_raw_apply.stdout).unwrap();
+    assert_eq!(valid_raw_apply["status"], "unchanged");
+    assert!(!valid.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read(valid.join(".st2/catalog-generation")).ok(),
+        generation_before
+    );
+    assert!(workspace.is_dir());
+
+    fs::write(valid.join("resolvers/observe.wasm"), b"stale module").unwrap();
+    let stale_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        stale_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_module_apply.stderr)
+    );
+    let stale_module_apply: Value =
+        serde_json::from_slice(&stale_module_apply.stdout).unwrap();
+    assert_eq!(stale_module_apply["status"], "applied");
+    assert_eq!(
+        fs::read(valid.join("resolvers/observe.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+    assert!(workspace.is_dir());
+
+    let live_module = valid.join("resolvers/observe.wasm");
+    let module_alias = temp.path().join("observe-alias.wasm");
+    fs::hard_link(&live_module, &module_alias).unwrap();
+    let hard_linked_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        hard_linked_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hard_linked_module_apply.stderr)
+    );
+    let hard_linked_module_apply: Value =
+        serde_json::from_slice(&hard_linked_module_apply.stdout).unwrap();
+    assert_eq!(hard_linked_module_apply["status"], "applied");
+    fs::write(&module_alias, b"mutated alias").unwrap();
+    assert_eq!(
+        fs::read(&live_module).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
     );
 
     let invalid = temp.path().join("invalid");
     write_invalid_agent(&invalid, "worker");
+    fs::create_dir(agent_dir(&invalid, "worker").join(".workspace")).unwrap();
     ensure_external_pty_config(&invalid);
     let declaration = agent_dir(&invalid, "worker").join("agent.kdl");
     let context = agent_dir(&invalid, "worker").join("resources/context/now.md");
@@ -1887,24 +2291,24 @@ fn raw_preimage_rejects_hard_linked_declarations() {
 }
 
 #[test]
-fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
+fn raw_preimage_treats_the_live_envelope_and_pty_root_as_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let malformed_envelope = temp.path().join("malformed-envelope");
-    write_invalid_agent(&malformed_envelope, "worker");
-    fs::write(malformed_envelope.join("catalog.kdl"), "catalog {").unwrap();
-    let rejected = raw_snapshot(&malformed_envelope, &temp.path().join("malformed-capture"));
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("requires a valid incumbent catalog envelope")
-    );
 
     let catalog = temp.path().join("catalog");
     write_invalid_agent(&catalog, "worker");
-    ensure_external_pty_config(&catalog);
-    let raw_capture = raw_snapshot(&catalog, &temp.path().join("raw-capture"));
-    assert!(raw_capture.status.success());
+    fs::write(catalog.join("catalog.kdl"), "catalog {").unwrap();
+    let raw_capture_dir = temp.path().join("raw-capture");
+    let raw_capture = raw_snapshot(&catalog, &raw_capture_dir);
+    assert!(
+        raw_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw_capture.stderr)
+    );
     let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+    assert_eq!(
+        fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
+        "catalog {"
+    );
 
     let desired_source = temp.path().join("desired-source");
     write_agent(&desired_source, "worker", false);
@@ -1915,19 +2319,19 @@ fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
     .unwrap();
     let prepared = temp.path().join("prepared");
     snapshot(&desired_source, &prepared);
-    let declaration = fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap();
-    let rejected = raw_apply(
+    let applied = raw_apply(
         &catalog,
         &prepared,
         raw_capture["rootSha256"].as_str().unwrap(),
     );
-    assert!(!rejected.status.success());
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("refuses an effective pty-root change")
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
     );
     assert_eq!(
-        fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
-        declaration
+        fs::read(catalog.join("catalog.kdl")).unwrap(),
+        fs::read(prepared.join("catalog.kdl")).unwrap()
     );
     assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
 }
@@ -2179,36 +2583,49 @@ fn workspace_facts_are_empty_in_prepared_admitted_against_live_and_never_applied
     )
     .unwrap();
 
-    for case in ["missing", "content"] {
-        let invalid = temp.path().join(format!("invalid-{case}"));
-        let current = snapshot(&catalog, &invalid);
-        let fact = invalid.join("agents/host/worker/.workspace");
-        if case == "missing" {
-            fs::remove_dir(&fact).unwrap();
-        } else {
-            let secret = temp.path().join("workspace-secret");
-            fs::write(&secret, "must never be opened or copied").unwrap();
-            std::os::unix::fs::symlink(&secret, fact.join("forbidden-link")).unwrap();
-        }
-        let rejected = apply(&catalog, &invalid, current["rootSha256"].as_str().unwrap());
-        assert!(
-            !rejected.status.success(),
-            "prepared workspace {case} unexpectedly succeeded"
-        );
-        if case == "content" {
-            assert!(
-                String::from_utf8_lossy(&rejected.stderr)
-                    .contains("prepared workspace fact must be empty"),
-                "{}",
-                String::from_utf8_lossy(&rejected.stderr)
-            );
-        }
-        assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
-        assert_eq!(
-            fs::read_to_string(workspace.join("live.txt")).unwrap(),
-            "preserve"
-        );
-    }
+    // A declared workspace fact is runtime-only: the agent owns its contents, a raw preimage
+    // captures none of them, and the transaction republishes the fact as an empty directory.
+    // A prepared plane that carries no directory for it is therefore admitted, and the live
+    // contents survive.
+    let absent = temp.path().join("prepared-absent-fact");
+    let current = snapshot(&catalog, &absent);
+    fs::remove_dir(absent.join("agents/host/worker/.workspace")).unwrap();
+    let admitted = apply(&catalog, &absent, current["rootSha256"].as_str().unwrap());
+    assert!(
+        admitted.status.success(),
+        "prepared plane without a declared workspace fact was rejected: {}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    assert!(workspace.is_dir());
+    assert!(task_workspace.is_dir());
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("live.txt")).unwrap(),
+        "preserve"
+    );
+
+    // Runtime bytes still may not ride into the declaration plane through the fact.
+    let invalid = temp.path().join("invalid-content");
+    let current = snapshot(&catalog, &invalid);
+    let fact = invalid.join("agents/host/worker/.workspace");
+    let secret = temp.path().join("workspace-secret");
+    fs::write(&secret, "must never be opened or copied").unwrap();
+    std::os::unix::fs::symlink(&secret, fact.join("forbidden-link")).unwrap();
+    let rejected = apply(&catalog, &invalid, current["rootSha256"].as_str().unwrap());
+    assert!(
+        !rejected.status.success(),
+        "prepared workspace content unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("prepared workspace fact must be empty"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("live.txt")).unwrap(),
+        "preserve"
+    );
 
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
@@ -3628,21 +4045,27 @@ fn marker_time_state_plane_writes_reject_a_swapped_state_ancestor() {
     ] {
         let ready = temp.path().join(format!("{name}-ready"));
         let release = temp.path().join(format!("{name}-release"));
-        let mut child = st2()
+        let mut command = st2();
+        command
             .args(args)
             .env("ST2_TEST_MESSAGE_CAPABILITY_READY", &ready)
             .env("ST2_TEST_MESSAGE_CAPABILITY_RELEASE", &release)
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+            .stderr(Stdio::piped());
+        if input.is_empty() {
+            command.stdin(Stdio::null());
+        } else {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn_owned().unwrap();
+        if !input.is_empty() {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
         wait_for(&ready);
         let resources = agent_dir(&catalog, "old").join("resources");
         let retained = temp.path().join(format!("{name}-retained-resources"));
