@@ -199,7 +199,10 @@ impl Reason {
                 matches!(source, Source::QuestionSnapshot)
             }
             Self::MissingAskId => {
-                matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
+                matches!(
+                    source,
+                    Source::PermissionSnapshot | Source::QuestionSnapshot
+                )
             }
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
                 matches!(source, Source::PromptTransport)
@@ -361,9 +364,15 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::VersionGate => "install a supported producer version and restart the seat",
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
-            Stage::Seed => "restore readable producer state snapshots; recovery clears this advisory",
-            Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
-            Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
+            Stage::Seed => {
+                "restore readable producer state snapshots; recovery clears this advisory"
+            }
+            Stage::Delivery => {
+                "restore the native prompt transport; the queued message remains retryable"
+            }
+            Stage::ReadBack => {
+                "restore message read-back; st2 will reconcile without duplicating the prompt"
+            }
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
         },
     }
@@ -375,10 +384,7 @@ pub fn path(agent_dir: &Path) -> PathBuf {
 
 /// Whether this declaration has a native driver that currently publishes this record.
 pub fn expected_for(spec: &crate::AgentSpec) -> bool {
-    matches!(
-        spec.driver.as_ref(),
-        Some(crate::Driver::OpenCode(_))
-    )
+    matches!(spec.driver.as_ref(), Some(crate::Driver::OpenCode(_)))
 }
 pub fn read(path: &Path) -> Observed {
     let raw = match fs::read(path) {
@@ -486,7 +492,14 @@ impl Publisher {
         };
         self.failures[index] = Some(record);
         crate::metrics::record_driver_diagnostic(stage, reason, source, self.support, false);
-        emit(stage, reason, source, self.support, "failure", self.producer_version.as_deref());
+        emit(
+            stage,
+            reason,
+            source,
+            self.support,
+            "failure",
+            self.producer_version.as_deref(),
+        );
         self.persist();
     }
 
@@ -644,9 +657,15 @@ mod tests {
         };
         assert_eq!(failure.evidence_age_ms, 25);
         assert_eq!(failure.stage, Stage::Seed);
-        assert_eq!(read_at(b"not json", 0), Observed::Indeterminate(InvalidReason::MalformedRecord));
         assert_eq!(
-            read_at(&valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"), 0),
+            read_at(b"not json", 0),
+            Observed::Indeterminate(InvalidReason::MalformedRecord)
+        );
+        assert_eq!(
+            read_at(
+                &valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"),
+                0
+            ),
             Observed::Indeterminate(InvalidReason::UnsupportedSchema)
         );
         assert_eq!(
@@ -686,12 +705,20 @@ mod tests {
         );
         publisher.publish(Stage::ReadBack, Reason::NotDurable, Source::MessageReadBack);
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(failure.stage, Stage::Sse, "earliest boundary wins");
 
         publisher.clear(Stage::ReadBack);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
-        assert_eq!(failure.stage, Stage::Sse, "unrelated recovery cannot clear SSE");
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
+        assert_eq!(
+            failure.stage,
+            Stage::Sse,
+            "unrelated recovery cannot clear SSE"
+        );
 
         publisher.clear(Stage::Sse);
         assert_eq!(read(&path(tmp.path())), Observed::Absent);
@@ -720,7 +747,10 @@ mod tests {
 
     impl ReplaceBytes for [u8] {
         fn replace(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
-            let at = self.windows(from.len()).position(|window| window == from).unwrap();
+            let at = self
+                .windows(from.len())
+                .position(|window| window == from)
+                .unwrap();
             let mut out = Vec::with_capacity(self.len() - from.len() + to.len());
             out.extend_from_slice(&self[..at]);
             out.extend_from_slice(to);

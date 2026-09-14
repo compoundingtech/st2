@@ -38,7 +38,6 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
     assert_eq!(descriptor.snapshot_schema_id, "st2.resource.pty-stats.v1");
     assert_eq!(descriptor.snapshot_media_type, "application/json");
 
-
     let first = executor
         .observe(
             &loaded,

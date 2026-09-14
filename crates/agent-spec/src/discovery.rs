@@ -10,9 +10,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::declared::{
-    DeclaredDiagnosticCode, DeclaredParse, parse_declared_document,
-};
+use crate::declared::{DeclaredDiagnosticCode, DeclaredParse, parse_declared_document};
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -302,12 +300,13 @@ fn is_canonical_bundle_descendant(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    let mut components = relative.components().filter_map(|component| match component {
-        Component::Normal(name) => Some(name),
-        _ => None,
-    });
-    components.next().and_then(|name| name.to_str()) == Some("agents")
-        && components.count() >= 4
+    let mut components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        });
+    components.next().and_then(|name| name.to_str()) == Some("agents") && components.count() >= 4
 }
 
 fn has_spec_extension(path: &Path) -> bool {

@@ -1852,7 +1852,10 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
         };
         if !same {
             crate::metrics::record_message_delivery(true);
-            anyhow::bail!("archived message differs from pending send {}", record.filename);
+            anyhow::bail!(
+                "archived message differs from pending send {}",
+                record.filename
+            );
         }
         crate::metrics::record_message_delivery(false);
         return Ok(());

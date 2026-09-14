@@ -64,12 +64,9 @@ fn ensure_external_pty_config(catalog: &Path) {
 }
 
 fn profile_catalog_config(profiles: &[(&str, &str)]) -> String {
-    let mut config =
-        "catalog { pty-root \"/tmp/st2-catalog-transaction-test-pty\" }\n".to_string();
+    let mut config = "catalog { pty-root \"/tmp/st2-catalog-transaction-test-pty\" }\n".to_string();
     for (scheme, module) in profiles {
-        config.push_str(&format!(
-            "profile {scheme:?} {{ wasm {module:?} }}\n"
-        ));
+        config.push_str(&format!("profile {scheme:?} {{ wasm {module:?} }}\n"));
     }
     config
 }
@@ -1280,11 +1277,7 @@ fn relative_profile_modules_reject_unsafe_missing_and_unprojected_inputs() {
             "symlink" => {
                 let external = temp.path().join("external.wasm");
                 fs::write(&external, b"external").unwrap();
-                std::os::unix::fs::symlink(
-                    &external,
-                    catalog.join("resolvers/goal.wasm"),
-                )
-                .unwrap();
+                std::os::unix::fs::symlink(&external, catalog.join("resolvers/goal.wasm")).unwrap();
             }
             "fifo" => {
                 let fifo = catalog.join("resolvers/goal.wasm");
@@ -1374,11 +1367,7 @@ fn raw_preimage_repairs_catalogs_with_unadmitted_profile_modules() {
             "symlink" => {
                 let external = temp.path().join("raw-external.wasm");
                 fs::write(&external, b"external").unwrap();
-                std::os::unix::fs::symlink(
-                    &external,
-                    catalog.join("resolvers/goal.wasm"),
-                )
-                .unwrap();
+                std::os::unix::fs::symlink(&external, catalog.join("resolvers/goal.wasm")).unwrap();
             }
             "fifo" => {
                 let fifo = catalog.join("resolvers/goal.wasm");
@@ -1679,8 +1668,7 @@ fn profile_module_recovery_admits_only_recorded_projected_module_paths() {
     let rejected_extra = resume(&catalog);
     assert!(
         !rejected_extra.status.success()
-            && String::from_utf8_lossy(&rejected_extra.stderr)
-                .contains("unowned declaration path"),
+            && String::from_utf8_lossy(&rejected_extra.stderr).contains("unowned declaration path"),
         "{}",
         String::from_utf8_lossy(&rejected_extra.stderr)
     );
@@ -1721,10 +1709,11 @@ fn profile_module_recovery_admits_only_recorded_projected_module_paths() {
     );
     assert!(!marker.exists());
     assert!(!catalog.join("resolvers/old.wasm").exists());
-    assert_eq!(fs::read(catalog.join("resolvers/new.wasm")).unwrap(), b"new");
+    assert_eq!(
+        fs::read(catalog.join("resolvers/new.wasm")).unwrap(),
+        b"new"
+    );
 }
-
-
 
 #[test]
 fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
