@@ -241,7 +241,19 @@
             "-p"
             "st3-schema"
           ];
-          nativeBuildInputs = [ pkgs.installShellFiles ];
+          # Render tests create throwaway repositories and call Git to protect
+          # tracked files. Keep that dependency in the hermetic check sandbox.
+          nativeBuildInputs = [
+            pkgs.git
+            pkgs.installShellFiles
+          ];
+          # The daemon survival suite exercises the packaged PTY boundary.
+          nativeCheckInputs = [
+            pkgs.bashInteractive
+            pkgs.jq
+            pkgs.which
+            pty.packages.${system}.default
+          ];
           postInstall = ''
             ln -s st3 $out/bin/st
             $out/bin/st3 completions bash > st3.bash

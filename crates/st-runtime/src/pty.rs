@@ -331,14 +331,29 @@ fn require_success(action: &str, output: Output) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
+
+    fn fake_executable(root: &Path, name: &str, body: &str) -> PathBuf {
+        let source = root.join(format!("{name}.source"));
+        let binary = root.join(name);
+        fs::write(&source, body).unwrap();
+        // A parallel test can fork while this process owns a writable file.
+        // Let install create the executable so no child inherits that writer.
+        let output = Command::new("install")
+            .args(["-m", "700"])
+            .arg(&source)
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "install failed: {output:?}");
+        binary
+    }
 
     #[test]
     fn terminal_input_checks_the_expected_incarnation() {
         let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("fake-pty");
-        fs::write(
-            &binary,
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty",
             r#"#!/bin/sh
 if [ "$1" = list ]; then
   printf '[{"name":"work","status":"running","pid":42,"createdAt":"now"}]'
@@ -346,9 +361,7 @@ if [ "$1" = list ]; then
 fi
 exit 0
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
@@ -370,9 +383,11 @@ exit 0
     #[test]
     fn spawn_records_the_shared_isolation_mode() {
         let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("fake-pty-spawn");
-        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-spawn",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        );
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
         runtime
@@ -397,9 +412,11 @@ exit 0
     #[test]
     fn spawn_preserves_an_explicit_terminal_type() {
         let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("fake-pty-term");
-        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-term",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        );
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
@@ -422,9 +439,9 @@ exit 0
     #[test]
     fn spawn_reaps_a_recent_session_id_and_retries() {
         let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("fake-pty-retry");
-        fs::write(
-            &binary,
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-retry",
             r#"#!/bin/sh
 if [ "$1" = run ]; then
   count=0
@@ -441,9 +458,7 @@ if [ "$1" = remove ]; then
 fi
 exit 0
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
