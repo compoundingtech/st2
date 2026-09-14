@@ -45,7 +45,12 @@ use presentation::{
 };
 
 #[derive(Parser)]
-#[command(name = "st3", version, about = "Claims-graph agent reconciler")]
+#[command(
+    name = "st3",
+    bin_name = "st",
+    version,
+    about = "Claims-graph agent reconciler"
+)]
 struct Cli {
     #[arg(long, global = true)]
     endpoint: Option<String>,
