@@ -278,7 +278,9 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                     anyhow::anyhow!("profile '{scheme}': runtime needs exactly one component path")
                 })?,
                 capability: capability.ok_or_else(|| {
-                    anyhow::anyhow!("profile '{scheme}': runtime needs exactly one typed capability")
+                    anyhow::anyhow!(
+                        "profile '{scheme}': runtime needs exactly one typed capability"
+                    )
                 })?,
                 demand,
             });
@@ -369,7 +371,10 @@ fn parse_github_issue_capability(
     let number = required_u64_property(scheme, node, "number")?;
     let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
     let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
-    anyhow::ensure!(number > 0, "profile '{scheme}': GitHub issue number must be positive");
+    anyhow::ensure!(
+        number > 0,
+        "profile '{scheme}': GitHub issue number must be positive"
+    );
     anyhow::ensure!(
         connect_timeout_ms > 0
             && connect_timeout_ms <= total_timeout_ms
@@ -403,12 +408,13 @@ fn parse_pty_stats_capability(
     let scope = required_string_property(scheme, node, "scope")?;
     let scope = if scope == "all" {
         DeclaredPtyStatsScope::All
-    } else if let Some(session) = scope.strip_prefix("session:").filter(|value| !value.is_empty()) {
+    } else if let Some(session) = scope
+        .strip_prefix("session:")
+        .filter(|value| !value.is_empty())
+    {
         DeclaredPtyStatsScope::Session(session.to_owned())
     } else {
-        anyhow::bail!(
-            "profile '{scheme}': PTY scope must be 'all' or 'session:<id>'"
-        );
+        anyhow::bail!("profile '{scheme}': PTY scope must be 'all' or 'session:<id>'");
     };
     Ok(DeclaredProviderCapability::PtyStats {
         executable,
@@ -435,11 +441,7 @@ fn required_string_property(
         })
 }
 
-fn required_u64_property(
-    scheme: &str,
-    node: &kdl::KdlNode,
-    name: &str,
-) -> anyhow::Result<u64> {
+fn required_u64_property(scheme: &str, node: &kdl::KdlNode, name: &str) -> anyhow::Result<u64> {
     node.get(name)
         .and_then(|value| value.as_integer())
         .and_then(|value| u64::try_from(value).ok())

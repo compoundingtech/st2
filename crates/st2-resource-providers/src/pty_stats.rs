@@ -86,7 +86,6 @@ impl PtyStatsModule {
     }
 }
 
-
 pub struct PtyStatsInvocation {
     config: PtyStatsConfig,
     control: Arc<ProcessControl>,
@@ -195,7 +194,6 @@ impl ProcessControl {
         reason
     }
 
-
     fn wait_and_reap(
         &self,
         child: &mut std::process::Child,
@@ -219,7 +217,6 @@ impl ProcessControl {
         *ownership = ChildOwnership::Reaped;
     }
 }
-
 
 impl CapabilityModule for PtyStatsModule {
     type Invocation = PtyStatsInvocation;
@@ -316,21 +313,22 @@ impl PtyStatsInvocation {
         let deadline_control = Arc::clone(&self.control);
         let timer = match thread::Builder::new()
             .name("st2-pty-stats-deadline".into())
-            .spawn(move || loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    deadline_control.terminate(Termination::TimedOut);
-                    return;
+            .spawn(move || {
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        deadline_control.terminate(Termination::TimedOut);
+                        return;
+                    }
+                    match completed_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if deadline_control.synchronize_interruption() != Termination::None {
+                        return;
+                    }
                 }
-                match completed_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                if deadline_control.synchronize_interruption() != Termination::None {
-                    return;
-                }
-            })
-        {
+            }) {
             Ok(timer) => timer,
             Err(_) => {
                 self.control.kill_and_reap(&mut child);
@@ -396,7 +394,9 @@ fn drain_bounded(
     let mut truncated = false;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let read = input.read(&mut buffer).map_err(|_| PtyStatsError::Unavailable)?;
+        let read = input
+            .read(&mut buffer)
+            .map_err(|_| PtyStatsError::Unavailable)?;
         if read == 0 {
             break;
         }
@@ -421,12 +421,7 @@ fn wait_without_reaping(pid: u32) -> std::io::Result<()> {
         // waitable so its process-group identity cannot be recycled before ownership is fenced.
         let result = unsafe {
             let mut info = std::mem::zeroed::<libc::siginfo_t>();
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
         };
         if result == 0 {
             return Ok(());
@@ -443,11 +438,7 @@ fn resolve_executable(executable: &Path) -> Option<PathBuf> {
     }
     let validation_cwd = std::env::current_dir().ok()?;
     let search_path = std::env::var_os("PATH");
-    resolve_executable_at(
-        executable,
-        &validation_cwd,
-        search_path.as_deref(),
-    )
+    resolve_executable_at(executable, &validation_cwd, search_path.as_deref())
 }
 
 fn resolve_executable_at(
@@ -474,16 +465,14 @@ fn resolve_executable_at(
 }
 
 fn executable_is_runnable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| {
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    })
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
-
 
     use super::*;
 
@@ -513,10 +502,7 @@ mod tests {
         let configured_cwd = temporary.path().join("configured");
         std::fs::create_dir_all(temporary.path().join("tools")).unwrap();
         let validated_executable = temporary.path().join("tools/pty-stats");
-        write_executable(
-            &validated_executable,
-            "#!/bin/sh\nprintf 'validated\\n'\n",
-        );
+        write_executable(&validated_executable, "#!/bin/sh\nprintf 'validated\\n'\n");
         let relative_executable = validated_executable.strip_prefix(&validation_cwd).unwrap();
         let rebound_executable = configured_cwd.join(relative_executable);
         std::fs::create_dir_all(rebound_executable.parent().unwrap()).unwrap();
@@ -605,13 +591,9 @@ mod tests {
     #[test]
     #[ignore = "requires packaged pty: cargo test -p st2-resource-providers pty_stats_live_json -- --ignored"]
     fn pty_stats_live_json() {
-        let config = PtyStatsConfig::resolve(
-            "pty",
-            "/",
-            PtyStatsScope::All,
-            Duration::from_secs(10),
-        )
-        .unwrap();
+        let config =
+            PtyStatsConfig::resolve("pty", "/", PtyStatsScope::All, Duration::from_secs(10))
+                .unwrap();
         let mut invocation = PtyStatsInvocation {
             config,
             control: Arc::new(ProcessControl::detached()),

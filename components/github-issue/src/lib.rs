@@ -78,9 +78,8 @@ impl provider_api::Guest for Component {
     }
 
     fn observe(request: provider_api::ObserveRequest) -> provider_api::ObservationResult {
-        observe(request).unwrap_or_else(|diagnostic| {
-            provider_api::ObservationResult::Failed(Some(diagnostic))
-        })
+        observe(request)
+            .unwrap_or_else(|diagnostic| provider_api::ObservationResult::Failed(Some(diagnostic)))
     }
 }
 
@@ -105,8 +104,8 @@ fn observe(
         }
         github_issue::IssueResponse::Ok(value) => value,
     };
-    let issue: GitHubIssue = serde_json::from_slice(&body)
-        .map_err(|_| "GitHub response was invalid".to_owned())?;
+    let issue: GitHubIssue =
+        serde_json::from_slice(&body).map_err(|_| "GitHub response was invalid".to_owned())?;
     if issue.number != selector.number {
         return Err("GitHub response did not match the requested issue".into());
     }
@@ -135,7 +134,10 @@ fn observe(
         provider_api::Fact {
             key: "etag".into(),
             before: provider_api::FactValue::Omitted,
-            after: etag.map_or(provider_api::FactValue::Null, provider_api::FactValue::Value),
+            after: etag.map_or(
+                provider_api::FactValue::Null,
+                provider_api::FactValue::Value,
+            ),
         },
     ];
     Ok(provider_api::ObservationResult::Published(

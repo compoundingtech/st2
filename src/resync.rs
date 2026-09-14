@@ -15,15 +15,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use agent_spec::profile::{ProfileClass, ResourceProfileRefresh, ResourceProfileRegistry};
+use agent_spec::spec::{AgentSpec, Resource, decode_percent_path};
 use notify::Watcher as _;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use agent_spec::profile::{
-    ProfileClass, ResourceProfileRefresh, ResourceProfileRegistry,
-};
-use agent_spec::spec::{AgentSpec, Resource, decode_percent_path};
 
-use crate::resource_profile::{MAX_FACTS, MAX_FACT_KEY_BYTES, ResourceFact};
+use crate::resource_profile::{MAX_FACT_KEY_BYTES, MAX_FACTS, ResourceFact};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
 pub const RESYNC_STREAM: &str = "resync";
@@ -78,7 +76,6 @@ impl ResyncCoverage {
     }
 }
 
-
 /// One watchable local carrier: binding label, absolute path, notification class, and an optional
 /// host root that must confine every read of a resolver-selected path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +125,8 @@ fn declaration_resource_digest(resource: &Resource) -> String {
         }
         None => digest.update([0]),
     }
-    let selector = serde_json::to_vec(&resource.selector())
-        .expect("a parsed JSON selector always serializes");
+    let selector =
+        serde_json::to_vec(&resource.selector()).expect("a parsed JSON selector always serializes");
     update_digest_field(&mut digest, &selector);
     format!("{:x}", digest.finalize())
 }
@@ -256,11 +253,15 @@ fn resolve_watch_set(
         AgentWatchSet {
             declaration_path,
             bus_id: spec.bus_id(this_host),
-            seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
-                task.id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
-            }),
+            seat_id: spec
+                .tasks
+                .iter()
+                .find(|task| task.name == "agent")
+                .map(|task| {
+                    task.id
+                        .clone()
+                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+                }),
             carriers,
             declaration_summary: Some(declaration_summary(spec)),
         },
@@ -390,7 +391,10 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     Some(lexical_clean(&agent_dir.join(path)))
 }
 /// Resolve the externally visible resync coverage for one Resource binding.
-pub fn resource_coverage(agent_dir: &Path, resource: &agent_spec::spec::Resource) -> ResyncCoverage {
+pub fn resource_coverage(
+    agent_dir: &Path,
+    resource: &agent_spec::spec::Resource,
+) -> ResyncCoverage {
     if resource.inactive_reason().is_some() {
         return ResyncCoverage::Inactive;
     }
@@ -403,7 +407,6 @@ pub fn resource_coverage(agent_dir: &Path, resource: &agent_spec::spec::Resource
         None => ResyncCoverage::Silent,
     }
 }
-
 
 /// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
 /// classification follows the authored path structure without resolving symlinks.
@@ -683,11 +686,10 @@ impl ResyncSupervisor {
     /// Sequence floors remain retained so a later successful install cannot reuse an occurrence.
     pub fn deactivate(&self, spec: &AgentSpec, this_host: &str) {
         let (ack_tx, ack_rx) = channel();
-        if self
-            .tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx)).is_ok())
-        {
+        if self.tx.as_ref().is_some_and(|tx| {
+            tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx))
+                .is_ok()
+        }) {
             let _ = ack_rx.recv();
         }
     }
@@ -751,22 +753,24 @@ fn declaration_transition_facts(
         .collect::<BTreeSet<_>>();
     let facts = labels
         .into_iter()
-        .filter_map(|label| match (old.bindings.get(&label), new.bindings.get(&label)) {
-            (None, Some(_)) => Some(ResourceFact::transition(
-                label,
-                None::<String>,
-                Some("declared".to_owned()),
-            )),
-            (Some(_), None) => Some(ResourceFact::transition(
-                label,
-                Some("declared".to_owned()),
-                None::<String>,
-            )),
-            (Some(before), Some(after)) if before != after => {
-                Some(ResourceFact::current(label, "changed"))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |label| match (old.bindings.get(&label), new.bindings.get(&label)) {
+                (None, Some(_)) => Some(ResourceFact::transition(
+                    label,
+                    None::<String>,
+                    Some("declared".to_owned()),
+                )),
+                (Some(_), None) => Some(ResourceFact::transition(
+                    label,
+                    Some("declared".to_owned()),
+                    None::<String>,
+                )),
+                (Some(before), Some(after)) if before != after => {
+                    Some(ResourceFact::current(label, "changed"))
+                }
+                _ => None,
+            },
+        )
         .collect::<Result<Vec<_>, _>>();
     match facts {
         Ok(facts) if !facts.is_empty() => facts,
@@ -781,7 +785,6 @@ fn current_declaration_summary(root: &Path, path: &Path) -> Option<DeclarationSu
         .find(|spec| lexical_clean(&spec.path) == path)
         .map(|spec| declaration_summary(&spec))
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTransition {
@@ -827,12 +830,8 @@ impl PendingTransition {
         incarnation: crate::event::StreamOwnerIncarnation,
         sequence: u64,
     ) -> Self {
-        let facts = declaration_transition_facts(
-            old_summary,
-            new_summary.as_ref(),
-            old_state,
-            new_state,
-        );
+        let facts =
+            declaration_transition_facts(old_summary, new_summary.as_ref(), old_state, new_state);
         Self::capture(
             "declaration",
             path,
@@ -1115,20 +1114,14 @@ impl Worker {
         previous
             .iter()
             .flat_map(|(path, entries)| {
-                entries.iter().map(|entry| {
-                    (
-                        (entry.bus_id.clone(), entry.label.clone()),
-                        path.clone(),
-                    )
-                })
+                entries
+                    .iter()
+                    .map(|entry| ((entry.bus_id.clone(), entry.label.clone()), path.clone()))
             })
             .collect()
     }
 
-    fn finish_carrier_update(
-        &mut self,
-        previous_paths: &BTreeMap<SubscriptionIdentity, PathBuf>,
-    ) {
+    fn finish_carrier_update(&mut self, previous_paths: &BTreeMap<SubscriptionIdentity, PathBuf>) {
         let rebound_paths = self
             .carriers
             .iter()
@@ -1545,12 +1538,7 @@ fn transition_identity(body: &str) -> String {
 }
 
 /// One superseded resync event through the supervisor-only built-in admission (`RESYNC-R06`).
-fn emit_resync(
-    root: &Path,
-    this_host: &str,
-    bus_id: &str,
-    transition: &PendingTransition,
-) -> bool {
+fn emit_resync(root: &Path, this_host: &str, bus_id: &str, transition: &PendingTransition) -> bool {
     let subject = crate::resource_profile_supervisor::resource_change_subject(
         &transition.binding,
         &transition.facts,
@@ -1577,8 +1565,6 @@ fn emit_resync(
         }
     }
 }
-
-
 
 fn read_state(path: &Path, containment_root: Option<&Path>) -> std::io::Result<CarrierState> {
     match containment_root {
@@ -1952,7 +1938,10 @@ mod tests {
         assert_eq!(pending.facts.len(), 1);
         assert_eq!(pending.facts[0].key(), "digest");
         assert_eq!(pending.topics, ["declaration"]);
-        assert_eq!(event_body(&pending.body)["facts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            event_body(&pending.body)["facts"].as_array().unwrap().len(),
+            1
+        );
         std::fs::write(&declaration, valid).unwrap();
         worker.flush_path(&declaration, None);
         let delivered = resync_inbox_event(&agent_dir);
@@ -1963,7 +1952,6 @@ mod tests {
         assert!(!delivered.contains("file:///"));
         assert!(!delivered.contains("Mission."));
     }
-
 
     #[test]
     fn watch_set_covers_declaration_and_local_bindings_only() {
@@ -2149,18 +2137,12 @@ mod tests {
         let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new());
         let entries = rebuilt.get(&shared).expect("shared path remains watched");
         assert_eq!(entries.len(), 2);
-        for (bus_id, digest) in [
-            ("host.alpha", "alpha-before"),
-            ("host.beta", "beta-before"),
-        ] {
+        for (bus_id, digest) in [("host.alpha", "alpha-before"), ("host.beta", "beta-before")] {
             let entry = entries
                 .iter()
                 .find(|entry| entry.bus_id == bus_id)
                 .expect("subscriber remains present");
-            assert_eq!(
-                entry.state,
-                Some(CarrierState::Present(digest.to_owned()))
-            );
+            assert_eq!(entry.state, Some(CarrierState::Present(digest.to_owned())));
             assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
         }
     }
@@ -2236,7 +2218,10 @@ mod tests {
             .iter()
             .find(|entry| entry.label == "goal")
             .unwrap();
-        assert!(!entry.dirty, "the current recipient accepted the transition");
+        assert!(
+            !entry.dirty,
+            "the current recipient accepted the transition"
+        );
         assert!(entry.pending_transition.is_none());
         let events = std::fs::read_dir(agent_dir.join("resources/inbox"))
             .unwrap()
@@ -2295,8 +2280,11 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let current =
-            watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
+        let current = watch_set_for(
+            &discover(root.path()),
+            "alias",
+            &ResourceProfileRegistry::empty(),
+        );
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -2306,7 +2294,10 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .find(|body| body.contains("stream: resync"))
             .expect("the retry routes through the refreshed recipient");
-        assert!(event.contains(&format!("event-id: {}", pending.event_id)), "{event}");
+        assert!(
+            event.contains(&format!("event-id: {}", pending.event_id)),
+            "{event}"
+        );
         assert!(event.contains(&pending.body), "{event}");
         let pending_body: serde_json::Value = serde_json::from_str(&pending.body).unwrap();
         assert_eq!(pending_body["binding"], "goal");
@@ -2632,7 +2623,10 @@ mod tests {
         worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.state, baseline);
-        assert!(entry.pending_transition.is_none(), "coalesced emit ran too early");
+        assert!(
+            entry.pending_transition.is_none(),
+            "coalesced emit ran too early"
+        );
 
         worker.flush_due(now + COALESCED_WINDOW + Duration::from_secs(1));
         assert!(
@@ -2731,7 +2725,10 @@ mod tests {
         let set_for = |identity: &str| {
             let spec = specs
                 .iter()
-                .find(|spec| spec.path.starts_with(root.path().join("agents/alias").join(identity)))
+                .find(|spec| {
+                    spec.path
+                        .starts_with(root.path().join("agents/alias").join(identity))
+                })
                 .expect("both declarations are valid");
             watch_set_for(spec, "alias", &ResourceProfileRegistry::empty())
         };
@@ -2832,7 +2829,10 @@ mod tests {
         worker.flush_due(now);
         let entries = worker.carriers.values().next().unwrap();
         assert!(!entries[0].dirty);
-        assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
+        assert!(
+            entries[1].dirty,
+            "coalesced subscriber must wait for its own deadline"
+        );
     }
 
     #[cfg(unix)]
@@ -3105,10 +3105,7 @@ mod tests {
         worker.apply_watch_sets(refresh_for(Vec::new()));
         assert!(worker.carriers.is_empty());
         assert!(worker.watched.is_empty());
-        assert_eq!(
-            worker.subscription_sequences.len(),
-            seen_subscription_count
-        );
+        assert_eq!(worker.subscription_sequences.len(), seen_subscription_count);
 
         std::fs::write(&carrier, "A").unwrap();
         worker.apply_watch_sets(refresh_for(vec![set]));
@@ -3157,8 +3154,11 @@ mod tests {
         let relocated_carrier = resources.join("relocated-goal.md");
         std::fs::write(&original_carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set =
-            watch_set_for(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
+        let set = watch_set_for(
+            &discover(root.path()),
+            "host",
+            &ResourceProfileRegistry::empty(),
+        );
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -3190,15 +3190,18 @@ mod tests {
             .find(|entry| entry.label == "goal")
             .unwrap();
         assert_eq!(rebound.occurrence_sequence, 1);
-        assert_eq!(
-            rebound.state,
-            read_state(&original_carrier, None).ok()
-        );
+        assert_eq!(rebound.state, read_state(&original_carrier, None).ok());
 
         worker.flush_path(&relocated_carrier, None);
         let back_to_a = resync_inbox_event(&agent_dir);
-        assert_eq!(event_field(&back_to_a, "old"), event_field(&first_a_to_b, "new"));
-        assert_eq!(event_field(&back_to_a, "new"), event_field(&first_a_to_b, "old"));
+        assert_eq!(
+            event_field(&back_to_a, "old"),
+            event_field(&first_a_to_b, "new")
+        );
+        assert_eq!(
+            event_field(&back_to_a, "new"),
+            event_field(&first_a_to_b, "old")
+        );
         assert!(event_field(&back_to_a, "occurrence").ends_with(":2"));
 
         std::fs::write(&relocated_carrier, "B").unwrap();
@@ -3269,8 +3272,14 @@ mod tests {
         assert_eq!(entries[0].occurrence_sequence, 1);
         assert_eq!(entries[1].occurrence_sequence, 1);
         assert_eq!(
-            event_field(&entries[0].pending_transition.as_ref().unwrap().body, "occurrence"),
-            event_field(&entries[1].pending_transition.as_ref().unwrap().body, "occurrence"),
+            event_field(
+                &entries[0].pending_transition.as_ref().unwrap().body,
+                "occurrence"
+            ),
+            event_field(
+                &entries[1].pending_transition.as_ref().unwrap().body,
+                "occurrence"
+            ),
             "one subscriber must not consume sequence numbers from another"
         );
     }
@@ -3358,8 +3367,7 @@ mod tests {
     #[test]
     fn transition_identity_covers_every_rendered_transition_dimension() {
         let topics = vec!["content".to_owned()];
-        let facts =
-            vec![ResourceFact::transition("digest", Some("old"), Some("new")).unwrap()];
+        let facts = vec![ResourceFact::transition("digest", Some("old"), Some("new")).unwrap()];
         let baseline = render_body("goal", &topics, &facts, "v1:1:2:42:3:1");
         assert_eq!(
             transition_identity(&baseline),
@@ -3425,10 +3433,7 @@ mod tests {
             Some(agent_dir.join("resources/journal.md"))
         );
         assert_eq!(
-            resolve_local_path(
-                agent_dir,
-                "resources/with%20space/%E2%82%AC-journal.md"
-            ),
+            resolve_local_path(agent_dir, "resources/with%20space/%E2%82%AC-journal.md"),
             Some(agent_dir.join("resources/with space/€-journal.md"))
         );
 
@@ -3496,8 +3501,14 @@ mod tests {
 
     #[test]
     fn profile_classes_map_onto_carrier_notification() {
-        assert_eq!(carrier_class(ProfileClass::Immediate), Some(CarrierClass::Immediate));
-        assert_eq!(carrier_class(ProfileClass::Coalesced), Some(CarrierClass::Coalesced));
+        assert_eq!(
+            carrier_class(ProfileClass::Immediate),
+            Some(CarrierClass::Immediate)
+        );
+        assert_eq!(
+            carrier_class(ProfileClass::Coalesced),
+            Some(CarrierClass::Coalesced)
+        );
         assert_eq!(
             carrier_class(ProfileClass::Silent),
             None,
@@ -3523,13 +3534,12 @@ mod tests {
 
         let broken = tmp.path().join("broken.wasm");
         std::fs::write(&broken, b"not a module").unwrap();
-        let profiles = ResourceProfileRegistry::empty().with_profile(
-            agent_spec::ResourceProfile::wasm(
+        let profiles =
+            ResourceProfileRegistry::empty().with_profile(agent_spec::ResourceProfile::wasm(
                 "dev.schickling.agent-goal",
                 &broken,
                 ProfileClass::Coalesced,
-            ),
-        );
+            ));
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
         let (set, diagnostics) =
@@ -3561,13 +3571,12 @@ mod tests {
         )
         .unwrap();
         let missing = tmp.path().join("must-not-load.wasm");
-        let profiles = ResourceProfileRegistry::empty().with_profile(
-            agent_spec::ResourceProfile::wasm(
+        let profiles =
+            ResourceProfileRegistry::empty().with_profile(agent_spec::ResourceProfile::wasm(
                 "dev.schickling.agent-goal",
                 missing,
                 ProfileClass::Silent,
-            ),
-        );
+            ));
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
         let (set, diagnostics) =

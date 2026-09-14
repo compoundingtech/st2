@@ -187,12 +187,16 @@ impl GitHubIssueInvocation {
         if status.is_redirection() && status.as_u16() != 304 {
             return Err(IssueError::Denied);
         }
-        let header_bytes = response.headers().iter().try_fold(0_usize, |total, (name, value)| {
-            total
-                .checked_add(name.as_str().len())
-                .and_then(|total| total.checked_add(value.as_bytes().len()))
-                .ok_or(IssueError::ResourceExhausted)
-        })?;
+        let header_bytes =
+            response
+                .headers()
+                .iter()
+                .try_fold(0_usize, |total, (name, value)| {
+                    total
+                        .checked_add(name.as_str().len())
+                        .and_then(|total| total.checked_add(value.as_bytes().len()))
+                        .ok_or(IssueError::ResourceExhausted)
+                })?;
         if header_bytes > MAX_HEADERS_BYTES {
             return Err(IssueError::ResourceExhausted);
         }
@@ -267,7 +271,6 @@ fn request_matches_scope(config: &GitHubIssueConfig, request: &IssueRequest) -> 
         && request.etag.as_ref().is_none_or(|etag| valid_etag(etag))
 }
 
-
 fn conditional_etag(
     has_authoritative_prior: bool,
     requested: Option<String>,
@@ -305,7 +308,9 @@ fn valid_slug(value: &str) -> bool {
 fn valid_etag(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ETAG_BYTES
-        && !value.bytes().any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+        && !value
+            .bytes()
+            .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
 }
 
 fn map_transport_error(error: reqwest::Error) -> IssueError {
@@ -364,7 +369,6 @@ fn is_public(address: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     fn live_config() -> GitHubIssueConfig {
         GitHubIssueConfig {
@@ -443,7 +447,10 @@ mod tests {
 
     #[test]
     fn shared_runtime_only_reuses_an_etag_for_a_binding_with_prior_state() {
-        assert_eq!(conditional_etag(false, None, Some("\"cached\"".into())), None);
+        assert_eq!(
+            conditional_etag(false, None, Some("\"cached\"".into())),
+            None
+        );
         assert_eq!(
             conditional_etag(true, None, Some("\"cached\"".into())),
             Some("\"cached\"".into())
@@ -457,12 +464,7 @@ mod tests {
             etag: Some("\"new\"".into()),
             body: newest_body.clone(),
         };
-        let response = not_modified_response(
-            true,
-            None,
-            Some("\"new\"".into()),
-            Some(cached),
-        );
+        let response = not_modified_response(true, None, Some("\"new\"".into()), Some(cached));
         let IssueResponse::Ok((etag, body)) = response else {
             panic!("shared cached revalidation must return the exact cached body");
         };
@@ -474,5 +476,4 @@ mod tests {
             "the guest can compare and publish the newer body for the skewed binding"
         );
     }
-
 }

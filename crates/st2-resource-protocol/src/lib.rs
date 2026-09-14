@@ -579,11 +579,7 @@ pub struct ProposalFence {
 }
 
 impl ProposalFence {
-    pub fn new(
-        generation: u64,
-        revision: u64,
-        prior_digest: Option<SnapshotDigest>,
-    ) -> Self {
+    pub fn new(generation: u64, revision: u64, prior_digest: Option<SnapshotDigest>) -> Self {
         Self {
             generation,
             revision,
@@ -874,7 +870,7 @@ impl<'de> Deserialize<'de> for RuntimeMessage {
                     registration,
                     publication,
                 }
-            },
+            }
             RuntimeMessageWire::Health {
                 owner,
                 binding_id,

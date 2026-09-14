@@ -157,7 +157,10 @@ impl CapabilityModule for BlockingCapabilities {
     }
 }
 
-fn executor(config: RuntimeConfig, cache: Option<PrivateArtifactCache>) -> Executor<FixtureCapabilities> {
+fn executor(
+    config: RuntimeConfig,
+    cache: Option<PrivateArtifactCache>,
+) -> Executor<FixtureCapabilities> {
     Executor::new(config, cache, FixtureCapabilities).unwrap()
 }
 
@@ -229,7 +232,6 @@ fn request_validation_precedes_capability_begin_and_leaves_no_host_state() {
     }
     assert_eq!(begins.load(Ordering::Relaxed), 0);
 }
-
 
 #[test]
 fn host_rejects_a_semantically_invalid_guest_proposal() {
@@ -411,7 +413,10 @@ fn verified_aot_artifact_is_reused_by_a_new_executor() {
     let bytes = component(NO_EFFECT);
     let first = executor(RuntimeConfig::default(), Some(cache.clone()));
     let loaded = first.load(&bytes).unwrap();
-    assert_eq!(loaded.cache_disposition(), &CacheDisposition::CompiledAndStored);
+    assert_eq!(
+        loaded.cache_disposition(),
+        &CacheDisposition::CompiledAndStored
+    );
     drop(first);
 
     let second = executor(RuntimeConfig::default(), Some(cache));

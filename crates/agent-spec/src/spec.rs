@@ -175,12 +175,12 @@ fn validate_delivery_readiness_value(field: &str, value: &str) -> anyhow::Result
         value.trim() == value
             && !value
                 .chars()
-                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')),
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
         "delivery-readiness {field} must have no surrounding whitespace, controls, or line separators"
     );
     Ok(())
 }
-
 
 /// One typed harness driver declaration.
 ///
@@ -1286,10 +1286,8 @@ impl RawSpec {
                 effective.as_str()
             );
         }
-        if let (
-            Some(DeliveryReadiness::Anonymous { harness, .. }),
-            Some(effective),
-        ) = (delivery_readiness.as_ref(), effective_session_driver)
+        if let (Some(DeliveryReadiness::Anonymous { harness, .. }), Some(effective)) =
+            (delivery_readiness.as_ref(), effective_session_driver)
         {
             anyhow::ensure!(
                 *harness == effective,

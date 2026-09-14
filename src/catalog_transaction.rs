@@ -2333,7 +2333,6 @@ pub(crate) fn read_provider_component(root: &Path, relative: &Path) -> Result<Ve
         .context("admitted provider component disappeared")
 }
 
-
 fn add_regular(
     root: &Path,
     path: &Path,

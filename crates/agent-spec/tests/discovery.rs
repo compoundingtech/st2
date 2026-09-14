@@ -13,8 +13,8 @@ use agent_spec::spec::{
     TaskLifecycle,
 };
 use agent_spec::{
-    discover, discover_file, discover_strict, AgentDesiredState, AgentSpec, DeliveryReadiness,
-    JobType, Resource, SessionDriver, Task,
+    AgentDesiredState, AgentSpec, DeliveryReadiness, JobType, Resource, SessionDriver, Task,
+    discover, discover_file, discover_strict,
 };
 
 #[test]
@@ -608,10 +608,12 @@ fn delivery_readiness_preempts_ding_and_rejects_mismatched_native_ownership() {
     );
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    assert!(find(&found.specs, "worker")
-        .tasks
-        .iter()
-        .all(|task| !task.derived));
+    assert!(
+        find(&found.specs, "worker")
+            .tasks
+            .iter()
+            .all(|task| !task.derived)
+    );
 
     for (name, declaration, expected) in [
         (
@@ -1278,30 +1280,36 @@ fn malformed_or_duplicate_kdl_presentation_is_rejected() {
 #[test]
 fn presentation_bounds_count_unicode_scalars_and_reject_noncanonical_values() {
     use agent_spec::spec::{
-        validate_presentation, AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS,
+        AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_presentation,
     };
 
     let name_at_limit = "é".repeat(AGENT_NAME_MAX_CHARS);
     let description_at_limit = "界".repeat(AGENT_DESCRIPTION_MAX_CHARS);
     assert!(validate_presentation("name", Some(&name_at_limit), AGENT_NAME_MAX_CHARS).is_ok());
-    assert!(validate_presentation(
-        "description",
-        Some(&description_at_limit),
-        AGENT_DESCRIPTION_MAX_CHARS,
-    )
-    .is_ok());
-    assert!(validate_presentation(
-        "name",
-        Some(&format!("{name_at_limit}x")),
-        AGENT_NAME_MAX_CHARS,
-    )
-    .is_err());
-    assert!(validate_presentation(
-        "description",
-        Some(&format!("{description_at_limit}x")),
-        AGENT_DESCRIPTION_MAX_CHARS,
-    )
-    .is_err());
+    assert!(
+        validate_presentation(
+            "description",
+            Some(&description_at_limit),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_presentation(
+            "name",
+            Some(&format!("{name_at_limit}x")),
+            AGENT_NAME_MAX_CHARS,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_presentation(
+            "description",
+            Some(&format!("{description_at_limit}x")),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )
+        .is_err()
+    );
     for (field, max_chars) in [
         ("name", AGENT_NAME_MAX_CHARS),
         ("description", AGENT_DESCRIPTION_MAX_CHARS),
@@ -1504,18 +1512,26 @@ fn malformed_resource_explanations_are_rejected_causally() {
         .iter()
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
-    assert!(messages
-        .iter()
-        .any(|error| error.contains("needs string `reason`")));
-    assert!(messages
-        .iter()
-        .any(|error| error.contains("unsupported property `relation`")));
-    assert!(messages
-        .iter()
-        .any(|error| error.contains("`inactive-reason` must be 1..160")));
-    assert!(messages
-        .iter()
-        .any(|error| error.contains("surrounding Unicode whitespace")));
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("needs string `reason`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("unsupported property `relation`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("`inactive-reason` must be 1..160"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("surrounding Unicode whitespace"))
+    );
 }
 
 #[test]
@@ -1524,19 +1540,23 @@ fn resource_explanation_byte_bounds_are_enforced() {
     let multibyte_too_long_reason = "é".repeat(81);
 
     assert!(Resource::new("work".into(), "issue://one".into(), valid_reason,).is_ok());
-    assert!(Resource::new_inactive(
-        "work".into(),
-        "issue://one".into(),
-        "Needed here.".into(),
-        "x".repeat(161),
-    )
-    .is_err());
-    assert!(Resource::new(
-        "work".into(),
-        "issue://one".into(),
-        multibyte_too_long_reason,
-    )
-    .is_err());
+    assert!(
+        Resource::new_inactive(
+            "work".into(),
+            "issue://one".into(),
+            "Needed here.".into(),
+            "x".repeat(161),
+        )
+        .is_err()
+    );
+    assert!(
+        Resource::new(
+            "work".into(),
+            "issue://one".into(),
+            multibyte_too_long_reason,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1596,18 +1616,26 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
         .iter()
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
-    assert!(errors
-        .iter()
-        .any(|error| error.contains("duplicate resource binding")));
-    assert!(errors
-        .iter()
-        .any(|error| error.contains("unsupported property `_tag`")));
-    assert!(errors
-        .iter()
-        .any(|error| error.contains("unsupported property `required`")));
-    assert!(errors
-        .iter()
-        .any(|error| error.contains("cannot have children")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("duplicate resource binding"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unsupported property `_tag`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unsupported property `required`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot have children"))
+    );
 }
 
 #[test]
@@ -1768,9 +1796,11 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
     let found = discover(tmp.path());
     assert!(found.specs.is_empty());
     assert_eq!(found.errors.len(), 1);
-    assert!(found.errors[0]
-        .message
-        .contains("duplicate resource binding 'work'"));
+    assert!(
+        found.errors[0]
+            .message
+            .contains("duplicate resource binding 'work'")
+    );
 }
 
 #[test]
@@ -1823,10 +1853,12 @@ reason = "Task."
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
     assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
-    assert!(found
-        .errors
-        .iter()
-        .all(|error| error.message.contains("must be an exact absolute URI")));
+    assert!(
+        found
+            .errors
+            .iter()
+            .all(|error| error.message.contains("must be an exact absolute URI"))
+    );
 }
 
 #[test]
@@ -1898,9 +1930,11 @@ fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
     );
     let found = discover(tmp.path());
     assert_eq!(found.errors.len(), 1);
-    assert!(found.errors[0]
-        .message
-        .contains("declares both a compact launch"));
+    assert!(
+        found.errors[0]
+            .message
+            .contains("declares both a compact launch")
+    );
 }
 
 #[test]
@@ -2012,10 +2046,12 @@ command = "exec claude 'boot'"
     assert_eq!(s.identity, "real-name");
     assert_eq!(s.host.as_deref(), Some("wrong-host"));
     assert_eq!(found.warnings.len(), 1);
-    assert!(found
-        .warnings
-        .iter()
-        .any(|w| w.contains("identity mismatch")));
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("identity mismatch"))
+    );
 }
 
 #[test]
@@ -2321,10 +2357,12 @@ fn strict_discovery_reports_unobservable_declaration_entries() {
     assert_eq!(strict.errors.len(), 2, "{:?}", strict.errors);
     assert!(strict.errors.iter().any(|error| error.path == dangling));
     assert!(strict.errors.iter().any(|error| error.path == socket));
-    assert!(strict
-        .errors
-        .iter()
-        .all(|error| error.message.contains("unobservable declaration entry")));
+    assert!(
+        strict
+            .errors
+            .iter()
+            .all(|error| error.message.contains("unobservable declaration entry"))
+    );
 }
 
 #[cfg(unix)]

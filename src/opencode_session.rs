@@ -141,8 +141,12 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-        let mut diagnostics =
-            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            producer_version,
+            support,
+        );
         if let Some(reason) = version_failure {
             diagnostics.publish(
                 DiagnosticStage::VersionGate,
@@ -367,11 +371,8 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_with_diagnostics(
-                &session.client,
-                &mut machine,
-                &mut session.diagnostics,
-            );
+            evidence =
+                seed_with_diagnostics(&session.client, &mut machine, &mut session.diagnostics);
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -775,7 +776,9 @@ fn seed_from_server(
             DiagnosticSource::QuestionSnapshot,
         ),
     ] {
-        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let pending = client
+            .get_json(endpoint)
+            .map_err(|_| (unavailable, source))?;
         let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
             // An unreadable id could never be released by its id-matched exit.
@@ -1609,10 +1612,7 @@ impl Delivery {
     }
 }
 
-fn report_read_back(
-    read_back: ReadBack,
-    diagnostics: &mut Option<&mut DiagnosticPublisher>,
-) {
+fn report_read_back(read_back: ReadBack, diagnostics: &mut Option<&mut DiagnosticPublisher>) {
     let Some(diagnostics) = diagnostics.as_deref_mut() else {
         return;
     };

@@ -64,9 +64,8 @@ impl provider_api::Guest for Component {
     }
 
     fn observe(request: provider_api::ObserveRequest) -> provider_api::ObservationResult {
-        observe(request).unwrap_or_else(|diagnostic| {
-            provider_api::ObservationResult::Failed(Some(diagnostic))
-        })
+        observe(request)
+            .unwrap_or_else(|diagnostic| provider_api::ObservationResult::Failed(Some(diagnostic)))
     }
 }
 
@@ -78,9 +77,12 @@ fn observe(
     if selector.session.as_deref().is_some_and(str::is_empty) {
         return Err("PTY session scope must be non-empty".into());
     }
-    let scope = selector.session.as_ref().map_or(pty_stats::Scope::All, |session| {
-        pty_stats::Scope::Session(session.clone())
-    });
+    let scope = selector
+        .session
+        .as_ref()
+        .map_or(pty_stats::Scope::All, |session| {
+            pty_stats::Scope::Session(session.clone())
+        });
     let outcome = pty_stats::get(&scope).map_err(map_source_error)?;
     if outcome.stdout_truncated || outcome.stderr_truncated {
         return Err("PTY stats output exceeded limits".into());

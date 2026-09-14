@@ -1,5 +1,6 @@
 #![cfg(all(unix, feature = "wasip2-provider-runtime"))]
 
+use parking_lot::Mutex;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -8,7 +9,6 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 
 use st2::resource_observe::{ObserveReceipt, ObserveReceiptStatus, ObserveRequest, submit_request};
 use st2::resource_profile_supervisor::ResourceProfileSupervisor;
@@ -43,7 +43,11 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
         "stats",
     );
     let first = pty.observe(None);
-    assert_eq!(first.status, ObserveReceiptStatus::SettledChanged, "{first:?}");
+    assert_eq!(
+        first.status,
+        ObserveReceiptStatus::SettledChanged,
+        "{first:?}"
+    );
     let first_bytes = fs::read(pty.snapshot()).unwrap();
     let replay = pty.observe(first.digest);
     assert_eq!(replay.status, ObserveReceiptStatus::SettledUnchanged);
@@ -53,12 +57,13 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
     let failed = pty.observe(first.digest);
     assert_eq!(failed.status, ObserveReceiptStatus::SettledFailed);
     assert_eq!(fs::read(pty.snapshot()).unwrap(), first_bytes);
-    assert!(pty
-        .supervisor
-        .health()
-        .iter()
-        .any(|health| health.binding.as_deref() == Some("observed")
-            && health.state == st2::resource_profile::RuntimeHealthState::Degraded));
+    assert!(
+        pty.supervisor
+            .health()
+            .iter()
+            .any(|health| health.binding.as_deref() == Some("observed")
+                && health.state == st2::resource_profile::RuntimeHealthState::Degraded)
+    );
 
     write_executable(
         &executable,
@@ -66,12 +71,13 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
     );
     let recovered = pty.observe(first.digest);
     assert_eq!(recovered.status, ObserveReceiptStatus::SettledChanged);
-    assert!(pty
-        .supervisor
-        .health()
-        .iter()
-        .any(|health| health.binding.as_deref() == Some("observed")
-            && health.state == st2::resource_profile::RuntimeHealthState::Ready));
+    assert!(
+        pty.supervisor
+            .health()
+            .iter()
+            .any(|health| health.binding.as_deref() == Some("observed")
+                && health.state == st2::resource_profile::RuntimeHealthState::Ready)
+    );
     let recovered_bytes = fs::read(pty.snapshot()).unwrap();
     drop(pty);
 
@@ -95,7 +101,6 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
     );
     assert_eq!(fs::read(restarted.snapshot()).unwrap(), recovered_bytes);
 }
-
 
 #[test]
 fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
@@ -125,7 +130,11 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
         "stats",
     );
     let first = primary.observe(None);
-    assert_eq!(first.status, ObserveReceiptStatus::SettledChanged, "{first:?}");
+    assert_eq!(
+        first.status,
+        ObserveReceiptStatus::SettledChanged,
+        "{first:?}"
+    );
     let first_snapshot = fs::read(primary.snapshot()).unwrap();
     let first_inbox = wait_until("first resync record", || {
         let inbox = resync_inbox(&primary.agent);
@@ -164,8 +173,7 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
         "#!/bin/sh\nread release < catch-up.fifo\nread payload < payload.json\nprintf '%s\\n' \"$payload\"\n",
     );
     let pending_request = primary.request(1, filtered.digest);
-    let pending_client =
-        submit_request(&primary.root, &primary.host, &pending_request).unwrap();
+    let pending_client = submit_request(&primary.root, &primary.host, &pending_request).unwrap();
     wait_receipt_status(
         &primary,
         &pending_request.request_id,
@@ -173,7 +181,11 @@ fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     );
     fs::remove_file(primary.owner_binding_path()).unwrap();
     release_fifo(&catch_up_fifo);
-    let pending = pending_client.wait_for_terminal(WAIT).unwrap().receipt.unwrap();
+    let pending = pending_client
+        .wait_for_terminal(WAIT)
+        .unwrap()
+        .receipt
+        .unwrap();
     assert_eq!(pending.status, ObserveReceiptStatus::SettledChanged);
     assert_eq!(resync_inbox(&primary.agent), first_inbox);
     st2::event::publish_owner_binding_for_test(&primary.root, &primary.host).unwrap();
@@ -293,8 +305,11 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
         Some(1)
     );
     for request in [&trailing_a, &trailing_b] {
-        let accepted =
-            wait_receipt_status(&fixture, &request.request_id, ObserveReceiptStatus::Accepted);
+        let accepted = wait_receipt_status(
+            &fixture,
+            &request.request_id,
+            ObserveReceiptStatus::Accepted,
+        );
         assert_eq!(accepted.demand_watermark, Some(2));
     }
     release_fifo(&fifo);
@@ -308,23 +323,15 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
 
     let disconnected = fixture.request(1, None);
     let disconnected_id = disconnected.request_id.clone();
-    let disconnected_client =
-        submit_request(&fixture.root, &fixture.host, &disconnected).unwrap();
-    wait_receipt_status(
-        &fixture,
-        &disconnected_id,
-        ObserveReceiptStatus::Accepted,
-    );
+    let disconnected_client = submit_request(&fixture.root, &fixture.host, &disconnected).unwrap();
+    wait_receipt_status(&fixture, &disconnected_id, ObserveReceiptStatus::Accepted);
     drop(disconnected_client);
     release_fifo(&fifo);
     let disconnected_receipt = wait_until("receipt after client disconnect", || {
-        st2::resource_observe::read_receipt(
-            &fixture.observe_receipt_dir(),
-            &disconnected_id,
-        )
-        .ok()
-        .flatten()
-        .filter(|receipt| receipt.status.is_terminal())
+        st2::resource_observe::read_receipt(&fixture.observe_receipt_dir(), &disconnected_id)
+            .ok()
+            .flatten()
+            .filter(|receipt| receipt.status.is_terminal())
     });
     assert!(
         matches!(
@@ -342,12 +349,9 @@ fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
     fixture.refresh_generation(1);
     assert!(future_path.is_file());
     assert!(
-        st2::resource_observe::read_receipt(
-            &fixture.observe_receipt_dir(),
-            &future.request_id,
-        )
-        .unwrap()
-        .is_none()
+        st2::resource_observe::read_receipt(&fixture.observe_receipt_dir(), &future.request_id,)
+            .unwrap()
+            .is_none()
     );
     fixture.refresh_generation(2);
     wait_receipt_status(&fixture, &future.request_id, ObserveReceiptStatus::Accepted);
@@ -463,7 +467,10 @@ fn wait_until<T>(description: &str, mut probe: impl FnMut() -> Option<T>) -> T {
         if let Some(value) = probe() {
             return value;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {description}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
         std::thread::yield_now();
     }
 }
@@ -579,9 +586,9 @@ impl ProviderFixture {
         let (config, profiles) = st2::catalog::declared_profile_catalog(&self.root).unwrap();
         let discovery = st2::discover_strict(&self.root);
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
-        let report = self
-            .supervisor
-            .refresh(&config, &profiles, Some(generation), &discovery.specs);
+        let report =
+            self.supervisor
+                .refresh(&config, &profiles, Some(generation), &discovery.specs);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
@@ -700,8 +707,16 @@ fn observable_resolver_wasm(schema_id: &str, topic: &str, selector: &str) -> Vec
     push_section(&mut module, 7, &exports);
     let mut code = vec![3];
     push_body(&mut code, 0x41, 16384);
-    push_body(&mut code, 0x42, (RESOLUTION_PTR << 32) | RESOLUTION.len() as i64);
-    push_body(&mut code, 0x42, (DESCRIPTOR_PTR << 32) | descriptor.len() as i64);
+    push_body(
+        &mut code,
+        0x42,
+        (RESOLUTION_PTR << 32) | RESOLUTION.len() as i64,
+    );
+    push_body(
+        &mut code,
+        0x42,
+        (DESCRIPTOR_PTR << 32) | descriptor.len() as i64,
+    );
     push_section(&mut module, 10, &code);
     let mut data = vec![2];
     push_data(&mut data, DESCRIPTOR_PTR, &descriptor);
@@ -743,9 +758,13 @@ fn push_u32(bytes: &mut Vec<u8>, mut value: u32) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 { byte |= 0x80; }
+        if value != 0 {
+            byte |= 0x80;
+        }
         bytes.push(byte);
-        if value == 0 { return; }
+        if value == 0 {
+            return;
+        }
     }
 }
 
@@ -755,6 +774,8 @@ fn push_i64(bytes: &mut Vec<u8>, mut value: i64) {
         value >>= 7;
         let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
         bytes.push(if done { byte } else { byte | 0x80 });
-        if done { return; }
+        if done {
+            return;
+        }
     }
 }

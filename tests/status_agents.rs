@@ -529,10 +529,17 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
             .args(["--host", "hetz"])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:92% \u{27f3}1\t\t\n");
+    assert_eq!(
+        human(root),
+        "hetz.filling\tbusy\tobs:-\tctx:92% \u{27f3}1\t\t\n"
+    );
 
     // A record whose percent the harness withheld — Claude before its first API response — must
     // not render like no record at all: the producer is watching and honestly does not know.
@@ -545,7 +552,10 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         .unwrap();
     let row = &roster(root, "hetz")[0];
     assert!(row.context.as_ref().unwrap().used_percent.is_none());
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n");
+    assert_eq!(
+        human(root),
+        "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n"
+    );
 
     // …and no record at all still reads `-`.
     fs::remove_file(st2::harness_context::harness_context_path(&agent_dir)).unwrap();
