@@ -18,9 +18,9 @@ accepted.
   boundary.
 - **A03 Durable host state:** Each host preserves its catalog and runtime state
   across process restarts. Whole-disk loss and backup are outside st2.
-- **A04 Eventual transport:** Hosts may disconnect; Fabric eventually resumes
-  transport when connectivity returns. st2 does not guarantee network
-  availability.
+- **A04 Eventual transport:** Hosts may disconnect. Fabric is the preferred
+  transport. Git over SSH is supported. No product behavior may require a
+  Fabric-only capability. st2 does not guarantee network availability.
 
 ## Acceptable Tradeoffs
 
