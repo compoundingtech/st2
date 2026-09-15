@@ -17,10 +17,10 @@ use uuid::Uuid;
 use crate::model::{
     ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
     AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
-    DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput,
-    MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView, MissionResponse,
-    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunRequest,
-    MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
+    DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput, LoopRoundView,
+    LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView,
+    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
     PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
     PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView,
     ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory, ReplicationPeerStatus,
@@ -1149,6 +1149,12 @@ impl Store {
             .mission
             .strip_prefix("mission/")
             .unwrap_or(&request.mission);
+        if child.is_none() && mission_id.starts_with("__st3/") {
+            return Err(St3Error::new(
+                "internal-mission",
+                "an embedded loop mission can start only through its parent loop",
+            ));
+        }
         let mission = self
             .mission_spec(mission_id, request.revision.as_deref())
             .map_err(internal)?
@@ -1239,6 +1245,13 @@ impl Store {
             ("ST_RUN_GENERATION".into(), generation_id.clone()),
             ("ST_REQUESTER".into(), requester.clone()),
             ("ST_ROOT_MISSION_RUN".into(), root_mission_run.clone()),
+            (
+                "ST_ROOT_MISSION_RUN_ID".into(),
+                root_mission_run
+                    .strip_prefix("mission-run/")
+                    .unwrap_or(&root_mission_run)
+                    .into(),
+            ),
             ("ST_WORKSPACE".into(), request.workspace.clone()),
             (
                 "ST_PARENT_STEP_RUN".into(),
@@ -1248,6 +1261,7 @@ impl Store {
         for (name, input) in &inputs {
             variables.insert(format!("input.{name}"), input.value.clone());
         }
+        extend_loop_variables(&mut variables, &inputs);
         let now = now_ms();
         transaction
             .execute(
@@ -7322,12 +7336,20 @@ fn create_declared_mission_run_tx(
         ("ST_RUN_GENERATION".into(), generation_id.clone()),
         ("ST_REQUESTER".into(), creation.requester.clone()),
         ("ST_ROOT_MISSION_RUN".into(), root_mission_run.clone()),
+        (
+            "ST_ROOT_MISSION_RUN_ID".into(),
+            root_mission_run
+                .strip_prefix("mission-run/")
+                .unwrap_or(&root_mission_run)
+                .into(),
+        ),
         ("ST_WORKSPACE".into(), creation.workspace.clone()),
         ("ST_PARENT_STEP_RUN".into(), String::new()),
     ]);
     for (name, input) in &inputs {
         variables.insert(format!("input.{name}"), input.value.clone());
     }
+    extend_loop_variables(&mut variables, &inputs);
     let now = now_ms();
     transaction
         .execute(
@@ -11985,13 +12007,52 @@ pub(crate) fn mission_run_variables(
             run.parent_step_run.clone().unwrap_or_default(),
         ),
         ("ST_ROOT_MISSION_RUN".into(), run.root_mission_run.clone()),
+        (
+            "ST_ROOT_MISSION_RUN_ID".into(),
+            run.root_mission_run
+                .strip_prefix("mission-run/")
+                .unwrap_or(&run.root_mission_run)
+                .into(),
+        ),
     ]);
     variables.extend(
         run.inputs
             .iter()
             .map(|(name, input)| (format!("input.{name}"), input.value.clone())),
     );
+    extend_loop_variables(&mut variables, &run.inputs);
     variables
+}
+
+fn extend_loop_variables(
+    variables: &mut BTreeMap<String, String>,
+    inputs: &BTreeMap<String, MissionRunInput>,
+) {
+    if let Some(round) = inputs.get(crate::mission::LOOP_ROUND_INPUT) {
+        variables.insert("ST_LOOP_ROUND".into(), round.value.clone());
+        variables.insert("loop.round".into(), round.value.clone());
+    }
+    if let Some(feedback) = inputs.get(crate::mission::LOOP_FEEDBACK_INPUT) {
+        variables.insert("ST_LOOP_FEEDBACK".into(), feedback.value.clone());
+        variables.insert("loop.feedback".into(), feedback.value.clone());
+    }
+    if let Some(candidate) = inputs.get(crate::mission::CANDIDATE_INDEX_INPUT) {
+        variables.insert("ST_CANDIDATE_INDEX".into(), candidate.value.clone());
+        variables.insert("candidate.index".into(), candidate.value.clone());
+    }
+    if let Some(item) = inputs.get(crate::mission::LOOP_ITEM_INPUT)
+        && let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&item.value)
+    {
+        for (name, value) in fields {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            variables.insert(format!("loop.item.{name}"), value);
+        }
+        let id = variables.get("loop.item.id").cloned().unwrap_or_default();
+        variables.insert("ST_LOOP_ITEM_ID".into(), id);
+    }
 }
 
 fn interpolate_goals(
@@ -12871,6 +12932,7 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
                 created_at_unix_ms: created.parse().unwrap_or(0),
                 updated_at_unix_ms: updated.parse().unwrap_or(0),
                 steps: Vec::new(),
+                loops: Vec::new(),
             })
         },
     )?;
@@ -12888,7 +12950,165 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
     for step in &mut view.steps {
         enrich_step_queue(connection, step)?;
     }
+    view.loops = loop_run_views_tx(connection, &view)?;
     Ok(view)
+}
+
+fn loop_run_views_tx(
+    connection: &Connection,
+    run: &MissionRunView,
+) -> rusqlite::Result<Vec<LoopRunView>> {
+    let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+    let body = connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission_id, run.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(mission) = body.and_then(|body| serde_json::from_str::<MissionSpec>(&body).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let generation = generation_id_from_subject(&run.generation);
+    let mut loops = Vec::new();
+    for step_id in &mission.display_order {
+        let Some(step) = mission.steps.get(step_id) else {
+            continue;
+        };
+        let Some(spec) = step.loop_spec.as_deref() else {
+            continue;
+        };
+        let subject = format!("loop-run/{generation}/{}", spec.path);
+        let state = connection
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='loop.state' ORDER BY store_index DESC LIMIT 1",
+                [&subject],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .unwrap_or(Value::Null);
+        let fields = state.get("fields").unwrap_or(&state);
+        let step_view = run.steps.iter().find(|view| view.step == spec.path);
+        let status = fields
+            .get("status")
+            .and_then(Value::as_str)
+            .or_else(|| step_view.map(|view| view.status.as_str()))
+            .unwrap_or("pending")
+            .to_owned();
+        let mut results_statement = connection.prepare(
+            "SELECT id, body, accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='loop.round-result' ORDER BY store_index",
+        )?;
+        let results = results_statement
+            .query_map([&subject], |row| {
+                let body =
+                    serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap_or(Value::Null);
+                let fields = body.get("fields").unwrap_or(&body);
+                let metrics = fields
+                    .get("metrics")
+                    .and_then(Value::as_object)
+                    .map(|metrics| {
+                        metrics
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value.as_f64().map(|value| (name.clone(), value))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let recorded: String = row.get(2)?;
+                Ok(LoopRoundView {
+                    claim: row.get(0)?,
+                    round: fields.get("round").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    status: fields
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    mission_run: fields
+                        .get("mission_run")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    metrics,
+                    feedback: fields
+                        .get("feedback")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    candidate: fields
+                        .get("candidate")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32),
+                    item: fields.get("item").cloned(),
+                    reason: fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    token_usage: fields
+                        .get("token_usage")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    recorded_at_unix_ms: recorded.parse().unwrap_or(0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mode, max_parallel, candidate_count) = if let Some(candidates) = &spec.candidates {
+            (
+                "best-of-n".to_owned(),
+                Some(candidates.max_parallel),
+                Some(candidates.count),
+            )
+        } else if let Some(for_each) = &spec.for_each {
+            ("for-each".to_owned(), Some(for_each.max_parallel), None)
+        } else {
+            ("rounds".to_owned(), None, None)
+        };
+        let best_metrics = fields
+            .get("best_metrics")
+            .and_then(Value::as_object)
+            .map(|metrics| {
+                metrics
+                    .iter()
+                    .filter_map(|(name, value)| value.as_f64().map(|value| (name.clone(), value)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        loops.push(LoopRunView {
+            subject: subject.clone(),
+            id: spec.id.clone(),
+            path: spec.path.clone(),
+            step_run: format!("step-run/{generation}/{}", spec.path),
+            mode,
+            status,
+            round: fields.get("round").and_then(Value::as_u64).unwrap_or(0) as u32,
+            max_rounds: spec.max_rounds,
+            timeout_ms: spec.timeout_ms,
+            max_parallel,
+            item_count: fields.get("items").and_then(Value::as_array).map(Vec::len),
+            candidate_count,
+            best_round: fields
+                .get("best_round")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32),
+            best_metrics,
+            feedback: fields
+                .get("feedback")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            winner: fields
+                .get("winner")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32),
+            reason: fields
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            results,
+        });
+    }
+    Ok(loops)
 }
 
 fn run_generation_view_tx(
@@ -13092,6 +13312,55 @@ mod tests {
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn an_embedded_loop_mission_cannot_start_without_its_parent() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+mission "root" state="ready" {
+  goal "Own one embedded loop mission."
+  loop "work" {
+    max-rounds 1
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let internal = intent.missions["root"].steps["work"]
+            .loop_spec
+            .as_ref()
+            .unwrap()
+            .round
+            .id
+            .clone();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "publish-loop-parent")
+            .unwrap();
+
+        let error = store
+            .create_mission_run(&MissionRunRequest {
+                mission: internal,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "direct-internal-run".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "internal-mission");
     }
 
     #[test]
@@ -14528,6 +14797,69 @@ version 2
                 .unwrap()
                 .unwrap(),
             b"replicated"
+        );
+    }
+
+    #[test]
+    fn replication_carries_loop_state_and_round_results() {
+        let source = Store::open_memory("source").unwrap();
+        let subject = "loop-run/01990000000070008000000000000000/improve";
+        source
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "loop.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("round".into(), Value::from(1)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("replicate-loop-state".into()),
+            })
+            .unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "loop.round-result".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("round".into(), Value::from(1)),
+                    ("status".into(), Value::String("completed".into())),
+                    (
+                        "mission_run".into(),
+                        Value::String("mission-run/01990000000070008000000000000001".into()),
+                    ),
+                    ("metrics".into(), serde_json::json!({"quality": 1})),
+                    ("token_usage".into(), Value::from(10)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("replicate-loop-result".into()),
+            })
+            .unwrap();
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            target
+                .latest_claim(subject, Some("loop.state"))
+                .unwrap()
+                .unwrap()
+                .body
+                .pointer("/fields/round")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            target
+                .claims_for(subject, Some("loop.round-result"))
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -16285,17 +16617,17 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
-    fn a_worker_can_submit_each_loop_attempt_once() {
+    fn a_worker_can_submit_each_retry_attempt_once() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"version 2
 
 agent "worker" { workspace "/tmp"; command "true" }
 
-mission "loop" state="ready" {
-  goal "Repeat work until its gate passes."
+mission "retry" state="ready" {
+  goal "Retry failed work."
   step "work" {
     assigned-to "agent/worker"
-    loop { max-rounds 3 }
+    retry { attempts 3 }
     gate "the result is ready" { exists "resource/result" }
   }
 }
@@ -16315,7 +16647,7 @@ mission "loop" state="ready" {
             .unwrap();
         let run = store
             .create_mission_run(&MissionRunRequest {
-                mission: "loop".into(),
+                mission: "retry".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -16344,7 +16676,7 @@ mission "loop" state="ready" {
         store
             .set_step_state(subject, "failed", Some("the gate failed"))
             .unwrap();
-        store.retry_step(subject, "loop round 2", 0).unwrap();
+        store.retry_step(subject, "retry attempt 2", 0).unwrap();
         store.set_step_state(subject, "ready", None).unwrap();
         store
             .work_action(subject, "claim", &request("claim-round-2"))

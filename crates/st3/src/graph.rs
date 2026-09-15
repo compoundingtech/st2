@@ -121,6 +121,7 @@ pub fn validate_mission_runtimes(
             ("ST_MISSION_RUN".into(), "migration-proof".into()),
             ("ST_RUN_GENERATION".into(), "migration-generation".into()),
             ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
+            ("ST_ROOT_MISSION_RUN_ID".into(), "migration-proof".into()),
             ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
             ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
             ("ST_STEP".into(), "migration-step".into()),
@@ -133,6 +134,15 @@ pub fn validate_mission_runtimes(
             ("ST_PARENT_STEP_RUN".into(), String::new()),
             ("ST_GATE".into(), "migration-gate".into()),
             ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
+            ("ST_LOOP_ROUND".into(), "1".into()),
+            ("ST_LOOP_FEEDBACK".into(), String::new()),
+            ("ST_LOOP_ITEM_ID".into(), "migration-item".into()),
+            ("ST_CANDIDATE_INDEX".into(), "1".into()),
+            ("loop.round".into(), "1".into()),
+            ("loop.feedback".into(), String::new()),
+            ("loop.item.id".into(), "migration-item".into()),
+            ("loop.item.*".into(), "migration-value".into()),
+            ("candidate.index".into(), "1".into()),
             ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
         ]);
         variables.extend(
@@ -3394,12 +3404,10 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
             })?;
             Value::Number(integer.into())
         }
-        KdlValue::Float(_) => {
-            return Err(St3Error::new(
-                "unsupported-float",
-                "st3.v1 does not accept floating-point values",
-            ));
-        }
+        KdlValue::Float(value) => Value::Number(
+            serde_json::Number::from_f64(*value)
+                .ok_or_else(|| St3Error::new("invalid-number", "a float must be finite"))?,
+        ),
         KdlValue::Bool(value) => Value::Bool(*value),
         KdlValue::Null => Value::Null,
     })

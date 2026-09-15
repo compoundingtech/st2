@@ -7069,6 +7069,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_cli_command_has_a_valid_help_surface() {
+        fn visit(command: &clap::Command, path: &[String]) {
+            let mut help = command.clone();
+            assert!(
+                !help.render_long_help().to_string().trim().is_empty(),
+                "{} has empty help",
+                path.join(" ")
+            );
+            let subcommands = command.get_subcommands().cloned().collect::<Vec<_>>();
+            for subcommand in subcommands {
+                let mut child_path = path.to_vec();
+                child_path.push(subcommand.get_name().to_owned());
+                let mut argv = child_path.clone();
+                argv.push("--help".into());
+                let error = match Cli::try_parse_from(argv) {
+                    Ok(_) => panic!("each command path must accept --help"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp,
+                    "{} did not render help",
+                    child_path.join(" ")
+                );
+                visit(&subcommand, &child_path);
+            }
+        }
+
+        let command = Cli::command();
+        command.clone().debug_assert();
+        visit(&command, &["st3".into()]);
+    }
+
+    #[test]
+    fn pty_attach_accepts_a_graph_subject() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "pty",
+            "attach",
+            "agent/fleet/app-web/standing/app-web",
+        ])
+        .unwrap();
+        let Command::Pty {
+            command: PtyCommand::Attach(args),
+        } = cli.command
+        else {
+            panic!("the PTY attach command did not parse");
+        };
+        assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
+    }
+
+    #[test]
     fn a_gate_result_uses_a_bounded_content_key() {
         let reason = "evidence ".repeat(100);
         let first = gate_result_idempotency_key("capability", "pass", &reason, &[]);
@@ -7946,6 +7998,7 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             steps,
+            loops: Vec::new(),
         }
     }
 

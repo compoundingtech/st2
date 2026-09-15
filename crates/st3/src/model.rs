@@ -201,6 +201,110 @@ pub struct RetrySpec {
     pub backoff_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum MetricSource {
+    Gate {
+        gate: String,
+    },
+    Field {
+        subject: String,
+        path: String,
+    },
+    Exec {
+        command: String,
+        host: String,
+        workspace: String,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+        time_limit_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MetricSpec {
+    pub name: String,
+    pub direction: String,
+    pub min_improvement: f64,
+    pub source: MetricSource,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LoopStopSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plateau_metric: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plateau_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_failure: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum LoopExhaustionSpec {
+    Fail,
+    Succeed,
+    Human { gate: GateSpec },
+}
+
+impl Default for LoopExhaustionSpec {
+    fn default() -> Self {
+        Self::Fail
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LoopForEachSpec {
+    pub resource: String,
+    pub field: String,
+    pub max_parallel: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "selector", rename_all = "kebab-case")]
+pub enum LoopCandidateSelector {
+    Metric { metric: String },
+    Llm { gate: GateSpec },
+    Human { gate: GateSpec },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LoopCandidatesSpec {
+    pub count: u32,
+    pub max_parallel: u32,
+    pub select: LoopCandidateSelector,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LoopSpec {
+    pub id: String,
+    pub path: String,
+    pub max_rounds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_each: Option<LoopForEachSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<LoopCandidatesSpec>,
+    #[serde(default)]
+    pub metrics: Vec<MetricSpec>,
+    #[serde(default)]
+    pub stop: LoopStopSpec,
+    #[serde(default)]
+    pub until: Vec<GateSpec>,
+    pub round: Box<MissionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_metric: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_keep: Option<Box<MissionSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_discard: Option<Box<MissionSpec>>,
+    #[serde(default)]
+    pub on_exhausted: LoopExhaustionSpec,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum WorkSelector {
@@ -262,6 +366,8 @@ pub struct StepSpec {
     pub uses_mission: Option<UsedMissionSpec>,
     pub gates: Vec<GateSpec>,
     pub nested_mission: Option<Box<MissionSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_spec: Option<Box<LoopSpec>>,
     pub definition_hash: String,
 }
 
@@ -1291,6 +1397,60 @@ pub struct MissionRunView {
     pub updated_at_unix_ms: u128,
     #[serde(default)]
     pub steps: Vec<StepRunView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loops: Vec<LoopRunView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoopRunView {
+    pub subject: String,
+    pub id: String,
+    pub path: String,
+    pub step_run: String,
+    pub mode: String,
+    pub status: String,
+    pub round: u32,
+    pub max_rounds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_round: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub best_metrics: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<LoopRoundView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoopRoundView {
+    pub claim: String,
+    pub round: u32,
+    pub status: String,
+    pub mission_run: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub token_usage: u64,
+    pub recorded_at_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `373c772c1336af04e13ecc06a29f982c486a155ee2c64dbb311119e9aa230d64`
+Digest: `8bbfc248193d30396021c69dd2ee0f831165a7bd715e19938d36fd4c61890f86`
 
 ## Subject families
 
@@ -19,6 +19,7 @@ Digest: `373c772c1336af04e13ecc06a29f982c486a155ee2c64dbb311119e9aa230d64`
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
 | `host` | `host/NAME` | no | A graph host. |
+| `loop-run` | `loop-run/GENERATION/PATH` | no | One bounded loop execution. |
 | `message` | `message/ID` | yes | A Small Talk message. |
 | `mission` | `mission/ID` | no | An immutable mission revision lineage. |
 | `mission-run` | `mission-run/ID` | no | A mission execution. |
@@ -72,6 +73,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
 | `harness.usage` | `agent` | `same-subject-actor` | `append` | `incarnation_id:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `total_tokens:integer` |  |
 | `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
+| `loop.round-result` | `loop-run` | `system-only` | `append` | `candidate:integer`, `feedback:subject-reference(doc)`, `item:any`, `metrics:object`, `mission_run!:subject-reference(mission-run)`, `reason:string`, `round!:integer`, `status!:string`, `token_usage:integer` | `loop`, `round` |
+| `loop.state` | `loop-run` | `system-only` | `state-transition` | `best_metrics:object`, `best_round:integer`, `feedback:subject-reference(doc)`, `items:array`, `reason:string`, `round:integer`, `status!:string`, `winner:integer` | `loop` |
 | `message.closed` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `message.read` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |

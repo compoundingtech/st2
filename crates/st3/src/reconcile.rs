@@ -9,9 +9,13 @@ use serde_json::Value;
 use sha2::Digest as _;
 use tokio::sync::{Notify, watch};
 
+use crate::mission::{
+    CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
+};
 use crate::model::{
-    ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec, MemberKind,
-    MemberLifecycle, MemberSpec, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec,
+    LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind, MemberLifecycle, MemberSpec,
+    MetricSource, MissionInputKind, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
     RestartIntensity, RestartType, StepSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
@@ -1497,6 +1501,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             if !view.agentless && !view.worker_reported {
                 continue;
             }
+            if let Some(loop_spec) = &step.spec.loop_spec {
+                changed |= self.evaluate_loop_step(run, &step, view, loop_spec)?;
+                continue;
+            }
             if let Some(nested) = &step.spec.nested_mission {
                 let nested_prefix = format!("{}/{}/", step.spec.path, nested.id);
                 if !views
@@ -1918,6 +1926,1789 @@ impl<R: RuntimeControl> Reconciler<R> {
             _ => UsedMissionOutcome::Pending,
         };
         Ok((changed, outcome))
+    }
+
+    fn evaluate_loop_step(
+        &self,
+        run: &MissionRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+    ) -> Result<bool> {
+        let loop_subject = format!(
+            "loop-run/{}/{}",
+            run.generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&run.generation),
+            loop_spec.path
+        );
+        let mut variables = run_variables(run, step, view);
+        variables.insert("ST_LOOP_ROUND".into(), view.attempt.to_string());
+        variables.insert("loop.round".into(), view.attempt.to_string());
+        let prior_feedback = self
+            .store
+            .claims_for(&loop_subject, Some("loop.round-result"))?
+            .last()
+            .and_then(|claim| claim.body.pointer("/fields/feedback"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        variables.insert("ST_LOOP_FEEDBACK".into(), prior_feedback.clone());
+        variables.insert("loop.feedback".into(), prior_feedback.clone());
+        variables.insert("ST_LOOP_ITEM_ID".into(), String::new());
+        self.record_once(
+            &loop_subject,
+            "loop.state",
+            BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("round".into(), Value::from(view.attempt)),
+            ]),
+        )?;
+        let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
+            now_ms().saturating_sub(view.created_at_unix_ms) >= timeout as u128
+        });
+        if timed_out {
+            return self.finish_exhausted_loop(
+                run,
+                view,
+                loop_spec,
+                &loop_subject,
+                &variables,
+                "the loop timeout expired",
+            );
+        }
+        if loop_spec.for_each.is_some() {
+            return self.evaluate_for_each_loop(
+                run,
+                step,
+                view,
+                loop_spec,
+                &loop_subject,
+                &variables,
+            );
+        }
+        if loop_spec.candidates.is_some() {
+            return self.evaluate_candidate_loop(
+                run,
+                step,
+                view,
+                loop_spec,
+                &loop_subject,
+                &variables,
+            );
+        }
+        let key = format!("loop-round:{}:{}", view.subject, view.attempt);
+        let expected = self.store.mission_run_subject_for_idempotency_key(&key);
+        let existed = self.store.mission_run(&expected)?.is_some();
+        let mut inputs: BTreeMap<String, String> = run
+            .inputs
+            .iter()
+            .map(|(name, input)| {
+                let value = match input.kind {
+                    MissionInputKind::Text => input.value.clone(),
+                    MissionInputKind::Resource => match (&input.subject, &input.claim_id) {
+                        (Some(subject), Some(claim)) => format!("{subject}@{claim}"),
+                        _ => input.value.clone(),
+                    },
+                };
+                (name.clone(), value)
+            })
+            .collect();
+        inputs.insert(LOOP_ROUND_INPUT.into(), view.attempt.to_string());
+        inputs.insert(LOOP_FEEDBACK_INPUT.into(), prior_feedback);
+        inputs.insert(LOOP_ITEM_INPUT.into(), "null".into());
+        inputs.insert(CANDIDATE_INDEX_INPUT.into(), String::new());
+        let child = if existed {
+            self.store
+                .mission_run(&expected)?
+                .context("the existing loop round disappeared")?
+        } else {
+            match self.store.create_child_mission_run(
+                &MissionRunRequest {
+                    mission: loop_spec.round.id.clone(),
+                    revision: Some(loop_spec.round.revision.clone()),
+                    workspace: run.workspace.clone(),
+                    requester: Some(run.requester.clone()),
+                    mode: Some(run.mode.clone()),
+                    inputs,
+                    idempotency_key: key,
+                },
+                run,
+                &view.subject,
+                None,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.code == "mission-run-capacity" => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        match child.status.as_str() {
+            "running" | "standing" | "blocked" => Ok(false),
+            "failed" | "cancelled" => {
+                let token_usage = self.mission_run_token_usage(&child)?;
+                let structural = self.loop_child_failure_is_structural(&child)?;
+                let failure_reason = if structural {
+                    "the loop round mission had a structural failure"
+                } else {
+                    "the loop round mission failed"
+                };
+                self.record_loop_round(
+                    &loop_subject,
+                    view.attempt,
+                    &child,
+                    "failed",
+                    &BTreeMap::new(),
+                    None,
+                    None,
+                    None,
+                    token_usage,
+                    Some(failure_reason),
+                )?;
+                if structural {
+                    self.record_once(
+                        &loop_subject,
+                        "loop.state",
+                        BTreeMap::from([
+                            ("status".into(), Value::String("failed".into())),
+                            ("round".into(), Value::from(view.attempt)),
+                            ("reason".into(), Value::String(failure_reason.into())),
+                        ]),
+                    )?;
+                    return self.store.set_step_state(
+                        &view.subject,
+                        "cancelled",
+                        Some(failure_reason),
+                    );
+                }
+                if self.repeated_loop_failures(&loop_subject)?
+                    >= loop_spec.stop.repeated_failure.unwrap_or(u32::MAX)
+                {
+                    return self.finish_exhausted_loop(
+                        run,
+                        view,
+                        loop_spec,
+                        &loop_subject,
+                        &variables,
+                        "the repeated-failure limit was reached",
+                    );
+                }
+                if view.attempt >= loop_spec.max_rounds {
+                    self.finish_exhausted_loop(
+                        run,
+                        view,
+                        loop_spec,
+                        &loop_subject,
+                        &variables,
+                        "the last loop round failed",
+                    )
+                } else {
+                    self.store.set_step_state(
+                        &view.subject,
+                        "failed",
+                        Some("the loop round failed and another round is available"),
+                    )
+                }
+            }
+            "completed" => {
+                let metrics = match self.evaluate_loop_metrics(
+                    run,
+                    step,
+                    view,
+                    loop_spec,
+                    &loop_subject,
+                    &variables,
+                ) {
+                    Ok(Some(metrics)) => metrics,
+                    Ok(None) => return Ok(false),
+                    Err(error) => {
+                        return self.store.set_step_state(
+                            &view.subject,
+                            "cancelled",
+                            Some(&format!("the loop metric failed: {error:#}")),
+                        );
+                    }
+                };
+                let keep = self.loop_round_improves(&loop_subject, loop_spec, &metrics)?;
+                let feedback = self.write_loop_feedback(
+                    &loop_subject,
+                    view.attempt,
+                    &child,
+                    &metrics,
+                    keep,
+                    None,
+                )?;
+                match self
+                    .evaluate_loop_branch(run, view, loop_spec, keep, &feedback, None, None)?
+                {
+                    LoopBranchOutcome::Pending => return Ok(false),
+                    LoopBranchOutcome::Failed(reason) => {
+                        self.record_loop_round(
+                            &loop_subject,
+                            view.attempt,
+                            &child,
+                            "failed",
+                            &metrics,
+                            Some(&feedback),
+                            None,
+                            None,
+                            self.mission_run_token_usage(&child)?,
+                            Some(&reason),
+                        )?;
+                        return self.store.set_step_state(
+                            &view.subject,
+                            "cancelled",
+                            Some(&reason),
+                        );
+                    }
+                    LoopBranchOutcome::Completed => {}
+                }
+                let round_status = if keep { "completed" } else { "discarded" };
+                let token_usage = self.mission_run_token_usage(&child)?;
+                self.record_loop_round(
+                    &loop_subject,
+                    view.attempt,
+                    &child,
+                    round_status,
+                    &metrics,
+                    Some(&feedback),
+                    None,
+                    None,
+                    token_usage,
+                    None,
+                )?;
+                let (best_round, best_metrics) = self.loop_best(&loop_subject, loop_spec)?;
+                self.record_once(
+                    &loop_subject,
+                    "loop.state",
+                    BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("round".into(), Value::from(view.attempt)),
+                        ("best_round".into(), Value::from(best_round)),
+                        ("best_metrics".into(), serde_json::to_value(&best_metrics)?),
+                        ("feedback".into(), Value::String(feedback.clone())),
+                    ]),
+                )?;
+                let mut passed = !loop_spec.until.is_empty();
+                let mut waiting = false;
+                for gate in &loop_spec.until {
+                    match self.evaluate_context_gate(
+                        run,
+                        &loop_subject,
+                        &loop_spec.id,
+                        &step.spec.definition_hash,
+                        view.attempt,
+                        gate,
+                        &variables,
+                    )? {
+                        GateOutcome::Pass => {}
+                        GateOutcome::Pending
+                            if matches!(
+                                gate,
+                                GateSpec::Mechanical { .. }
+                                    | GateSpec::Llm { .. }
+                                    | GateSpec::Human { .. }
+                            ) =>
+                        {
+                            waiting = true;
+                            passed = false;
+                            break;
+                        }
+                        GateOutcome::Pending | GateOutcome::Fail(_) => passed = false,
+                    }
+                }
+                if waiting {
+                    return Ok(false);
+                }
+                if passed {
+                    self.record_once(
+                        &loop_subject,
+                        "loop.state",
+                        BTreeMap::from([
+                            ("status".into(), Value::String("completed".into())),
+                            ("round".into(), Value::from(view.attempt)),
+                            ("best_round".into(), Value::from(best_round)),
+                            ("best_metrics".into(), serde_json::to_value(&best_metrics)?),
+                            ("feedback".into(), Value::String(feedback)),
+                        ]),
+                    )?;
+                    return self.store.set_step_state(&view.subject, "completed", None);
+                }
+                if self.loop_stop_reason(&loop_subject, loop_spec)?.is_some() {
+                    let reason = self
+                        .loop_stop_reason(&loop_subject, loop_spec)?
+                        .expect("the stop reason was present");
+                    return self.finish_exhausted_loop(
+                        run,
+                        view,
+                        loop_spec,
+                        &loop_subject,
+                        &variables,
+                        &reason,
+                    );
+                }
+                if view.attempt >= loop_spec.max_rounds {
+                    self.finish_exhausted_loop(
+                        run,
+                        view,
+                        loop_spec,
+                        &loop_subject,
+                        &variables,
+                        "the loop reached max-rounds without satisfying until",
+                    )
+                } else {
+                    self.store.set_step_state(
+                        &view.subject,
+                        "failed",
+                        Some("the loop exit gates did not pass"),
+                    )
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn evaluate_loop_metrics(
+        &self,
+        run: &MissionRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        variables: &BTreeMap<String, String>,
+    ) -> Result<Option<BTreeMap<String, f64>>> {
+        let mut values = BTreeMap::new();
+        for metric in &loop_spec.metrics {
+            let value = match &metric.source {
+                MetricSource::Gate { gate } => {
+                    let gate = loop_spec
+                        .until
+                        .iter()
+                        .find(|candidate| crate::graph::gate_name(candidate) == gate)
+                        .with_context(|| {
+                            format!("metric `{}` names an unavailable gate", metric.name)
+                        })?;
+                    match self.evaluate_context_gate(
+                        run,
+                        loop_subject,
+                        &loop_spec.id,
+                        &step.spec.definition_hash,
+                        view.attempt,
+                        gate,
+                        variables,
+                    )? {
+                        GateOutcome::Pass => 1.0,
+                        GateOutcome::Pending
+                            if matches!(
+                                gate,
+                                GateSpec::Mechanical { .. }
+                                    | GateSpec::Llm { .. }
+                                    | GateSpec::Human { .. }
+                            ) =>
+                        {
+                            return Ok(None);
+                        }
+                        GateOutcome::Pending | GateOutcome::Fail(_) => 0.0,
+                    }
+                }
+                MetricSource::Field { subject, path } => {
+                    let subject = crate::mission::interpolate(subject, variables)?;
+                    let path = crate::mission::interpolate(path, variables)?;
+                    let Some(actual) = self.subject_value(&subject)? else {
+                        return Ok(None);
+                    };
+                    actual_field(&actual, &path)
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite())
+                        .with_context(|| {
+                            format!(
+                                "metric `{}` did not find a finite number at `{path}` on `{subject}`",
+                                metric.name
+                            )
+                        })?
+                }
+                MetricSource::Exec { .. } => {
+                    let Some(value) =
+                        self.evaluate_exec_metric(run, view, loop_subject, metric, variables)?
+                    else {
+                        return Ok(None);
+                    };
+                    value
+                }
+            };
+            values.insert(metric.name.clone(), value);
+        }
+        Ok(Some(values))
+    }
+
+    fn evaluate_exec_metric(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+        loop_subject: &str,
+        metric: &crate::model::MetricSpec,
+        variables: &BTreeMap<String, String>,
+    ) -> Result<Option<f64>> {
+        let MetricSource::Exec {
+            command,
+            host,
+            workspace,
+            environment,
+            time_limit_ms,
+        } = &metric.source
+        else {
+            unreachable!("the caller selected an exec metric")
+        };
+        let digest = hex::encode(sha2::Sha256::digest(
+            format!("{loop_subject}:{}:{}", view.attempt, metric.name).as_bytes(),
+        ));
+        let subject = format!("gate-operation/loop-metric/{}", &digest[..32]);
+        if let Some(result) = self.store.latest_claim(&subject, Some("gate.result"))? {
+            return result
+                .body
+                .pointer("/fields/value")
+                .and_then(Value::as_f64)
+                .map(Some)
+                .context("a completed loop metric has no numeric value");
+        }
+        let command = crate::mission::interpolate(command, variables)?;
+        let host = crate::mission::interpolate(host, variables)?;
+        let mut workspace = crate::mission::interpolate(workspace, variables)?;
+        if Path::new(&workspace).is_relative() {
+            workspace = Path::new(&run.workspace)
+                .join(&workspace)
+                .to_string_lossy()
+                .into_owned();
+        }
+        let mut environment = environment
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), crate::mission::interpolate(value, variables)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        environment.extend(variables.clone());
+        if host != self.host {
+            return Ok(None);
+        }
+        let runtime_id = subject.replace('/', ".");
+        if let Some(request) = self.store.latest_claim(&subject, Some("gate.requested"))? {
+            if now_ms().saturating_sub(request.accepted_at_unix_ms) >= *time_limit_ms as u128 {
+                self.stop_gate_runner(&subject, true)?;
+                anyhow::bail!("metric `{}` exceeded {}ms", metric.name, time_limit_ms);
+            }
+            match self.runtime.observe_exec(&runtime_id)? {
+                Some(observation) if observation.status == "running" => {
+                    self.arm_gate_poll();
+                    return Ok(None);
+                }
+                Some(observation) if observation.status == "exited" => {
+                    if observation.exit_code != Some(0) {
+                        anyhow::bail!("metric `{}` exited unsuccessfully", metric.name);
+                    }
+                    let log = self
+                        .runtime
+                        .read_exec_log(&runtime_id)?
+                        .context("the metric command has no output")?;
+                    let value = log
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| value.is_finite())
+                        .context("the metric command did not print one finite number")?;
+                    self.record_once(
+                        &subject,
+                        "gate.result",
+                        BTreeMap::from([
+                            ("verdict".into(), Value::String("pass".into())),
+                            ("value".into(), Value::from(value)),
+                        ]),
+                    )?;
+                    return Ok(Some(value));
+                }
+                _ => {
+                    self.arm_gate_poll();
+                    return Ok(None);
+                }
+            }
+        }
+        self.record_once(
+            &subject,
+            "gate.requested",
+            BTreeMap::from([
+                ("status".into(), Value::String("requested".into())),
+                ("runner".into(), Value::String("loop-metric".into())),
+            ]),
+        )?;
+        let member = MemberSpec {
+            kind: MemberKind::Exec,
+            host,
+            runtime_id,
+            workspace: workspace.clone(),
+            workspace_create: false,
+            cwd: workspace,
+            terminal: false,
+            launch: LaunchSpec::Shell(command),
+            environment,
+            tags: BTreeMap::new(),
+            display_name: Some(format!("loop metric {}", metric.name)),
+            lifecycle: MemberLifecycle::Service,
+            restart: RestartType::Never,
+            restart_intensity: RestartIntensity::default(),
+            shutdown_timeout_ms: 5_000,
+            driver: Some("loop-metric".into()),
+        };
+        self.perform_start(
+            &DesiredSubject {
+                subject: subject.clone(),
+                kind: "gate".into(),
+                desired: Value::Null,
+                member: Some(member.clone()),
+                owner_run: Some(run.subject.clone()),
+                owner_generation: Some(run.generation.clone()),
+                owner_step: Some(view.subject.clone()),
+            },
+            &member,
+            "the loop metric was requested",
+        )?;
+        self.arm_gate_poll();
+        Ok(None)
+    }
+
+    fn loop_round_improves(
+        &self,
+        loop_subject: &str,
+        loop_spec: &LoopSpec,
+        metrics: &BTreeMap<String, f64>,
+    ) -> Result<bool> {
+        let Some(metric_name) = &loop_spec.keep_metric else {
+            return Ok(true);
+        };
+        let metric = loop_spec
+            .metrics
+            .iter()
+            .find(|metric| &metric.name == metric_name)
+            .context("the keep metric disappeared")?;
+        let Some(current) = metrics.get(metric_name) else {
+            anyhow::bail!("the keep metric has no current value");
+        };
+        let prior = self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?
+            .into_iter()
+            .filter(|claim| {
+                claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("completed")
+            })
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer(&format!("/fields/metrics/{metric_name}"))
+                    .and_then(Value::as_f64)
+            })
+            .next_back();
+        Ok(prior.is_none_or(|prior| {
+            if metric.direction == "higher" {
+                current - prior >= metric.min_improvement
+            } else {
+                prior - current >= metric.min_improvement
+            }
+        }))
+    }
+
+    fn write_loop_feedback(
+        &self,
+        loop_subject: &str,
+        round: u32,
+        child: &MissionRunView,
+        metrics: &BTreeMap<String, f64>,
+        keep: bool,
+        candidate: Option<u32>,
+    ) -> Result<String> {
+        let suffix = candidate.map_or_else(String::new, |value| format!("/candidate-{value}"));
+        let name = format!(
+            "doc/loop-feedback/{}/{round}{suffix}",
+            loop_subject
+                .strip_prefix("loop-run/")
+                .unwrap_or(loop_subject),
+        );
+        let body = serde_json::to_vec_pretty(&serde_json::json!({
+            "loop": loop_subject,
+            "round": round,
+            "mission_run": child.subject,
+            "metrics": metrics,
+            "decision": if keep { "keep" } else { "discard" },
+            "candidate": candidate,
+        }))?;
+        let document = self.store.put_document(
+            &name,
+            &body,
+            &None,
+            &format!("loop-feedback:{loop_subject}:{round}:{candidate:?}"),
+        )?;
+        Ok(format!("{}@{}", document.name, document.hash))
+    }
+
+    fn evaluate_loop_branch(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        keep: bool,
+        feedback: &str,
+        candidate: Option<u32>,
+        item: Option<&Value>,
+    ) -> Result<LoopBranchOutcome> {
+        let branch = if keep {
+            loop_spec.on_keep.as_deref()
+        } else {
+            loop_spec.on_discard.as_deref()
+        };
+        let Some(branch) = branch else {
+            return Ok(LoopBranchOutcome::Completed);
+        };
+        let label = if keep { "keep" } else { "discard" };
+        let key = format!(
+            "loop-{label}:{}:{}:{}",
+            view.subject,
+            view.attempt,
+            candidate.map_or_else(|| "round".into(), |value| format!("candidate-{value}"))
+        );
+        let subject = self.store.mission_run_subject_for_idempotency_key(&key);
+        if let Some(child) = self.store.mission_run(&subject)? {
+            return Ok(match child.status.as_str() {
+                "completed" => LoopBranchOutcome::Completed,
+                "failed" | "cancelled" => LoopBranchOutcome::Failed(format!(
+                    "the loop {label} branch failed in `{}`",
+                    child.subject
+                )),
+                _ => LoopBranchOutcome::Pending,
+            });
+        }
+        let mut inputs = self.child_loop_inputs(run);
+        inputs.insert(LOOP_ROUND_INPUT.into(), view.attempt.to_string());
+        inputs.insert(LOOP_FEEDBACK_INPUT.into(), feedback.into());
+        inputs.insert(
+            CANDIDATE_INDEX_INPUT.into(),
+            candidate.map_or_else(String::new, |value| value.to_string()),
+        );
+        inputs.insert(
+            LOOP_ITEM_INPUT.into(),
+            item.map_or_else(|| "null".into(), Value::to_string),
+        );
+        self.store.create_child_mission_run(
+            &MissionRunRequest {
+                mission: branch.id.clone(),
+                revision: Some(branch.revision.clone()),
+                workspace: run.workspace.clone(),
+                requester: Some(run.requester.clone()),
+                mode: Some(run.mode.clone()),
+                inputs,
+                idempotency_key: key,
+            },
+            run,
+            &view.subject,
+            None,
+        )?;
+        Ok(LoopBranchOutcome::Pending)
+    }
+
+    fn child_loop_inputs(&self, run: &MissionRunView) -> BTreeMap<String, String> {
+        let mut inputs = run
+            .inputs
+            .iter()
+            .filter(|(name, _)| !name.starts_with("__st3_"))
+            .map(|(name, input)| {
+                let value = match input.kind {
+                    MissionInputKind::Text => input.value.clone(),
+                    MissionInputKind::Resource => match (&input.subject, &input.claim_id) {
+                        (Some(subject), Some(claim)) => format!("{subject}@{claim}"),
+                        _ => input.value.clone(),
+                    },
+                };
+                (name.clone(), value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        inputs.insert(LOOP_ROUND_INPUT.into(), String::new());
+        inputs.insert(LOOP_FEEDBACK_INPUT.into(), String::new());
+        inputs.insert(LOOP_ITEM_INPUT.into(), "null".into());
+        inputs.insert(CANDIDATE_INDEX_INPUT.into(), String::new());
+        inputs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_loop_child(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+        mission: &MissionSpec,
+        key: String,
+        round: u32,
+        feedback: &str,
+        item: Option<&Value>,
+        candidate: Option<u32>,
+    ) -> Result<(MissionRunView, bool)> {
+        let subject = self.store.mission_run_subject_for_idempotency_key(&key);
+        if let Some(child) = self.store.mission_run(&subject)? {
+            return Ok((child, false));
+        }
+        let mut inputs = self.child_loop_inputs(run);
+        inputs.insert(LOOP_ROUND_INPUT.into(), round.to_string());
+        inputs.insert(LOOP_FEEDBACK_INPUT.into(), feedback.into());
+        inputs.insert(
+            LOOP_ITEM_INPUT.into(),
+            item.map_or_else(|| "null".into(), Value::to_string),
+        );
+        inputs.insert(
+            CANDIDATE_INDEX_INPUT.into(),
+            candidate.map_or_else(String::new, |value| value.to_string()),
+        );
+        let child = self.store.create_child_mission_run(
+            &MissionRunRequest {
+                mission: mission.id.clone(),
+                revision: Some(mission.revision.clone()),
+                workspace: run.workspace.clone(),
+                requester: Some(run.requester.clone()),
+                mode: Some(run.mode.clone()),
+                inputs,
+                idempotency_key: key,
+            },
+            run,
+            &view.subject,
+            None,
+        )?;
+        Ok((child, true))
+    }
+
+    fn loop_result_claim(
+        &self,
+        loop_subject: &str,
+        round: u32,
+        candidate: Option<u32>,
+    ) -> Result<Option<crate::model::ClaimRecord>> {
+        Ok(self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?
+            .into_iter()
+            .find(|claim| {
+                claim.body.pointer("/fields/round").and_then(Value::as_u64)
+                    == Some(u64::from(round))
+                    && claim
+                        .body
+                        .pointer("/fields/candidate")
+                        .and_then(Value::as_u64)
+                        == candidate.map(u64::from)
+            }))
+    }
+
+    fn evaluate_for_each_loop(
+        &self,
+        run: &MissionRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        base_variables: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let for_each = loop_spec
+            .for_each
+            .as_ref()
+            .expect("the caller selected a for-each loop");
+        let snapshot = self
+            .store
+            .claims_for(loop_subject, Some("loop.state"))?
+            .into_iter()
+            .find_map(|claim| claim.body.pointer("/fields/items").cloned());
+        let items = if let Some(Value::Array(items)) = snapshot {
+            items
+        } else {
+            let resource = crate::mission::interpolate(&for_each.resource, base_variables)?;
+            let field = crate::mission::interpolate(&for_each.field, base_variables)?;
+            let Some(actual) = self.subject_value(&resource)? else {
+                return Ok(false);
+            };
+            let Some(items) = actual_field(&actual, &field)
+                .and_then(Value::as_array)
+                .cloned()
+            else {
+                return self.store.set_step_state(
+                    &view.subject,
+                    "cancelled",
+                    Some("a for-each field must contain an array"),
+                );
+            };
+            if items.len() > 100 || items.len() > loop_spec.max_rounds as usize {
+                return self.store.set_step_state(
+                    &view.subject,
+                    "cancelled",
+                    Some("the for-each snapshot exceeds max-rounds or 100 items"),
+                );
+            }
+            let mut ids = BTreeSet::new();
+            for item in &items {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    return self.store.set_step_state(
+                        &view.subject,
+                        "cancelled",
+                        Some("each for-each item needs a string id"),
+                    );
+                };
+                if !ids.insert(id.to_owned()) {
+                    return self.store.set_step_state(
+                        &view.subject,
+                        "cancelled",
+                        Some("the for-each snapshot contains duplicate item IDs"),
+                    );
+                }
+            }
+            self.record_once(
+                loop_subject,
+                "loop.state",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("round".into(), Value::from(0)),
+                    ("items".into(), Value::Array(items.clone())),
+                ]),
+            )?;
+            return Ok(true);
+        };
+        let mut active = 0_u32;
+        let mut completed = 0_usize;
+        for (index, item) in items.iter().enumerate() {
+            let round = index as u32 + 1;
+            if self.loop_result_claim(loop_subject, round, None)?.is_some() {
+                completed += 1;
+                continue;
+            }
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                return self.store.set_step_state(
+                    &view.subject,
+                    "cancelled",
+                    Some("the stored for-each item has no ID"),
+                );
+            };
+            let key = format!("loop-item:{}:{id}", view.subject);
+            let subject = self.store.mission_run_subject_for_idempotency_key(&key);
+            if let Some(child) = self.store.mission_run(&subject)? {
+                match child.status.as_str() {
+                    "running" | "standing" | "blocked" => active += 1,
+                    "failed" | "cancelled" => {
+                        return self.store.set_step_state(
+                            &view.subject,
+                            "cancelled",
+                            Some(&format!("the for-each item `{id}` failed")),
+                        );
+                    }
+                    "completed" => {
+                        let mut item_view = view.clone();
+                        item_view.attempt = round;
+                        let mut variables = base_variables.clone();
+                        variables.insert("ST_LOOP_ROUND".into(), round.to_string());
+                        variables.insert("loop.round".into(), round.to_string());
+                        if let Some(fields) = item.as_object() {
+                            for (name, value) in fields {
+                                variables.insert(
+                                    format!("loop.item.{name}"),
+                                    value
+                                        .as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| value.to_string()),
+                                );
+                            }
+                        }
+                        variables.insert("ST_LOOP_ITEM_ID".into(), id.into());
+                        let metrics = match self.evaluate_loop_metrics(
+                            run,
+                            step,
+                            &item_view,
+                            loop_spec,
+                            &format!("{loop_subject}/item/{id}"),
+                            &variables,
+                        ) {
+                            Ok(Some(metrics)) => metrics,
+                            Ok(None) => return Ok(false),
+                            Err(error) => {
+                                return self.store.set_step_state(
+                                    &view.subject,
+                                    "cancelled",
+                                    Some(&format!("the loop metric failed: {error:#}")),
+                                );
+                            }
+                        };
+                        let feedback = self.write_loop_feedback(
+                            loop_subject,
+                            round,
+                            &child,
+                            &metrics,
+                            true,
+                            None,
+                        )?;
+                        match self.evaluate_loop_branch(
+                            run,
+                            &item_view,
+                            loop_spec,
+                            true,
+                            &feedback,
+                            None,
+                            Some(item),
+                        )? {
+                            LoopBranchOutcome::Pending => return Ok(false),
+                            LoopBranchOutcome::Failed(reason) => {
+                                return self.store.set_step_state(
+                                    &view.subject,
+                                    "cancelled",
+                                    Some(&reason),
+                                );
+                            }
+                            LoopBranchOutcome::Completed => {}
+                        }
+                        self.record_loop_round(
+                            loop_subject,
+                            round,
+                            &child,
+                            "completed",
+                            &metrics,
+                            Some(&feedback),
+                            None,
+                            Some(item),
+                            self.mission_run_token_usage(&child)?,
+                            None,
+                        )?;
+                        if let Some(reason) = self.loop_stop_reason(loop_subject, loop_spec)? {
+                            return self.finish_exhausted_loop(
+                                run,
+                                view,
+                                loop_spec,
+                                loop_subject,
+                                &variables,
+                                &reason,
+                            );
+                        }
+                        completed += 1;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if active < for_each.max_parallel {
+                self.ensure_loop_child(
+                    run,
+                    view,
+                    &loop_spec.round,
+                    key,
+                    round,
+                    "",
+                    Some(item),
+                    None,
+                )?;
+                active += 1;
+            }
+        }
+        if completed != items.len() {
+            return Ok(false);
+        }
+        self.record_once(
+            loop_subject,
+            "loop.state",
+            BTreeMap::from([
+                ("status".into(), Value::String("completed".into())),
+                ("round".into(), Value::from(items.len() as u64)),
+                ("items".into(), Value::Array(items)),
+            ]),
+        )?;
+        self.store.set_step_state(&view.subject, "completed", None)
+    }
+
+    fn evaluate_candidate_loop(
+        &self,
+        run: &MissionRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        base_variables: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let candidates = loop_spec
+            .candidates
+            .as_ref()
+            .expect("the caller selected a candidate loop");
+        let mut active = 0_u32;
+        let mut completed = Vec::new();
+        for candidate in 1..=candidates.count {
+            if let Some(result) =
+                self.loop_result_claim(loop_subject, view.attempt, Some(candidate))?
+            {
+                if result
+                    .body
+                    .pointer("/fields/status")
+                    .and_then(Value::as_str)
+                    != Some("failed")
+                {
+                    completed.push((candidate, result));
+                }
+                continue;
+            }
+            let key = format!(
+                "loop-candidate:{}:{}:{candidate}",
+                view.subject, view.attempt
+            );
+            let subject = self.store.mission_run_subject_for_idempotency_key(&key);
+            if let Some(child) = self.store.mission_run(&subject)? {
+                match child.status.as_str() {
+                    "running" | "standing" | "blocked" => active += 1,
+                    "failed" | "cancelled" => {
+                        let structural = self.loop_child_failure_is_structural(&child)?;
+                        let reason = if structural {
+                            "the candidate mission had a structural failure"
+                        } else {
+                            "the candidate mission failed"
+                        };
+                        self.record_loop_round(
+                            loop_subject,
+                            view.attempt,
+                            &child,
+                            "failed",
+                            &BTreeMap::new(),
+                            None,
+                            Some(candidate),
+                            None,
+                            self.mission_run_token_usage(&child)?,
+                            Some(reason),
+                        )?;
+                        if structural {
+                            self.record_once(
+                                loop_subject,
+                                "loop.state",
+                                BTreeMap::from([
+                                    ("status".into(), Value::String("failed".into())),
+                                    ("round".into(), Value::from(view.attempt)),
+                                    ("reason".into(), Value::String(reason.into())),
+                                ]),
+                            )?;
+                            return self.store.set_step_state(
+                                &view.subject,
+                                "cancelled",
+                                Some(reason),
+                            );
+                        }
+                    }
+                    "completed" => {
+                        let mut variables = base_variables.clone();
+                        variables.insert("ST_CANDIDATE_INDEX".into(), candidate.to_string());
+                        variables.insert("candidate.index".into(), candidate.to_string());
+                        let metrics = match self.evaluate_loop_metrics(
+                            run,
+                            step,
+                            view,
+                            loop_spec,
+                            &format!(
+                                "{loop_subject}/round/{}/candidate/{candidate}",
+                                view.attempt
+                            ),
+                            &variables,
+                        ) {
+                            Ok(Some(metrics)) => metrics,
+                            Ok(None) => return Ok(false),
+                            Err(error) => {
+                                return self.store.set_step_state(
+                                    &view.subject,
+                                    "cancelled",
+                                    Some(&format!("the candidate metric failed: {error:#}")),
+                                );
+                            }
+                        };
+                        let feedback = self.write_loop_feedback(
+                            loop_subject,
+                            view.attempt,
+                            &child,
+                            &metrics,
+                            true,
+                            Some(candidate),
+                        )?;
+                        self.record_loop_round(
+                            loop_subject,
+                            view.attempt,
+                            &child,
+                            "completed",
+                            &metrics,
+                            Some(&feedback),
+                            Some(candidate),
+                            None,
+                            self.mission_run_token_usage(&child)?,
+                            None,
+                        )?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if active < candidates.max_parallel {
+                self.ensure_loop_child(
+                    run,
+                    view,
+                    &loop_spec.round,
+                    key,
+                    view.attempt,
+                    "",
+                    None,
+                    Some(candidate),
+                )?;
+                active += 1;
+            }
+        }
+        let all_results = self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?
+            .into_iter()
+            .filter(|claim| {
+                claim.body.pointer("/fields/round").and_then(Value::as_u64)
+                    == Some(u64::from(view.attempt))
+                    && claim.body.pointer("/fields/candidate").is_some()
+            })
+            .collect::<Vec<_>>();
+        if all_results.len() < candidates.count as usize {
+            return Ok(false);
+        }
+        completed = all_results
+            .iter()
+            .cloned()
+            .filter(|claim| {
+                claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("completed")
+            })
+            .filter_map(|claim| {
+                let candidate = claim
+                    .body
+                    .pointer("/fields/candidate")
+                    .and_then(Value::as_u64)? as u32;
+                Some((candidate, claim))
+            })
+            .collect();
+        if completed.is_empty() {
+            if let Some(child) = self.loop_result_child(&all_results)? {
+                self.record_loop_round(
+                    loop_subject,
+                    view.attempt,
+                    &child,
+                    "failed",
+                    &BTreeMap::new(),
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some("all candidate missions failed"),
+                )?;
+            }
+            if self.repeated_loop_failures(loop_subject)?
+                >= loop_spec.stop.repeated_failure.unwrap_or(u32::MAX)
+            {
+                return self.finish_exhausted_loop(
+                    run,
+                    view,
+                    loop_spec,
+                    loop_subject,
+                    base_variables,
+                    "the repeated-failure limit was reached",
+                );
+            }
+            if view.attempt >= loop_spec.max_rounds {
+                return self.finish_exhausted_loop(
+                    run,
+                    view,
+                    loop_spec,
+                    loop_subject,
+                    base_variables,
+                    "all candidate missions failed",
+                );
+            }
+            return self.store.set_step_state(
+                &view.subject,
+                "failed",
+                Some("all candidate missions failed"),
+            );
+        }
+        let selection = self.select_loop_candidate(
+            run,
+            view,
+            loop_spec,
+            loop_subject,
+            base_variables,
+            &completed,
+        )?;
+        let winner = match selection {
+            LoopCandidateSelection::Winner(winner) => winner,
+            LoopCandidateSelection::Pending => return Ok(false),
+            LoopCandidateSelection::NoWinner => {
+                if let Some(child) = self.loop_result_child(
+                    &completed
+                        .iter()
+                        .map(|(_, claim)| claim.clone())
+                        .collect::<Vec<_>>(),
+                )? {
+                    self.record_loop_round(
+                        loop_subject,
+                        view.attempt,
+                        &child,
+                        "failed",
+                        &BTreeMap::new(),
+                        None,
+                        None,
+                        None,
+                        0,
+                        Some("the candidate selector rejected every candidate"),
+                    )?;
+                }
+                if view.attempt >= loop_spec.max_rounds {
+                    return self.finish_exhausted_loop(
+                        run,
+                        view,
+                        loop_spec,
+                        loop_subject,
+                        base_variables,
+                        "the candidate selector rejected every candidate",
+                    );
+                }
+                return self.store.set_step_state(
+                    &view.subject,
+                    "failed",
+                    Some("the candidate selector rejected every candidate"),
+                );
+            }
+        };
+        for (candidate, result) in &completed {
+            let feedback = result
+                .body
+                .pointer("/fields/feedback")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match self.evaluate_loop_branch(
+                run,
+                view,
+                loop_spec,
+                *candidate == winner,
+                feedback,
+                Some(*candidate),
+                None,
+            )? {
+                LoopBranchOutcome::Pending => return Ok(false),
+                LoopBranchOutcome::Failed(reason) => {
+                    return self
+                        .store
+                        .set_step_state(&view.subject, "cancelled", Some(&reason));
+                }
+                LoopBranchOutcome::Completed => {}
+            }
+        }
+        let winner_result = completed
+            .iter()
+            .find(|(candidate, _)| *candidate == winner)
+            .map(|(_, claim)| claim)
+            .expect("the selected candidate exists");
+        let best_metrics = winner_result
+            .body
+            .pointer("/fields/metrics")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let winner_feedback = winner_result
+            .body
+            .pointer("/fields/feedback")
+            .and_then(Value::as_str);
+        let winner_child = self
+            .loop_result_child(std::slice::from_ref(winner_result))?
+            .context("the selected candidate mission disappeared")?;
+        let winner_metrics = best_metrics
+            .as_object()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|(name, value)| value.as_f64().map(|value| (name.clone(), value)))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        self.record_loop_round(
+            loop_subject,
+            view.attempt,
+            &winner_child,
+            "completed",
+            &winner_metrics,
+            winner_feedback,
+            None,
+            None,
+            0,
+            Some(&format!("candidate {winner} was selected")),
+        )?;
+        let mut winner_variables = base_variables.clone();
+        winner_variables.insert("ST_CANDIDATE_INDEX".into(), winner.to_string());
+        winner_variables.insert("candidate.index".into(), winner.to_string());
+        let mut passed = true;
+        for gate in &loop_spec.until {
+            match self.evaluate_context_gate(
+                run,
+                loop_subject,
+                &loop_spec.id,
+                &view.definition_hash,
+                view.attempt,
+                gate,
+                &winner_variables,
+            )? {
+                GateOutcome::Pass => {}
+                GateOutcome::Pending
+                    if matches!(
+                        gate,
+                        GateSpec::Mechanical { .. } | GateSpec::Llm { .. } | GateSpec::Human { .. }
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                GateOutcome::Pending | GateOutcome::Fail(_) => passed = false,
+            }
+        }
+        self.record_once(
+            loop_subject,
+            "loop.state",
+            BTreeMap::from([
+                (
+                    "status".into(),
+                    Value::String(if passed { "completed" } else { "running" }.into()),
+                ),
+                ("round".into(), Value::from(view.attempt)),
+                ("winner".into(), Value::from(winner)),
+                ("best_metrics".into(), best_metrics),
+            ]),
+        )?;
+        if passed {
+            return self.store.set_step_state(&view.subject, "completed", None);
+        }
+        if let Some(reason) = self.loop_stop_reason(loop_subject, loop_spec)? {
+            return self.finish_exhausted_loop(
+                run,
+                view,
+                loop_spec,
+                loop_subject,
+                &winner_variables,
+                &reason,
+            );
+        }
+        if view.attempt >= loop_spec.max_rounds {
+            return self.finish_exhausted_loop(
+                run,
+                view,
+                loop_spec,
+                loop_subject,
+                &winner_variables,
+                "the candidate rounds did not satisfy the exit gates",
+            );
+        }
+        self.store.set_step_state(
+            &view.subject,
+            "failed",
+            Some("the selected candidate did not satisfy the exit gates"),
+        )
+    }
+
+    fn select_loop_candidate(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        base_variables: &BTreeMap<String, String>,
+        results: &[(u32, crate::model::ClaimRecord)],
+    ) -> Result<LoopCandidateSelection> {
+        let candidates = loop_spec
+            .candidates
+            .as_ref()
+            .expect("the caller selected candidates");
+        match &candidates.select {
+            LoopCandidateSelector::Metric { metric } => {
+                let spec = loop_spec
+                    .metrics
+                    .iter()
+                    .find(|spec| &spec.name == metric)
+                    .context("the candidate metric disappeared")?;
+                Ok(results
+                    .iter()
+                    .filter_map(|(candidate, claim)| {
+                        claim
+                            .body
+                            .pointer(&format!("/fields/metrics/{metric}"))
+                            .and_then(Value::as_f64)
+                            .map(|value| (*candidate, value))
+                    })
+                    .max_by(|left, right| {
+                        let order = left.1.total_cmp(&right.1);
+                        if spec.direction == "higher" {
+                            order
+                        } else {
+                            order.reverse()
+                        }
+                    })
+                    .map_or(LoopCandidateSelection::NoWinner, |(candidate, _)| {
+                        LoopCandidateSelection::Winner(candidate)
+                    }))
+            }
+            LoopCandidateSelector::Llm { gate } | LoopCandidateSelector::Human { gate } => {
+                for (candidate, _) in results {
+                    let mut variables = base_variables.clone();
+                    variables.insert("ST_CANDIDATE_INDEX".into(), candidate.to_string());
+                    variables.insert("candidate.index".into(), candidate.to_string());
+                    match self.evaluate_context_gate(
+                        run,
+                        &format!(
+                            "{loop_subject}/round/{}/candidate/{candidate}",
+                            view.attempt
+                        ),
+                        &format!("select candidate {candidate}"),
+                        &view.definition_hash,
+                        view.attempt,
+                        gate,
+                        &variables,
+                    )? {
+                        GateOutcome::Pass => {
+                            return Ok(LoopCandidateSelection::Winner(*candidate));
+                        }
+                        GateOutcome::Pending => return Ok(LoopCandidateSelection::Pending),
+                        GateOutcome::Fail(_) => {}
+                    }
+                }
+                Ok(LoopCandidateSelection::NoWinner)
+            }
+        }
+    }
+
+    fn loop_result_child(
+        &self,
+        results: &[crate::model::ClaimRecord],
+    ) -> Result<Option<MissionRunView>> {
+        let Some(subject) = results.iter().find_map(|claim| {
+            claim
+                .body
+                .pointer("/fields/mission_run")
+                .and_then(Value::as_str)
+        }) else {
+            return Ok(None);
+        };
+        self.store.mission_run(subject)
+    }
+
+    fn loop_child_failure_is_structural(&self, child: &MissionRunView) -> Result<bool> {
+        if child.status == "cancelled" || child.steps.iter().any(|step| step.status == "cancelled")
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .store
+            .latest_claim(&child.subject, Some("mission-run.state"))?
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|reason| {
+                reason.contains("revision is unavailable")
+                    || reason.contains("structural")
+                    || reason.contains("invalid")
+            }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_loop_round(
+        &self,
+        loop_subject: &str,
+        round: u32,
+        child: &MissionRunView,
+        status: &str,
+        metrics: &BTreeMap<String, f64>,
+        feedback: Option<&str>,
+        candidate: Option<u32>,
+        item: Option<&Value>,
+        token_usage: u64,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let mut fields = BTreeMap::from([
+            ("round".into(), Value::from(round)),
+            ("status".into(), Value::String(status.into())),
+            ("mission_run".into(), Value::String(child.subject.clone())),
+            ("metrics".into(), serde_json::to_value(metrics)?),
+            ("token_usage".into(), Value::from(token_usage)),
+        ]);
+        if let Some(feedback) = feedback {
+            fields.insert("feedback".into(), Value::String(feedback.into()));
+        }
+        if let Some(candidate) = candidate {
+            fields.insert("candidate".into(), Value::from(candidate));
+        }
+        if let Some(item) = item {
+            fields.insert("item".into(), item.clone());
+        }
+        if let Some(reason) = reason {
+            fields.insert("reason".into(), Value::String(reason.into()));
+        }
+        self.store.append_claim(&ClaimInput {
+            subject: loop_subject.into(),
+            kind: "loop.round-result".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "loop-round-result:{loop_subject}:{round}:{}",
+                candidate.map_or_else(|| "round".into(), |value| format!("candidate-{value}"))
+            )),
+        })?;
+        self.signal_changed();
+        Ok(())
+    }
+
+    fn repeated_loop_failures(&self, loop_subject: &str) -> Result<u32> {
+        Ok(self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?
+            .iter()
+            .rev()
+            .filter(|claim| claim.body.pointer("/fields/candidate").is_none())
+            .filter(|claim| claim.body.pointer("/fields/item").is_none())
+            .take_while(|claim| {
+                claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("failed")
+            })
+            .count() as u32)
+    }
+
+    fn mission_run_token_usage(&self, run: &MissionRunView) -> Result<u64> {
+        let desired = self.store.desired_subjects()?;
+        Ok(desired
+            .iter()
+            .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
+            .filter_map(|subject| {
+                self.store
+                    .latest_claim(&subject.subject, Some("harness.usage"))
+                    .ok()
+                    .flatten()
+            })
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/total_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .sum())
+    }
+
+    fn loop_best(
+        &self,
+        loop_subject: &str,
+        loop_spec: &LoopSpec,
+    ) -> Result<(u64, BTreeMap<String, f64>)> {
+        let claims = self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?;
+        let selected = if let Some(metric_name) = &loop_spec.keep_metric {
+            let metric = loop_spec
+                .metrics
+                .iter()
+                .find(|metric| &metric.name == metric_name)
+                .context("the keep metric disappeared")?;
+            claims
+                .iter()
+                .filter(|claim| claim.body.pointer("/fields/candidate").is_none())
+                .filter(|claim| claim.body.pointer("/fields/item").is_none())
+                .filter(|claim| {
+                    claim.body.pointer("/fields/status").and_then(Value::as_str)
+                        == Some("completed")
+                })
+                .filter_map(|claim| {
+                    let round = claim.body.pointer("/fields/round")?.as_u64()?;
+                    let value = claim
+                        .body
+                        .pointer(&format!("/fields/metrics/{metric_name}"))?
+                        .as_f64()?;
+                    Some((claim, round, value))
+                })
+                .max_by(|left, right| {
+                    let order = left.2.total_cmp(&right.2);
+                    if metric.direction == "higher" {
+                        order
+                    } else {
+                        order.reverse()
+                    }
+                })
+                .map(|(claim, round, _)| (claim, round))
+        } else {
+            claims
+                .iter()
+                .filter(|claim| claim.body.pointer("/fields/candidate").is_none())
+                .filter(|claim| claim.body.pointer("/fields/item").is_none())
+                .filter(|claim| {
+                    claim.body.pointer("/fields/status").and_then(Value::as_str)
+                        == Some("completed")
+                })
+                .next_back()
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/round")
+                        .and_then(Value::as_u64)
+                        .map(|round| (claim, round))
+                })
+        };
+        let Some((claim, round)) = selected else {
+            return Ok((0, BTreeMap::new()));
+        };
+        let metrics = claim
+            .body
+            .pointer("/fields/metrics")
+            .and_then(Value::as_object)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|(name, value)| value.as_f64().map(|value| (name.clone(), value)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((round, metrics))
+    }
+
+    fn loop_stop_reason(&self, loop_subject: &str, loop_spec: &LoopSpec) -> Result<Option<String>> {
+        let results = self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?;
+        if let Some(limit) = loop_spec.stop.token_budget {
+            let used = results
+                .iter()
+                .filter_map(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/token_usage")
+                        .and_then(Value::as_u64)
+                })
+                .sum::<u64>();
+            if used >= limit {
+                return Ok(Some(format!(
+                    "the loop token budget of {limit} was reached"
+                )));
+            }
+        }
+        if let (Some(metric_name), Some(rounds)) = (
+            &loop_spec.stop.plateau_metric,
+            loop_spec.stop.plateau_rounds,
+        ) {
+            let metric = loop_spec
+                .metrics
+                .iter()
+                .find(|metric| &metric.name == metric_name)
+                .context("the plateau metric disappeared")?;
+            let mut best: Option<f64> = None;
+            let mut stalled = 0_u32;
+            for value in results
+                .iter()
+                .filter(|claim| claim.body.pointer("/fields/candidate").is_none())
+                .filter(|claim| claim.body.pointer("/fields/item").is_none())
+                .filter_map(|claim| {
+                    claim
+                        .body
+                        .pointer(&format!("/fields/metrics/{metric_name}"))
+                        .and_then(Value::as_f64)
+                })
+            {
+                let improves = best.is_none_or(|prior| {
+                    if metric.direction == "higher" {
+                        value - prior >= metric.min_improvement
+                    } else {
+                        prior - value >= metric.min_improvement
+                    }
+                });
+                if improves {
+                    best = Some(value);
+                    stalled = 0;
+                } else {
+                    stalled += 1;
+                }
+            }
+            if stalled >= rounds {
+                return Ok(Some(format!(
+                    "the loop metric did not improve for {rounds} rounds"
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish_exhausted_loop(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        variables: &BTreeMap<String, String>,
+        reason: &str,
+    ) -> Result<bool> {
+        match &loop_spec.on_exhausted {
+            LoopExhaustionSpec::Fail => {
+                self.record_once(
+                    loop_subject,
+                    "loop.state",
+                    BTreeMap::from([
+                        ("status".into(), Value::String("failed".into())),
+                        ("round".into(), Value::from(view.attempt)),
+                        ("reason".into(), Value::String(reason.into())),
+                    ]),
+                )?;
+                self.store
+                    .set_step_state(&view.subject, "failed", Some(reason))
+            }
+            LoopExhaustionSpec::Succeed => {
+                self.record_once(
+                    loop_subject,
+                    "loop.state",
+                    BTreeMap::from([
+                        ("status".into(), Value::String("exhausted".into())),
+                        ("round".into(), Value::from(view.attempt)),
+                        ("reason".into(), Value::String(reason.into())),
+                    ]),
+                )?;
+                self.store.set_step_state(
+                    &view.subject,
+                    "completed",
+                    Some("the loop accepted its best result at exhaustion"),
+                )
+            }
+            LoopExhaustionSpec::Human { gate } => match self.evaluate_context_gate(
+                run,
+                loop_subject,
+                &loop_spec.id,
+                &view.definition_hash,
+                view.attempt,
+                gate,
+                variables,
+            )? {
+                GateOutcome::Pass => {
+                    self.record_once(
+                        loop_subject,
+                        "loop.state",
+                        BTreeMap::from([
+                            ("status".into(), Value::String("exhausted".into())),
+                            ("round".into(), Value::from(view.attempt)),
+                            ("reason".into(), Value::String(reason.into())),
+                        ]),
+                    )?;
+                    self.store.set_step_state(
+                        &view.subject,
+                        "completed",
+                        Some("the human reviewer accepted the exhausted loop result"),
+                    )
+                }
+                GateOutcome::Fail(review_reason) => {
+                    self.record_once(
+                        loop_subject,
+                        "loop.state",
+                        BTreeMap::from([
+                            ("status".into(), Value::String("failed".into())),
+                            ("round".into(), Value::from(view.attempt)),
+                            ("reason".into(), Value::String(review_reason.clone())),
+                        ]),
+                    )?;
+                    self.store
+                        .set_step_state(&view.subject, "failed", Some(&review_reason))
+                }
+                GateOutcome::Pending => Ok(false),
+            },
+        }
     }
 
     fn step_dependencies_hold(
@@ -4037,6 +5828,13 @@ fn run_variables(
         ("ST_REQUESTER".into(), run.requester.clone()),
         ("ST_PARENT_STEP_RUN".into(), parent_step_run),
         ("ST_ROOT_MISSION_RUN".into(), run.root_mission_run.clone()),
+        (
+            "ST_ROOT_MISSION_RUN_ID".into(),
+            run.root_mission_run
+                .strip_prefix("mission-run/")
+                .unwrap_or(&run.root_mission_run)
+                .into(),
+        ),
         ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
     ]);
     variables.extend(
@@ -4044,6 +5842,31 @@ fn run_variables(
             .iter()
             .map(|(name, input)| (format!("input.{name}"), input.value.clone())),
     );
+    if let Some(round) = run.inputs.get(LOOP_ROUND_INPUT) {
+        variables.insert("ST_LOOP_ROUND".into(), round.value.clone());
+        variables.insert("loop.round".into(), round.value.clone());
+    }
+    if let Some(feedback) = run.inputs.get(LOOP_FEEDBACK_INPUT) {
+        variables.insert("ST_LOOP_FEEDBACK".into(), feedback.value.clone());
+        variables.insert("loop.feedback".into(), feedback.value.clone());
+    }
+    if let Some(candidate) = run.inputs.get(CANDIDATE_INDEX_INPUT) {
+        variables.insert("ST_CANDIDATE_INDEX".into(), candidate.value.clone());
+        variables.insert("candidate.index".into(), candidate.value.clone());
+    }
+    if let Some(item) = run.inputs.get(LOOP_ITEM_INPUT)
+        && let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&item.value)
+    {
+        for (name, value) in fields {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            variables.insert(format!("loop.item.{name}"), value);
+        }
+        let id = variables.get("loop.item.id").cloned().unwrap_or_default();
+        variables.insert("ST_LOOP_ITEM_ID".into(), id);
+    }
     variables
 }
 
@@ -4203,6 +6026,18 @@ enum GateOutcome {
     Pass,
     Pending,
     Fail(String),
+}
+
+enum LoopBranchOutcome {
+    Pending,
+    Completed,
+    Failed(String),
+}
+
+enum LoopCandidateSelection {
+    Pending,
+    NoWinner,
+    Winner(u32),
 }
 
 enum UsedMissionOutcome {
@@ -4696,10 +6531,8 @@ version 2
             .unwrap();
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
-        assert_eq!(
-            store.mission_run(&run.id).unwrap().unwrap().status,
-            "completed"
-        );
+        let completed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
         let evidence = store
             .claims_page(None, None, 0, None, false, 500)
             .unwrap()
@@ -5652,10 +7485,8 @@ version 2
         for _ in 0..8 {
             reconciler.reconcile_once().unwrap();
         }
-        assert_eq!(
-            store.mission_run(&run.id).unwrap().unwrap().status,
-            "completed"
-        );
+        let completed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
         assert_eq!(
             store.mission_run(&child.id).unwrap().unwrap().status,
             "completed"
@@ -7839,6 +9670,513 @@ version 2
         assert_eq!(
             store.mission_run(&zero.id).unwrap().unwrap().status,
             "standing"
+        );
+    }
+
+    #[test]
+    fn a_first_class_loop_runs_bounded_child_missions_until_its_gate_passes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+resource "loop-result" { kind "custom.test.loop-result" }
+mission "loop" state="ready" {
+  goal "Repeat a bounded graph until its result is ready."
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 3
+    until { gate "ready" { field "state" "resource/loop-result" is "ready" } }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" {
+        agentless
+        goal "Complete round ${loop.round}."
+      }
+    }
+
+  }
+}
+"#;
+        apply_source(&store, source, "first-class-loop");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "loop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "first-class-loop-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..12 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let first = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(first.steps[0].attempt, 2);
+        assert_ne!(first.status, "completed");
+        let second_round = store
+            .mission_run(&store.mission_run_subject_for_idempotency_key(&format!(
+                "loop-round:{}:2",
+                first.steps[0].subject
+            )))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_round.inputs[LOOP_ROUND_INPUT].value, "2");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/loop-result".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    (
+                        "kind".into(),
+                        Value::String("custom.test.loop-result".into()),
+                    ),
+                    ("state".into(), Value::String("ready".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("loop-result-ready".into()),
+            })
+            .unwrap();
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let completed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.loops.len(), 1);
+        assert_eq!(completed.loops[0].status, "completed");
+        assert_eq!(completed.loops[0].round, 2);
+        assert_eq!(completed.loops[0].results.len(), 2);
+    }
+
+    #[test]
+    fn loop_stop_rules_use_durable_round_results() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+mission "stops" state="ready" {
+  goal "Evaluate durable loop stop rules."
+  loop "improve" {
+    max-rounds 5
+    metric "quality" direction="higher" min-improvement=0.1 {
+      field "score" "resource/result"
+    }
+    stop { plateau metric="quality" rounds=2; repeated-failure 2; token-budget 100 }
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let spec = intent.missions["stops"].steps["improve"]
+            .loop_spec
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let subject = "loop-run/01990000000070008000000000000000/improve";
+        for (round, quality) in [(1, 1.0), (2, 1.05), (3, 1.06)] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "loop.round-result".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("round".into(), Value::from(round)),
+                        ("status".into(), Value::String("completed".into())),
+                        (
+                            "mission_run".into(),
+                            Value::String(format!("mission-run/round-{round}")),
+                        ),
+                        ("metrics".into(), serde_json::json!({"quality": quality})),
+                        ("token_usage".into(), Value::from(10)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("stop-round-{round}")),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            reconciler.loop_stop_reason(subject, &spec).unwrap(),
+            Some("the loop metric did not improve for 2 rounds".into())
+        );
+
+        let mut token_spec = spec.clone();
+        token_spec.stop.plateau_metric = None;
+        token_spec.stop.plateau_rounds = None;
+        token_spec.stop.token_budget = Some(30);
+        assert_eq!(
+            reconciler.loop_stop_reason(subject, &token_spec).unwrap(),
+            Some("the loop token budget of 30 was reached".into())
+        );
+
+        for round in 4..=5 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "loop.round-result".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("round".into(), Value::from(round)),
+                        ("status".into(), Value::String("failed".into())),
+                        (
+                            "mission_run".into(),
+                            Value::String(format!("mission-run/round-{round}")),
+                        ),
+                        ("metrics".into(), serde_json::json!({})),
+                        ("token_usage".into(), Value::from(0)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("stop-failure-{round}")),
+                })
+                .unwrap();
+        }
+        assert_eq!(reconciler.repeated_loop_failures(subject).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_for_each_loop_snapshots_items_and_runs_each_child() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+resource "batch" { kind "custom.test.batch" }
+mission "gauntlet" state="ready" {
+  goal "Run one child graph for each stable input item."
+  completion { when "all-steps-exhausted" }
+  loop "checks" for-each="resource/batch" field="items" max-parallel=2 {
+    max-rounds 5
+    round {
+      completion { when "all-steps-exhausted" }
+      step "check" { agentless; goal "Check ${loop.item.name}." }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "for-each-loop");
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/batch".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("custom.test.batch".into())),
+                    (
+                        "items".into(),
+                        serde_json::json!([
+                            {"id":"one","name":"first"}, {"id":"two","name":"second"},
+                            {"id":"three","name":"third"}
+                        ]),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("batch-items".into()),
+            })
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "gauntlet".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "gauntlet-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..40 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+        let subject = format!(
+            "loop-run/{}/checks",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        assert_eq!(
+            store
+                .claims_for(&subject, Some("loop.round-result"))
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_malformed_for_each_snapshot_fails_only_its_mission_run() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+resource "batch" { kind "custom.test.batch" }
+mission "gauntlet" state="ready" {
+  goal "Contain an invalid input snapshot."
+  completion { when "all-steps-exhausted" }
+  loop "checks" for-each="resource/batch" field="items" {
+    max-rounds 5
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        apply_source(&store, source, "malformed-for-each-loop");
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/batch".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("custom.test.batch".into())),
+                    ("items".into(), Value::String("not-an-array".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("invalid-batch-items".into()),
+            })
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "gauntlet".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "malformed-gauntlet-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.steps[0].status, "cancelled");
+        assert_eq!(
+            run.steps[0].blocked_reason.as_deref(),
+            Some("a for-each field must contain an array")
+        );
+    }
+
+    #[test]
+    fn a_human_can_accept_the_best_result_after_loop_exhaustion() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+resource "result" { kind "custom.test.loop-result" }
+mission "human-exhaustion" state="ready" {
+  goal "Let a person accept the bounded result."
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 1
+    until { gate "ready" { field "state" "resource/result" is "ready" } }
+    round { completion { when "all-steps-exhausted" } }
+    on-exhausted {
+      gate "accept-best" type="human" {
+        reviewer "person/nathan"
+        question "Accept the best bounded result?"
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "human-loop-exhaustion");
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/result".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    (
+                        "kind".into(),
+                        Value::String("custom.test.loop-result".into()),
+                    ),
+                    ("state".into(), Value::String("not-ready".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("human-loop-result".into()),
+            })
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "human-exhaustion".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "human-exhaustion-run".into(),
+            })
+            .unwrap();
+        let loop_subject = format!(
+            "loop-run/{}/improve",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let mut requested = None;
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            if let Some(request) = store.gate_request_for_owner(&loop_subject).unwrap() {
+                requested = Some(request);
+                break;
+            }
+        }
+        let request = requested.expect("the exhaustion review was not requested");
+        assert_eq!(
+            request
+                .body
+                .pointer("/fields/question")
+                .and_then(Value::as_str),
+            Some("Accept the best bounded result?")
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("pass".into())),
+                    ("request".into(), Value::String(request.id.clone())),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some("accept-human-loop-result".into()),
+            })
+            .unwrap();
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let completed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.loops[0].status, "exhausted");
+    }
+
+    #[test]
+    fn a_best_of_n_loop_selects_the_metric_winner() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+resource "candidate-1" { kind "custom.test.candidate" }
+resource "candidate-2" { kind "custom.test.candidate" }
+mission "best" state="ready" {
+  goal "Select the best bounded candidate."
+  completion { when "all-steps-exhausted" }
+  loop "choose" {
+    max-rounds 2
+    metric "quality" direction="higher" {
+      field "score" "resource/candidate-${candidate.index}"
+    }
+    candidates 2 max-parallel=2 { select metric="quality" }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "create" { agentless; goal "Create candidate ${candidate.index}." }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "candidate-loop");
+        for (candidate, score) in [(1, 0.25), (2, 0.75)] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("resource/candidate-{candidate}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("custom.test.candidate".into())),
+                        ("score".into(), Value::from(score)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("candidate-score-{candidate}")),
+                })
+                .unwrap();
+        }
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "best".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "best-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let mut initial_candidates = 0;
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+            initial_candidates = (1..=3)
+                .filter(|candidate| {
+                    let key = format!("loop-candidate:{}:1:{candidate}", run.steps[0].subject);
+                    let subject = store.mission_run_subject_for_idempotency_key(&key);
+                    store.mission_run(&subject).unwrap().is_some()
+                })
+                .count();
+            if initial_candidates > 0 {
+                break;
+            }
+        }
+        assert_eq!(initial_candidates, 2);
+        for _ in 0..40 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+        let subject = format!(
+            "loop-run/{}/choose",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let state = store
+            .latest_claim(&subject, Some("loop.state"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.body.pointer("/fields/winner").and_then(Value::as_u64),
+            Some(2)
         );
     }
 

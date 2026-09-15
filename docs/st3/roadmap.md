@@ -22,6 +22,13 @@ This file records accepted future work. Active fleet work belongs in st3 mission
 - [ ] Use cgroups on Linux where available.
 - [ ] Evaluate the macOS sandbox and resource-limit surfaces before selecting an enforcement contract.
 
+## CLI reliability
+
+- [x] Fix Unix-socket PTY attach so the client performs a complete WebSocket handshake.
+- [x] Exercise each CLI parser and help path in an automated test.
+- [x] Exercise HTTP and Unix request and WebSocket transports in automated tests.
+- [ ] Ship the verified attach fix to each active st3 host.
+
 ## Harness accounts
 
 - [ ] Design quota-aware account pools for Codex and OMP harnesses.

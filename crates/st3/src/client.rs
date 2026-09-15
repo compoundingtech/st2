@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 use crate::model::{ApiErrorResponse, ApiResponse};
 
@@ -98,11 +99,7 @@ impl Client {
                 let stream = tokio::net::UnixStream::connect(socket)
                     .await
                     .with_context(|| format!("connect to the st3 API at {}", socket.display()))?;
-                let request = tokio_tungstenite::tungstenite::http::Request::builder()
-                    .uri(format!("ws://localhost{path}"))
-                    .header("Host", "localhost")
-                    .header("Sec-WebSocket-Protocol", "st3.terminal.v1")
-                    .body(())?;
+                let request = terminal_request(&format!("ws://localhost{path}"))?;
                 let (websocket, _) = tokio_tungstenite::client_async(request, stream).await?;
                 proxy_websocket(websocket).await
             }
@@ -115,12 +112,23 @@ impl Client {
                             .map(|value| format!("wss://{value}"))
                     })
                     .context("a terminal endpoint must use http or https")?;
-                let (websocket, _) =
-                    tokio_tungstenite::connect_async(format!("{base}{path}")).await?;
+                let request = terminal_request(&format!("{base}{path}"))?;
+                let (websocket, _) = tokio_tungstenite::connect_async(request).await?;
                 proxy_websocket(websocket).await
             }
         }
     }
+}
+
+fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = url.into_client_request()?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        "st3.terminal.v1"
+            .parse()
+            .expect("the protocol header is valid"),
+    );
+    Ok(request)
 }
 
 async fn proxy_websocket<S>(websocket: tokio_tungstenite::WebSocketStream<S>) -> Result<()>
@@ -279,4 +287,164 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
         "st3 API returned {status}: {}",
         String::from_utf8_lossy(bytes).trim()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UnixListener;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    fn test_api() -> Router {
+        Router::new().route(
+            "/v1/test",
+            get(|| async { Json(test_envelope(json!({"method": "get"}))) })
+                .post(|Json(body): Json<Value>| async move { Json(test_envelope(body)) }),
+        )
+    }
+
+    fn test_envelope(value: Value) -> ApiResponse<Value> {
+        ApiResponse {
+            api_version: "st3.v1".into(),
+            request_id: "test-request".into(),
+            snapshot_host: "test-node".into(),
+            store_index: 1,
+            value,
+        }
+    }
+
+    async fn assert_request_transports(client: Client) {
+        let get: Value = client.get("/v1/test").await.unwrap();
+        assert_eq!(get, json!({"method": "get"}));
+        let post: Value = client
+            .post("/v1/test", &json!({"method": "post"}))
+            .await
+            .unwrap();
+        assert_eq!(post, json!({"method": "post"}));
+    }
+
+    #[tokio::test]
+    async fn the_unix_transport_completes_real_get_and_post_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, test_api())
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the Unix API socket did not start");
+        assert_request_transports(Client::unix(&socket)).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_http_transport_completes_real_get_and_post_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_api()).await.unwrap();
+        });
+        assert_request_transports(Client::new(Endpoint::Http(format!("http://{address}")))).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_unix_terminal_transport_completes_a_real_websocket_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let server_observed = observed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |request: &Request, mut response: Response| {
+                    *server_observed.lock().unwrap() = Some((
+                        request.uri().path().to_owned(),
+                        request
+                            .headers()
+                            .get("Sec-WebSocket-Protocol")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    ));
+                    response
+                        .headers_mut()
+                        .insert("Sec-WebSocket-Protocol", "st3.terminal.v1".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        Client::unix(&socket)
+            .proxy_terminal("/v1/pty/agent%2Fdemo/attach")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((
+                "/v1/pty/agent%2Fdemo/attach".into(),
+                Some("st3.terminal.v1".into())
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_http_terminal_transport_completes_a_real_websocket_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let server_observed = observed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |request: &Request, mut response: Response| {
+                    *server_observed.lock().unwrap() = Some((
+                        request.uri().path().to_owned(),
+                        request
+                            .headers()
+                            .get("Sec-WebSocket-Protocol")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    ));
+                    response
+                        .headers_mut()
+                        .insert("Sec-WebSocket-Protocol", "st3.terminal.v1".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        Client::new(Endpoint::Http(format!("http://{address}")))
+            .proxy_terminal("/v1/pty/agent%2Fdemo/attach")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((
+                "/v1/pty/agent%2Fdemo/attach".into(),
+                Some("st3.terminal.v1".into())
+            ))
+        );
+    }
 }

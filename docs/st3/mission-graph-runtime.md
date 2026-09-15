@@ -33,6 +33,8 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - A mission can declare exact text and resource inputs.
 - A mission can declare one absolute run `timeout`.
 - An eval entry mission must declare a timeout no greater than 20 minutes.
+- A first-class `loop` runs one bounded child mission for each round.
+- A loop always declares `max-rounds`. It can also declare one total `timeout`.
 
 ## Complete example
 
@@ -256,7 +258,6 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   DESIRED_STATE...
   mission "nested-work" { ... }
   retry { attempts 3; backoff "30s" }
-  loop { max-rounds 5; backoff "30s" }
   produces { PRODUCT... }
   produces-mission "generated-mission"
   uses-mission output-of="producer-step"
@@ -264,11 +265,9 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `mission`, `retry`, `loop`, `produces`, `produces-mission`, and `uses-mission` are single fields.
+`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, and `uses-mission` are single fields.
 
-A step can contain `retry` or `loop`, but not both. A retry handles a bounded transient failure.
-
-A loop repeats the complete step until all its gates pass. It needs at least one gate and an explicit `max-rounds` cap.
+A retry repeats one failed step attempt. It handles a bounded transient failure.
 
 `available-to`, `goal`, `constraint`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
 
@@ -310,6 +309,167 @@ An ordinary mission body can contain multiple queues and ordinary steps. A neste
 A queue cannot contain another queue or a `finally` block in this version. A `finally` block cannot contain a queue.
 
 Queue order is definition state. Reordering items changes moved step hashes and uses the ordinary successor-generation compatibility rules.
+
+## Bounded loops
+
+A loop is a mission graph node. It is not a step property.
+
+```kdl
+loop "improve" timeout="2h" {
+  max-rounds 6
+
+  metric "quality" direction="higher" min-improvement=0.01 {
+    field "score" "resource/result"
+  }
+
+  stop {
+    plateau metric="quality" rounds=2
+    repeated-failure 2
+    token-budget 50000
+  }
+
+  until {
+    gate "the result is ready" {
+      field "state" "resource/result" "is" "ready"
+    }
+  }
+
+  round {
+    completion { when "all-steps-exhausted" }
+    step "work" {
+      assigned-to "agent/${ST_ROOT_MISSION_RUN_ID}/worker"
+      goal "Improve the result for round ${loop.round}."
+    }
+  }
+
+  keep-if metric="quality"
+  on-keep {
+    completion { when "all-steps-exhausted" }
+    step "keep" {
+      agentless
+      exec "keep-result" {
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        command "./keep.sh"
+        restart "never"
+      }
+      gate "the keep action passes" {
+        field "exit_code" "exec/${ST_MISSION_RUN}/keep-result" "is" 0
+      }
+    }
+  }
+  on-discard {
+    completion { when "all-steps-exhausted" }
+    step "discard" {
+      agentless
+      exec "discard-result" {
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        command "./discard.sh"
+        restart "never"
+      }
+      gate "the discard action passes" {
+        field "exit_code" "exec/${ST_MISSION_RUN}/discard-result" "is" 0
+      }
+    }
+  }
+
+  on-exhausted { fail }
+}
+```
+
+`max-rounds` is required. Its value is between 1 and 100.
+
+The optional loop `timeout` covers all rounds, metrics, gates, and branch work. A loop uses the first bound that it reaches.
+
+The `round` block is one embedded mission. It needs an explicit `completion` block.
+
+Generated round and branch missions inherit the smaller loop or parent mission timeout.
+
+The embedded mission revision is immutable. A client cannot start it directly. The parent loop starts each exact child run.
+
+An agent declared inside `round` belongs to that child run. st3 removes it when the child run ends.
+
+An agent declared outside the loop belongs to the root run. A round can address it with `ST_ROOT_MISSION_RUN_ID`.
+
+`until` contains repeated gates. All exit gates must pass.
+
+Each round writes one `loop.round-result` claim. The result records the child run, metrics, token use, status, and feedback document.
+
+The feedback document is immutable. The next round receives its exact reference through `${loop.feedback}`.
+
+A metric has `direction="higher"` or `direction="lower"`. Its value must be a finite number.
+
+A metric can read a numeric resource field, run an exec command, or normalize one exit gate to zero or one.
+
+An exec metric must print one finite number. Its `time-limit` defaults to two minutes.
+
+`keep-if` compares one metric with the best kept result. Its `min-improvement` value defines a meaningful improvement.
+
+`on-keep` and `on-discard` are ordinary embedded missions. They make file, Git, or other projection behavior explicit.
+
+The loop has no built-in Git behavior. A failed keep or discard mission stops the loop immediately.
+
+`stop` can limit a plateau, repeated round failures, and total structured token use. A reached stop rule exhausts the loop.
+
+`on-exhausted` defaults to `fail`. It can contain `succeed` or one human gate instead.
+
+A human exhaustion approval accepts the current best result. More rounds require a published mission revision.
+
+A cancelled round or a structural child failure stops immediately. An ordinary failed round can start the next round.
+
+### Dynamic for-each loops
+
+```kdl
+loop "checks" for-each="resource/release" field="parts" max-parallel=4 {
+  max-rounds 100
+  round {
+    completion { when "all-steps-exhausted" }
+    step "check" {
+      agentless
+      goal "Check ${loop.item.id} at ${loop.item.path}."
+    }
+  }
+}
+```
+
+The selected field must contain an array of objects. Each object needs a unique string `id`.
+
+st3 snapshots the array before it starts work. Later resource changes do not change that run.
+
+The array can contain at most 100 items. `max-rounds` can set a smaller item bound.
+
+`max-parallel` defaults to one. It can be between one and 100.
+
+Each item receives `${loop.item.FIELD}` and `ST_LOOP_ITEM_ID`. All item child runs must complete.
+
+### Best-of-N loops
+
+```kdl
+loop "choose" timeout="30m" {
+  max-rounds 3
+  metric "quality" direction="higher" {
+    field "score" "resource/candidate-${candidate.index}"
+  }
+  candidates 4 max-parallel=2 { select metric="quality" }
+  round {
+    completion { when "all-steps-exhausted" }
+    step "create" { agentless; goal "Create candidate ${candidate.index}." }
+  }
+}
+```
+
+The candidate count is between 2 and 16. `max-parallel` defaults to one and cannot exceed that count.
+
+Each candidate is a separate child mission run. It receives `${candidate.index}` and `ST_CANDIDATE_INDEX`.
+
+`select` can name a metric. It can instead contain one LLM gate or one human gate.
+
+The metric selector uses the metric direction. A gate selector tests candidates in stable index order.
+
+The selected candidate can run `on-keep`. Every other completed candidate can run `on-discard`.
+
+The selected candidate becomes the round result. An optional `until` block decides whether another candidate round starts.
 
 ## Goals
 
@@ -567,11 +727,11 @@ For a normal step, st3 performs this sequence:
 13. Evaluate gates.
 14. Mark the step completed or failed.
 
-When a step fails and its repeat policy permits another attempt, st3 increments the attempt, applies backoff, and starts at dependency admission.
+When a step retry permits another attempt, st3 increments the attempt, applies backoff, and starts at dependency admission.
 
-Each attempt can submit or fail its work once. A failed gate can therefore return the same step to its worker for another loop round.
+Each attempt can submit or fail its work once. A failed gate can return the step for another retry attempt.
 
-`ST_ATTEMPT` contains the current attempt or loop round. The step subject stays stable across all rounds.
+`ST_ATTEMPT` contains the current step attempt. The step subject stays stable across all attempts.
 
 A retryable failure does not terminate the mission before the next attempt.
 
@@ -640,6 +800,7 @@ st3 supplies these exact context names:
 | `ST_MISSION_RUN` | Stable mission run ID without the `mission-run/` prefix. |
 | `ST_RUN_GENERATION` | Current generation ID without the `run-generation/` prefix. |
 | `ST_ROOT_MISSION_RUN` | Full root `mission-run/...` subject. |
+| `ST_ROOT_MISSION_RUN_ID` | Root mission run ID without the `mission-run/` prefix. |
 | `ST_WORKSPACE` | Absolute run workspace. |
 | `ST_REQUESTER` | Normalized requester subject. |
 | `ST_STEP` | Step path in a step context. |
@@ -651,8 +812,14 @@ st3 supplies these exact context names:
 | `ST3_SUBJECT` | Full subject of the current runtime member. |
 | `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
 | `ST3_BIN` | Absolute path to the exact st3 executable that started the runtime. |
+| `ST_LOOP_ROUND` | Current loop round. It is present in loop child missions. |
+| `ST_LOOP_FEEDBACK` | Exact prior feedback document, or an empty value. |
+| `ST_LOOP_ITEM_ID` | Current for-each item ID, or an empty value. |
+| `ST_CANDIDATE_INDEX` | Current candidate index, or an empty value. |
 
 The mission and step values are available for `${NAME}` KDL interpolation when the current context defines them. Step members and running gates receive those values as environment variables.
+
+Loop KDL can also use `${loop.round}`, `${loop.feedback}`, `${loop.item.FIELD}`, and `${candidate.index}`.
 
 `ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 

@@ -576,6 +576,7 @@ pub(crate) fn mission_run_signature(runs: &[MissionRunView]) -> anyhow::Result<S
                 "generation": run.generation,
                 "status": run.status,
                 "phase": run.phase,
+                "loops": run.loops,
                 "steps": run.steps.iter().map(|step| serde_json::json!({
                     "subject": step.subject,
                     "status": step.status,
@@ -656,6 +657,41 @@ fn render_run_steps(
     );
     for step in roots {
         render_graph_step(output, step, indent, style);
+        if let Some(loop_run) = run.loops.iter().find(|loop_run| loop_run.path == step.step) {
+            let _ = write!(
+                output,
+                "{indent}  ↳ loop {} · {} · round {}/{}",
+                loop_run.mode,
+                style.status(&loop_run.status),
+                loop_run.round,
+                loop_run.max_rounds
+            );
+            if let Some(parallel) = loop_run.max_parallel {
+                let _ = write!(output, " · {parallel} parallel");
+            }
+            if let Some(items) = loop_run.item_count {
+                let _ = write!(output, " · {items} items");
+            }
+            if let Some(candidates) = loop_run.candidate_count {
+                let _ = write!(output, " · {candidates} candidates");
+            }
+            if let Some(winner) = loop_run.winner {
+                let _ = write!(output, " · winner {winner}");
+            }
+            let _ = writeln!(output);
+            if !loop_run.best_metrics.is_empty() {
+                let metrics = loop_run
+                    .best_metrics
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(output, "{indent}    best {metrics}");
+            }
+            if let Some(reason) = &loop_run.reason {
+                let _ = writeln!(output, "{indent}    {reason}");
+            }
+        }
         let prefix = format!("{}/", step.step);
         let nested = run
             .steps
@@ -859,7 +895,7 @@ fn relative_time(value: u128, now: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use st3::model::{MissionRunInput, UnderSpec};
+    use st3::model::{LoopRunView, MissionRunInput, UnderSpec};
 
     fn step(subject: &str, path: &str, status: &str) -> StepRunView {
         StepRunView {
@@ -924,6 +960,7 @@ mod tests {
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 2_000,
             steps,
+            loops: Vec::new(),
         }
     }
 
@@ -1061,6 +1098,38 @@ mod tests {
         assert!(rendered.contains("queue issues #1"));
         assert!(rendered.contains("↳ demo · completed · 1/1 completed"));
         assert!(!rendered.contains("publish — publish"));
+    }
+
+    #[test]
+    fn mission_view_shows_loop_progress_and_best_metrics() {
+        let loop_step = step("step-run/demo-generation/improve", "improve", "working");
+        let mut root = run("mission-run/demo/run", None, vec![loop_step]);
+        root.loops.push(LoopRunView {
+            subject: "loop-run/demo-generation/improve".into(),
+            id: "improve".into(),
+            path: "improve".into(),
+            step_run: "step-run/demo-generation/improve".into(),
+            mode: "best-of-n".into(),
+            status: "running".into(),
+            round: 2,
+            max_rounds: 5,
+            timeout_ms: Some(60_000),
+            max_parallel: Some(2),
+            item_count: None,
+            candidate_count: Some(3),
+            best_round: Some(1),
+            best_metrics: BTreeMap::from([("quality".into(), 0.75)]),
+            feedback: Some("doc/loop-feedback/example@hash".into()),
+            winner: Some(2),
+            reason: None,
+            results: Vec::new(),
+        });
+
+        let rendered = render_mission_run(&root, &[root.clone()], OutputStyle::plain(), 3_000);
+
+        assert!(rendered.contains("loop best-of-n · running · round 2/5"));
+        assert!(rendered.contains("2 parallel · 3 candidates · winner 2"));
+        assert!(rendered.contains("best quality=0.75"));
     }
 
     #[test]

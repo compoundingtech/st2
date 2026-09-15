@@ -6,9 +6,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, MissionInputKind, MissionInputSpec,
-    MissionSpec, MissionState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec,
-    UsedMissionSpec, WorkSelector,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopCandidateSelector,
+    LoopCandidatesSpec, LoopExhaustionSpec, LoopForEachSpec, LoopSpec, LoopStopSpec, MetricSource,
+    MetricSpec, MissionInputKind, MissionInputSpec, MissionSpec, MissionState, ProductSpec,
+    RetrySpec, RevisionCutover, St3Error, StepSpec, UsedMissionSpec, WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
@@ -17,6 +18,7 @@ const VARIABLES: &[&str] = &[
     "ST_MISSION_RUN",
     "ST_RUN_GENERATION",
     "ST_ROOT_MISSION_RUN",
+    "ST_ROOT_MISSION_RUN_ID",
     "ST_WORKSPACE",
     "ST_REQUESTER",
     "ST_STEP",
@@ -26,8 +28,21 @@ const VARIABLES: &[&str] = &[
     "ST_PARENT_STEP_RUN",
     "ST_GATE",
     "ST_AGENT",
+    "ST_LOOP_ROUND",
+    "ST_LOOP_FEEDBACK",
+    "ST_LOOP_ITEM_ID",
+    "ST_CANDIDATE_INDEX",
+    "loop.round",
+    "loop.feedback",
+    "loop.item.id",
+    "candidate.index",
     "PATH",
 ];
+
+pub(crate) const LOOP_ROUND_INPUT: &str = "__st3_loop_round";
+pub(crate) const LOOP_FEEDBACK_INPUT: &str = "__st3_loop_feedback";
+pub(crate) const LOOP_ITEM_INPUT: &str = "__st3_loop_item";
+pub(crate) const CANDIDATE_INDEX_INPUT: &str = "__st3_candidate_index";
 
 pub(crate) fn is_reserved_context_name(name: &str) -> bool {
     (VARIABLES.contains(&name) && name != "PATH") || name == "ST3_SUBJECT"
@@ -43,15 +58,43 @@ pub fn parse_missions(
 ) -> Result<BTreeMap<String, MissionSpec>, St3Error> {
     let mut missions = BTreeMap::new();
     let outer_owners = direct_agent_owners(document, default_host)?;
+    let mut top_level = Vec::new();
     for node in document.nodes() {
         if node.name().value() == "mission" {
-            insert_mission(
-                &mut missions,
-                parse_mission(node, outer_owners.clone(), default_host, true)?,
-            )?;
+            let mission = parse_mission(node, outer_owners.clone(), default_host, true)?;
+            top_level.push(mission.id.clone());
+            insert_mission(&mut missions, mission)?;
         }
     }
+    let mut embedded = Vec::new();
+    for id in top_level {
+        collect_embedded_missions(&missions[&id], &mut embedded);
+    }
+    for mission in embedded {
+        insert_mission(&mut missions, mission)?;
+    }
     Ok(missions)
+}
+
+fn collect_embedded_missions(mission: &MissionSpec, output: &mut Vec<MissionSpec>) {
+    for id in &mission.display_order {
+        let step = &mission.steps[id];
+        if let Some(loop_spec) = &step.loop_spec {
+            output.push((*loop_spec.round).clone());
+            collect_embedded_missions(&loop_spec.round, output);
+            if let Some(branch) = &loop_spec.on_keep {
+                output.push((**branch).clone());
+                collect_embedded_missions(branch, output);
+            }
+            if let Some(branch) = &loop_spec.on_discard {
+                output.push((**branch).clone());
+                collect_embedded_missions(branch, output);
+            }
+        }
+        if let Some(nested) = &step.nested_mission {
+            collect_embedded_missions(nested, output);
+        }
+    }
 }
 
 pub fn find_step<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a StepSpec> {
@@ -278,6 +321,16 @@ fn parse_mission(
                     display_order.push(step.id);
                 }
             }
+            "loop" => {
+                let step = parse_loop_group(child, &id, default_host, &inputs, timeout_ms)?;
+                if steps.insert(step.id.clone(), step.clone()).is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-step",
+                        format!("mission `{id}` repeats graph node `{}`", step.id),
+                    ));
+                }
+                display_order.push(step.id);
+            }
             "completion" => {
                 if completion.is_some() {
                     return Err(St3Error::new(
@@ -400,6 +453,692 @@ fn parse_mission(
     Ok(mission)
 }
 
+fn parse_loop_group(
+    node: &KdlNode,
+    parent_mission: &str,
+    default_host: &str,
+    inputs: &BTreeMap<String, MissionInputSpec>,
+    parent_timeout_ms: Option<u64>,
+) -> Result<StepSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["timeout", "for-each", "field", "max-parallel"])?;
+    let id = first_string(node)?;
+    validate_id(&id, "loop")?;
+    let path = id.clone();
+    let timeout_ms = property_string(node, "timeout")?
+        .map(|value| parse_duration(&value))
+        .transpose()?;
+    if timeout_ms == Some(0) {
+        return Err(St3Error::new(
+            "invalid-loop-timeout",
+            format!("loop `{id}` timeout must be greater than zero"),
+        ));
+    }
+    let for_each = match property_string(node, "for-each")? {
+        Some(resource) => {
+            if !resource.starts_with("resource/") && !resource.contains("${") {
+                return Err(St3Error::new(
+                    "invalid-loop-resource",
+                    format!("loop `{id}` for-each needs a resource subject"),
+                ));
+            }
+            let field = property_string(node, "field")?.ok_or_else(|| {
+                St3Error::new(
+                    "missing-loop-field",
+                    format!("loop `{id}` for-each needs a field property"),
+                )
+            })?;
+            let max_parallel = property_integer(node, "max-parallel")?.unwrap_or(1);
+            if !(1..=100).contains(&max_parallel) {
+                return Err(St3Error::new(
+                    "invalid-loop-parallelism",
+                    "loop max-parallel must be between 1 and 100",
+                ));
+            }
+            Some(LoopForEachSpec {
+                resource,
+                field,
+                max_parallel: max_parallel as u32,
+            })
+        }
+        None => {
+            if property_string(node, "field")?.is_some()
+                || property_integer(node, "max-parallel")?.is_some()
+            {
+                return Err(St3Error::new(
+                    "orphan-loop-property",
+                    format!("loop `{id}` uses field or max-parallel without for-each"),
+                ));
+            }
+            None
+        }
+    };
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-loop", format!("loop `{id}` is empty")))?;
+    let rounds = child_integer(body, "max-rounds")?
+        .ok_or_else(|| St3Error::new("missing-loop-rounds", "loop needs `max-rounds`"))?;
+    if !(1..=100).contains(&rounds) {
+        return Err(St3Error::new(
+            "invalid-loop-rounds",
+            "loop max-rounds must be between 1 and 100",
+        ));
+    }
+    let dependencies = body
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "depends-on")
+        .map(|child| parse_dependencies(child, default_host))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut metrics = Vec::new();
+    let mut metric_names = BTreeSet::new();
+    for child in body
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "metric")
+    {
+        let metric = parse_metric(child, default_host)?;
+        if !metric_names.insert(metric.name.clone()) {
+            return Err(St3Error::new(
+                "duplicate-loop-metric",
+                format!("loop `{id}` repeats metric `{}`", metric.name),
+            ));
+        }
+        metrics.push(metric);
+    }
+    let stop = body
+        .nodes()
+        .iter()
+        .find(|child| child.name().value() == "stop")
+        .map(|child| parse_loop_stop(child, &metric_names))
+        .transpose()?
+        .unwrap_or_default();
+    let until = body
+        .nodes()
+        .iter()
+        .find(|child| child.name().value() == "until")
+        .map(|child| parse_until(child, default_host))
+        .transpose()?
+        .unwrap_or_default();
+    for metric in &metrics {
+        if let MetricSource::Gate { gate } = &metric.source
+            && !until
+                .iter()
+                .any(|candidate| crate::graph::gate_name(candidate) == gate)
+        {
+            return Err(St3Error::new(
+                "unknown-metric-gate",
+                format!("metric `{}` names unknown gate `{gate}`", metric.name),
+            ));
+        }
+    }
+    let candidates = unique_named_child(body, "candidates")?
+        .map(|child| parse_loop_candidates(child, &metric_names, default_host))
+        .transpose()?;
+    if candidates.is_some() && for_each.is_some() {
+        return Err(St3Error::new(
+            "conflicting-loop-shape",
+            "a loop cannot use candidates and for-each together",
+        ));
+    }
+    let round_node = unique_named_child(body, "round")?.ok_or_else(|| {
+        St3Error::new(
+            "missing-loop-round",
+            format!("loop `{id}` needs one round block"),
+        )
+    })?;
+    let child_timeout_ms = [timeout_ms, parent_timeout_ms].into_iter().flatten().min();
+    let round = parse_embedded_mission(
+        round_node,
+        &format!("__st3/{parent_mission}/loop/{id}/round"),
+        default_host,
+        inputs,
+        child_timeout_ms,
+    )?;
+    if round.completion.is_none() {
+        return Err(St3Error::new(
+            "missing-round-completion",
+            format!("loop `{id}` round needs an explicit completion"),
+        ));
+    }
+    let keep_metric = unique_named_child(body, "keep-if")?
+        .map(|child| {
+            ensure_only_properties(child, &["metric"])?;
+            ensure_no_children(child)?;
+            property_string(child, "metric")?.ok_or_else(|| {
+                St3Error::new("missing-keep-metric", "keep-if needs a metric property")
+            })
+        })
+        .transpose()?;
+    if let Some(metric) = &keep_metric
+        && !metric_names.contains(metric)
+    {
+        return Err(St3Error::new(
+            "unknown-keep-metric",
+            format!("loop `{id}` keep-if names unknown metric `{metric}`"),
+        ));
+    }
+    let on_keep = parse_loop_branch(
+        body,
+        "on-keep",
+        parent_mission,
+        &id,
+        default_host,
+        inputs,
+        child_timeout_ms,
+    )?;
+    let on_discard = parse_loop_branch(
+        body,
+        "on-discard",
+        parent_mission,
+        &id,
+        default_host,
+        inputs,
+        child_timeout_ms,
+    )?;
+    if candidates.is_some() {
+        if keep_metric.is_some() {
+            return Err(St3Error::new(
+                "conflicting-candidate-keep-policy",
+                format!("loop `{id}` candidates use their selector instead of keep-if"),
+            ));
+        }
+        if on_keep.is_some() != on_discard.is_some() {
+            return Err(St3Error::new(
+                "incomplete-candidate-projection",
+                format!("loop `{id}` candidates need both on-keep and on-discard"),
+            ));
+        }
+    } else if keep_metric.is_some() != (on_keep.is_some() && on_discard.is_some()) {
+        return Err(St3Error::new(
+            "incomplete-keep-policy",
+            format!("loop `{id}` keep-if, on-keep, and on-discard must appear together"),
+        ));
+    }
+    let on_exhausted = unique_named_child(body, "on-exhausted")?
+        .map(|child| parse_loop_exhaustion(child, default_host))
+        .transpose()?
+        .unwrap_or_default();
+    for child in body.nodes() {
+        if !matches!(
+            child.name().value(),
+            "max-rounds"
+                | "depends-on"
+                | "metric"
+                | "stop"
+                | "until"
+                | "candidates"
+                | "round"
+                | "keep-if"
+                | "on-keep"
+                | "on-discard"
+                | "on-exhausted"
+        ) {
+            return Err(St3Error::new(
+                "invalid-loop-field",
+                format!("loop `{id}` cannot contain `{}`", child.name().value()),
+            ));
+        }
+    }
+    let loop_spec = LoopSpec {
+        id: id.clone(),
+        path: path.clone(),
+        max_rounds: rounds as u32,
+        timeout_ms,
+        for_each,
+        candidates,
+        metrics,
+        stop,
+        until,
+        round: Box::new(round),
+        keep_metric,
+        on_keep,
+        on_discard,
+        on_exhausted,
+    };
+    let mut step = StepSpec {
+        id,
+        path,
+        queue: None,
+        queue_position: None,
+        title: None,
+        goals: Vec::new(),
+        constraints: Vec::new(),
+        timeout_ms: None,
+        retry: RetrySpec {
+            attempts: rounds as u32,
+            backoff_ms: 0,
+        },
+        finally: false,
+        work_selector: Some(WorkSelector::Agentless),
+        revision_owners: Vec::new(),
+        revisions_human_only: false,
+        revision_reviewer: None,
+        dependencies,
+        baselines: Vec::new(),
+        documents: Vec::new(),
+        declarations_kdl: None,
+        products: Vec::new(),
+        produces_mission: None,
+        uses_mission: None,
+        gates: Vec::new(),
+        nested_mission: None,
+        loop_spec: Some(Box::new(loop_spec)),
+        definition_hash: String::new(),
+    };
+    step.definition_hash = hash(&step)?;
+    Ok(step)
+}
+
+fn parse_embedded_mission(
+    node: &KdlNode,
+    id: &str,
+    default_host: &str,
+    inputs: &BTreeMap<String, MissionInputSpec>,
+    timeout_ms: Option<u64>,
+) -> Result<MissionSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let mut body = KdlDocument::new();
+    for input in inputs.values() {
+        let mut input_node = KdlNode::new("input");
+        input_node
+            .entries_mut()
+            .push(kdl::KdlEntry::new(input.name.as_str()));
+        input_node.entries_mut().push(kdl::KdlEntry::new_prop(
+            "kind",
+            match input.kind {
+                MissionInputKind::Text => "text",
+                MissionInputKind::Resource => "resource",
+            },
+        ));
+        body.nodes_mut().push(input_node);
+    }
+    for name in [
+        LOOP_ROUND_INPUT,
+        LOOP_FEEDBACK_INPUT,
+        LOOP_ITEM_INPUT,
+        CANDIDATE_INDEX_INPUT,
+    ] {
+        let mut input_node = KdlNode::new("input");
+        input_node.entries_mut().push(kdl::KdlEntry::new(name));
+        input_node
+            .entries_mut()
+            .push(kdl::KdlEntry::new_prop("kind", "text"));
+        body.nodes_mut().push(input_node);
+    }
+    let mut goal = KdlNode::new("goal");
+    goal.entries_mut()
+        .push(kdl::KdlEntry::new("Execute one bounded graph iteration."));
+    body.nodes_mut().push(goal);
+    let children = node.children().ok_or_else(|| {
+        St3Error::new(
+            "empty-embedded-mission",
+            format!("`{}` has no body", node.name().value()),
+        )
+    })?;
+    body.nodes_mut().extend(children.nodes().iter().cloned());
+    let mut mission = KdlNode::new("mission");
+    mission.entries_mut().push(kdl::KdlEntry::new(id));
+    mission.set_children(body);
+    let mut parsed = parse_mission(&mission, Vec::new(), default_host, false)?;
+    parsed.max_active_runs = None;
+    parsed.timeout_ms = timeout_ms;
+    parsed.revision.clear();
+    parsed.revision = hash(&parsed)?;
+    Ok(parsed)
+}
+
+fn parse_loop_branch(
+    body: &KdlDocument,
+    name: &str,
+    parent_mission: &str,
+    loop_id: &str,
+    default_host: &str,
+    inputs: &BTreeMap<String, MissionInputSpec>,
+    timeout_ms: Option<u64>,
+) -> Result<Option<Box<MissionSpec>>, St3Error> {
+    unique_named_child(body, name)?
+        .map(|node| {
+            let mission = parse_embedded_mission(
+                node,
+                &format!("__st3/{parent_mission}/loop/{loop_id}/{name}"),
+                default_host,
+                inputs,
+                timeout_ms,
+            )?;
+            if mission.completion.is_none() {
+                return Err(St3Error::new(
+                    "missing-branch-completion",
+                    format!("loop `{loop_id}` {name} needs an explicit completion"),
+                ));
+            }
+            Ok(Box::new(mission))
+        })
+        .transpose()
+}
+
+fn parse_until(node: &KdlNode, default_host: &str) -> Result<Vec<GateSpec>, St3Error> {
+    ensure_bare(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-loop-until", "until is empty"))?;
+    if body.nodes().is_empty() {
+        return Err(St3Error::new("empty-loop-until", "until is empty"));
+    }
+    let mut names = BTreeSet::new();
+    body.nodes()
+        .iter()
+        .map(|child| {
+            if child.name().value() != "gate" {
+                return Err(St3Error::new(
+                    "invalid-loop-until",
+                    "until accepts only gate blocks",
+                ));
+            }
+            let gate = crate::graph::parse_gate(child, default_host)?;
+            if !names.insert(crate::graph::gate_name(&gate).to_owned()) {
+                return Err(St3Error::new("duplicate-gate", "an until gate repeats"));
+            }
+            Ok(gate)
+        })
+        .collect()
+}
+
+fn parse_metric(node: &KdlNode, default_host: &str) -> Result<MetricSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["direction", "min-improvement"])?;
+    let name = first_string(node)?;
+    validate_id(&name, "metric")?;
+    let direction = property_string(node, "direction")?.ok_or_else(|| {
+        St3Error::new(
+            "missing-metric-direction",
+            format!("metric `{name}` needs direction"),
+        )
+    })?;
+    if !matches!(direction.as_str(), "higher" | "lower") {
+        return Err(St3Error::new(
+            "invalid-metric-direction",
+            "metric direction must be higher or lower",
+        ));
+    }
+    let min_improvement = property_number(node, "min-improvement")?.unwrap_or(0.0);
+    if !min_improvement.is_finite() || min_improvement < 0.0 {
+        return Err(St3Error::new(
+            "invalid-metric-improvement",
+            "metric min-improvement must be a finite non-negative number",
+        ));
+    }
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-metric", format!("metric `{name}` is empty")))?;
+    if body.nodes().len() != 1 {
+        return Err(St3Error::new(
+            "invalid-metric-source",
+            format!("metric `{name}` needs exactly one source"),
+        ));
+    }
+    let source = &body.nodes()[0];
+    let source = match source.name().value() {
+        "from-gate" => MetricSource::Gate {
+            gate: first_string(source)?,
+        },
+        "field" => {
+            let values = positional_strings(source)?;
+            if values.len() != 2 {
+                return Err(St3Error::new(
+                    "invalid-metric-field",
+                    "a metric field needs a path and a resource subject",
+                ));
+            }
+            MetricSource::Field {
+                path: values[0].clone(),
+                subject: values[1].clone(),
+            }
+        }
+        "exec" => {
+            let command = first_string(source)?;
+            let source_body = source.children().ok_or_else(|| {
+                St3Error::new("missing-metric-exec-body", "a metric exec needs a body")
+            })?;
+            MetricSource::Exec {
+                command,
+                host: placement_host_for_mission(
+                    child_string(source_body, "host")?.ok_or_else(|| {
+                        St3Error::new("missing-metric-host", "a metric exec needs host")
+                    })?,
+                    default_host,
+                ),
+                workspace: child_string(source_body, "workspace")?.ok_or_else(|| {
+                    St3Error::new("missing-metric-workspace", "a metric exec needs workspace")
+                })?,
+                environment: parse_string_map(source_body, "env")?,
+                time_limit_ms: child_string(source_body, "time-limit")?
+                    .map(|value| parse_duration(&value))
+                    .transpose()?
+                    .unwrap_or(120_000),
+            }
+        }
+        other => {
+            return Err(St3Error::new(
+                "invalid-metric-source",
+                format!("metric `{name}` cannot use `{other}`"),
+            ));
+        }
+    };
+    Ok(MetricSpec {
+        name,
+        direction,
+        min_improvement,
+        source,
+    })
+}
+
+fn parse_loop_stop(node: &KdlNode, metrics: &BTreeSet<String>) -> Result<LoopStopSpec, St3Error> {
+    ensure_bare(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-loop-stop", "stop is empty"))?;
+    let mut stop = LoopStopSpec::default();
+    for child in body.nodes() {
+        match child.name().value() {
+            "plateau" => {
+                ensure_only_properties(child, &["metric", "rounds"])?;
+                let metric = property_string(child, "metric")?.ok_or_else(|| {
+                    St3Error::new("missing-plateau-metric", "plateau needs metric")
+                })?;
+                if !metrics.contains(&metric) {
+                    return Err(St3Error::new(
+                        "unknown-plateau-metric",
+                        format!("plateau names unknown metric `{metric}`"),
+                    ));
+                }
+                let rounds = property_integer(child, "rounds")?.ok_or_else(|| {
+                    St3Error::new("missing-plateau-rounds", "plateau needs rounds")
+                })?;
+                if !(1..=100).contains(&rounds) {
+                    return Err(St3Error::new(
+                        "invalid-plateau-rounds",
+                        "plateau rounds must be between 1 and 100",
+                    ));
+                }
+                if stop.plateau_metric.replace(metric).is_some() {
+                    return Err(St3Error::new("duplicate-plateau", "plateau repeats"));
+                }
+                stop.plateau_rounds = Some(rounds as u32);
+            }
+            "repeated-failure" => {
+                let value = child_integer_value(child)?;
+                if !(2..=100).contains(&value) {
+                    return Err(St3Error::new(
+                        "invalid-repeated-failure",
+                        "repeated-failure must be between 2 and 100",
+                    ));
+                }
+                if stop.repeated_failure.replace(value as u32).is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-repeated-failure",
+                        "repeated-failure repeats",
+                    ));
+                }
+            }
+            "token-budget" => {
+                let value = child_integer_value(child)?;
+                if value <= 0 {
+                    return Err(St3Error::new(
+                        "invalid-loop-token-budget",
+                        "a loop token budget must be positive",
+                    ));
+                }
+                if stop.token_budget.replace(value as u64).is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-loop-token-budget",
+                        "token-budget repeats",
+                    ));
+                }
+            }
+            other => {
+                return Err(St3Error::new(
+                    "invalid-loop-stop",
+                    format!("stop cannot contain `{other}`"),
+                ));
+            }
+        }
+    }
+    Ok(stop)
+}
+
+fn parse_loop_exhaustion(
+    node: &KdlNode,
+    default_host: &str,
+) -> Result<LoopExhaustionSpec, St3Error> {
+    ensure_bare(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-loop-exhaustion", "on-exhausted is empty"))?;
+    if body.nodes().len() != 1 {
+        return Err(St3Error::new(
+            "invalid-loop-exhaustion",
+            "on-exhausted needs one fail, succeed, or human gate",
+        ));
+    }
+    let child = &body.nodes()[0];
+    match child.name().value() {
+        "fail" => {
+            ensure_bare(child)?;
+            Ok(LoopExhaustionSpec::Fail)
+        }
+        "succeed" => {
+            ensure_bare(child)?;
+            Ok(LoopExhaustionSpec::Succeed)
+        }
+        "gate" => match crate::graph::parse_gate(child, default_host)? {
+            gate @ GateSpec::Human { .. } => Ok(LoopExhaustionSpec::Human { gate }),
+            _ => Err(St3Error::new(
+                "invalid-loop-exhaustion-gate",
+                "on-exhausted accepts only a human gate",
+            )),
+        },
+        _ => Err(St3Error::new(
+            "invalid-loop-exhaustion",
+            "on-exhausted needs one fail, succeed, or human gate",
+        )),
+    }
+}
+
+fn parse_loop_candidates(
+    node: &KdlNode,
+    metrics: &BTreeSet<String>,
+    default_host: &str,
+) -> Result<LoopCandidatesSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["max-parallel"])?;
+    let count = first_integer_value(node)?;
+    if !(2..=16).contains(&count) {
+        return Err(St3Error::new(
+            "invalid-candidate-count",
+            "candidate count must be between 2 and 16",
+        ));
+    }
+    let max_parallel = property_integer(node, "max-parallel")?.unwrap_or(1);
+    if !(1..=16).contains(&max_parallel) || max_parallel > count {
+        return Err(St3Error::new(
+            "invalid-candidate-parallelism",
+            "candidate max-parallel must be positive and cannot exceed count",
+        ));
+    }
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-candidate-selector", "candidates needs select"))?;
+    let select = unique_named_child(body, "select")?
+        .ok_or_else(|| St3Error::new("missing-candidate-selector", "candidates needs select"))?;
+    if body.nodes().len() != 1 {
+        return Err(St3Error::new(
+            "invalid-candidate-selector",
+            "candidates accepts only one select",
+        ));
+    }
+    let selector = if let Some(metric) = property_string(select, "metric")? {
+        ensure_only_properties(select, &["metric"])?;
+        ensure_no_children(select)?;
+        if !metrics.contains(&metric) {
+            return Err(St3Error::new(
+                "unknown-candidate-metric",
+                format!("candidate selector names unknown metric `{metric}`"),
+            ));
+        }
+        LoopCandidateSelector::Metric { metric }
+    } else {
+        ensure_bare(select)?;
+        let children = select
+            .children()
+            .ok_or_else(|| St3Error::new("missing-candidate-selector", "select needs one gate"))?;
+        if children.nodes().len() != 1 || children.nodes()[0].name().value() != "gate" {
+            return Err(St3Error::new(
+                "invalid-candidate-selector",
+                "select needs one LLM or human gate",
+            ));
+        }
+        let gate = crate::graph::parse_gate(&children.nodes()[0], default_host)?;
+        match gate {
+            gate @ GateSpec::Llm { .. } => LoopCandidateSelector::Llm { gate },
+            gate @ GateSpec::Human { .. } => LoopCandidateSelector::Human { gate },
+            _ => {
+                return Err(St3Error::new(
+                    "invalid-candidate-selector",
+                    "select accepts only a metric, LLM gate, or human gate",
+                ));
+            }
+        }
+    };
+    Ok(LoopCandidatesSpec {
+        count: count as u32,
+        max_parallel: max_parallel as u32,
+        select: selector,
+    })
+}
+
+fn unique_named_child<'a>(
+    body: &'a KdlDocument,
+    name: &str,
+) -> Result<Option<&'a KdlNode>, St3Error> {
+    let found = body
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == name)
+        .collect::<Vec<_>>();
+    if found.len() > 1 {
+        return Err(St3Error::new(
+            "duplicate-field",
+            format!("`{name}` repeats"),
+        ));
+    }
+    Ok(found.first().copied())
+}
+
 fn parse_step(
     node: &KdlNode,
     parent_path: &str,
@@ -437,8 +1176,6 @@ fn parse_step(
     let mut gates = Vec::new();
     let mut nested_mission = None;
     let mut retry = RetrySpec::default();
-    let mut retry_seen = false;
-    let mut looping = false;
     let mut revision_owners = Vec::new();
     if let Some(children) = node.children() {
         let mut names = BTreeSet::new();
@@ -541,24 +1278,15 @@ fn parse_step(
                     nested_mission = Some(Box::new(mission));
                 }
                 "retry" => {
-                    if looping {
-                        return Err(St3Error::new(
-                            "conflicting-step-repeat",
-                            format!("step `{path}` cannot contain both `retry` and `loop`"),
-                        ));
-                    }
                     retry = parse_retry(child)?;
-                    retry_seen = true;
                 }
                 "loop" => {
-                    if retry_seen {
-                        return Err(St3Error::new(
-                            "conflicting-step-repeat",
-                            format!("step `{path}` cannot contain both `retry` and `loop`"),
-                        ));
-                    }
-                    retry = parse_loop(child)?;
-                    looping = true;
+                    return Err(St3Error::new(
+                        "loop-is-graph-node",
+                        format!(
+                            "step `{path}` cannot contain `loop`; declare a named loop beside the step"
+                        ),
+                    ));
                 }
                 other => {
                     return Err(St3Error::new(
@@ -568,12 +1296,6 @@ fn parse_step(
                 }
             }
         }
-    }
-    if looping && gates.is_empty() {
-        return Err(St3Error::new(
-            "loop-without-gate",
-            format!("step `{path}` loop needs at least one gate"),
-        ));
     }
     validate_goal_count(&format!("step `{path}`"), &goals, false)?;
     let work_selector = build_work_selector(
@@ -607,6 +1329,7 @@ fn parse_step(
         uses_mission,
         gates,
         nested_mission,
+        loop_spec: None,
         definition_hash: String::new(),
     };
     validate_variables(&serde_json::to_value(&step).map_err(internal)?, input_names)?;
@@ -1294,37 +2017,6 @@ fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
     })
 }
 
-fn parse_loop(node: &KdlNode) -> Result<RetrySpec, St3Error> {
-    ensure_bare(node)?;
-    let body = node
-        .children()
-        .ok_or_else(|| St3Error::new("empty-loop", "loop is empty"))?;
-    for child in body.nodes() {
-        if !matches!(child.name().value(), "max-rounds" | "backoff") {
-            return Err(St3Error::new(
-                "invalid-loop-field",
-                format!("loop cannot contain `{}`", child.name().value()),
-            ));
-        }
-    }
-    let rounds = child_integer(body, "max-rounds")?
-        .ok_or_else(|| St3Error::new("missing-loop-rounds", "loop needs `max-rounds`"))?;
-    if !(2..=100).contains(&rounds) {
-        return Err(St3Error::new(
-            "invalid-loop-rounds",
-            "loop max-rounds must be between 2 and 100",
-        ));
-    }
-    let backoff_ms = child_string(body, "backoff")?
-        .map(|value| parse_duration(&value))
-        .transpose()?
-        .unwrap_or(0);
-    Ok(RetrySpec {
-        attempts: rounds as u32,
-        backoff_ms,
-    })
-}
-
 fn validate_dependencies(
     mission: &str,
     steps: &BTreeMap<String, StepSpec>,
@@ -1455,18 +2147,25 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
             ));
         };
         let name = &tail[..end];
-        if !VARIABLES.contains(&name) && !name.starts_with("input.") {
+        if !registered_variable(name) && !name.starts_with("input.") {
             return Err(St3Error::new(
                 "unknown-variable",
                 format!("variable `{name}` is not registered"),
             ));
         }
-        let value = variables.get(name).ok_or_else(|| {
-            St3Error::new(
-                "unavailable-variable",
-                format!("variable `{name}` is not available in this phase"),
-            )
-        })?;
+        let value = variables
+            .get(name)
+            .or_else(|| {
+                name.starts_with("loop.item.")
+                    .then(|| variables.get("loop.item.*"))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                St3Error::new(
+                    "unavailable-variable",
+                    format!("variable `{name}` is not available in this phase"),
+                )
+            })?;
         output.push_str(value);
         rest = &tail[end + 1..];
     }
@@ -1521,7 +2220,7 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
                 let declared_input = name
                     .strip_prefix("input.")
                     .is_some_and(|name| input_names.contains(name));
-                if !VARIABLES.contains(&name) && !declared_input {
+                if !registered_variable(name) && !declared_input {
                     return Err(St3Error::new(
                         "unknown-variable",
                         format!("variable `{name}` is not registered"),
@@ -1543,6 +2242,10 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+fn registered_variable(name: &str) -> bool {
+    VARIABLES.contains(&name) || name.starts_with("loop.item.")
 }
 
 fn parse_mission_state(value: &str) -> Result<MissionState, St3Error> {
@@ -1729,6 +2432,109 @@ fn property_string(node: &KdlNode, name: &str) -> Result<Option<String>, St3Erro
     }
 }
 
+fn property_integer(node: &KdlNode, name: &str) -> Result<Option<i64>, St3Error> {
+    match node.get(name) {
+        None => Ok(None),
+        Some(KdlValue::Integer(value)) => i64::try_from(*value).map(Some).map_err(|_| {
+            St3Error::new(
+                "invalid-property",
+                format!("property `{name}` is too large"),
+            )
+        }),
+        Some(_) => Err(St3Error::new(
+            "invalid-property",
+            format!("property `{name}` must be an integer"),
+        )),
+    }
+}
+
+fn property_number(node: &KdlNode, name: &str) -> Result<Option<f64>, St3Error> {
+    match node.get(name) {
+        None => Ok(None),
+        Some(KdlValue::Float(value)) => Ok(Some(*value)),
+        Some(KdlValue::Integer(value)) => Ok(Some(*value as f64)),
+        Some(_) => Err(St3Error::new(
+            "invalid-property",
+            format!("property `{name}` must be a number"),
+        )),
+    }
+}
+
+fn child_integer_value(node: &KdlNode) -> Result<i64, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    ensure_no_children(node)?;
+    if node.entries().len() != 1 {
+        return Err(St3Error::new(
+            "invalid-field",
+            format!("`{}` needs one integer", node.name().value()),
+        ));
+    }
+    match node.entries()[0].value() {
+        KdlValue::Integer(value) => i64::try_from(*value)
+            .map_err(|_| St3Error::new("invalid-field", "an integer is too large")),
+        _ => Err(St3Error::new(
+            "invalid-field",
+            format!("`{}` needs one integer", node.name().value()),
+        )),
+    }
+}
+
+fn first_integer_value(node: &KdlNode) -> Result<i64, St3Error> {
+    let values = node
+        .entries()
+        .iter()
+        .filter(|entry| entry.name().is_none())
+        .collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(St3Error::new(
+            "invalid-field",
+            format!("`{}` needs one integer value", node.name().value()),
+        ));
+    }
+    match values[0].value() {
+        KdlValue::Integer(value) => i64::try_from(*value)
+            .map_err(|_| St3Error::new("invalid-field", "an integer is too large")),
+        _ => Err(St3Error::new(
+            "invalid-field",
+            format!("`{}` needs one integer value", node.name().value()),
+        )),
+    }
+}
+
+fn placement_host_for_mission(host: String, default_host: &str) -> String {
+    if host == "local" {
+        default_host.into()
+    } else {
+        host
+    }
+}
+
+fn parse_string_map(
+    document: &KdlDocument,
+    name: &str,
+) -> Result<BTreeMap<String, String>, St3Error> {
+    let Some(node) = unique_named_child(document, name)? else {
+        return Ok(BTreeMap::new());
+    };
+    ensure_bare(node)?;
+    let Some(children) = node.children() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut output = BTreeMap::new();
+    for child in children.nodes() {
+        let key = child.name().value().to_owned();
+        let value = first_string(child)?;
+        if output.insert(key.clone(), value).is_some() {
+            return Err(St3Error::new(
+                "duplicate-map-key",
+                format!("map key `{key}` repeats"),
+            ));
+        }
+    }
+    Ok(output)
+}
+
 fn child_string(document: &KdlDocument, name: &str) -> Result<Option<String>, St3Error> {
     let nodes = document
         .nodes()
@@ -1793,59 +2599,154 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn step_loops_use_one_bounded_repeat_policy() {
+    fn first_class_loops_have_bounded_child_mission_rounds() {
         let source = r#"
 version 2
 
 mission "loop" state="ready" {
-  goal "Repeat one step until its gate passes."
-  step "improve" {
-    loop { max-rounds 4; backoff "2s" }
-    gate "the result is ready" { exists "resource/result" }
+  goal "Repeat a graph until its gate passes."
+  completion { when "all-steps-exhausted" }
+  loop "improve" timeout="2h" {
+    max-rounds 4
+    until { gate "the result is ready" { exists "resource/result" } }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { agentless }
+    }
   }
 }
 "#;
         let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let retry = &intent.missions["loop"].steps["improve"].retry;
+        let step = &intent.missions["loop"].steps["improve"];
+        let retry = &step.retry;
         assert_eq!(retry.attempts, 4);
-        assert_eq!(retry.backoff_ms, 2_000);
+        let loop_spec = step.loop_spec.as_ref().unwrap();
+        assert_eq!(loop_spec.max_rounds, 4);
+        assert_eq!(loop_spec.timeout_ms, Some(7_200_000));
+        assert_eq!(loop_spec.round.timeout_ms, Some(7_200_000));
+        assert_eq!(loop_spec.round.steps.len(), 1);
+        assert!(intent.missions.contains_key(&loop_spec.round.id));
+
+        let source = r#"
+version 2
+mission "eval-loop" state="ready" timeout="20m" {
+  goal "Bound every generated eval mission."
+  loop "work" {
+    max-rounds 2
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let loop_spec = intent.missions["eval-loop"].steps["work"]
+            .loop_spec
+            .as_ref()
+            .unwrap();
+        assert_eq!(loop_spec.round.timeout_ms, Some(1_200_000));
 
         for (source, code) in [
             (
                 r#"version 2
 mission "bad" state="ready" {
   goal "Reject an unbounded loop."
-  step "work" { loop { backoff "1s" }; gate "ready" { exists "resource/result" } }
+  loop "work" { round { completion { when "all-steps-exhausted" } } }
 }"#,
                 "missing-loop-rounds",
             ),
             (
                 r#"version 2
 mission "bad" state="ready" {
-  goal "Reject a one-round loop."
-  step "work" { loop { max-rounds 1 }; gate "ready" { exists "resource/result" } }
+  goal "Reject a zero-round loop."
+  loop "work" { max-rounds 0; round { completion { when "all-steps-exhausted" } } }
 }"#,
                 "invalid-loop-rounds",
             ),
             (
                 r#"version 2
 mission "bad" state="ready" {
-  goal "Reject a loop without a gate."
-  step "work" { loop { max-rounds 2 } }
+  goal "Reject a loop without a round completion."
+  loop "work" { max-rounds 2; round { step "one" { agentless } } }
 }"#,
-                "loop-without-gate",
+                "missing-round-completion",
             ),
             (
                 r#"version 2
 mission "bad" state="ready" {
-  goal "Reject two repeat policies."
-  step "work" {
-    retry { attempts 2 }
-    loop { max-rounds 2 }
-    gate "ready" { exists "resource/result" }
-  }
+  goal "Reject the removed step loop."
+  step "work" { loop { max-rounds 2 } }
 }"#,
-                "conflicting-step-repeat",
+                "loop-is-graph-node",
+            ),
+        ] {
+            assert_eq!(
+                crate::graph::parse_intent(source, "node").unwrap_err().code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn loop_collection_modes_have_strict_bounds_and_selectors() {
+        let source = r#"
+version 2
+resource "items" { kind "custom.test.items" }
+mission "collections" state="ready" {
+  goal "Exercise both collection loop forms."
+  loop "items" for-each="resource/items" field="values" {
+    max-rounds 100
+    round {
+      completion { when "all-steps-exhausted" }
+      step "read" { agentless; goal "Read ${loop.item.name}." }
+    }
+  }
+  loop "candidates" {
+    max-rounds 1
+    metric "quality" direction="higher" { field "score" "resource/candidate-${candidate.index}" }
+    candidates 3 { select metric="quality" }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "create" { agentless; goal "Create candidate ${candidate.index}." }
+    }
+    on-keep { completion { when "all-steps-exhausted" }; step "keep" { agentless } }
+    on-discard { completion { when "all-steps-exhausted" }; step "discard" { agentless } }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let mission = &intent.missions["collections"];
+        let for_each = mission.steps["items"]
+            .loop_spec
+            .as_ref()
+            .unwrap()
+            .for_each
+            .as_ref()
+            .unwrap();
+        assert_eq!(for_each.max_parallel, 1);
+        let candidates = mission.steps["candidates"]
+            .loop_spec
+            .as_ref()
+            .unwrap()
+            .candidates
+            .as_ref()
+            .unwrap();
+        assert_eq!(candidates.count, 3);
+        assert_eq!(candidates.max_parallel, 1);
+
+        for (source, code) in [
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject too many candidates."; loop "choose" { max-rounds 1; candidates 17 { select { gate "pick" type="human" { reviewer "person/operator" } } }; round { completion { when "all-steps-exhausted" } } } }"#,
+                "invalid-candidate-count",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject conflicting collections."; loop "choose" for-each="resource/items" field="values" { max-rounds 1; candidates 2 { select { gate "pick" type="human" { reviewer "person/operator" } } }; round { completion { when "all-steps-exhausted" } } } }"#,
+                "conflicting-loop-shape",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject a missing metric."; loop "choose" { max-rounds 1; candidates 2 { select metric="missing" }; round { completion { when "all-steps-exhausted" } } } }"#,
+                "unknown-candidate-metric",
             ),
         ] {
             assert_eq!(
