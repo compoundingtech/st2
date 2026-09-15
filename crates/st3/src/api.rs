@@ -4823,9 +4823,11 @@ async fn terminal_session(
             "the terminal incarnation changed before attachment",
         )));
     }
-    Ok(websocket.on_upgrade(move |socket| {
-        terminal_proxy(socket, state, subject, runtime_id, current_incarnation)
-    }))
+    Ok(websocket
+        .protocols(["st3.terminal.v1"])
+        .on_upgrade(move |socket| {
+            terminal_proxy(socket, state, subject, runtime_id, current_incarnation)
+        }))
 }
 
 async fn terminal_proxy(
@@ -4958,6 +4960,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     fn state(root: &Path) -> AppState {
         AppState {
@@ -7607,6 +7610,29 @@ version 2
                 .unwrap()
                 .contains("capability=")
         );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app).await.unwrap();
+        });
+        let mut request = format!(
+            "ws://{address}{}",
+            attachment["websocket_path"].as_str().unwrap()
+        )
+        .into_client_request()
+        .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "st3.terminal.v1".parse().unwrap());
+        let (mut websocket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").unwrap(),
+            "st3.terminal.v1"
+        );
+        let _ = websocket.close(None).await;
+        server.abort();
 
         let (status, error) = json_request(
             app,
