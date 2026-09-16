@@ -5948,11 +5948,17 @@ fn expand_gate(
         Ok(())
     };
     match gate {
-        GateSpec::Exists { subject, .. }
-        | GateSpec::Empty { subject, .. }
-        | GateSpec::Field { subject, .. }
-        | GateSpec::Has { subject, .. }
-        | GateSpec::Lacks { subject, .. } => expand(subject)?,
+        GateSpec::Exists { subject, .. } | GateSpec::Empty { subject, .. } => expand(subject)?,
+        GateSpec::Field { subject, value, .. } => {
+            expand(subject)?;
+            if let Value::String(value) = value {
+                expand(value)?;
+            }
+        }
+        GateSpec::Has { subject, text, .. } | GateSpec::Lacks { subject, text, .. } => {
+            expand(subject)?;
+            expand(text)?;
+        }
         GateSpec::Mechanical {
             name,
             command,
@@ -9725,10 +9731,11 @@ version 2
 resource "loop-result" { kind "custom.test.loop-result" }
 mission "loop" state="ready" {
   goal "Repeat a bounded graph until its result is ready."
+  input "expected" kind="text"
   completion { when "all-steps-exhausted" }
   loop "improve" {
     max-rounds 3
-    until { gate "ready" { field "state" "resource/loop-result" is "ready" } }
+    until { gate "ready" { field "state" "resource/loop-result" is "${input.expected}" } }
     round {
       completion { when "all-steps-exhausted" }
       step "work" {
@@ -9748,7 +9755,7 @@ mission "loop" state="ready" {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
-                inputs: BTreeMap::new(),
+                inputs: BTreeMap::from([("expected".into(), "ready".into())]),
                 idempotency_key: "first-class-loop-run".into(),
             })
             .unwrap();
