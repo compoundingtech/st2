@@ -782,6 +782,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
             "A human review of another graph subject.",
             &[
                 ("target", reference()),
+                ("document", string()),
                 ("reviewer", reference()),
                 (
                     "decision",
@@ -2267,6 +2268,21 @@ mod tests {
                 "vcs.pull-request",
                 "vcs.ref",
                 "vcs.repository",
+            ]
+        );
+        assert_eq!(
+            registry.resources["human.review"]
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "decision",
+                "document",
+                "reason",
+                "reviewer",
+                "submitted_at",
+                "target"
             ]
         );
         assert_eq!(
