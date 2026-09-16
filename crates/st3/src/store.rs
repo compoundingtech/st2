@@ -3932,8 +3932,13 @@ impl Store {
                         desired.kind,
                         revision,
                         claim_id,
-                        serde_json::to_string(&desired.desired).map_err(internal)?,
-                        desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
+                        canonical_json_text(&desired.desired).map_err(internal)?,
+                        desired
+                            .member
+                            .as_ref()
+                            .map(canonical_serialized_json_text)
+                            .transpose()
+                            .map_err(internal)?,
                         desired.owner_run,
                         desired.owner_generation,
                         desired.owner_step,
@@ -6458,13 +6463,24 @@ impl Store {
             if !replacement_exists {
                 continue;
             }
+            let repaired_claim = transaction
+                .query_row(
+                    "SELECT claim_id FROM replica_records WHERE record_ref=?1",
+                    [record_ref],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
             changed += transaction.execute(
                 "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
                     error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
-                 WHERE record_ref=?1 AND state IN ('invalid','unknown','repaired')
+                 WHERE record_ref=?1 AND state IN ('valid','invalid','unknown','repaired')
                    AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
                 params![record_ref, replacement, now_ms().to_string()],
             )?;
+            if let Some(repaired_claim) = repaired_claim {
+                select_desired_repair_tx(&transaction, &repaired_claim, replacement)?;
+            }
             transaction.execute(
                 "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
                  VALUES (?1, 'healthy', ?2, ?3)
@@ -6542,6 +6558,7 @@ impl Store {
             idempotency_key: Some(idempotency_key.into()),
         })?;
         self.apply_replication_repairs().map_err(internal)?;
+        self.project_replication_backlog().map_err(internal)?;
         Ok(claim)
     }
 
@@ -6863,7 +6880,7 @@ impl Store {
                             claim.kind,
                             claim.origin,
                             claim.actor,
-                            serde_json::to_string(&claim.body).map_err(internal)?,
+                            canonical_json_text(&claim.body).map_err(internal)?,
                             serde_json::to_string(&claim.predecessors).map_err(internal)?,
                             claim.accepted_at_unix_ms.to_string(),
                         ],
@@ -8427,7 +8444,13 @@ fn desired_row_at(
     };
     let mut statement = connection.prepare(
         "SELECT id, body, predecessors FROM claims
-         WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2 ORDER BY store_index",
+         WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY store_index",
     )?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
@@ -8466,10 +8489,10 @@ fn desired_row_at(
                 kind: desired.kind,
                 revision,
                 claim_id,
-                body: serde_json::to_string(&desired.desired)?,
+                body: canonical_json_text(&desired.desired)?,
                 member: desired
                     .member
-                    .map(|member| serde_json::to_string(&member))
+                    .map(|member| canonical_serialized_json_text(&member))
                     .transpose()?,
                 owner_run: desired.owner_run,
             })
@@ -9468,7 +9491,7 @@ fn insert_claim(
             kind,
             origin,
             actor,
-            serde_json::to_string(body)?,
+            canonical_json_text(body)?,
             serde_json::to_string(predecessors)?,
             now.to_string(),
         ],
@@ -9485,7 +9508,7 @@ fn insert_event(
 ) -> Result<()> {
     transaction.execute(
         "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (?1, ?2, ?3, ?4)",
-        params![store_index, kind, subject, serde_json::to_string(body)?],
+        params![store_index, kind, subject, canonical_json_text(body)?],
     )?;
     Ok(())
 }
@@ -9633,7 +9656,14 @@ fn desired_conflicts_at(
 ) -> Result<Vec<String>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare(
-        "SELECT id, predecessors FROM claims WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2 ORDER BY store_index",
+        "SELECT id, predecessors FROM claims
+         WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY store_index",
     )?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
@@ -9655,7 +9685,14 @@ fn desired_conflicts_at(
 
 fn intent_leaves_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Vec<String>> {
     let mut statement = transaction.prepare(
-        "SELECT id, predecessors FROM claims WHERE subject=?1 AND kind='intent.desired' ORDER BY id",
+        "SELECT id, predecessors FROM claims
+         WHERE subject=?1 AND kind='intent.desired'
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY id",
     )?;
     let rows = statement
         .query_map([subject], |row| {
@@ -9698,7 +9735,13 @@ fn intent_leaves_at(
     let through = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare(
         "SELECT id, predecessors FROM claims
-         WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2 ORDER BY id",
+         WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY id",
     )?;
     let rows = statement
         .query_map(params![subject, through], |row| {
@@ -10275,6 +10318,14 @@ fn canonical_json_value(value: &Value) -> Value {
         }
         _ => value.clone(),
     }
+}
+
+fn canonical_json_text(value: &Value) -> Result<String> {
+    Ok(serde_json::to_string(&canonical_json_value(value))?)
+}
+
+fn canonical_serialized_json_text(value: &impl Serialize) -> Result<String> {
+    canonical_json_text(&serde_json::to_value(value)?)
 }
 
 fn now_ms() -> u128 {
@@ -10886,7 +10937,7 @@ fn validate_and_admit_envelope_tx(
                             claim.kind,
                             claim.origin,
                             claim.actor,
-                            serde_json::to_string(&claim.body).map_err(internal)?,
+                            canonical_json_text(&claim.body).map_err(internal)?,
                             serde_json::to_string(&claim.predecessors).map_err(internal)?,
                             claim.accepted_at_unix_ms.to_string(),
                         ],
@@ -11048,6 +11099,11 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
                     claims.origin, claims.actor, claims.body, claims.predecessors,
                     claims.accepted_at_unix_ms
              FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM replica_records
+                 WHERE replica_records.claim_id=claims.id
+                   AND replica_records.state='repaired'
+             )
              ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
                       batches.origin, batches.replica_sequence,
                       COALESCE((SELECT MIN(position) FROM replica_records
@@ -11148,7 +11204,9 @@ fn select_replicated_desired(
     let current = current_desired_row_tx(transaction, &claim.subject).map_err(internal)?;
     let revision = desired_revision(desired);
     let select = if let Some(row) = &current {
-        if claim_descends_from(transaction, &claim.id, &row.claim_id).map_err(internal)? {
+        if claim.id == row.claim_id {
+            true
+        } else if claim_descends_from(transaction, &claim.id, &row.claim_id).map_err(internal)? {
             true
         } else if claim_descends_from(transaction, &row.claim_id, &claim.id).map_err(internal)? {
             false
@@ -11170,14 +11228,76 @@ fn select_replicated_desired(
                 desired.kind,
                 revision,
                 claim.id,
-                serde_json::to_string(&desired.desired).map_err(internal)?,
-                desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
+                canonical_json_text(&desired.desired).map_err(internal)?,
+                desired
+                    .member
+                    .as_ref()
+                    .map(canonical_serialized_json_text)
+                    .transpose()
+                    .map_err(internal)?,
                 desired.owner_run,
                 desired.owner_generation,
                 desired.owner_step,
             ],
         )
         .map_err(internal)?;
+    Ok(())
+}
+
+fn select_desired_repair_tx(
+    transaction: &Transaction<'_>,
+    repaired_claim_id: &str,
+    replacement_claim_id: &str,
+) -> Result<()> {
+    let selected = transaction
+        .query_row(
+            "SELECT subject FROM desired WHERE claim_id=?1",
+            [repaired_claim_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(subject) = selected else {
+        return Ok(());
+    };
+    let replacement = transaction
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors,
+                    accepted_at_unix_ms
+             FROM claims WHERE id=?1",
+            [replacement_claim_id],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(replacement) = replacement else {
+        return Ok(());
+    };
+    if replacement.subject != subject || replacement.kind != "intent.desired" {
+        return Ok(());
+    }
+    let desired = serde_json::from_value::<DesiredSubject>(replacement.body.clone())?;
+    transaction.execute(
+        "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision,
+            claim_id=excluded.claim_id, body=excluded.body, member=excluded.member,
+            owner_run=excluded.owner_run, owner_generation=excluded.owner_generation,
+            owner_step=excluded.owner_step",
+        params![
+            replacement.subject,
+            desired.kind,
+            desired_revision(&desired),
+            replacement.id,
+            canonical_json_text(&desired.desired)?,
+            desired
+                .member
+                .as_ref()
+                .map(canonical_serialized_json_text)
+                .transpose()?,
+            desired.owner_run,
+            desired.owner_generation,
+            desired.owner_step,
+        ],
+    )?;
     Ok(())
 }
 
@@ -15748,6 +15868,117 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let replicated = source.replica_record(&record.record_ref).unwrap().unwrap();
         assert_eq!(replicated.state, "repaired");
         assert!(source.replica_records(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_replicated_repair_replaces_a_record_that_the_source_had_accepted() {
+        let source = Store::open_memory("source").unwrap();
+        let target = Store::open_memory("target").unwrap();
+
+        let initial = simple("true");
+        let preview = source
+            .mission(
+                &initial,
+                IntentInput {
+                    kdl: "initial".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        source
+            .apply(&initial, &preview.subject_tokens, "initial")
+            .unwrap();
+        receive_and_project(
+            &target,
+            "source",
+            &exchange_from(&source, &target.replication_inventory().unwrap()),
+        );
+        let replacement = source.selected_desired_token("exec/work").unwrap().unwrap();
+
+        let changed = simple("printf changed");
+        let preview = source
+            .mission(
+                &changed,
+                IntentInput {
+                    kdl: "changed".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        source
+            .apply(&changed, &preview.subject_tokens, "changed")
+            .unwrap();
+        receive_and_project(
+            &target,
+            "source",
+            &exchange_from(&source, &target.replication_inventory().unwrap()),
+        );
+        let repaired_claim = source.selected_desired_token("exec/work").unwrap().unwrap();
+        assert_ne!(repaired_claim, replacement);
+
+        let record_ref = {
+            let connection = target.connection.lock().unwrap();
+            let record_ref = connection
+                .query_row(
+                    "SELECT record_ref FROM replica_records WHERE claim_id=?1",
+                    [&repaired_claim],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE replica_records SET state='invalid' WHERE record_ref=?1",
+                    [&record_ref],
+                )
+                .unwrap();
+            record_ref
+        };
+        target
+            .repair_replica_record(
+                &record_ref,
+                &replacement,
+                "the receiver rejects this record after an upgrade",
+                "person/operator",
+                "repair-version-skew",
+            )
+            .unwrap();
+        assert_eq!(
+            target.selected_desired_token("exec/work").unwrap().unwrap(),
+            replacement
+        );
+
+        receive_and_project(
+            &source,
+            "target",
+            &exchange_from(&target, &source.replication_inventory().unwrap()),
+        );
+        assert_eq!(
+            source.selected_desired_token("exec/work").unwrap().unwrap(),
+            replacement
+        );
+        let repaired = source
+            .replica_records(false)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(repaired_claim.as_str()))
+            .unwrap();
+        assert_eq!(repaired.state, "repaired");
+        assert_eq!(
+            repaired.replacement_claim_id.as_deref(),
+            Some(replacement.as_str())
+        );
+
+        let source_status = source
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        let target_status = target
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        assert_eq!(
+            source_status.authority_digest,
+            target_status.authority_digest
+        );
+        assert_eq!(source_status.graph_digest, target_status.graph_digest);
     }
 
     proptest! {
