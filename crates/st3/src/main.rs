@@ -5554,6 +5554,15 @@ fn quick_agent_intent(
     agent_body
         .nodes_mut()
         .push(kdl_node("workspace", [worktree.to_string_lossy().as_ref()]));
+    if driver == "claude" {
+        let mut environment = KdlNode::new("env");
+        let mut environment_body = KdlDocument::new();
+        environment_body
+            .nodes_mut()
+            .push(kdl_node("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK", ["1"]));
+        environment.set_children(environment_body);
+        agent_body.nodes_mut().push(environment);
+    }
     agent_body.nodes_mut().push(harness);
     agent.set_children(agent_body);
 
@@ -5817,8 +5826,35 @@ async fn run_st2_native_driver(
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    let incarnation = current_agent_incarnation(client, subject).await?;
+    publish_harness_state(
+        client,
+        subject,
+        driver,
+        "starting",
+        incarnation.as_deref(),
+        None,
+    )
+    .await?;
     let argv = if driver == "claude" {
-        prepare_st3_claude_channel_argv(subject, argv)?
+        match prepare_st3_claude_channel_argv(subject, argv) {
+            Ok(argv) => argv,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                publish_harness_state(
+                    client,
+                    subject,
+                    driver,
+                    "blocked",
+                    incarnation.as_deref(),
+                    Some(&reason),
+                )
+                .await?;
+                request_claude_channel_attention(client, subject, incarnation.as_deref(), &reason)
+                    .await?;
+                return Err(error);
+            }
+        }
     } else {
         argv
     };
@@ -5904,6 +5940,7 @@ async fn run_st2_native_driver(
                             client,
                             subject,
                             driver,
+                            incarnation.as_deref(),
                             &observed,
                             &mut last_activity_fingerprint,
                         )
@@ -5943,18 +5980,38 @@ fn prepare_st3_claude_channel_argv(subject: &str, argv: Vec<String>) -> Result<V
     if !uses_channel {
         return Ok(argv);
     }
-    match st2::claude_channel::verify_st3_installed() {
+    let allow_interactive_fallback = std::env::var_os("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK")
+        .as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    prepare_st3_claude_channel_argv_after_verification(
+        subject,
+        argv,
+        st2::claude_channel::verify_st3_installed(),
+        allow_interactive_fallback,
+    )
+}
+
+fn prepare_st3_claude_channel_argv_after_verification(
+    subject: &str,
+    argv: Vec<String>,
+    verification: Result<()>,
+    allow_interactive_fallback: bool,
+) -> Result<Vec<String>> {
+    match verification {
         Ok(()) => Ok(argv),
-        Err(error) => {
+        Err(error) if allow_interactive_fallback => {
             eprintln!(
                 "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
                  warning: using Claude's interactive development channel; Claude can ask for confirmation\n\
-                 warning: run `st3 claude-channel install` for unattended startup"
+                 warning: run `st3 claude-channel install` and install its policy for unattended startup"
             );
             let executable = std::env::current_exe()
                 .context("resolving the st3 executable for the Claude development channel")?;
             st3_development_channel_argv(argv, &executable, subject)
         }
+        Err(error) => anyhow::bail!(
+            "the approved st3 Claude channel plugin is unavailable: {error:#}. Run `st3 claude-channel install`, then `sudo \"$(command -v st3)\" claude-channel install-policy`"
+        ),
     }
 }
 
@@ -6041,11 +6098,12 @@ async fn publish_harness_activity(
     client: &Client,
     subject: &str,
     driver: &str,
+    incarnation: Option<&str>,
     observed: &st2::harness_state::Observed,
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let status = harness_activity_state(observed.state);
-    let fields = BTreeMap::from([
+    let mut fields = BTreeMap::from([
         ("state".into(), Value::String(status.into())),
         ("driver".into(), Value::String(driver.into())),
         (
@@ -6074,6 +6132,9 @@ async fn publish_harness_activity(
                 .unwrap_or(Value::Null),
         ),
     ]);
+    if let Some(incarnation) = incarnation {
+        fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+    }
     let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
         observed.since_ms,
         &fields,
@@ -6096,6 +6157,80 @@ async fn publish_harness_activity(
         )
         .await?;
     *last_fingerprint = Some(fingerprint);
+    Ok(())
+}
+
+async fn publish_harness_state(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    state: &str,
+    incarnation: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let mut fields = BTreeMap::from([
+        ("state".into(), Value::String(state.into())),
+        ("driver".into(), Value::String(driver.into())),
+    ]);
+    if let Some(incarnation) = incarnation {
+        fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+    }
+    if let Some(reason) = reason {
+        fields.insert("reason".into(), Value::String(reason.into()));
+    }
+    let incarnation_key = work_incarnation_key(incarnation);
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("harness-state:{subject}:{incarnation_key}:{state}")),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn request_claude_channel_attention(
+    client: &Client,
+    subject: &str,
+    incarnation: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let reviewer = "person/nathan";
+    let pending: Vec<AttentionItemView> = client
+        .get(&format!(
+            "/v1/attention?person={}",
+            urlencoding::encode(reviewer)
+        ))
+        .await?;
+    if pending.iter().any(|item| {
+        item.kind == "fault"
+            && item.targets.iter().any(|target| target == subject)
+            && item.title == "A Claude agent needs its approved channel"
+    }) {
+        return Ok(());
+    }
+    let incarnation_key = work_incarnation_key(incarnation);
+    let _: AttentionRequestView = client
+        .post(
+            "/v1/attention",
+            &AttentionRequest {
+                reviewer: reviewer.into(),
+                title: "A Claude agent needs its approved channel".into(),
+                reason: format!("`{subject}` cannot start unattended. {reason}"),
+                severity: "error".into(),
+                targets: vec![subject.into()],
+                actor: subject.into(),
+                idempotency_key: format!("claude-channel-policy:{subject}:{incarnation_key}"),
+            },
+        )
+        .await?;
     Ok(())
 }
 
@@ -6831,6 +6966,16 @@ async fn sync_claude_mcp_state(
     use tokio::io::AsyncWriteExt as _;
 
     if !*ready {
+        let incarnation = current_agent_incarnation(client, subject).await?;
+        let incarnation_key = work_incarnation_key(incarnation.as_deref());
+        let mut fields = BTreeMap::from([
+            ("state".into(), Value::String("ready".into())),
+            ("driver".into(), Value::String("claude".into())),
+            ("transport".into(), Value::String("claude-channel".into())),
+        ]);
+        if let Some(incarnation) = incarnation {
+            fields.insert("incarnation_id".into(), Value::String(incarnation));
+        }
         let _: ClaimRecord = client
             .post(
                 "/v1/claims",
@@ -6838,13 +6983,10 @@ async fn sync_claude_mcp_state(
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String("ready".into())),
-                        ("driver".into(), Value::String("claude".into())),
-                    ]),
+                    fields,
                     evidence: Vec::new(),
                     expected_subject: None,
-                    idempotency_key: Some(format!("claude-ready:{subject}")),
+                    idempotency_key: Some(format!("claude-ready:{subject}:{incarnation_key}")),
                 },
             )
             .await?;
@@ -7417,6 +7559,16 @@ mod tests {
         let quick = st3::parse_intent(&quick, "node").unwrap();
         assert!(quick.missions.contains_key("standing/example.worker"));
 
+        let quick_claude = quick_agent_intent(
+            "standing/example.claude",
+            "example.claude",
+            Path::new("/work/example"),
+            "claude",
+            None,
+            None,
+        );
+        assert!(quick_claude.contains("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK \"1\""));
+
         let message = message_mission_intent(
             "message/test",
             "test",
@@ -7639,6 +7791,40 @@ mod tests {
         assert_eq!(
             config["mcpServers"]["st3"]["args"],
             json!(["driver", "claude-mcp", "--subject", "agent/node.worker"])
+        );
+    }
+
+    #[test]
+    fn unattended_claude_startup_refuses_a_missing_approved_channel() {
+        let argv = vec![
+            "claude".into(),
+            "--channels".into(),
+            st2::claude_channel::ST3_CHANNEL.into(),
+            "Do the work.".into(),
+        ];
+        let error = prepare_st3_claude_channel_argv_after_verification(
+            "agent/node.worker",
+            argv.clone(),
+            Err(anyhow::anyhow!("the managed policy is absent")),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("plugin is unavailable"));
+        assert!(error.contains("claude-channel install"));
+        assert!(error.contains("claude-channel install-policy"));
+
+        let fallback = prepare_st3_claude_channel_argv_after_verification(
+            "agent/node.worker",
+            argv,
+            Err(anyhow::anyhow!("the managed policy is absent")),
+            true,
+        )
+        .unwrap();
+        assert!(
+            fallback.iter().any(|argument| {
+                argument == "--dangerously-load-development-channels=server:st3"
+            })
         );
     }
 

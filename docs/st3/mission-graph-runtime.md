@@ -414,6 +414,22 @@ The loop has no built-in Git behavior. A failed keep or discard mission stops th
 
 `on-exhausted` defaults to `fail`. It can contain `succeed` or one human gate instead.
 
+A failed loop can also request human attention:
+
+```kdl
+on-exhausted {
+  fail
+  attention "Automatic review failed" {
+    reviewer "person/nathan"
+    severity "error"
+  }
+}
+```
+
+The attention request targets the loop and its root mission run. Reconciliation creates it once for that loop.
+
+The severity can be `warning` or `error`. An attention request is not valid after `succeed` or a human gate.
+
 A human exhaustion approval accepts the current best result. More rounds require a published mission revision.
 
 A cancelled round or a structural child failure stops immediately. An ordinary failed round can start the next round.

@@ -13,10 +13,10 @@ use crate::mission::{
     CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
 };
 use crate::model::{
-    ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec,
-    LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind, MemberLifecycle, MemberSpec,
-    MetricSource, MissionInputKind, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
-    RestartIntensity, RestartType, StepSpec, UsedMissionSpec, WorkSelector,
+    AttentionRequest, ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec,
+    LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind, MemberLifecycle,
+    MemberSpec, MetricSource, MissionInputKind, MissionRunRequest, MissionRunView, MissionSpec,
+    MissionState, RestartIntensity, RestartType, StepSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
 use crate::store::Store;
@@ -3661,6 +3661,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<bool> {
         match &loop_spec.on_exhausted {
             LoopExhaustionSpec::Fail => {
+                self.request_loop_exhaustion_attention(run, loop_spec, loop_subject, reason)?;
                 self.record_once(
                     loop_subject,
                     "loop.state",
@@ -3730,6 +3731,52 @@ impl<R: RuntimeControl> Reconciler<R> {
                 GateOutcome::Pending => Ok(false),
             },
         }
+    }
+
+    fn request_loop_exhaustion_attention(
+        &self,
+        run: &MissionRunView,
+        loop_spec: &LoopSpec,
+        loop_subject: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(attention) = &loop_spec.exhaustion_attention else {
+            return Ok(());
+        };
+        let feedback = self
+            .store
+            .claims_for(loop_subject, Some("loop.round-result"))?
+            .into_iter()
+            .rev()
+            .find_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/feedback")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let detail = feedback.as_deref().map_or_else(
+            || format!("Loop `{loop_subject}` failed: {reason}."),
+            |feedback| {
+                format!("Loop `{loop_subject}` failed: {reason}. Latest feedback: `{feedback}`.")
+            },
+        );
+        let idempotency_key = format!("loop-exhausted-attention:{loop_subject}");
+        let digest = hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()));
+        self.store.request_attention(
+            &format!("attention/{}", &digest[..32]),
+            &AttentionRequest {
+                reviewer: attention.reviewer.clone(),
+                title: attention.title.clone(),
+                reason: detail,
+                severity: attention.severity.clone(),
+                targets: vec![loop_subject.into(), run.subject.clone()],
+                actor: "agent/st3/reconciler".into(),
+                idempotency_key,
+            },
+        )?;
+        self.signal_changed();
+        Ok(())
     }
 
     fn step_dependencies_hold(
@@ -10081,6 +10128,68 @@ mission "human-exhaustion" state="ready" {
         let completed = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.loops[0].status, "exhausted");
+    }
+
+    #[test]
+    fn a_failed_loop_requests_attention_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+resource "result" { kind "custom.test.loop-result" }
+mission "alert-exhaustion" state="ready" {
+  goal "Fail with a visible bounded-loop fault."
+  completion { when "all-steps-exhausted" }
+  loop "review" {
+    max-rounds 1
+    until { gate "ready" { field "state" "resource/result" is "ready" } }
+    round { completion { when "all-steps-exhausted" } }
+    on-exhausted {
+      fail
+      attention "Automatic review failed" {
+        reviewer "person/nathan"
+        severity "error"
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "alert-loop-exhaustion");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "alert-exhaustion".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "alert-exhaustion-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "failed"
+        );
+        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].title, "Automatic review failed");
+        assert_eq!(attention[0].kind, "fault");
+        assert!(attention[0].targets.contains(&run.subject));
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.attention_items(Some("person/nathan")).unwrap().len(),
+            1
+        );
     }
 
     #[test]

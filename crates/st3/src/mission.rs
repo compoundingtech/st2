@@ -6,10 +6,11 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopCandidateSelector,
-    LoopCandidatesSpec, LoopExhaustionSpec, LoopForEachSpec, LoopSpec, LoopStopSpec, MetricSource,
-    MetricSpec, MissionInputKind, MissionInputSpec, MissionSpec, MissionState, ProductSpec,
-    RetrySpec, RevisionCutover, St3Error, StepSpec, UsedMissionSpec, WorkSelector,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopAttentionSpec,
+    LoopCandidateSelector, LoopCandidatesSpec, LoopExhaustionSpec, LoopForEachSpec, LoopSpec,
+    LoopStopSpec, MetricSource, MetricSpec, MissionInputKind, MissionInputSpec, MissionSpec,
+    MissionState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec, UsedMissionSpec,
+    WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
@@ -658,10 +659,10 @@ fn parse_loop_group(
             format!("loop `{id}` keep-if, on-keep, and on-discard must appear together"),
         ));
     }
-    let on_exhausted = unique_named_child(body, "on-exhausted")?
+    let (on_exhausted, exhaustion_attention) = unique_named_child(body, "on-exhausted")?
         .map(|child| parse_loop_exhaustion(child, default_host))
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or((LoopExhaustionSpec::default(), None));
     for child in body.nodes() {
         if !matches!(
             child.name().value(),
@@ -698,6 +699,7 @@ fn parse_loop_group(
         on_keep,
         on_discard,
         on_exhausted,
+        exhaustion_attention,
     };
     let mut step = StepSpec {
         id,
@@ -1014,39 +1016,115 @@ fn parse_loop_stop(node: &KdlNode, metrics: &BTreeSet<String>) -> Result<LoopSto
 fn parse_loop_exhaustion(
     node: &KdlNode,
     default_host: &str,
-) -> Result<LoopExhaustionSpec, St3Error> {
+) -> Result<(LoopExhaustionSpec, Option<LoopAttentionSpec>), St3Error> {
     ensure_bare(node)?;
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("empty-loop-exhaustion", "on-exhausted is empty"))?;
-    if body.nodes().len() != 1 {
+    if body.nodes().is_empty() || body.nodes().len() > 2 {
         return Err(St3Error::new(
             "invalid-loop-exhaustion",
-            "on-exhausted needs one fail, succeed, or human gate",
+            "on-exhausted needs fail, succeed, or one human gate",
         ));
     }
     let child = &body.nodes()[0];
-    match child.name().value() {
+    let outcome = match child.name().value() {
         "fail" => {
             ensure_bare(child)?;
-            Ok(LoopExhaustionSpec::Fail)
+            LoopExhaustionSpec::Fail
         }
         "succeed" => {
             ensure_bare(child)?;
-            Ok(LoopExhaustionSpec::Succeed)
+            LoopExhaustionSpec::Succeed
         }
         "gate" => match crate::graph::parse_gate(child, default_host)? {
-            gate @ GateSpec::Human { .. } => Ok(LoopExhaustionSpec::Human { gate }),
-            _ => Err(St3Error::new(
-                "invalid-loop-exhaustion-gate",
-                "on-exhausted accepts only a human gate",
-            )),
+            gate @ GateSpec::Human { .. } => LoopExhaustionSpec::Human { gate },
+            _ => {
+                return Err(St3Error::new(
+                    "invalid-loop-exhaustion-gate",
+                    "on-exhausted accepts only a human gate",
+                ));
+            }
         },
-        _ => Err(St3Error::new(
-            "invalid-loop-exhaustion",
-            "on-exhausted needs one fail, succeed, or human gate",
-        )),
+        _ => {
+            return Err(St3Error::new(
+                "invalid-loop-exhaustion",
+                "on-exhausted needs fail, succeed, or one human gate",
+            ));
+        }
+    };
+    let attention = body.nodes().get(1).map(parse_loop_attention).transpose()?;
+    if attention.is_some() && !matches!(outcome, LoopExhaustionSpec::Fail) {
+        return Err(St3Error::new(
+            "invalid-loop-exhaustion-attention",
+            "only a failed loop exhaustion can request attention",
+        ));
     }
+    Ok((outcome, attention))
+}
+
+fn parse_loop_attention(node: &KdlNode) -> Result<LoopAttentionSpec, St3Error> {
+    if node.name().value() != "attention" {
+        return Err(St3Error::new(
+            "invalid-loop-exhaustion",
+            "the second on-exhausted entry must be attention",
+        ));
+    }
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let title = first_string(node)?;
+    if title.trim().is_empty() {
+        return Err(St3Error::new(
+            "invalid-loop-attention-title",
+            "loop exhaustion attention needs a title",
+        ));
+    }
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "missing-loop-attention-body",
+            "loop exhaustion attention needs reviewer and severity",
+        )
+    })?;
+    for child in body.nodes() {
+        if !matches!(child.name().value(), "reviewer" | "severity") {
+            return Err(St3Error::new(
+                "invalid-loop-attention-field",
+                format!(
+                    "loop exhaustion attention cannot contain `{}`",
+                    child.name().value()
+                ),
+            ));
+        }
+    }
+    let reviewer = unique_named_child(body, "reviewer")?
+        .ok_or_else(|| {
+            St3Error::new(
+                "missing-loop-attention-reviewer",
+                "loop exhaustion attention needs a reviewer",
+            )
+        })
+        .and_then(plain_string)?;
+    if !reviewer.starts_with("person/") {
+        return Err(St3Error::new(
+            "invalid-loop-attention-reviewer",
+            "loop exhaustion attention needs a full person subject",
+        ));
+    }
+    let severity = unique_named_child(body, "severity")?
+        .map(plain_string)
+        .transpose()?
+        .unwrap_or_else(|| "error".into());
+    if !matches!(severity.as_str(), "warning" | "error") {
+        return Err(St3Error::new(
+            "invalid-loop-attention-severity",
+            "loop exhaustion attention severity must be warning or error",
+        ));
+    }
+    Ok(LoopAttentionSpec {
+        title,
+        reviewer,
+        severity,
+    })
 }
 
 fn parse_loop_candidates(
@@ -2629,6 +2707,33 @@ mission "loop" state="ready" {
 
         let source = r#"
 version 2
+mission "alert-loop" state="ready" {
+  goal "Alert a person after bounded failure."
+  loop "review" {
+    max-rounds 3
+    round { completion { when "all-steps-exhausted" } }
+    on-exhausted {
+      fail
+      attention "Automatic review failed" {
+        reviewer "person/nathan"
+        severity "error"
+      }
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let loop_spec = intent.missions["alert-loop"].steps["review"]
+            .loop_spec
+            .as_ref()
+            .unwrap();
+        let attention = loop_spec.exhaustion_attention.as_ref().unwrap();
+        assert_eq!(attention.title, "Automatic review failed");
+        assert_eq!(attention.reviewer, "person/nathan");
+        assert_eq!(attention.severity, "error");
+
+        let source = r#"
+version 2
 mission "eval-loop" state="ready" timeout="20m" {
   goal "Bound every generated eval mission."
   loop "work" {
@@ -2676,6 +2781,18 @@ mission "bad" state="ready" {
   step "work" { loop { max-rounds 2 } }
 }"#,
                 "loop-is-graph-node",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" {
+  goal "Reject attention after success."
+  loop "work" {
+    max-rounds 2
+    round { completion { when "all-steps-exhausted" } }
+    on-exhausted { succeed; attention "Wrong" { reviewer "person/nathan" } }
+  }
+}"#,
+                "invalid-loop-exhaustion-attention",
             ),
         ] {
             assert_eq!(

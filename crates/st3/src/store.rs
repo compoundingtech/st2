@@ -5337,7 +5337,7 @@ impl Store {
             }) {
                 let requested_at_unix_ms = connection.query_row(
                     "SELECT accepted_at_unix_ms FROM claims
-                     WHERE subject=?1 AND kind='message.sent'
+                     WHERE subject=?1
                      ORDER BY store_index LIMIT 1",
                     [&message.subject],
                     |row| row.get::<_, String>(0),
@@ -18919,6 +18919,45 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
+    }
+
+    #[test]
+    fn desired_person_messages_appear_in_attention_without_a_sent_claim() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+message "human-attention" {
+  from "agent/demo/worker"
+  to "person/nathan"
+  title "Please review"
+  content "The declarative message is ready."
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "desired-human-attention")
+            .unwrap();
+
+        let items = store.attention_items(Some("person/nathan")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "unread-message");
+        assert_eq!(items[0].title, "Please review");
+        assert!(items[0].requested_at_unix_ms > 0);
+        assert!(
+            store
+                .claims_for("message/human-attention", Some("message.sent"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

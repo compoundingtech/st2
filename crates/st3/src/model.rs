@@ -255,6 +255,13 @@ impl Default for LoopExhaustionSpec {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LoopAttentionSpec {
+    pub title: String,
+    pub reviewer: String,
+    pub severity: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct LoopForEachSpec {
     pub resource: String,
@@ -303,6 +310,8 @@ pub struct LoopSpec {
     pub on_discard: Option<Box<MissionSpec>>,
     #[serde(default)]
     pub on_exhausted: LoopExhaustionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion_attention: Option<LoopAttentionSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
