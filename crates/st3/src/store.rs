@@ -5407,12 +5407,13 @@ impl Store {
         next_check_unix_ms: u128,
         subscriptions: &[(String, SubscriptionSpec)],
     ) -> Result<ResourceObservationOutcome, St3Error> {
+        let facts = canonical_json_value(facts);
         let operation_hash = canonical_hash(&(
             observer,
             desired_revision,
             attempt,
             cursor,
-            facts,
+            &facts,
             next_check_unix_ms,
         ))
         .map_err(internal)?;
@@ -5648,7 +5649,7 @@ impl Store {
         if !baseline {
             for field in ["pull_requests", "issues"] {
                 for (subject, kind, item_facts) in
-                    discovered_collection_items(resource, field, previous.as_ref(), facts)
+                    discovered_collection_items(resource, field, previous.as_ref(), &facts)
                 {
                     let predecessors = latest_claim_id_tx(&transaction, &subject)
                         .map_err(internal)?
@@ -8500,7 +8501,9 @@ fn current_desired_row_tx(
 }
 
 fn desired_revision(desired: &DesiredSubject) -> String {
-    canonical_hash(desired).expect("desired subject serializes")
+    let mut desired = desired.clone();
+    desired.desired = canonical_json_value(&desired.desired);
+    canonical_hash(&desired).expect("desired subject serializes")
 }
 
 fn validate_documents(
@@ -8905,12 +8908,17 @@ fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>, St3Er
     let mut evidence = input.evidence.clone();
     evidence.sort();
     evidence.dedup();
+    let fields = input
+        .fields
+        .iter()
+        .map(|(name, value)| (name.clone(), canonical_json_value(value)))
+        .collect::<BTreeMap<_, _>>();
     let request_digest = canonical_hash(&(
         "st3.claim-request.v1",
         &input.subject,
         &input.kind,
         &input.actor,
-        &input.fields,
+        fields,
         evidence,
         &input.expected_subject,
     ))
@@ -13370,6 +13378,31 @@ mod tests {
         .expect("right claim hash");
 
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn desired_revision_does_not_depend_on_json_object_insertion_order() {
+        let mut left_value = serde_json::Map::new();
+        left_value.insert("workspace".into(), Value::String("/workspace".into()));
+        left_value.insert("restart".into(), Value::String("always".into()));
+        let mut right_value = serde_json::Map::new();
+        right_value.insert("restart".into(), Value::String("always".into()));
+        right_value.insert("workspace".into(), Value::String("/workspace".into()));
+        let left = DesiredSubject {
+            subject: "agent/example".into(),
+            kind: "agent".into(),
+            desired: Value::Object(left_value),
+            member: None,
+            owner_run: Some("mission-run/example".into()),
+            owner_generation: Some("run-generation/example".into()),
+            owner_step: None,
+        };
+        let right = DesiredSubject {
+            desired: Value::Object(right_value),
+            ..left.clone()
+        };
+
+        assert_eq!(desired_revision(&left), desired_revision(&right));
     }
 
     fn publish_mission(store: &Store, source: &str, key: &str) -> MissionSpec {
