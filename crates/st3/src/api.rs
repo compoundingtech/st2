@@ -182,7 +182,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
         .route("/v1/replication/repair", post(repair_replication_record))
-        .route("/v1/internal/replication/export", post(replication_export))
+        .route(
+            "/v1/internal/replication/export",
+            post(replication_export).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
+        )
         .route(
             "/v1/internal/replication/receive",
             post(replication_receive).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
@@ -5064,6 +5067,30 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/internal/replication/receive")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn replication_export_accepts_a_request_above_axums_default_body_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let value = json!({
+            "fleet_id": "fleet",
+            "inventory": { "digest": "", "envelopes": [] },
+            "summary_only": false
+        });
+        let mut body = serde_json::to_vec(&value).unwrap();
+        body.resize(2 * 1024 * 1024 + 1, b' ');
+        let response = router(state(root.path()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/replication/export")
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .unwrap(),
