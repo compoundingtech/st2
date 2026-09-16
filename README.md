@@ -75,10 +75,11 @@ user priority. They do not lower the priority of the runtime scopes.
 
 The service files contain the absolute st3 path. They do not contain a captured or guessed `PATH`.
 Before each new PTY or exec starts, st3 runs the account's default shell as an interactive login
-shell. It captures the shell's current exported environment. The mission environment then overrides
-those values. A `${PATH}` value expands against the fresh shell path. st3 starts the declared command
-directly after this probe, so a shell wrapper does not change its arguments, signals, or exit status.
-The probe has a ten-second timeout. A broken shell startup cannot stop reconciliation forever.
+shell in a short-lived real terminal. This matches startup files that require a TTY. st3 captures the
+shell's current exported environment. The mission environment then overrides those values. A
+`${PATH}` value expands against the fresh shell path. st3 starts the declared command directly after
+this probe, so a shell wrapper does not change its arguments, signals, or exit status. The probe has
+a ten-second timeout. A broken shell startup cannot stop reconciliation forever.
 
 On macOS, run `st service permissions` for the one-time Full Disk Access and Developer Tools steps.
 Use `st service permissions --open` to open the matching System Settings pages. macOS does not let a

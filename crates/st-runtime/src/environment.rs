@@ -2,18 +2,17 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use wait_timeout::ChildExt as _;
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const SHELL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const SHELL_OUTPUT_LIMIT: usize = 1024 * 1024;
+const ENVIRONMENT_BEGIN: &[u8] = b"ST3_ENV_BEGIN";
+const ENVIRONMENT_END: &[u8] = b"ST3_ENV_END";
 
 pub fn login_environment() -> Result<BTreeMap<String, String>> {
     let shell = account_shell().context("the user account has no default shell")?;
@@ -21,39 +20,76 @@ pub fn login_environment() -> Result<BTreeMap<String, String>> {
 }
 
 fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<String, String>> {
-    let mut output = tempfile::tempfile().context("create the shell environment buffer")?;
-    let output_writer = output
-        .try_clone()
-        .context("clone the shell environment buffer")?;
-    let mut command = Command::new(shell);
-    command
-        .args(["-l", "-i", "-c", "/usr/bin/printf '\\0'; /usr/bin/env -0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output_writer))
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .spawn()
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("create a terminal for the default shell")?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("read the default shell terminal")?;
+    let reader_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, bool)> {
+        let mut output = Vec::new();
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let remaining = SHELL_OUTPUT_LIMIT.saturating_sub(output.len());
+                    output.extend_from_slice(&buffer[..count.min(remaining)]);
+                    truncated |= count > remaining;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((output, truncated))
+    });
+    let mut command = CommandBuilder::new(shell);
+    command.args([
+        "-l",
+        "-i",
+        "-c",
+        "/usr/bin/printf '\\0ST3_ENV_BEGIN\\0'; /usr/bin/env -0; /usr/bin/printf 'ST3_ENV_END\\0'",
+    ]);
+    command.env("TERM", "xterm-256color");
+    command.env("TERM_PROGRAM", "st3");
+    let mut child = pair
+        .slave
+        .spawn_command(command)
         .with_context(|| format!("run the default shell {}", shell.display()))?;
-    let status = match child
-        .wait_timeout(timeout)
-        .context("wait for the default shell")?
-    {
-        Some(status) => status,
-        None => {
+    drop(pair.slave);
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for the default shell")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
             #[cfg(unix)]
-            let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) == 0 };
+            if let Some(group) = pair.master.process_group_leader() {
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            } else {
+                let _ = child.kill();
+            }
             #[cfg(not(unix))]
-            let killed = child.kill().is_ok();
-            anyhow::ensure!(killed, "stop the timed-out default shell");
+            let _ = child.kill();
             let _ = child.wait();
+            drop(pair.master);
+            let _ = reader_thread.join();
             anyhow::bail!(
                 "the default shell {} did not finish startup within {} seconds",
                 shell.display(),
                 timeout.as_secs_f64()
             );
         }
+        std::thread::sleep(Duration::from_millis(10));
     };
     anyhow::ensure!(
         status.success(),
@@ -61,9 +97,16 @@ fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<St
         shell.display(),
         status
     );
-    output.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    output.read_to_end(&mut bytes)?;
+    drop(pair.master);
+    let (bytes, truncated) = reader_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("the shell terminal reader panicked"))?
+        .context("read the default shell output")?;
+    anyhow::ensure!(
+        !truncated,
+        "the default shell wrote more than {} bytes during startup",
+        SHELL_OUTPUT_LIMIT
+    );
     parse_login_environment(&bytes)
 }
 
@@ -133,12 +176,18 @@ pub fn expand_path_placeholder(value: &mut String, environment: &BTreeMap<String
 }
 
 fn parse_login_environment(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
-    let start = bytes
+    let records = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let start = records
         .iter()
-        .position(|byte| *byte == 0)
+        .position(|record| *record == ENVIRONMENT_BEGIN)
         .context("the default shell did not start the environment record")?;
     let mut environment = BTreeMap::new();
-    for record in bytes[start + 1..].split(|byte| *byte == 0) {
+    let mut ended = false;
+    for record in &records[start + 1..] {
+        if *record == ENVIRONMENT_END {
+            ended = true;
+            break;
+        }
         if record.is_empty() {
             continue;
         }
@@ -150,6 +199,10 @@ fn parse_login_environment(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
             environment.insert(name.into(), value.into());
         }
     }
+    anyhow::ensure!(
+        ended,
+        "the default shell did not finish the environment record"
+    );
     anyhow::ensure!(
         environment.contains_key("PATH"),
         "the default shell did not export PATH"
@@ -220,7 +273,7 @@ mod tests {
     #[test]
     fn parser_ignores_shell_startup_output_before_the_record() {
         let parsed = parse_login_environment(
-            b"welcome from the shell\n\0PATH=/custom/bin:/usr/bin\0LANG=en_US.UTF-8\0BAD-NAME=x\0",
+            b"welcome from the shell\n\0ST3_ENV_BEGIN\0PATH=/custom/bin:/usr/bin\0LANG=en_US.UTF-8\0BAD-NAME=x\0ST3_ENV_END\0logout\r\n",
         )
         .unwrap();
         assert_eq!(parsed["PATH"], "/custom/bin:/usr/bin");
@@ -254,7 +307,7 @@ mod tests {
         let shell = root.path().join("shell");
         std::fs::write(
             &shell,
-            "#!/bin/sh\nprintf 'startup output\\n'\nprintf '\\0PATH=/fresh/bin:/usr/bin\\0FRESH=yes\\0'\n",
+            "#!/bin/sh\nprintf 'startup output\\n'\nprintf '\\0ST3_ENV_BEGIN\\0PATH=/fresh/bin:/usr/bin\\0FRESH=yes\\0ST3_ENV_END\\0'\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
