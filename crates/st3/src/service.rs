@@ -1,14 +1,8 @@
 //! Install the st3 daemon as a native user service.
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
@@ -25,25 +19,16 @@ const REPLICATION_SERVICE_NAME: &str = "st3-replication.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 const REPLICATION_SERVICE_LABEL: &str = "com.compoundingtech.st3.replication";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
-const PROVIDER_PROGRAMS: &[&str] = &["codex", "claude", "pi", "opencode", "omp"];
 
 #[derive(Clone, Debug)]
 pub struct ServiceSpec {
     exe: PathBuf,
     config: Config,
-    path: String,
     memory_max_mb: u64,
 }
 
 impl ServiceSpec {
-    pub fn new(
-        exe: impl Into<PathBuf>,
-        config: Config,
-        path: impl Into<String>,
-        memory_max_mb: u64,
-    ) -> Result<Self> {
-        let path = path.into();
-        anyhow::ensure!(!path.is_empty(), "the service PATH cannot be empty");
+    pub fn new(exe: impl Into<PathBuf>, config: Config, memory_max_mb: u64) -> Result<Self> {
         anyhow::ensure!(
             memory_max_mb > 0,
             "the memory limit must be greater than zero"
@@ -63,7 +48,6 @@ impl ServiceSpec {
         Ok(Self {
             exe: exe.into(),
             config,
-            path,
             memory_max_mb,
         })
     }
@@ -148,8 +132,7 @@ pub fn install(mut config: Config) -> Result<()> {
     ) {
         crate::peer::FleetAuth::load(fleet_id, secret)?;
     }
-    let path = service_path(&exe)?;
-    let spec = ServiceSpec::new(exe, config, path, DEFAULT_MEMORY_MAX_MB)?;
+    let spec = ServiceSpec::new(exe, config, DEFAULT_MEMORY_MAX_MB)?;
     install_native_service(&spec)?;
     println!("installed");
     Ok(())
@@ -186,6 +169,46 @@ fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
 
 pub fn status() -> Result<()> {
     status_native_service()
+}
+
+pub fn permissions(open: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let executable = env::current_exe().context("resolve the current st3 executable")?;
+        print!("{}", macos_permission_guidance(&executable));
+        if open {
+            run_command(
+                "open",
+                &["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+            )?;
+            run_command(
+                "open",
+                &["x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTools"],
+            )?;
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = open;
+        println!("st3 does not need a macOS privacy approval on this host.");
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_permission_guidance(executable: &Path) -> String {
+    format!(
+        "st3 executable\t{}\n\
+1. Open System Settings > Privacy & Security > Full Disk Access.\n\
+2. Add the st3 executable and enable it.\n\
+3. Open System Settings > Privacy & Security > Developer Tools.\n\
+4. Add the st3 executable and enable it.\n\
+5. Run `st3 service restart` after an approval changes.\n\
+macOS assigns service-owned file and developer access to st3, not to the terminal that installed it.\n\
+A launchd property list cannot grant these approvals.\n",
+        executable.display()
+    )
 }
 
 pub fn restart(mut config: Config) -> Result<()> {
@@ -233,69 +256,6 @@ pub fn uninstall() -> Result<()> {
     uninstall_native_service()?;
     println!("uninstalled");
     Ok(())
-}
-
-fn service_path(exe: &Path) -> Result<String> {
-    service_path_from(
-        exe,
-        env::var_os("HOME").as_deref().map(Path::new),
-        env::var_os("PATH").as_deref(),
-    )
-}
-
-fn service_path_from(exe: &Path, home: Option<&Path>, ambient: Option<&OsStr>) -> Result<String> {
-    let mut entries = Vec::new();
-    if let Some(parent) = exe.parent() {
-        push_unique(&mut entries, parent.to_path_buf());
-    }
-    if let Some(home) = home {
-        push_unique(&mut entries, home.join(".local/bin"));
-        push_unique(&mut entries, home.join(".cargo/bin"));
-    }
-    for program in PROVIDER_PROGRAMS {
-        if let Some(directory) = program_directory(program, ambient) {
-            push_unique(&mut entries, directory);
-        }
-    }
-    for directory in [
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/sbin"),
-        PathBuf::from("/sbin"),
-    ] {
-        push_unique(&mut entries, directory);
-    }
-    env::join_paths(entries)
-        .context("the service PATH contains an unsupported byte")
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
-fn program_directory(program: &str, ambient: Option<&OsStr>) -> Option<PathBuf> {
-    env::split_paths(ambient.unwrap_or_default()).find(|directory| {
-        let candidate = directory.join(program);
-        let Ok(metadata) = fs::metadata(candidate) else {
-            return false;
-        };
-        metadata.is_file() && is_executable(&metadata)
-    })
-}
-
-#[cfg(unix)]
-fn is_executable(metadata: &fs::Metadata) -> bool {
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
-    true
-}
-
-fn push_unique(entries: &mut Vec<PathBuf>, directory: PathBuf) {
-    if !entries.contains(&directory) {
-        entries.push(directory);
-    }
 }
 
 fn validate_reset_target(config: &Config) -> Result<()> {
@@ -889,15 +849,16 @@ After=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-Environment={}\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
+Nice=0\n\
+CPUWeight=100\n\
+KillMode=control-group\n\
 MemoryMax={}M\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        systemd_quote_arg(&format!("PATH={}", spec.path)),
         spec.memory_max_mb,
     )
 }
@@ -927,15 +888,16 @@ After=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-Environment={}\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
+Nice=0\n\
+CPUWeight=100\n\
+KillMode=control-group\n\
 MemoryMax={}M\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        systemd_quote_arg(&format!("PATH={}", spec.path)),
         spec.memory_max_mb,
     )
 }
@@ -946,6 +908,7 @@ pub fn render_launchd_plist(spec: &ServiceSpec) -> String {
         &spec.program_arguments(),
         "st3.stdout.log",
         "st3.stderr.log",
+        "Interactive",
         spec,
     )
 }
@@ -956,6 +919,7 @@ pub fn render_launchd_replication_plist(spec: &ServiceSpec) -> String {
         &spec.replication_program_arguments(),
         "st3-replication.stdout.log",
         "st3-replication.stderr.log",
+        "Background",
         spec,
     )
 }
@@ -965,6 +929,7 @@ fn render_launchd_program_plist(
     program_arguments: &[String],
     stdout_name: &str,
     stderr_name: &str,
+    process_type: &str,
     spec: &ServiceSpec,
 ) -> String {
     let arguments = program_arguments
@@ -980,16 +945,14 @@ fn render_launchd_program_plist(
 <dict>\n\
   <key>Label</key><string>{label}</string>\n\
   <key>ProgramArguments</key>\n  <array>\n{arguments}  </array>\n\
-  <key>EnvironmentVariables</key>\n  <dict><key>PATH</key><string>{}</string></dict>\n\
   <key>RunAtLoad</key><true/>\n\
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
-  <key>ProcessType</key><string>Background</string>\n\
+  <key>ProcessType</key><string>{process_type}</string>\n\
   <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>8192</integer></dict>\n\
   <key>StandardOutPath</key><string>{}</string>\n\
   <key>StandardErrorPath</key><string>{}</string>\n\
 </dict>\n\
 </plist>\n",
-        xml_escape(&spec.path),
         xml_escape(&stdout.display().to_string()),
         xml_escape(&stderr.display().to_string()),
     )
@@ -1032,39 +995,6 @@ mod tests {
     use super::*;
     use crate::config::PeerConfig;
 
-    #[cfg(unix)]
-    #[test]
-    fn service_path_adds_only_discovered_provider_directories() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let provider = root.path().join("provider/bin");
-        let unrelated = root.path().join("unrelated/bin");
-        fs::create_dir_all(&provider)?;
-        fs::create_dir_all(&unrelated)?;
-        let codex = provider.join("codex");
-        fs::write(&codex, b"#!/bin/sh\n")?;
-        let mut permissions = fs::metadata(&codex)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&codex, permissions)?;
-        fs::write(unrelated.join("not-a-provider"), b"ignored")?;
-        let ambient = env::join_paths([&unrelated, &provider, &provider])?;
-
-        let path = service_path_from(
-            Path::new("/opt/st3/bin/st3"),
-            Some(Path::new("/home/test")),
-            Some(&ambient),
-        )?;
-        let entries = env::split_paths(OsStr::new(&path)).collect::<Vec<_>>();
-
-        assert_eq!(
-            entries.iter().filter(|entry| *entry == &provider).count(),
-            1
-        );
-        assert!(!entries.contains(&unrelated));
-        assert!(entries.contains(&PathBuf::from("/home/test/.local/bin")));
-        assert!(entries.contains(&PathBuf::from("/usr/bin")));
-        Ok(())
-    }
-
     #[test]
     fn unit_bakes_the_effective_config_and_limit() -> Result<()> {
         let config = Config {
@@ -1080,7 +1010,7 @@ mod tests {
                 url: "http://127.0.0.1:31314".into(),
             }],
         };
-        let spec = ServiceSpec::new("/usr/bin/st3", config, "/usr/bin", 1024)?;
+        let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
         let unit = render_systemd_user_unit(&spec);
         assert!(unit.contains("ExecStart=/usr/bin/st3 up --node node-a"));
         assert!(unit.contains("--state-dir /var/lib/st3"));
@@ -1088,8 +1018,14 @@ mod tests {
         assert!(unit.contains("--peer node-b=http://127.0.0.1:31314"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Nice=0"));
+        assert!(unit.contains("CPUWeight=100"));
+        assert!(unit.contains("KillMode=control-group"));
         let replication = render_systemd_replication_unit(&spec);
         assert!(replication.contains("replication-worker"));
+        assert!(replication.contains("Nice=0"));
+        assert!(replication.contains("CPUWeight=100"));
+        assert!(replication.contains("KillMode=control-group"));
         assert!(replication.contains("--fleet-id 1f91ca65-7793-48cc-866e-ac15690130e1"));
         assert!(replication.contains("--shared-secret-file /var/lib/st3/fleet.secret"));
         Ok(())
@@ -1102,7 +1038,7 @@ mod tests {
             socket: "/tmp/st3 socket".into(),
             ..Config::default()
         };
-        let spec = ServiceSpec::new("/opt/st3 tools/st3", config, "/opt/st3 tools", 1024)?;
+        let spec = ServiceSpec::new("/opt/st3 tools/st3", config, 1024)?;
         let unit = render_systemd_user_unit(&spec);
         assert!(unit.contains("\"/opt/st3 tools/st3\""));
         assert!(unit.contains("\"/tmp/st3 state 100%%\""));
@@ -1117,20 +1053,29 @@ mod tests {
             socket: "/tmp/st3.sock".into(),
             ..Config::default()
         };
-        let spec = ServiceSpec::new(
-            "/Users/test/bin/st3",
-            config,
-            "/Users/test/bin:/usr/bin:/bin",
-            1024,
-        )?;
+        let spec = ServiceSpec::new("/Users/test/bin/st3", config, 1024)?;
         let plist = render_launchd_plist(&spec);
         assert!(plist.contains("<string>com.compoundingtech.st3</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        assert!(plist.contains("<key>ProcessType</key><string>Interactive</string>"));
+        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>NumberOfFiles</key><integer>8192</integer>"));
         assert!(plist.contains("st3.stdout.log"));
         assert!(plist.contains("Application Support/st3"));
+
+        let replication = render_launchd_replication_plist(&spec);
+        assert!(replication.contains("<key>ProcessType</key><string>Background</string>"));
         Ok(())
+    }
+
+    #[test]
+    fn macos_permission_guidance_names_the_exact_binary_and_manual_steps() {
+        let guidance = macos_permission_guidance(Path::new("/Users/test/bin/st3"));
+        assert!(guidance.contains("st3 executable\t/Users/test/bin/st3"));
+        assert!(guidance.contains("Full Disk Access"));
+        assert!(guidance.contains("Developer Tools"));
+        assert!(guidance.contains("cannot grant"));
     }
 
     #[test]

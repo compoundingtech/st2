@@ -65,6 +65,25 @@ or another loopback port exposer carries those endpoints between machines.
 
 See [fleet replication](docs/st3/replication.md) for the peer configuration and repair commands.
 
+The service installer keeps the control processes separate from mission runtimes. Linux starts each
+runtime in its own systemd user scope. macOS starts each runtime in its own process session. A main
+daemon restart does not stop an existing runtime. The replication worker also has its own service.
+
+The macOS main service uses the interactive launchd class because it starts interactive agent
+sessions. The replication worker stays in the background class. The Linux services use the normal
+user priority. They do not lower the priority of the runtime scopes.
+
+The service files contain the absolute st3 path. They do not contain a captured or guessed `PATH`.
+Before each new PTY or exec starts, st3 runs the account's default shell as an interactive login
+shell. It captures the shell's current exported environment. The mission environment then overrides
+those values. A `${PATH}` value expands against the fresh shell path. st3 starts the declared command
+directly after this probe, so a shell wrapper does not change its arguments, signals, or exit status.
+The probe has a ten-second timeout. A broken shell startup cannot stop reconciliation forever.
+
+On macOS, run `st service permissions` for the one-time Full Disk Access and Developer Tools steps.
+Use `st service permissions --open` to open the matching System Settings pages. macOS does not let a
+launchd property list grant these permissions.
+
 ## Publish and run a mission
 
 Start with an example or a KDL file from your private network repository:
@@ -170,6 +189,26 @@ st schema list
 Invalid replicated records remain visible and cannot halt replication. An explicit repair names the
 bad record and publishes its replacement. See [data authority](docs/st3/data-authority.md) and
 [fleet replication](docs/st3/replication.md) for the guarantees.
+
+## CLI output and terminals
+
+Structured commands print a readable view by default. Add the global `--json` option when a program
+needs the stable data shape:
+
+```sh
+st pty ls
+st --json pty ls
+st --json status
+```
+
+Commands that return document bytes, logs, terminal screens, or completion scripts keep their raw
+payload output.
+
+`st pty attach SUBJECT` uses the same Rust terminal client as `pty attach`. Type normally in the
+attached session. Press Ctrl+\ once to detach without stopping the session. The client restores
+terminal modes before it exits. It forwards terminal resize and Kitty key sequences without a text
+translation layer. A nested attachment is refused by default. Use `--force` only when the nested
+attachment is intentional.
 
 ## Documentation
 

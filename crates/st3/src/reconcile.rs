@@ -59,13 +59,14 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
-    pub fn new(state_dir: &Path, pty_root: Option<&Path>) -> Self {
+    pub fn new(state_dir: &Path, pty_root: Option<&Path>, pty_binary: &Path) -> Self {
         Self {
             pty: st_runtime::PtyRuntime::new(
                 pty_root
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| state_dir.join("pty")),
-            ),
+            )
+            .with_binary(pty_binary.to_string_lossy()),
             exec: st_runtime::ExecRuntime::new(state_dir.join("exec"), state_dir.join("logs")),
         }
     }
@@ -122,20 +123,36 @@ impl RuntimeControl for NativeRuntime {
     }
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
-        let launch = st_runtime::Launch::from(&member.launch);
+        let executable = std::env::current_exe()?;
+        let environment = st_runtime::materialize_environment(&member.environment, &executable)?;
+        let mut launch = st_runtime::Launch::from(&member.launch);
+        match &mut launch {
+            st_runtime::Launch::Shell(source) => {
+                st_runtime::expand_path_placeholder(source, &environment);
+            }
+            st_runtime::Launch::Argv(argv) => {
+                for value in argv {
+                    st_runtime::expand_path_placeholder(value, &environment);
+                }
+            }
+        }
         let cwd = PathBuf::from(&member.cwd);
         if member.terminal {
-            self.pty.spawn(
-                &member.runtime_id,
-                &launch,
-                &cwd,
-                &member.environment,
-                member.display_name.as_deref(),
-                &member.tags,
-            )
+            let pty_binary = st_runtime::resolve_executable("pty", &environment)?;
+            self.pty
+                .clone()
+                .with_binary(pty_binary.to_string_lossy())
+                .spawn(
+                    &member.runtime_id,
+                    &launch,
+                    &cwd,
+                    &environment,
+                    member.display_name.as_deref(),
+                    &member.tags,
+                )
         } else {
             self.exec
-                .spawn(&member.runtime_id, &launch, &cwd, &member.environment)
+                .spawn(&member.runtime_id, &launch, &cwd, &environment)
                 .map(|_| ())
         }
     }
@@ -223,17 +240,22 @@ impl Reconciler<NativeRuntime> {
         store: Arc<Store>,
         state_dir: &Path,
         pty_root: Option<&Path>,
+        pty_binary: &Path,
         host: String,
         endpoint: String,
         notify: Arc<Notify>,
         event_notify: watch::Sender<u64>,
-    ) -> Self {
+    ) -> Result<Self> {
         let selected_pty_root = pty_root
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state_dir.join("pty"));
-        Self {
+        Ok(Self {
             store,
-            runtime: Arc::new(NativeRuntime::new(state_dir, Some(&selected_pty_root))),
+            runtime: Arc::new(NativeRuntime::new(
+                state_dir,
+                Some(&selected_pty_root),
+                pty_binary,
+            )),
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
@@ -250,7 +272,7 @@ impl Reconciler<NativeRuntime> {
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
-        }
+        })
     }
 }
 
@@ -763,7 +785,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .insert("ST3_BIN".into(), executable.to_string_lossy().into_owned());
-        prepend_executable_dir(&mut launch_member.environment, &executable)?;
         if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
             && argv.first().map(String::as_str) == Some("st3")
         {
@@ -5835,7 +5856,7 @@ fn run_variables(
                 .unwrap_or(&run.root_mission_run)
                 .into(),
         ),
-        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+        ("PATH".into(), "${PATH}".into()),
     ]);
     variables.extend(
         run.inputs
@@ -6129,29 +6150,6 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn prepend_executable_dir(
-    environment: &mut BTreeMap<String, String>,
-    executable: &Path,
-) -> Result<()> {
-    let Some(directory) = executable.parent() else {
-        return Ok(());
-    };
-    let ambient = std::env::var_os("PATH").unwrap_or_default();
-    let declared = environment
-        .get("PATH")
-        .map(String::as_str)
-        .unwrap_or("${PATH}");
-    let expanded = declared.replace("${PATH}", &ambient.to_string_lossy());
-    let current = std::ffi::OsString::from(expanded);
-    let paths = std::iter::once(directory.to_path_buf())
-        .chain(std::env::split_paths(&current).filter(|path| path != directory));
-    environment.insert(
-        "PATH".into(),
-        std::env::join_paths(paths)?.to_string_lossy().into_owned(),
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -6640,10 +6638,9 @@ version 2
             .find(|member| member.environment.contains_key("CUSTOM_PATH"))
             .cloned()
             .expect("the mission task did not start");
-        assert!(mission_task.environment["CUSTOM_PATH"].starts_with("/opt/st3-shims:"));
-        assert!(
-            mission_task.environment["CUSTOM_PATH"]
-                .ends_with(&std::env::var("PATH").unwrap_or_default())
+        assert_eq!(
+            mission_task.environment["CUSTOM_PATH"],
+            "/opt/st3-shims:${PATH}"
         );
 
         runtime.execs.lock().unwrap().insert(
@@ -7745,12 +7742,11 @@ version 2
             members[0].environment.get("ST_AGENT").map(String::as_str),
             Some("agent/node.worker")
         );
-        let executable = std::env::current_exe().unwrap();
-        let path = members[0].environment.get("PATH").unwrap();
         assert_eq!(
-            std::env::split_paths(std::ffi::OsStr::new(path)).next(),
-            executable.parent().map(Path::to_path_buf)
+            members[0].environment.get("ST3_BIN").map(PathBuf::from),
+            Some(std::env::current_exe().unwrap())
         );
+        assert!(!members[0].environment.contains_key("PATH"));
     }
 
     #[test]

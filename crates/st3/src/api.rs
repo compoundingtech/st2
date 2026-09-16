@@ -55,6 +55,7 @@ pub struct AppState {
     pub node: String,
     pub state_dir: std::path::PathBuf,
     pub pty_root: std::path::PathBuf,
+    pub pty_binary: std::path::PathBuf,
     pub fleet_id: Option<String>,
     pub configured_peers: Vec<String>,
 }
@@ -221,6 +222,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
+        .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
         .route("/v1/sessions/input/{*subject}", post(input_session))
@@ -483,7 +485,9 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             .as_ref()
             .is_some_and(|member| member.terminal)
     });
-    let pty_snapshot = st_runtime::PtyRuntime::new(state.pty_root.clone()).snapshot();
+    let pty_snapshot = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
+        .snapshot();
     match &pty_snapshot {
         Ok(items) => checks.push(DoctorCheck {
             name: "pty-runtime".into(),
@@ -2931,6 +2935,15 @@ async fn status(
     .map(Json)
 }
 
+async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::model::SubjectStatus>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.terminal_statuses())
+        .await
+        .map(Json)
+}
+
 async fn reset_runtime(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -4249,6 +4262,7 @@ async fn screen_session(
         )));
     }
     let screen = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
         .screen(&session.runtime_id)
         .map_err(ApiError::internal)?;
     Ok(Json(SessionScreen {
@@ -4346,7 +4360,8 @@ async fn input_session(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone());
+    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy());
     let effect = match request.mode {
         SessionInputMode::Line => runtime.send_line_if(
             &session.runtime_id,
@@ -4436,11 +4451,9 @@ async fn clear_context(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let effect = st_runtime::PtyRuntime::new(state.pty_root.clone()).send_line_if(
-        &session.runtime_id,
-        "/clear",
-        Some(&session.incarnation_id),
-    );
+    let effect = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
+        .send_line_if(&session.runtime_id, "/clear", Some(&session.incarnation_id));
     finish_session_control(
         &state,
         &subject,
@@ -4527,11 +4540,9 @@ async fn signal_session(
         })
         .map_err(ApiError::bad)?;
     let effect = if session.terminal {
-        st_runtime::PtyRuntime::new(state.pty_root.clone()).signal_if(
-            &session.runtime_id,
-            Some(&session.incarnation_id),
-            signal,
-        )
+        st_runtime::PtyRuntime::new(state.pty_root.clone())
+            .with_binary(state.pty_binary.to_string_lossy())
+            .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
     } else {
         st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"))
             .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
@@ -4825,124 +4836,44 @@ async fn terminal_session(
     }
     Ok(websocket
         .protocols(["st3.terminal.v1"])
-        .on_upgrade(move |socket| {
-            terminal_proxy(socket, state, subject, runtime_id, current_incarnation)
-        }))
+        .on_upgrade(move |socket| terminal_proxy(socket, state.pty_root, runtime_id)))
 }
 
-async fn terminal_proxy(
-    socket: WebSocket,
-    state: AppState,
-    subject: String,
-    runtime_id: String,
-    incarnation_id: Option<String>,
-) {
-    let mut output = match tokio::process::Command::new("pty")
-        .env("PTY_ROOT", &state.pty_root)
-        .args(["peek", "-f", &runtime_id])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return,
-    };
-    let Some(mut output_stream) = output.stdout.take() else {
-        return;
-    };
+async fn terminal_proxy(socket: WebSocket, pty_root: std::path::PathBuf, runtime_id: String) {
+    let stream =
+        match tokio::net::UnixStream::connect(pty_root.join(format!("{runtime_id}.sock"))).await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
     let (mut writer, mut reader) = socket.split();
-    let store = state.store.clone();
-    let input_subject = subject.clone();
-    let input_runtime = runtime_id.clone();
-    let pty_root = state.pty_root.clone();
-    let input = tokio::spawn(async move {
-        let runtime = st_runtime::PtyRuntime::new(pty_root);
-        let mut sequence = 0_u64;
-        while let Some(Ok(message)) = reader.next().await {
-            let (mode, bytes) = match message {
-                WsMessage::Binary(bytes) => ("binary", bytes.to_vec()),
-                WsMessage::Text(text) => ("text", text.as_bytes().to_vec()),
-                WsMessage::Close(_) => break,
-                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
-            };
-            sequence = sequence.saturating_add(1);
-            let sha256 = hex::encode(Sha256::digest(&bytes));
-            let mut fields = BTreeMap::from([
-                ("sequence".into(), Value::from(sequence)),
-                ("mode".into(), Value::String(mode.into())),
-                ("sha256".into(), Value::String(sha256)),
-                ("byte_count".into(), Value::from(bytes.len() as u64)),
-                ("runtime_id".into(), Value::String(input_runtime.clone())),
-            ]);
-            if let Some(incarnation_id) = &incarnation_id {
-                fields.insert(
-                    "incarnation_id".into(),
-                    Value::String(incarnation_id.clone()),
-                );
-            }
-            let request = store.append_claim(&ClaimInput {
-                subject: input_subject.clone(),
-                kind: "terminal.input.requested".into(),
-                actor: None,
-                fields,
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!(
-                    "terminal:{input_subject}:{input_runtime}:{sequence}"
-                )),
-            });
-            let Ok(request) = request else {
-                break;
-            };
-            if runtime
-                .send_raw_if(&input_runtime, &bytes, incarnation_id.as_deref())
-                .is_err()
-            {
-                break;
-            }
-            let mut fields = BTreeMap::from([
-                ("sequence".into(), Value::from(sequence)),
-                ("result".into(), Value::String("written".into())),
-                ("runtime_id".into(), Value::String(input_runtime.clone())),
-            ]);
-            if let Some(incarnation_id) = &incarnation_id {
-                fields.insert(
-                    "incarnation_id".into(),
-                    Value::String(incarnation_id.clone()),
-                );
-            }
-            let _ = store.append_claim(&ClaimInput {
-                subject: input_subject.clone(),
-                kind: "terminal.input.result".into(),
-                actor: None,
-                fields,
-                evidence: vec![request.id],
-                expected_subject: None,
-                idempotency_key: Some(format!(
-                    "terminal-result:{input_subject}:{input_runtime}:{sequence}"
-                )),
-            });
-        }
-    });
-    use tokio::io::AsyncReadExt as _;
+    let (mut output_stream, mut input_stream) = stream.into_split();
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let mut bytes = vec![0_u8; 8192];
     loop {
-        match output_stream.read(&mut bytes).await {
-            Ok(0) | Err(_) => break,
-            Ok(count)
-                if writer
-                    .send(WsMessage::Binary(bytes[..count].to_vec().into()))
-                    .await
-                    .is_err() =>
-            {
-                break;
+        tokio::select! {
+            read = output_stream.read(&mut bytes) => {
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) if writer
+                        .send(WsMessage::Binary(bytes[..count].to_vec().into()))
+                        .await
+                        .is_err() => break,
+                    Ok(_) => {}
+                }
             }
-            Ok(_) => {}
+            message = reader.next() => {
+                let payload = match message {
+                    Some(Ok(WsMessage::Binary(bytes))) => bytes.to_vec(),
+                    Some(Ok(WsMessage::Text(text))) => text.as_bytes().to_vec(),
+                    Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                };
+                if input_stream.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
         }
     }
-    input.abort();
-    let _ = output.kill().await;
 }
 
 fn normalize_message_party(value: &str) -> String {
@@ -4960,6 +4891,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use std::path::PathBuf;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     fn state(root: &Path) -> AppState {
@@ -4970,6 +4902,7 @@ mod tests {
             node: "node".into(),
             state_dir: root.to_path_buf(),
             pty_root: root.join("pty"),
+            pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
         }

@@ -4772,6 +4772,28 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn terminal_statuses(&self) -> Result<Vec<SubjectStatus>> {
+        let subjects = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT subject FROM desired
+                 WHERE member IS NOT NULL
+                   AND json_extract(member, '$.terminal')=1
+                 ORDER BY subject",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut statuses = Vec::with_capacity(subjects.len());
+        for subject in subjects {
+            if let Some(status) = self.status(Some(&subject))?.subjects.into_iter().next() {
+                statuses.push(status);
+            }
+        }
+        Ok(statuses)
+    }
+
     pub fn retire_eval_owned_desired(&self, run: &str) -> Result<Vec<String>> {
         let run = if run.starts_with("mission-run/") {
             run.to_owned()
@@ -12001,7 +12023,7 @@ pub(crate) fn mission_run_variables(
         ),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_REQUESTER".into(), run.requester.clone()),
-        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+        ("PATH".into(), "${PATH}".into()),
         (
             "ST_PARENT_STEP_RUN".into(),
             run.parent_step_run.clone().unwrap_or_default(),

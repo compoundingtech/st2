@@ -1,7 +1,9 @@
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
+use pty_core::client::{AttachParams, ClientIo, attach};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -93,7 +95,7 @@ impl Client {
         Ok(response.value)
     }
 
-    pub async fn proxy_terminal(&self, path: &str) -> Result<()> {
+    pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
         match &self.endpoint {
             Endpoint::Unix(socket) => {
                 let stream = tokio::net::UnixStream::connect(socket)
@@ -101,7 +103,7 @@ impl Client {
                     .with_context(|| format!("connect to the st3 API at {}", socket.display()))?;
                 let request = terminal_request(&format!("ws://localhost{path}"))?;
                 let (websocket, _) = tokio_tungstenite::client_async(request, stream).await?;
-                proxy_websocket(websocket).await
+                proxy_websocket(name, websocket).await
             }
             Endpoint::Http(base) => {
                 let base = base
@@ -114,7 +116,7 @@ impl Client {
                     .context("a terminal endpoint must use http or https")?;
                 let request = terminal_request(&format!("{base}{path}"))?;
                 let (websocket, _) = tokio_tungstenite::connect_async(request).await?;
-                proxy_websocket(websocket).await
+                proxy_websocket(name, websocket).await
             }
         }
     }
@@ -131,35 +133,58 @@ fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::R
     Ok(request)
 }
 
-async fn proxy_websocket<S>(websocket: tokio_tungstenite::WebSocketStream<S>) -> Result<()>
+async fn proxy_websocket<S>(
+    name: &str,
+    websocket: tokio_tungstenite::WebSocketStream<S>,
+) -> Result<i32>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (client_stream, bridge_stream) = StdUnixStream::pair()?;
+    bridge_stream.set_nonblocking(true)?;
+    let bridge_stream = tokio::net::UnixStream::from_std(bridge_stream)?;
+    let bridge = tokio::spawn(bridge_terminal_protocol(websocket, bridge_stream));
+    let name = name.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        attach(
+            AttachParams::new(&name, client_stream),
+            &ClientIo::default(),
+        )
+    })
+    .await
+    .context("join the terminal client")?;
+    bridge.abort();
+    Ok(outcome.exit_code())
+}
+
+async fn bridge_terminal_protocol<S>(
+    websocket: tokio_tungstenite::WebSocketStream<S>,
+    stream: tokio::net::UnixStream,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let _raw = RawTerminal::enter();
     let (mut writer, mut reader) = websocket.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut input = vec![0_u8; 4096];
+    let (mut input, mut output) = stream.into_split();
+    let mut bytes = vec![0_u8; 65_536];
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     loop {
         tokio::select! {
-            read = stdin.read(&mut input) => {
+            read = input.read(&mut bytes) => {
                 let count = read?;
                 if count == 0 {
                     writer.close().await?;
                     break;
                 }
-                writer.send(tokio_tungstenite::tungstenite::Message::Binary(input[..count].to_vec().into())).await?;
+                writer.send(tokio_tungstenite::tungstenite::Message::Binary(bytes[..count].to_vec().into())).await?;
             }
             message = reader.next() => {
                 match message {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
-                        stdout.write_all(&bytes).await?;
-                        stdout.flush().await?;
+                        output.write_all(&bytes).await?;
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                        stdout.write_all(text.as_bytes()).await?;
-                        stdout.flush().await?;
+                        output.write_all(text.as_bytes()).await?;
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
@@ -169,34 +194,6 @@ where
         }
     }
     Ok(())
-}
-
-struct RawTerminal(Option<String>);
-
-impl RawTerminal {
-    fn enter() -> Self {
-        let state = std::process::Command::new("stty")
-            .arg("-g")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|value| value.trim().to_owned());
-        if state.is_some() {
-            let _ = std::process::Command::new("stty")
-                .args(["raw", "-echo"])
-                .status();
-        }
-        Self(state)
-    }
-}
-
-impl Drop for RawTerminal {
-    fn drop(&mut self) {
-        if let Some(state) = &self.0 {
-            let _ = std::process::Command::new("stty").arg(state).status();
-        }
-    }
 }
 
 async fn unix_request(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>> {
@@ -391,7 +388,7 @@ mod tests {
         });
 
         Client::unix(&socket)
-            .proxy_terminal("/v1/pty/agent%2Fdemo/attach")
+            .proxy_terminal("demo", "/v1/pty/agent%2Fdemo/attach")
             .await
             .unwrap();
         server.await.unwrap();
@@ -435,7 +432,7 @@ mod tests {
         });
 
         Client::new(Endpoint::Http(format!("http://{address}")))
-            .proxy_terminal("/v1/pty/agent%2Fdemo/attach")
+            .proxy_terminal("demo", "/v1/pty/agent%2Fdemo/attach")
             .await
             .unwrap();
         server.await.unwrap();

@@ -5,8 +5,11 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 struct Daemon(Child);
 
@@ -83,7 +86,7 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
     step "operator" {
 
         pty "operator" {
-          argv "sh" "-c" "printf ready; read line; printf ' got:%s' \"$line\"; sleep 1"
+          argv "sh" "-c" "printf ready; while IFS= read -r line; do if [ \"$line\" = size ]; then stty size; else printf ' got:%s hex:' \"$line\"; printf %s \"$line\" | od -An -tx1 | tr -d ' \\n'; fi; done"
           restart "never"
         }
 
@@ -168,7 +171,34 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         .output()
         .unwrap();
     assert!(listed.status.success());
-    assert!(String::from_utf8_lossy(&listed.stdout).contains(&subject));
+    let listed_text = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed_text.contains("TERMINALS"), "{listed_text}");
+    assert!(listed_text.contains(&subject), "{listed_text}");
+    assert!(serde_json::from_slice::<serde_json::Value>(&listed.stdout).is_err());
+    let listed_json = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--json",
+            "pty",
+            "ls",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        listed_json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed_json.stderr)
+    );
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed_json.stdout).unwrap();
+    assert!(
+        listed_json
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["subject"] == subject))
+    );
+
+    attach_types_detaches_and_leaves_the_session_running(binary, &socket, &subject);
+
     let sent = st3_command(binary)
         .args([
             "--endpoint",
@@ -220,6 +250,268 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         String::from_utf8_lossy(&signalled.stderr)
     );
     daemon.stop();
+}
+
+#[test]
+fn structured_cli_views_offer_human_and_json_surfaces() {
+    let binary = assert_cmd::cargo::cargo_bin!("st3");
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let socket = temporary.path().join("st3.sock");
+    let mut daemon = start_daemon(binary, &state, &socket);
+    wait_for(
+        || {
+            st3_command(binary)
+                .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        },
+        "the daemon did not become ready",
+    );
+
+    let surfaces: &[(&str, &[&str], &str)] = &[
+        ("doctor", &["doctor"], "pass"),
+        ("status", &["status"], "RESULT"),
+        ("agent list", &["agents"], ""),
+        ("runtime list", &["runtime", "ls"], ""),
+        ("document list", &["doc", "list"], ""),
+        ("resource list", &["resource", "ls"], ""),
+        ("message list", &["message", "ls"], ""),
+        ("replication status", &["replication", "status"], "fleet"),
+        (
+            "replication invalid records",
+            &["replication", "invalid"],
+            "",
+        ),
+        ("schema subjects", &["schema", "subjects"], ""),
+        ("schema resources", &["schema", "resources"], ""),
+        ("schema claims", &["schema", "claims"], ""),
+        ("schema export", &["schema", "export"], "RESULT"),
+        ("review list", &["review", "ls"], "HUMAN REVIEWS"),
+        ("attention list", &["attention", "ls"], "HUMAN ATTENTION"),
+        ("work list", &["work", "ls"], "WORK"),
+        ("terminal list", &["pty", "ls"], "TERMINALS"),
+    ];
+    for (name, arguments, expected) in surfaces {
+        let human = st3_command(binary)
+            .args(["--endpoint", socket.to_str().unwrap()])
+            .args(*arguments)
+            .output()
+            .unwrap();
+        assert!(
+            human.status.success(),
+            "{name} human output failed: {}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let human_text = String::from_utf8(human.stdout).unwrap();
+        assert!(
+            human_text.contains(expected),
+            "{name} human output did not contain {expected:?}: {human_text:?}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&human_text).is_err(),
+            "{name} printed JSON by default: {human_text}"
+        );
+
+        let json = st3_command(binary)
+            .args(["--endpoint", socket.to_str().unwrap(), "--json"])
+            .args(*arguments)
+            .output()
+            .unwrap();
+        assert!(
+            json.status.success(),
+            "{name} JSON output failed: {}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&json.stdout)
+            .unwrap_or_else(|error| panic!("{name} did not print valid JSON: {error}"));
+    }
+    daemon.stop();
+}
+
+fn attach_types_detaches_and_leaves_the_session_running(
+    binary: &Path,
+    socket: &Path,
+    subject: &str,
+) {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(binary);
+    command.args([
+        "--endpoint",
+        socket.to_str().unwrap(),
+        "pty",
+        "attach",
+        subject,
+    ]);
+    command.env("ST_AGENT", "person/test");
+    command.env_remove("PTY_SESSION");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => reader_output
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..count]),
+            }
+        }
+    });
+    wait_for(
+        || String::from_utf8_lossy(&output.lock().unwrap()).contains("ready"),
+        "the attached terminal did not replay its screen",
+    );
+    writer.write_all(b"from-attach\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "pty",
+                    "peek",
+                    subject,
+                ])
+                .output()
+                .is_ok_and(|result| {
+                    result.status.success()
+                        && String::from_utf8_lossy(&result.stdout).contains("got:from-attach")
+                })
+        },
+        "typed terminal input did not reach the managed session",
+    );
+
+    pair.master
+        .resize(PtySize {
+            rows: 41,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    writer.write_all(b"size\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "pty",
+                    "peek",
+                    subject,
+                ])
+                .output()
+                .is_ok_and(|result| {
+                    result.status.success()
+                        && String::from_utf8_lossy(&result.stdout).contains("41 132")
+                })
+        },
+        "the managed terminal did not receive the outer terminal resize",
+    );
+
+    writer.write_all(b"\x1b[13;2u\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "pty",
+                    "peek",
+                    subject,
+                ])
+                .output()
+                .is_ok_and(|result| {
+                    result.status.success()
+                        && String::from_utf8_lossy(&result.stdout).contains("hex:1b5b31333b3275")
+                })
+        },
+        "the Kitty Shift+Enter sequence did not reach the managed terminal unchanged",
+    );
+
+    writer.write_all(b"\x1b[92;5u").unwrap();
+    writer.flush().unwrap();
+    wait_for(
+        || child.try_wait().is_ok_and(|status| status.is_some()),
+        "the Kitty Ctrl+\\ key did not detach",
+    );
+    drop(writer);
+    let _ = reader_thread.join();
+    let output = output.lock().unwrap().clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("[detached]"), "attach output: {text:?}");
+    assert!(
+        output
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "the attach client did not reset the alternate screen: {text:?}"
+    );
+
+    let still_running = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "pty",
+            "send",
+            subject,
+            "after-detach",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        still_running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&still_running.stderr)
+    );
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "pty",
+                    "peek",
+                    subject,
+                ])
+                .output()
+                .is_ok_and(|result| {
+                    result.status.success()
+                        && String::from_utf8_lossy(&result.stdout).contains("got:after-detach")
+                })
+        },
+        "the managed session did not survive the attachment",
+    );
+    let peeked = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "pty",
+            "peek",
+            subject,
+        ])
+        .output()
+        .unwrap();
+    assert!(peeked.status.success());
+    assert!(
+        !String::from_utf8_lossy(&peeked.stdout).contains("1b5b39323b3575"),
+        "the local Kitty Ctrl+\\ detach sequence leaked into the managed terminal"
+    );
 }
 
 fn wait_for(mut test: impl FnMut() -> bool, message: &str) {
@@ -744,7 +1036,13 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
     wait_for(
         || {
             let output = st3_command(binary)
-                .args(["--endpoint", socket.to_str().unwrap(), "inspect", &subject])
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "--json",
+                    "inspect",
+                    &subject,
+                ])
                 .output();
             output.is_ok_and(|output| {
                 output.status.success()

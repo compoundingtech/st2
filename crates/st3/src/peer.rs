@@ -874,6 +874,7 @@ mod tests {
             node: "target".into(),
             state_dir: root.path().to_path_buf(),
             pty_root: root.path().join("pty"),
+            pty_binary: std::path::PathBuf::from("pty"),
             fleet_id: Some(fleet.into()),
             configured_peers: vec!["source".into()],
         });

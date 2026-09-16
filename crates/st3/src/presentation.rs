@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
+use serde_json::Value;
 use st3::model::{
     AttentionItemView, HumanReviewView, MissionInputKind, MissionRunView, RevisionCutover,
-    RevisionProposalView, RunGenerationView, StepRunView,
+    RevisionProposalView, RunGenerationView, StepRunView, SubjectStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +239,221 @@ pub(crate) fn render_work_list(
         let _ = writeln!(output, "{}", style.muted("No ready or active work."));
     }
     output
+}
+
+pub(crate) fn render_pty_list(sessions: &[SubjectStatus], style: OutputStyle) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "{}", style.heading("TERMINALS"));
+    if sessions.is_empty() {
+        let _ = writeln!(
+            output,
+            "{}",
+            style.muted("No terminal sessions are declared.")
+        );
+        return output;
+    }
+    let _ = writeln!(
+        output,
+        "{} {}",
+        sessions.len(),
+        if sessions.len() == 1 {
+            "session"
+        } else {
+            "sessions"
+        }
+    );
+    for session in sessions {
+        let fields = session
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual));
+        let state = fields
+            .and_then(|fields| fields.get("state").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                fields.and_then(|fields| fields.get("status").and_then(serde_json::Value::as_str))
+            })
+            .unwrap_or_else(|| {
+                if session.gap.is_some() {
+                    "pending"
+                } else {
+                    session.reachability.as_str()
+                }
+            });
+        let host = fields
+            .and_then(|fields| fields.get("host").and_then(serde_json::Value::as_str))
+            .unwrap_or("unknown host");
+        let runtime = fields
+            .and_then(|fields| fields.get("runtime_id").and_then(serde_json::Value::as_str))
+            .unwrap_or("no runtime");
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  {} {}",
+            style.status_value(state, state_mark(state)),
+            session.subject
+        );
+        let _ = write!(
+            output,
+            "    {} · {} · {}",
+            style.status(state),
+            host,
+            runtime
+        );
+        if let Some(owner) = &session.owner_run {
+            let _ = write!(output, " · {owner}");
+        }
+        let _ = writeln!(output);
+    }
+    output
+}
+
+pub(crate) fn render_human_value(value: &Value, style: OutputStyle) -> String {
+    let mut output = String::new();
+    match value {
+        Value::Object(fields) => {
+            let title = object_identity(fields).unwrap_or("RESULT");
+            let _ = writeln!(output, "{}", style.heading(title));
+            render_object_fields(&mut output, fields, 0, style, None);
+        }
+        Value::Array(items) => {
+            let _ = writeln!(output, "{}", style.heading("RESULTS"));
+            let _ = writeln!(
+                output,
+                "{} {}",
+                items.len(),
+                if items.len() == 1 { "item" } else { "items" }
+            );
+            if items.is_empty() {
+                let _ = writeln!(output, "{}", style.muted("No items."));
+            }
+            for item in items {
+                render_array_item(&mut output, item, style);
+            }
+        }
+        scalar => {
+            let _ = writeln!(output, "{}", scalar_text(scalar));
+        }
+    }
+    output
+}
+
+fn render_array_item(output: &mut String, value: &Value, style: OutputStyle) {
+    match value {
+        Value::Object(fields) => {
+            let identity = object_identity(fields).unwrap_or("item");
+            let _ = writeln!(output);
+            let _ = writeln!(output, "  {}", style.heading(identity));
+            render_object_fields(output, fields, 2, style, Some(identity));
+        }
+        Value::Array(items) => {
+            let _ = writeln!(output, "  • {} items", items.len());
+            for item in items {
+                render_nested_value(output, item, 4, style);
+            }
+        }
+        scalar => {
+            let _ = writeln!(output, "  • {}", scalar_text(scalar));
+        }
+    }
+}
+
+fn render_object_fields(
+    output: &mut String,
+    fields: &serde_json::Map<String, Value>,
+    indent: usize,
+    style: OutputStyle,
+    displayed_identity: Option<&str>,
+) {
+    for (key, value) in fields {
+        if displayed_identity.is_some_and(|identity| scalar_text(value) == identity)
+            && matches!(key.as_str(), "subject" | "id" | "name" | "reference")
+        {
+            continue;
+        }
+        let padding = " ".repeat(indent);
+        let label = field_label(key);
+        match value {
+            Value::Object(nested) if nested.is_empty() => {
+                let _ = writeln!(output, "{padding}{label:<14} {}", style.muted("none"));
+            }
+            Value::Object(nested) => {
+                let _ = writeln!(output, "{padding}{}", style.heading(label));
+                render_object_fields(output, nested, indent + 2, style, None);
+            }
+            Value::Array(items) if items.is_empty() => {
+                let _ = writeln!(output, "{padding}{label:<14} {}", style.muted("none"));
+            }
+            Value::Array(items) if items.iter().all(is_scalar) => {
+                let joined = items.iter().map(scalar_text).collect::<Vec<_>>().join(", ");
+                let _ = writeln!(output, "{padding}{label:<14} {joined}");
+            }
+            Value::Array(items) => {
+                let _ = writeln!(
+                    output,
+                    "{padding}{}  {} items",
+                    style.heading(label),
+                    items.len()
+                );
+                for item in items {
+                    render_nested_value(output, item, indent + 2, style);
+                }
+            }
+            scalar => {
+                let text = scalar_text(scalar);
+                let mut lines = text.lines();
+                let first = lines.next().unwrap_or_default();
+                let _ = writeln!(output, "{padding}{label:<14} {first}");
+                for line in lines {
+                    let _ = writeln!(output, "{padding}{:<14} {line}", "");
+                }
+            }
+        }
+    }
+}
+
+fn render_nested_value(output: &mut String, value: &Value, indent: usize, style: OutputStyle) {
+    let padding = " ".repeat(indent);
+    match value {
+        Value::Object(fields) => {
+            let identity = object_identity(fields).unwrap_or("item");
+            let _ = writeln!(output, "{padding}• {identity}");
+            render_object_fields(output, fields, indent + 2, style, Some(identity));
+        }
+        Value::Array(items) => {
+            let _ = writeln!(output, "{padding}• {} items", items.len());
+            for item in items {
+                render_nested_value(output, item, indent + 2, style);
+            }
+        }
+        scalar => {
+            let _ = writeln!(output, "{padding}• {}", scalar_text(scalar));
+        }
+    }
+}
+
+fn object_identity(fields: &serde_json::Map<String, Value>) -> Option<&str> {
+    ["subject", "reference", "name", "id", "status"]
+        .into_iter()
+        .find_map(|key| fields.get(key).and_then(Value::as_str))
+}
+
+fn is_scalar(value: &Value) -> bool {
+    !matches!(value, Value::Array(_) | Value::Object(_))
+}
+
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::Null => "—".into(),
+        Value::Bool(true) => "yes".into(),
+        Value::Bool(false) => "no".into(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        Value::Array(_) | Value::Object(_) => "—".into(),
+    }
+}
+
+fn field_label(key: &str) -> String {
+    key.replace(['_', '-'], " ").to_uppercase()
 }
 
 pub(crate) fn render_human_review_list(
@@ -981,6 +1197,99 @@ mod tests {
             attempt: 1,
             requested_at_unix_ms,
         }
+    }
+
+    fn terminal(subject: &str, status: &str) -> SubjectStatus {
+        SubjectStatus {
+            subject: subject.into(),
+            kind: Some("agent".into()),
+            desired_token: Some("claim/desired".into()),
+            desired_revision: Some("revision".into()),
+            desired: None,
+            actual: Some(serde_json::json!({
+                "fields": {
+                    "status": status,
+                    "host": "test-node",
+                    "runtime_id": "runtime.test",
+                    "terminal": true
+                }
+            })),
+            conflicts: Vec::new(),
+            claims: vec!["claim/actual".into()],
+            owner_run: Some("mission-run/test/run".into()),
+            gap: None,
+            reachability: "reachable".into(),
+            reason: None,
+            under: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_list_is_readable_and_keeps_exact_identifiers() {
+        let rendered = render_pty_list(
+            &[terminal("agent/test/worker", "running")],
+            OutputStyle::plain(),
+        );
+        assert!(rendered.contains("TERMINALS"));
+        assert!(rendered.contains("1 session"));
+        assert!(rendered.contains("agent/test/worker"));
+        assert!(rendered.contains("running · test-node · runtime.test"));
+        assert!(rendered.contains("mission-run/test/run"));
+        assert!(!rendered.contains('{'));
+    }
+
+    #[test]
+    fn terminal_list_has_a_clear_empty_state() {
+        assert_eq!(
+            render_pty_list(&[], OutputStyle::plain()),
+            "TERMINALS\nNo terminal sessions are declared.\n"
+        );
+    }
+
+    #[test]
+    fn generic_human_output_renders_objects_without_json_syntax() {
+        let value = serde_json::json!({
+            "subject": "claim/example",
+            "ready": true,
+            "optional": null,
+            "tags": ["one", "two"],
+            "details": {"exit_code": 0}
+        });
+        let rendered = render_human_value(&value, OutputStyle::plain());
+        assert!(rendered.starts_with("claim/example\n"));
+        assert!(rendered.contains("READY          yes"));
+        assert!(rendered.contains("OPTIONAL       —"));
+        assert!(rendered.contains("TAGS           one, two"));
+        assert!(rendered.contains("EXIT CODE      0"));
+        assert!(!rendered.contains('{'));
+        assert!(!rendered.contains('"'));
+    }
+
+    #[test]
+    fn generic_human_output_renders_nested_arrays_and_multiline_text() {
+        let value = serde_json::json!([
+            {"id": "first", "message": "line one\nline two"},
+            {"id": "second", "values": [{"name": "nested", "ok": false}]}
+        ]);
+        let rendered = render_human_value(&value, OutputStyle::plain());
+        assert!(rendered.contains("RESULTS\n2 items"));
+        assert!(rendered.contains("first"));
+        assert!(rendered.contains("line one"));
+        assert!(rendered.contains("line two"));
+        assert!(rendered.contains("nested"));
+        assert!(rendered.contains("OK             no"));
+    }
+
+    #[test]
+    fn generic_human_output_handles_empty_and_scalar_values() {
+        assert_eq!(
+            render_human_value(&serde_json::json!([]), OutputStyle::plain()),
+            "RESULTS\n0 items\nNo items.\n"
+        );
+        assert_eq!(
+            render_human_value(&serde_json::json!("plain"), OutputStyle::plain()),
+            "plain\n"
+        );
     }
 
     #[test]

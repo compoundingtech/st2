@@ -40,8 +40,8 @@ mod presentation;
 
 use presentation::{
     OutputStyle, follow_snapshot, mission_run_signature, render_attention_list, render_generation,
-    render_generations, render_human_review_list, render_mission_run, render_revision_proposal,
-    render_step_run, render_work_list,
+    render_generations, render_human_review_list, render_human_value, render_mission_run,
+    render_pty_list, render_revision_proposal, render_step_run, render_work_list,
 };
 
 #[derive(Parser)]
@@ -439,7 +439,7 @@ struct LogsArgs {
 #[derive(Subcommand)]
 enum PtyCommand {
     Ls,
-    Attach(PtySubjectArgs),
+    Attach(PtyAttachArgs),
     Peek(PtySubjectArgs),
     Send(PtySendArgs),
     Signal(PtySignalArgs),
@@ -449,6 +449,14 @@ enum PtyCommand {
 #[derive(Args)]
 struct PtySubjectArgs {
     subject: String,
+}
+
+#[derive(Args)]
+struct PtyAttachArgs {
+    subject: String,
+    /// Allow an attachment from inside another PTY session.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -508,6 +516,12 @@ enum ServiceCommand {
         config: Option<PathBuf>,
     },
     Status,
+    /// Explain the one-time macOS permissions for service-owned work.
+    Permissions {
+        /// Open the matching System Settings pages on macOS.
+        #[arg(long)]
+        open: bool,
+    },
     Restart {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1274,6 +1288,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
+    let login_environment = st_runtime::login_environment()?;
+    let pty_binary = st_runtime::resolve_executable("pty", &login_environment)?;
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -1281,6 +1297,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         node: config.node.clone(),
         state_dir: config.state_dir.clone(),
         pty_root: pty_root.clone(),
+        pty_binary: pty_binary.clone(),
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
     };
@@ -1288,11 +1305,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         &config.state_dir,
         Some(&pty_root),
+        &pty_binary,
         config.node.clone(),
         config.socket.display().to_string(),
         notify.clone(),
         event_notify.clone(),
-    ));
+    )?);
     tokio::spawn(reconciler.run());
     eprintln!("st3: local API listening at {}", config.socket.display());
     serve_unix(&config.socket, router(state)).await
@@ -2219,32 +2237,17 @@ async fn run_pty(
 ) -> Result<()> {
     match command {
         PtyCommand::Ls => {
-            let status: StatusResponse = client.get("/v1/status").await?;
-            let sessions = status
-                .subjects
-                .into_iter()
-                .filter(|subject| {
-                    subject.actual.as_ref().is_some_and(|actual| {
-                        actual
-                            .get("fields")
-                            .unwrap_or(actual)
-                            .get("terminal")
-                            .and_then(Value::as_bool)
-                            == Some(true)
-                    })
-                })
-                .collect::<Vec<_>>();
-            print_value(&sessions, json_output)
+            let sessions: Vec<st3::model::SubjectStatus> = client.get("/v1/sessions").await?;
+            if json_output {
+                print_value(&sessions, true)
+            } else {
+                print!("{}", render_pty_list(&sessions, OutputStyle::stdout()));
+                Ok(())
+            }
         }
         PtyCommand::Attach(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
-            let attachment: Attachment = client
-                .post(
-                    &format!("/v1/sessions/attach/{}", urlencoding::encode(&subject)),
-                    &AttachRequest::default(),
-                )
-                .await?;
-            client.proxy_terminal(&attachment.websocket_path).await
+            attach_terminal(client, &subject, args.force).await
         }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -2323,6 +2326,31 @@ async fn run_pty(
             );
             Ok(())
         }
+    }
+}
+
+async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<()> {
+    if !force
+        && let Ok(outer) = std::env::var("PTY_SESSION")
+        && !outer.is_empty()
+    {
+        anyhow::bail!(
+            "st3 pty attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
+        );
+    }
+    let attachment: Attachment = client
+        .post(
+            &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
+            &AttachRequest::default(),
+        )
+        .await?;
+    let code = client
+        .proxy_terminal(&attachment.runtime_id, &attachment.websocket_path)
+        .await?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CommandExit(code.clamp(1, 255) as u8).into())
     }
 }
 
@@ -2782,6 +2810,7 @@ fn run_service(command: ServiceCommand) -> Result<()> {
             st3::service::install(Config::load(config.as_deref())?)
         }
         ServiceCommand::Status => st3::service::status(),
+        ServiceCommand::Permissions { open } => st3::service::permissions(open),
         ServiceCommand::Restart { config } => {
             st3::service::restart(Config::load(config.as_deref())?)
         }
@@ -5487,15 +5516,9 @@ async fn run_quick(
             }
         }
     }
-    let attachment: Attachment = client
-        .post(
-            &format!("/v1/sessions/attach/{}", created.subject),
-            &AttachRequest::default(),
-        )
-        .await?;
     let _ = endpoint;
     let _ = config;
-    client.proxy_terminal(&attachment.websocket_path).await
+    attach_terminal(client, &created.subject, false).await
 }
 
 fn quick_agent_intent(
@@ -6977,8 +7000,13 @@ fn print_mission(response: &MissionResponse, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_value(value: &impl serde::Serialize, _json_output: bool) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+fn print_value(value: &impl serde::Serialize, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        let value = serde_json::to_value(value)?;
+        print!("{}", render_human_value(&value, OutputStyle::stdout()));
+    }
     Ok(())
 }
 
@@ -7118,6 +7146,26 @@ mod tests {
             panic!("the PTY attach command did not parse");
         };
         assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn pty_attach_accepts_an_explicit_nested_override() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "pty",
+            "attach",
+            "agent/fleet/app-web/standing/app-web",
+            "--force",
+        ])
+        .unwrap();
+        let Command::Pty {
+            command: PtyCommand::Attach(args),
+        } = cli.command
+        else {
+            panic!("the PTY attach command did not parse");
+        };
+        assert!(args.force);
     }
 
     #[test]
@@ -7608,6 +7656,7 @@ mod tests {
             node: "node".into(),
             state_dir: root.path().into(),
             pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
         });
