@@ -10248,7 +10248,25 @@ fn claim_hash(
     body: &Value,
     predecessors: &[String],
 ) -> Result<String> {
+    let body = canonical_json_value(body);
     canonical_hash(&(batch_id, subject, kind, origin, actor, body, predecessors))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(fields) => {
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                    .collect(),
+            )
+        }
+        _ => value.clone(),
+    }
 }
 
 fn now_ms() -> u128 {
@@ -13312,6 +13330,46 @@ mod tests {
             "node",
         )
         .expect("intent")
+    }
+
+    #[test]
+    fn claim_hash_does_not_depend_on_json_object_insertion_order() {
+        let mut left_fields = serde_json::Map::new();
+        left_fields.insert("status".into(), Value::String("running".into()));
+        left_fields.insert("pid".into(), Value::Number(42.into()));
+        let mut left = serde_json::Map::new();
+        left.insert("fields".into(), Value::Object(left_fields));
+        left.insert("evidence".into(), Value::Array(Vec::new()));
+
+        let mut right_fields = serde_json::Map::new();
+        right_fields.insert("pid".into(), Value::Number(42.into()));
+        right_fields.insert("status".into(), Value::String("running".into()));
+        let mut right = serde_json::Map::new();
+        right.insert("evidence".into(), Value::Array(Vec::new()));
+        right.insert("fields".into(), Value::Object(right_fields));
+
+        let left = claim_hash(
+            "batch/node/1/hash",
+            "daemon/node",
+            "daemon.started",
+            "node",
+            None,
+            &Value::Object(left),
+            &[],
+        )
+        .expect("left claim hash");
+        let right = claim_hash(
+            "batch/node/1/hash",
+            "daemon/node",
+            "daemon.started",
+            "node",
+            None,
+            &Value::Object(right),
+            &[],
+        )
+        .expect("right claim hash");
+
+        assert_eq!(left, right);
     }
 
     fn publish_mission(store: &Store, source: &str, key: &str) -> MissionSpec {
