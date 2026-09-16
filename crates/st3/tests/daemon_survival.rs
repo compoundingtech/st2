@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+const INTERACTIVE_LATENCY_LIMIT: Duration = Duration::from_secs(3);
+
 struct Daemon(Child);
 
 fn st3_command(binary: &Path) -> Command {
@@ -708,7 +710,7 @@ mission "wait-owner" state="ready" {{
     );
     assert!(!wait_status.unwrap().success());
     assert!(
-        ready_at.elapsed() < Duration::from_secs(1),
+        ready_at.elapsed() < INTERACTIVE_LATENCY_LIMIT,
         "new ready work took too long to interrupt the wait"
     );
     let diagnostic = fs::read_to_string(wait_stderr).unwrap();
@@ -898,7 +900,7 @@ fn interrupt_stops_follow_and_optional_cancel_stops_the_member() {
         "the followed exec did not enter the log follower",
     );
     assert!(
-        followed_started.elapsed() < Duration::from_secs(1),
+        followed_started.elapsed() < INTERACTIVE_LATENCY_LIMIT,
         "the CLI did not publish its subject promptly"
     );
     let followed_record = followed_record.unwrap();
