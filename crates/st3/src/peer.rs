@@ -36,7 +36,7 @@ const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
 const HEADER_SIGNATURE: &str = "x-st3-signature";
 const HEADER_REQUEST: &str = "x-st3-request-digest";
-const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -185,7 +185,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/internal/replication/export", post(replication_export))
         .route(
             "/v1/internal/replication/receive",
-            post(replication_receive),
+            post(replication_receive).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
         )
         .route(
             "/v1/internal/replication/peer-failure",
@@ -5039,6 +5039,38 @@ mod tests {
                 .iter()
                 .any(|check| check["name"] == "runtime-ownership")
         );
+    }
+
+    #[tokio::test]
+    async fn replication_receive_accepts_a_request_above_axums_default_body_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let value = json!({
+            "peer": "source",
+            "fleet_id": "fleet",
+            "exchange": {
+                "peer": "source",
+                "fleet_id": "fleet",
+                "schema_digest": st3_schema::registry().digest(),
+                "authority_digest": "",
+                "graph_digest": "",
+                "inventory": { "digest": "", "envelopes": [] },
+                "envelopes": []
+            }
+        });
+        let mut body = serde_json::to_vec(&value).unwrap();
+        body.resize(2 * 1024 * 1024 + 1, b' ');
+        let response = router(state(root.path()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/replication/receive")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
