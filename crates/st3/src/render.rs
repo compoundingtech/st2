@@ -973,7 +973,10 @@ host "node" {{
         );
         assert_eq!(
             result.receipts[0].destination,
-            common.join("info/exclude").display().to_string()
+            fs::canonicalize(common.join("info/exclude"))
+                .unwrap()
+                .display()
+                .to_string()
         );
     }
 
