@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -36,6 +36,7 @@ const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
 const HEADER_SIGNATURE: &str = "x-st3-signature";
 const HEADER_REQUEST: &str = "x-st3-request-digest";
+const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -364,11 +365,16 @@ pub async fn run_worker(config: Config) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("bind the replication listener at {address}"))?;
-    let app = Router::new()
-        .route(EXCHANGE_PATH, post(receive_exchange))
-        .with_state(state);
+    let app = peer_router(state);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn peer_router(state: PeerState) -> Router {
+    Router::new()
+        .route(EXCHANGE_PATH, post(receive_exchange))
+        .layer(DefaultBodyLimit::max(MAX_EXCHANGE_BYTES))
+        .with_state(state)
 }
 
 async fn wait_for_main_daemon(socket: &Path) {
@@ -650,9 +656,11 @@ async fn wake_main(socket: &Path) {
 mod tests {
     use super::*;
     use crate::model::ClaimInput;
-    use axum::body::to_bytes;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use tower::ServiceExt as _;
 
     #[test]
     fn signed_messages_detect_tampering_and_wrong_fleets() {
@@ -752,6 +760,53 @@ mod tests {
             "RESPONSE",
             EXCHANGE_PATH,
             &bytes,
+            Some("target"),
+            Some(&request_digest),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_peer_route_accepts_an_exchange_above_axums_default_body_limit() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[5; 32]);
+        let state = PeerState {
+            backend: PeerBackend::Local(Arc::new(Store::open_memory("target").unwrap())),
+            node: "target".into(),
+            auth: auth.clone(),
+            peers: BTreeSet::from(["source".into()]),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let exchange = ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: fleet.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory::default(),
+            envelopes: Vec::new(),
+        };
+        let mut body = serde_json::to_vec(&exchange).unwrap();
+        body.resize(2 * 1024 * 1024 + 1, b' ');
+        let request_digest = FleetAuth::body_digest(&body);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(EXCHANGE_PATH)
+            .body(Body::from(body.clone()))
+            .unwrap();
+        request
+            .headers_mut()
+            .extend(auth.request_headers("source", &body).unwrap());
+        let response = peer_router(state).oneshot(request).await.unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let headers = response.headers().clone();
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        auth.verify(
+            &headers,
+            "RESPONSE",
+            EXCHANGE_PATH,
+            &response_body,
             Some("target"),
             Some(&request_digest),
         )
