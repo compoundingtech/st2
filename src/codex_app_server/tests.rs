@@ -468,10 +468,11 @@ fn protocol_schema_gate_accepts_additive_items_and_server_requests() {
 }
 
 /// The classifier reads one word out of `Turn.error.codexErrorInfo` and depends on it being
-/// distinct from the quota words. A release that dropped or merged it must refuse the launch
-/// rather than let st2 report an exhausted allowance as a rejected credential.
+/// distinct from the stable quota word. A release that dropped or merged it must refuse the
+/// launch rather than let st2 report an exhausted allowance as a rejected credential. Codex
+/// 0.146 does not expose the later `rateLimitExceeded` word, so that word is optional.
 #[test]
-fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words() {
+fn protocol_schema_gate_requires_distinct_credential_and_stable_quota_error_words() {
     let mut schemas = compatible_protocol_schemas();
     let words = schemas
         .protocol
@@ -486,6 +487,16 @@ fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words()
         "{error:#}"
     );
 
+    let mut no_later_rate_limit_word = compatible_protocol_schemas();
+    no_later_rate_limit_word
+        .protocol
+        .pointer_mut("/definitions/CodexErrorInfo/oneOf/0/enum")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .retain(|word| word.as_str() != Some("rateLimitExceeded"));
+    verify_codex_protocol_schemas(&no_later_rate_limit_word).unwrap();
+
     let mut merged = compatible_protocol_schemas();
     merged
         .protocol
@@ -493,10 +504,10 @@ fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words()
         .unwrap()
         .as_array_mut()
         .unwrap()
-        .retain(|word| word.as_str() != Some("rateLimitExceeded"));
+        .retain(|word| word.as_str() != Some("usageLimitExceeded"));
     let error = verify_codex_protocol_schemas(&merged).unwrap_err();
     assert!(
-        format!("{error:#}").contains("CodexErrorInfo has no 'rateLimitExceeded' word"),
+        format!("{error:#}").contains("CodexErrorInfo has no 'usageLimitExceeded' word"),
         "{error:#}"
     );
 

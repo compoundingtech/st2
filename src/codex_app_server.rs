@@ -255,9 +255,10 @@ pub(crate) enum CodexTerminalError {
 /// The `CodexErrorInfo` word that names a rejected provider credential.
 ///
 /// It is the 401/invalid-credential arm of Codex's own closed error vocabulary and is distinct
-/// from both quota words (`usageLimitExceeded`, `rateLimitExceeded`) — the protocol gate pins all
-/// three present so a release that merged them refuses the launch instead of silently making st2
-/// call an exhausted allowance a rejected credential.
+/// from `usageLimitExceeded`. Some supported Codex releases do not expose the later
+/// `rateLimitExceeded` word. The protocol gate pins the credential and stable quota words so a
+/// release that merges them refuses the launch instead of reporting an exhausted allowance as a
+/// rejected credential.
 const CODEX_PROVIDER_AUTH_REJECTED: &str = "unauthorized";
 
 /// What one `turn/completed` notification proves about this thread's provider credential.
