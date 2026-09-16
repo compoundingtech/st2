@@ -3148,9 +3148,16 @@ impl Store {
                 mission.blockers.join("; "),
             ));
         }
-        let materialization =
-            serde_json::to_vec(&(key, &mission.normalized, &mission.subject_tokens))
-                .map_err(internal)?;
+        // A repair can remove a desired claim from the effective leaf set. The leaf set can
+        // then equal an older snapshot whose cached response reported `changed: true`. Include
+        // the monotonic store index so convergence never replays that stale success response.
+        let materialization = serde_json::to_vec(&(
+            key,
+            mission.store_index,
+            &mission.normalized,
+            &mission.subject_tokens,
+        ))
+        .map_err(internal)?;
         let key = format!(
             "internal:{key}:{}",
             hex::encode(Sha256::digest(materialization))
@@ -14223,6 +14230,39 @@ mission "guarded" state="ready" {
 
         let restored = store.apply_internal(&intent, "materialize:test").unwrap();
         assert!(restored.changed);
+        assert_eq!(
+            store.selected_desired_kind("exec/work").unwrap(),
+            Some("exec".into())
+        );
+    }
+
+    #[test]
+    fn an_internal_apply_restores_a_repaired_desired_claim() {
+        let store = Store::open_memory("node").unwrap();
+        let intent = simple("true");
+        let first = store.apply_internal(&intent, "materialize:test").unwrap();
+        let claim = first.claim_ids.first().expect("desired claim").clone();
+
+        {
+            let connection = store.connection.lock().expect("store mutex");
+            connection
+                .execute(
+                    "INSERT INTO replica_records(
+                         record_ref, writer, sequence, envelope_hash, position, raw, state,
+                         claim_id, subject_hint, kind_hint, updated_at_unix_ms
+                     ) VALUES (?1, 'node', 1, 'test-envelope', 0, X'', 'repaired',
+                               ?2, 'exec/work', 'intent.desired', '0')",
+                    params![format!("record/{claim}"), claim],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM desired WHERE subject='exec/work'", [])
+                .unwrap();
+        }
+
+        let restored = store.apply_internal(&intent, "materialize:test").unwrap();
+        assert!(restored.changed);
+        assert_ne!(restored.batch_id, first.batch_id);
         assert_eq!(
             store.selected_desired_kind("exec/work").unwrap(),
             Some("exec".into())
