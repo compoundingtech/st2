@@ -1570,6 +1570,8 @@ pub(crate) fn gate_name(gate: &GateSpec) -> &str {
         GateSpec::Exists { name, .. }
         | GateSpec::Empty { name, .. }
         | GateSpec::Field { name, .. }
+        | GateSpec::Every { name, .. }
+        | GateSpec::NotEvery { name, .. }
         | GateSpec::Has { name, .. }
         | GateSpec::Lacks { name, .. }
         | GateSpec::Deadline { name, .. }
@@ -1675,6 +1677,100 @@ fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Er
                 operator,
                 value: json_value(entries[3])?,
             })
+        }
+        "every" | "not-every" => {
+            ensure_no_properties(child)?;
+            let entries = child
+                .entries()
+                .iter()
+                .filter(|entry| entry.name().is_none())
+                .map(|entry| entry.value())
+                .collect::<Vec<_>>();
+            if entries.len() != 2 {
+                return Err(St3Error::new(
+                    "invalid-quantified-predicate",
+                    "every and not-every require a list field path and subject",
+                ));
+            }
+            let path = value_string(entries[0])?;
+            if !valid_field_path(&path) {
+                return Err(St3Error::new(
+                    "invalid-field-path",
+                    format!("invalid field path `{path}`"),
+                ));
+            }
+            let subject = value_string(entries[1])?;
+            validate_full_subject(&subject)?;
+            let body = child.children().ok_or_else(|| {
+                St3Error::new(
+                    "empty-quantified-predicate",
+                    "every and not-every require at least one field predicate",
+                )
+            })?;
+            if body.nodes().is_empty() {
+                return Err(St3Error::new(
+                    "empty-quantified-predicate",
+                    "every and not-every require at least one field predicate",
+                ));
+            }
+            let mut fields = Vec::with_capacity(body.nodes().len());
+            for predicate in body.nodes() {
+                if predicate.name().value() != "field" {
+                    return Err(St3Error::new(
+                        "invalid-quantified-predicate",
+                        "every and not-every accept only field predicates",
+                    ));
+                }
+                ensure_no_properties(predicate)?;
+                ensure_no_children(predicate)?;
+                let entries = predicate
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.name().is_none())
+                    .map(|entry| entry.value())
+                    .collect::<Vec<_>>();
+                if entries.len() != 3 {
+                    return Err(St3Error::new(
+                        "invalid-quantified-field",
+                        "a quantified field requires path, operator, and value",
+                    ));
+                }
+                let path = value_string(entries[0])?;
+                if !valid_field_path(&path) {
+                    return Err(St3Error::new(
+                        "invalid-field-path",
+                        format!("invalid field path `{path}`"),
+                    ));
+                }
+                let operator = value_string(entries[1])?;
+                if !matches!(operator.as_str(), "is" | "starts-with" | "contains") {
+                    return Err(St3Error::new(
+                        "invalid-field-operator",
+                        format!("invalid field operator `{operator}`"),
+                    ));
+                }
+                fields.push(crate::model::QuantifiedFieldSpec {
+                    path,
+                    operator,
+                    value: json_value(entries[2])?,
+                });
+            }
+            let gate = if child.name().value() == "every" {
+                GateSpec::Every {
+                    name,
+                    path,
+                    subject,
+                    fields,
+                }
+            } else {
+                GateSpec::NotEvery {
+                    name,
+                    path,
+                    subject,
+                    fields,
+                }
+            };
+            Ok(gate)
         }
         "deadline" => {
             let duration = one_duration(child)?;

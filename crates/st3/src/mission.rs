@@ -2677,6 +2677,81 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn quantified_fields_are_available_to_gates_loops_and_dependencies() {
+        let source = r#"
+version 2
+
+resource "pull" { kind "vcs.pull-request" }
+mission "quantified" state="ready" {
+  goal "Use observed check lists declaratively."
+  gate "all checks passed" {
+    every "checks" "resource/pull" {
+      field "status" "is" "completed"
+      field "conclusion" "is" "success"
+    }
+  }
+  loop "wait" {
+    max-rounds 2
+    until {
+      gate "checks settled" {
+        every "checks" "resource/pull" {
+          field "status" "is" "completed"
+        }
+      }
+    }
+    round { completion { when "all-steps-exhausted" } }
+  }
+  step "report-failure" {
+    agentless
+    depends-on {
+      not-every "checks" "resource/pull" {
+        field "conclusion" "is" "success"
+      }
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let mission = &intent.missions["quantified"];
+        assert!(matches!(
+            &mission.gates[0],
+            crate::model::GateSpec::Every { path, subject, fields, .. }
+                if path == "checks" && subject == "resource/pull" && fields.len() == 2
+        ));
+        assert!(matches!(
+            &mission.steps["wait"].loop_spec.as_ref().unwrap().until[0],
+            crate::model::GateSpec::Every { fields, .. } if fields.len() == 1
+        ));
+        assert!(matches!(
+            &mission.steps["report-failure"].dependencies[0],
+            crate::model::DependencySpec::Predicate {
+                gate: crate::model::GateSpec::NotEvery { fields, .. }
+            } if fields.len() == 1
+        ));
+
+        for (predicate, code) in [
+            (
+                r#"every "checks" "resource/pull""#,
+                "empty-quantified-predicate",
+            ),
+            (
+                r#"every "checks" "resource/pull" { exists "resource/other" }"#,
+                "invalid-quantified-predicate",
+            ),
+            (
+                r#"not-every "checks" "resource/pull" { field "status" "is" }"#,
+                "invalid-quantified-field",
+            ),
+        ] {
+            let source = format!(
+                "version 2\nmission \"bad\" state=\"ready\" {{ goal \"Reject a malformed quantifier.\"; gate \"bad\" {{ {predicate} }} }}"
+            );
+            let error = crate::graph::parse_intent(&source, "node").unwrap_err();
+            assert_eq!(error.code, code, "{predicate}");
+        }
+    }
+
+    #[test]
     fn first_class_loops_have_bounded_child_mission_rounds() {
         let source = r#"
 version 2
