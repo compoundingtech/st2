@@ -6353,7 +6353,7 @@ mod tests {
     }
 
     #[test]
-    fn quantified_field_predicates_evaluate_lists_and_their_negation() {
+    fn quantified_field_predicates_wait_for_the_last_item_and_evaluate_negation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -6416,6 +6416,22 @@ mod tests {
                 })
                 .unwrap();
         };
+
+        observe(
+            serde_json::json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "in_progress", "conclusion": null}
+            ]),
+            "one-check-pending",
+        );
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &every).unwrap(),
+            GateOutcome::Pending
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &not_every).unwrap(),
+            GateOutcome::Pass
+        ));
 
         observe(
             serde_json::json!([
