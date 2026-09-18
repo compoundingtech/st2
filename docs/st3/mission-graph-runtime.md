@@ -633,6 +633,26 @@ gate "text omits value" { lacks "message/report" "UNVERIFIED" }
 
 `field` uses this argument order: path, full subject, operator, value. Operators are `is`, `starts-with`, and `contains`.
 
+Use `every` to apply one or more field predicates to every item in an observed list:
+
+```kdl
+gate "every check passed" {
+  every "checks" "resource/github/acme/app/pull/42" {
+    field "status" "is" "completed"
+    field "conclusion" "is" "success"
+  }
+}
+```
+
+The outer arguments are the list path and full subject. Each nested `field` path is relative to one
+list item and uses path, operator, value. All nested fields must match every item. `not-every` has the
+same shape and passes when at least one item does not match.
+
+A missing subject, missing path, or non-list value keeps both predicates pending. `every` follows
+universal quantification and therefore passes for an empty list; `not-every` remains pending for an
+empty list. Use these quantified predicates anywhere deterministic graph predicates are accepted,
+including baselines, dependencies, loop exit gates, and ordinary gates.
+
 `has` and `lacks` accept file, document, or message subjects.
 
 A mission gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
