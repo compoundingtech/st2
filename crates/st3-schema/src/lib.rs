@@ -706,6 +706,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("repository", immutable_reference()),
                 ("name", immutable_string()),
                 ("target", reference()),
+                ("head", string()),
+                ("ancestors", array()),
                 ("ref_type", enumeration(&["branch", "tag", "other"])),
                 ("url", string()),
             ],
@@ -2780,6 +2782,22 @@ mod tests {
         let pull = registry().resource("vcs.pull-request").unwrap();
         assert!(!pull.open_facts);
         assert!(pull.fields.contains_key("head"));
+        let reference = registry().resource("vcs.ref").unwrap();
+        assert!(!reference.open_facts);
+        assert!(reference.fields.contains_key("head"));
+        assert!(reference.fields.contains_key("ancestors"));
+        registry()
+            .validate_resource_facts(
+                "vcs.ref",
+                &BTreeMap::from([
+                    ("head".into(), Value::String("abc123".into())),
+                    (
+                        "ancestors".into(),
+                        Value::Array(vec![Value::String("refs/heads/topic".into())]),
+                    ),
+                ]),
+            )
+            .unwrap();
         assert!(
             registry()
                 .validate_resource_kind("custom.acme.ticket")
