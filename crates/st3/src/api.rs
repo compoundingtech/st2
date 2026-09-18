@@ -3328,7 +3328,10 @@ async fn start_eval(
         .apply(
             &intent,
             &mission.subject_tokens,
-            &format!("eval:{}:{}", request.name, request.bundle_hash),
+            &format!(
+                "eval:{}:{}:{nonce}:apply",
+                request.name, request.bundle_hash
+            ),
         )
         .map_err(ApiError::bad)?;
     let run = match state.store.create_mission_run(&MissionRunRequest {
@@ -6452,6 +6455,51 @@ version 2
                 .unwrap(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn the_same_eval_bundle_can_run_again_with_a_new_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let eval_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            eval_dir.path().join("eval.kdl"),
+            r#"version 2
+mission "eval/repeat" state="ready" timeout="2m" {
+  concurrent-runs max=2
+  goal "Run the same archived eval in a fresh workspace."
+  completion { when "all-steps-exhausted" }
+  step "done" {
+    agentless
+    gate "the current eval workspace exists" {
+      exec "test -d '${EVAL_ROOT}'"
+      host "local"
+      workspace "${EVAL_ROOT}"
+      time-limit "1m"
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let bundle = crate::archive::archive_eval(eval_dir.path()).unwrap();
+        let bundle_hash = hex::encode(Sha256::digest(&bundle));
+        let app = router(state(root.path()));
+
+        let request = || {
+            serde_json::to_value(EvalStartRequest {
+                name: "repeat".into(),
+                bundle_hash: bundle_hash.clone(),
+                bundle: bundle.clone(),
+                inputs: BTreeMap::new(),
+            })
+            .unwrap()
+        };
+        let (first_status, first) = json_request(app.clone(), "/v1/evals", request()).await;
+        let (second_status, second) = json_request(app, "/v1/evals", request()).await;
+
+        assert_eq!(first_status, StatusCode::OK, "{first}");
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert_ne!(first["mission_run"], second["mission_run"]);
     }
 
     #[tokio::test]
