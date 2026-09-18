@@ -599,40 +599,61 @@ impl<R: RuntimeControl> Reconciler<R> {
             "the {driver} harness did not become ready within {} seconds",
             HARNESS_READINESS_DEADLINE_MS / 1_000
         );
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "runtime.readiness-deadline-reached".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                (
-                    "runtime_id".into(),
-                    Value::String(observation.runtime_id.clone()),
-                ),
-                ("driver".into(), Value::String(driver.into())),
-                ("incarnation_id".into(), Value::String(incarnation.into())),
-                (
-                    "deadline_unix_ms".into(),
-                    Value::String(deadline.to_string()),
-                ),
-                ("reason".into(), Value::String(reason.clone())),
-            ]),
-            evidence: vec![runtime_claim.id],
-            expected_subject: None,
-            idempotency_key: Some(format!("{attention_key}:deadline")),
-        })?;
-        self.store.request_attention(
-            &attention_subject,
-            &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: "An agent harness did not become ready".into(),
-                reason,
-                severity: "error".into(),
-                targets: vec![subject.subject.clone()],
-                actor: "agent/st3/reconciler".into(),
-                idempotency_key: format!("{attention_key}:requested"),
-            },
-        )?;
-        self.signal_changed();
+        let deadline_recorded = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.readiness-deadline-reached"))?
+            .iter()
+            .any(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/incarnation_id")
+                    .and_then(Value::as_str)
+                    == Some(incarnation)
+            });
+        let attention_recorded = self.store.attention_request(&attention_subject)?.is_some();
+        let mut changed = false;
+        if !deadline_recorded {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.readiness-deadline-reached".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        Value::String(observation.runtime_id.clone()),
+                    ),
+                    ("driver".into(), Value::String(driver.into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    (
+                        "deadline_unix_ms".into(),
+                        Value::String(deadline.to_string()),
+                    ),
+                    ("reason".into(), Value::String(reason.clone())),
+                ]),
+                evidence: vec![runtime_claim.id],
+                expected_subject: None,
+                idempotency_key: Some(format!("{attention_key}:deadline")),
+            })?;
+            changed = true;
+        }
+        if !attention_recorded {
+            self.store.request_attention(
+                &attention_subject,
+                &AttentionRequest {
+                    reviewer: "person/operator".into(),
+                    title: "An agent harness did not become ready".into(),
+                    reason,
+                    severity: "error".into(),
+                    targets: vec![subject.subject.clone()],
+                    actor: "agent/st3/reconciler".into(),
+                    idempotency_key: format!("{attention_key}:requested"),
+                },
+            )?;
+            changed = true;
+        }
+        if changed {
+            self.signal_changed();
+        }
         Ok(())
     }
 
@@ -11428,20 +11449,24 @@ version 2
             })
             .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
+        let (event_notify, _) = watch::channel(0_u64);
         let reconciler = Reconciler::new(
             store.clone(),
             runtime.clone(),
             "node".into(),
             Arc::new(Notify::new()),
-        );
+        )
+        .with_event_notify(event_notify.clone());
         let after_deadline = runtime_claim.accepted_at_unix_ms + HARNESS_READINESS_DEADLINE_MS + 1;
 
         reconciler
             .reconcile_driver_readiness(&desired, member, &observation, after_deadline)
             .unwrap();
+        let first_generation = *event_notify.borrow();
         reconciler
             .reconcile_driver_readiness(&desired, member, &observation, after_deadline + 1)
             .unwrap();
+        assert_eq!(*event_notify.borrow(), first_generation);
         assert_eq!(
             store
                 .claims_for(
