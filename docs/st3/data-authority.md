@@ -6,6 +6,9 @@ Schema version 12 upgrades schema versions 10 and 11 in place.
 
 The claim log and immutable blobs are the durable graph authority.
 
+Runtime observations and harness observations remain separate claims. The status projection puts
+runtime fields in `actual` and the current incarnation's harness fields in `harness`.
+
 All other tables are indexes, projections, local capabilities, or transport recovery state.
 
 | Table | Class | Rebuild or recovery source |

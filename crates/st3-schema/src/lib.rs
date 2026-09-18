@@ -1255,6 +1255,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "runtime.readiness-deadline-reached",
+            &["agent"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("runtimes"),
+            true,
+            &[],
+        ),
+        (
             "agent.presence",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -1865,6 +1874,13 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("key", string()),
             ("input_number", integer()),
         ],
+        "runtime.readiness-deadline-reached" => &[
+            ("runtime_id", required_string()),
+            ("driver", required_string()),
+            ("incarnation_id", required_string()),
+            ("deadline_unix_ms", required_string()),
+            ("reason", required_string()),
+        ],
         "harness.observed" => &[
             (
                 "state",
@@ -2344,6 +2360,7 @@ mod tests {
                 "runtime.action.requested",
                 "runtime.action.succeeded",
                 "runtime.observed",
+                "runtime.readiness-deadline-reached",
                 "runtime.reconcile-decision",
                 "runtime.restart-window-reset",
                 "schedule.occurrence-cancelled",

@@ -1214,6 +1214,7 @@ mod tests {
                     "terminal": true
                 }
             })),
+            harness: None,
             conflicts: Vec::new(),
             claims: vec!["claim/actual".into()],
             owner_run: Some("mission-run/test/run".into()),

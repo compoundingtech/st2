@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `413f501864fe1e01e49b1906eddd0f8efe8c804670941f0a1ee0fd149abdb5b4`
+Digest: `43b86385a1640efa5f79c02184ecb2fe4c3082b7e6f91866a6630dd90b606d5e`
 
 ## Subject families
 
@@ -108,6 +108,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `runtime.action.requested` | `agent`, `exec`, `pty`, `gate-operation` | `authorized-requester` | `append` | `action:string`, `deadline_unix_ms:string`, `incarnation_id:string`, `operation:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
 | `runtime.action.succeeded` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
 | `runtime.observed` | `agent`, `exec`, `pty`, `gate-operation` | `same-subject-actor` | `append` | `adopted:boolean`, `driver:string`, `exit_code:integer`, `exit_signal:integer`, `host:string`, `incarnation_id:string`, `reachability:string`, `reason:string`, `runtime_id:string`, `shutdown_timeout_ms:integer`, `status:string`, `terminal:boolean` |  |
+| `runtime.readiness-deadline-reached` | `agent` | `system-only` | `append` | `deadline_unix_ms!:string`, `driver!:string`, `incarnation_id!:string`, `reason!:string`, `runtime_id!:string` |  |
 | `runtime.reconcile-decision` | `agent`, `exec`, `pty`, `schedule` | `system-only` | `append` | `decision:string`, `gate:string`, `input_number:integer`, `key:string`, `reachability:string`, `reason:string`, `restart_at_unix_ms:string` |  |
 | `runtime.restart-window-reset` | `agent`, `exec`, `pty` | `system-only` | `append` | `desired_token:string`, `incarnation_id!:string`, `reason!:string` | `reset` |
 | `schedule.occurrence-cancelled` | `schedule` | `system-only` | `append` | `occurrence:integer`, `reason:string`, `revision:string` | `schedule` |

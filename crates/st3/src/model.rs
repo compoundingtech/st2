@@ -1026,6 +1026,8 @@ pub struct SubjectStatus {
     pub desired_revision: Option<String>,
     pub desired: Option<Value>,
     pub actual: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<CurrentHarnessView>,
     pub conflicts: Vec<String>,
     pub claims: Vec<String>,
     pub owner_run: Option<String>,
@@ -1034,6 +1036,34 @@ pub struct SubjectStatus {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CurrentHarnessView {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    pub incarnation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_buffer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
+    pub claim: String,
+    pub observed_at_unix_ms: u128,
+}
+
+impl CurrentHarnessView {
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state.as_str(), "ready" | "working" | "idle")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

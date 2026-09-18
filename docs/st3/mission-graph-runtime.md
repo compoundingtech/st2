@@ -273,7 +273,11 @@ A retry repeats one failed step attempt. It handles a bounded transient failure.
 
 `timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
 
-If a step produces a native harness driver, the step waits for a ready, working, or idle harness observation. A driver declared with `restart "never"` that exits, vanishes, or fails to start before that observation fails the step immediately. A restartable driver remains pending while its restart policy can still recover it and fails the step when that policy raises an unrecoverable decision. The step timeout is a containment bound, not a reason to hide an already terminal driver for the rest of the interval.
+If a step produces a native harness driver, the step waits for a ready, working, or idle harness observation from the current runtime incarnation. An observation with another incarnation cannot satisfy the step. An old observation without an incarnation applies only when it was recorded after the current runtime epoch began.
+
+A driver declared with `restart "never"` that exits, vanishes, or fails to start before readiness fails the step immediately. A restartable driver remains pending while its restart policy can still recover it. It fails when that policy raises an unrecoverable decision. The step timeout contains the complete step attempt.
+
+The daemon gives a running native harness 60 seconds to become ready. At the deadline, the daemon preserves the PTY and records `runtime.readiness-deadline-reached`. It requests attention from `person/operator` once. It does not restart the runtime or send input. A later ready observation from the same incarnation resolves that attention item as `daemon/runtime`.
 
 `finally {}` contains final-phase steps. Final steps run after normal success, failure, or cancellation.
 
@@ -1004,15 +1008,13 @@ The default `work show` and `work claim` output gives a human-readable step view
 
 A worker completion report is not a correctness result. Products and gates still control final completion.
 
-The native driver renews active claims. It delivers one Small Talk message for each readiness epoch and harness incarnation.
+The native driver renews active claims and transports messages. The reconciler creates one durable Small Talk message for each readiness epoch and runtime incarnation.
 
 A pool message closes when another agent wins the claim. Release or expiry creates a new readiness epoch and a new message.
 
 The work queue is authoritative. A notification only tells an agent that the queue might contain new work.
 
-The reconciler does not send periodic reminders. A future harness-stall policy can create a new explicit epoch after a measured timeout.
-
-The MVP does not implement that harness-stall timeout.
+The reconciler does not send periodic reminders. An undelivered message remains pending. A daemon or harness restart recreates the message only for a new runtime incarnation while the work remains ready.
 
 ## Standing runs and cancellation
 

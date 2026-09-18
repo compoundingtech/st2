@@ -1090,6 +1090,76 @@ fn a_claude_channel_reconnects_after_a_daemon_restart() {
         "the first daemon did not become ready",
     );
 
+    let mission = temporary.path().join("survival.kdl");
+    fs::write(
+        &mission,
+        format!(
+            r#"version 2
+
+mission "survival" state="ready" {{
+  goal "Keep one runtime available for the channel survival test."
+  agent "claude" {{
+    workspace "{}"
+    command "sleep 30"
+    restart "never"
+  }}
+}}
+"#,
+            temporary.path().display()
+        ),
+    )
+    .unwrap();
+    let published = st3_command(binary)
+        .args(["--endpoint", socket.to_str().unwrap(), "publish"])
+        .arg(&mission)
+        .args(["--as", "person/test"])
+        .output()
+        .unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let started = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "mission",
+            "start",
+            "survival",
+            "--id",
+            "survival",
+            "--workspace",
+            temporary.path().to_str().unwrap(),
+            "--as",
+            "person/test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "status",
+                    "agent/survival/claude",
+                    "--json",
+                ])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("\"incarnation_id\"")
+                })
+        },
+        "the Claude channel test runtime did not start",
+    );
+
     let channel_stderr = temporary.path().join("channel.stderr");
     let mut channel = st3_command(binary)
         .args([

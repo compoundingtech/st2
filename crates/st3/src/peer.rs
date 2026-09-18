@@ -604,18 +604,23 @@ async fn post_signed(
     let body = serde_json::to_vec(exchange)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}{}",
-            peer.url.trim_end_matches('/'),
-            EXCHANGE_PATH
-        ))
+    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
+    let response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(120))
+        .build()?
+        .post(&endpoint)
         .headers(headers)
         .header("content-type", "application/json")
         .body(body)
         .send()
         .await
-        .with_context(|| format!("connect to peer {}", peer.name))?;
+        .with_context(|| {
+            format!(
+                "replication endpoint `{endpoint}` failed during its 120 second exchange limit; retry peer {}",
+                peer.name
+            )
+        })?;
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.bytes().await?.to_vec();

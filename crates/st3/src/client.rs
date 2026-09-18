@@ -1,5 +1,6 @@
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -33,13 +34,40 @@ impl Endpoint {
 pub struct Client {
     endpoint: Endpoint,
     http: reqwest::Client,
+    deadlines: ClientDeadlines,
+}
+
+#[derive(Clone, Copy)]
+struct ClientDeadlines {
+    connect: Duration,
+    request: Duration,
+    bulk: Duration,
+    event: Duration,
+    terminal_handshake: Duration,
+}
+
+impl Default for ClientDeadlines {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(3),
+            request: Duration::from_secs(15),
+            bulk: Duration::from_secs(120),
+            event: Duration::from_secs(35),
+            terminal_handshake: Duration::from_secs(10),
+        }
+    }
 }
 
 impl Client {
     pub fn new(endpoint: Endpoint) -> Self {
+        let deadlines = ClientDeadlines::default();
         Self {
             endpoint,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(deadlines.connect)
+                .build()
+                .expect("the st3 HTTP client configuration is valid"),
+            deadlines,
         }
     }
 
@@ -65,20 +93,40 @@ impl Client {
             .map(serde_json::to_vec)
             .transpose()?
             .unwrap_or_default();
+        let deadline = request_deadline(path, self.deadlines);
         let response = match &self.endpoint {
-            Endpoint::Unix(socket) => unix_request(socket, method, path, &bytes).await?,
+            Endpoint::Unix(socket) => {
+                unix_request(
+                    socket,
+                    method,
+                    path,
+                    &bytes,
+                    self.deadlines.connect,
+                    deadline,
+                )
+                .await?
+            }
             Endpoint::Http(base) => {
+                let started = tokio::time::Instant::now();
                 let url = format!("{base}{path}");
                 let request = match method {
-                    "GET" => self.http.get(url),
-                    "POST" => self.http.post(url).body(bytes),
+                    "GET" => self.http.get(&url),
+                    "POST" => self.http.post(&url).body(bytes),
                     other => anyhow::bail!("unsupported HTTP method {other}"),
                 }
                 .header("content-type", "application/json")
                 .header("connection", "close");
-                let response = request.send().await.context("connect to the st3 API")?;
+                let endpoint = url.clone();
+                let response = tokio::time::timeout(deadline, request.send())
+                    .await
+                    .map_err(|_| deadline_error(&endpoint, "request", deadline))?
+                    .with_context(|| format!("connect to the st3 API endpoint {endpoint}"))?;
                 let status = response.status();
-                let bytes = response.bytes().await?.to_vec();
+                let remaining = deadline.saturating_sub(started.elapsed());
+                let bytes = tokio::time::timeout(remaining, response.bytes())
+                    .await
+                    .map_err(|_| deadline_error(&endpoint, "response", deadline))??
+                    .to_vec();
                 if !status.is_success() {
                     return Err(api_error(status.as_u16(), &bytes));
                 }
@@ -98,11 +146,27 @@ impl Client {
     pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
         match &self.endpoint {
             Endpoint::Unix(socket) => {
-                let stream = tokio::net::UnixStream::connect(socket)
-                    .await
-                    .with_context(|| format!("connect to the st3 API at {}", socket.display()))?;
+                let endpoint = socket.display().to_string();
+                let stream = tokio::time::timeout(
+                    self.deadlines.connect,
+                    tokio::net::UnixStream::connect(socket),
+                )
+                .await
+                .map_err(|_| deadline_error(&endpoint, "connect", self.deadlines.connect))?
+                .with_context(|| format!("connect to the st3 API at {endpoint}"))?;
                 let request = terminal_request(&format!("ws://localhost{path}"))?;
-                let (websocket, _) = tokio_tungstenite::client_async(request, stream).await?;
+                let (websocket, _) = tokio::time::timeout(
+                    self.deadlines.terminal_handshake,
+                    tokio_tungstenite::client_async(request, stream),
+                )
+                .await
+                .map_err(|_| {
+                    deadline_error(
+                        &endpoint,
+                        "terminal WebSocket handshake",
+                        self.deadlines.terminal_handshake,
+                    )
+                })??;
                 proxy_websocket(name, websocket).await
             }
             Endpoint::Http(base) => {
@@ -115,7 +179,19 @@ impl Client {
                     })
                     .context("a terminal endpoint must use http or https")?;
                 let request = terminal_request(&format!("{base}{path}"))?;
-                let (websocket, _) = tokio_tungstenite::connect_async(request).await?;
+                let endpoint = format!("{base}{path}");
+                let (websocket, _) = tokio::time::timeout(
+                    self.deadlines.terminal_handshake,
+                    tokio_tungstenite::connect_async(request),
+                )
+                .await
+                .map_err(|_| {
+                    deadline_error(
+                        &endpoint,
+                        "terminal WebSocket handshake",
+                        self.deadlines.terminal_handshake,
+                    )
+                })??;
                 proxy_websocket(name, websocket).await
             }
         }
@@ -196,29 +272,48 @@ where
     Ok(())
 }
 
-async fn unix_request(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>> {
+async fn unix_request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    connect_deadline: Duration,
+    deadline: Duration,
+) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let mut stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .with_context(|| {
-            format!(
-                "connect to the st3 API at {}; run `st3 up` first",
-                socket.display()
-            )
-        })?;
-    stream
-        .write_all(
-        format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .as_bytes(),
+    let started = tokio::time::Instant::now();
+    let endpoint = socket.display().to_string();
+    let mut stream = tokio::time::timeout(
+        connect_deadline.min(deadline),
+        tokio::net::UnixStream::connect(socket),
     )
-        .await?;
-    stream.write_all(body).await?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    .await
+    .map_err(|_| deadline_error(&endpoint, "connect", connect_deadline))?
+    .with_context(|| {
+        format!(
+            "connect to the st3 API at {}; run `st3 up` first",
+            socket.display()
+        )
+    })?;
+    let remaining = deadline.saturating_sub(started.elapsed());
+    let response = tokio::time::timeout(remaining, async {
+        stream
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        stream.write_all(body).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    })
+    .await
+    .map_err(|_| deadline_error(&endpoint, "request and response", deadline))??;
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -241,6 +336,25 @@ async fn unix_request(socket: &Path, method: &str, path: &str, body: &[u8]) -> R
         return Err(api_error(status, &body));
     }
     Ok(body)
+}
+
+fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
+    if path.starts_with("/v1/internal/replication/export")
+        || path.starts_with("/v1/internal/replication/receive")
+    {
+        deadlines.bulk
+    } else if path.starts_with("/v1/events?") && path.contains("wait=true") {
+        deadlines.event
+    } else {
+        deadlines.request
+    }
+}
+
+fn deadline_error(endpoint: &str, phase: &str, deadline: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "st3 API endpoint `{endpoint}` exceeded the {phase} limit of {} ms; the service may be busy or unavailable, retry the command",
+        deadline.as_millis()
+    )
 }
 
 fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -312,6 +426,78 @@ mod tests {
             store_index: 1,
             value,
         }
+    }
+
+    fn fast_client(endpoint: Endpoint) -> Client {
+        let deadlines = ClientDeadlines {
+            connect: Duration::from_millis(20),
+            request: Duration::from_millis(30),
+            bulk: Duration::from_millis(40),
+            event: Duration::from_millis(50),
+            terminal_handshake: Duration::from_millis(30),
+        };
+        Client {
+            endpoint,
+            http: reqwest::Client::builder()
+                .connect_timeout(deadlines.connect)
+                .build()
+                .unwrap(),
+            deadlines,
+        }
+    }
+
+    #[test]
+    fn request_classes_have_distinct_bounded_deadlines() {
+        let deadlines = ClientDeadlines::default();
+        assert_eq!(
+            request_deadline("/v1/status", deadlines),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            request_deadline("/v1/events?wait=true&timeout_ms=30000", deadlines),
+            Duration::from_secs(35)
+        );
+        assert_eq!(
+            request_deadline("/v1/internal/replication/export", deadlines),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_unix_response_fails_with_a_retryable_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let error = fast_client(Endpoint::Unix(socket))
+            .get::<Value>("/v1/status")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("request and response"));
+        assert!(error.contains("retry the command"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_http_response_fails_with_a_retryable_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let error = fast_client(Endpoint::Http(format!("http://{address}")))
+            .get::<Value>("/v1/status")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("request"));
+        assert!(error.contains("retry the command"));
+        server.abort();
     }
 
     async fn assert_request_transports(client: Client) {

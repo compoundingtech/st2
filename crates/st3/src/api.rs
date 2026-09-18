@@ -619,13 +619,22 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                         .as_ref()
                         .and_then(|member| member.driver.as_ref())
                         .is_some()
-            }) && subject.gap.is_some()
+            }) && (!subject
+                .harness
+                .as_ref()
+                .is_some_and(crate::model::CurrentHarnessView::is_ready)
+                || subject.gap.is_some())
         })
         .map(|subject| {
             format!(
                 "{}: {}",
                 subject.subject,
-                subject.gap.as_deref().unwrap_or("not ready")
+                subject
+                    .harness
+                    .as_ref()
+                    .and_then(|harness| harness.reason.as_deref())
+                    .or(subject.gap.as_deref())
+                    .unwrap_or("the current harness incarnation is not ready")
             )
         })
         .collect::<Vec<_>>();
@@ -638,7 +647,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }
         .into(),
         message: if driver_gaps.is_empty() {
-            "all desired native drivers have no current graph gap".into()
+            "all desired native drivers have a ready current harness incarnation".into()
         } else {
             driver_gaps.join("; ")
         },
@@ -3200,13 +3209,13 @@ async fn quick_agent(
     }
     signal_changed(state);
     let runtime_id = format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', "."));
-    let ready = state
+    let harness = state
         .store
-        .latest_claim(&agent_subject, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("ready")
-        });
+        .current_harness(&agent_subject)
+        .map_err(ApiError::internal)?;
+    let ready = harness
+        .as_ref()
+        .is_some_and(crate::model::CurrentHarnessView::is_ready);
     let response = QuickAgentResponse {
         subject: agent_subject,
         mission: format!("mission/{mission_id}"),
@@ -3214,7 +3223,7 @@ async fn quick_agent(
         generation: run.generation,
         runtime_id,
         event_cursor: state.store.index().map_err(ApiError::internal)?,
-        incarnation_id: None,
+        incarnation_id: harness.map(|harness| harness.incarnation_id),
         ready,
     };
     state

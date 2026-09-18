@@ -27,6 +27,10 @@ declaration. Publish an explicit cancellation or replacement when the graph must
 Agents claim eligible work. The reconciler does not choose work for an agent. It starts declared
 runtimes, delivers graph changes, enforces leases, evaluates gates, and cleans up owned runtimes.
 
+An agent status keeps runtime facts in `actual` and current harness facts in `harness`. A harness
+observation applies only to the current runtime incarnation. A stale ready claim cannot make a new
+runtime ready.
+
 ## Install
 
 The Nix package installs `st`, `st3`, and `st3-migrate`:
@@ -84,6 +88,12 @@ a ten-second timeout. A broken shell startup cannot stop reconciliation forever.
 On macOS, run `st service permissions` for the one-time Full Disk Access and Developer Tools steps.
 Use `st service permissions --open` to open the matching System Settings pages. macOS does not let a
 launchd property list grant these permissions.
+
+Finite client commands have bounded waits. A connection gets three seconds. An ordinary request gets
+15 seconds in total. A replication import or export gets 120 seconds. A 30-second event wait gets 35
+seconds. A terminal WebSocket handshake gets ten seconds. An attached terminal and an explicit
+follow remain open after their connection succeeds. A timeout names the endpoint and phase, exits
+nonzero, and tells the operator to retry.
 
 ## Publish and run a mission
 

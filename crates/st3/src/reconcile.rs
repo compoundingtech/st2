@@ -21,6 +21,8 @@ use crate::model::{
 use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
 use crate::store::Store;
 
+const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeObservation {
     pub runtime_id: String,
@@ -433,6 +435,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             match observed {
                 Some(observation) if observation.status == "running" => {
                     self.record_member(subject, &observation, true)?;
+                    self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
+                    if subject.kind == "agent"
+                        && let Some(incarnation) = observation.incarnation_id.as_deref()
+                    {
+                        self.reconcile_work_messages(&subject.subject, incarnation)?;
+                    }
                 }
                 Some(observation)
                     if matches!(observation.status.as_str(), "exited" | "vanished") =>
@@ -517,6 +525,227 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_scheduled_work(&desired)?;
         self.reconcile_subscription_missions(&desired)?;
         self.evaluate_mission_runs()?;
+        Ok(())
+    }
+
+    fn reconcile_driver_readiness(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        now: u128,
+    ) -> Result<()> {
+        if subject.kind != "agent" {
+            return Ok(());
+        }
+        let Some(driver) = member.driver.as_deref() else {
+            return Ok(());
+        };
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(());
+        };
+        let attention_key = format!("harness-readiness:{0}:{incarnation}", subject.subject);
+        let attention_digest = hex::encode(sha2::Sha256::digest(attention_key.as_bytes()));
+        let attention_subject = format!("attention/{}", &attention_digest[..32]);
+        let harness_ready = self
+            .store
+            .current_harness(&subject.subject)?
+            .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
+        if harness_ready {
+            if self
+                .store
+                .attention_request(&attention_subject)?
+                .is_some_and(|attention| attention.status == "pending")
+            {
+                self.store.resolve_attention_automatically(
+                    &attention_subject,
+                    "the same runtime incarnation became ready",
+                    &format!("{attention_key}:resolved"),
+                )?;
+                self.signal_changed();
+            }
+            return Ok(());
+        }
+
+        let runtime_claim = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.observed"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/incarnation_id")
+                    .and_then(Value::as_str)
+                    == Some(incarnation)
+                    && claim.body.pointer("/fields/status").and_then(Value::as_str)
+                        == Some("running")
+            });
+        let Some(runtime_claim) = runtime_claim else {
+            return Ok(());
+        };
+        let deadline = runtime_claim
+            .accepted_at_unix_ms
+            .saturating_add(HARNESS_READINESS_DEADLINE_MS);
+        if now < deadline {
+            self.arm_restart(
+                &format!("readiness:{}:{incarnation}", subject.subject),
+                deadline,
+            );
+            return Ok(());
+        }
+
+        let reason = format!(
+            "the {driver} harness did not become ready within {} seconds",
+            HARNESS_READINESS_DEADLINE_MS / 1_000
+        );
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.readiness-deadline-reached".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                (
+                    "runtime_id".into(),
+                    Value::String(observation.runtime_id.clone()),
+                ),
+                ("driver".into(), Value::String(driver.into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+                (
+                    "deadline_unix_ms".into(),
+                    Value::String(deadline.to_string()),
+                ),
+                ("reason".into(), Value::String(reason.clone())),
+            ]),
+            evidence: vec![runtime_claim.id],
+            expected_subject: None,
+            idempotency_key: Some(format!("{attention_key}:deadline")),
+        })?;
+        self.store.request_attention(
+            &attention_subject,
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: "An agent harness did not become ready".into(),
+                reason,
+                severity: "error".into(),
+                targets: vec![subject.subject.clone()],
+                actor: "agent/st3/reconciler".into(),
+                idempotency_key: format!("{attention_key}:requested"),
+            },
+        )?;
+        self.signal_changed();
+        Ok(())
+    }
+
+    fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
+        const TAG_PREFIX: &str = "st3-work:";
+        let incarnation_key = harness_incarnation_key(incarnation);
+        let messages = self.store.messages(Some(agent), true)?;
+        let work = self.store.work(Some(agent), true)?;
+
+        for message in messages.iter().filter(|message| message.status != "closed") {
+            let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
+                work_message_target(message)
+            else {
+                continue;
+            };
+            if !work_message_should_close(
+                &work,
+                step_subject,
+                attempt,
+                readiness_epoch,
+                message_incarnation,
+                &incarnation_key,
+            ) {
+                continue;
+            }
+            if message.status == "delivered" {
+                self.store.append_claim(&ClaimInput {
+                    subject: message.subject.clone(),
+                    kind: "message.read".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("work-message-read:{}", message.subject)),
+                })?;
+            }
+            self.store.append_claim(&ClaimInput {
+                subject: message.subject.clone(),
+                kind: "message.closed".into(),
+                actor: Some(if message.status == "sent" {
+                    "daemon/runtime".into()
+                } else {
+                    agent.into()
+                }),
+                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("message-close:{}", message.subject)),
+            })?;
+            self.signal_changed();
+        }
+
+        let present = messages
+            .iter()
+            .flat_map(|message| message.tags.iter())
+            .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        for step in work
+            .iter()
+            .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
+        {
+            let tag_value = format!(
+                "{}@{}@{}@{}",
+                step.subject, step.attempt, step.readiness_epoch, incarnation_key
+            );
+            if present.contains(&tag_value) {
+                continue;
+            }
+            let idempotency_key = format!("work-message:{agent}:{tag_value}");
+            let message_id = &hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()))[..16];
+            let message_subject = format!("message/{message_id}");
+            let queue = step
+                .queue
+                .as_deref()
+                .zip(step.queue_position)
+                .map(|(queue, position)| format!("\nQueue: {queue} #{position}"))
+                .unwrap_or_default();
+            let content = format!(
+                "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}",
+                step.subject,
+                step.title.as_deref().unwrap_or(&step.step),
+            );
+            self.store.append_claim(&ClaimInput {
+                subject: message_subject,
+                kind: "message.sent".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("daemon/runtime".into())),
+                    ("to".into(), Value::String(agent.into())),
+                    ("content".into(), Value::String(content)),
+                    ("status".into(), Value::String("sent".into())),
+                    (
+                        "title".into(),
+                        Value::String(format!(
+                            "Mission step ready: {}",
+                            step.title.as_deref().unwrap_or(&step.step)
+                        )),
+                    ),
+                    ("in_reply_to".into(), Value::Null),
+                    (
+                        "tags".into(),
+                        Value::Array(vec![
+                            Value::String(format!("{TAG_PREFIX}{tag_value}")),
+                            Value::String(format!("mission-run:{}", step.run)),
+                        ]),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(idempotency_key),
+            })?;
+            self.signal_changed();
+        }
         Ok(())
     }
 
@@ -4037,13 +4266,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|actual| actual_field(actual, "status"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let harness_state = self
-                .store
-                .latest_actual_value(&subject.subject)?
-                .as_ref()
-                .and_then(|actual| actual_field(actual, "state"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let harness = self.store.current_harness(&subject.subject)?;
             let holds = match subject.kind.as_str() {
                 "stop" => {
                     matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
@@ -4051,7 +4274,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "message" => matches!(status.as_deref(), Some("delivered" | "read" | "closed")),
                 _ => match subject.member.as_ref() {
                     Some(member) if member.driver.is_some() => {
-                        matches!(harness_state.as_deref(), Some("ready" | "working" | "idle"))
+                        harness.as_ref().is_some_and(|harness| harness.is_ready())
                     }
                     Some(_) => matches!(
                         status.as_deref(),
@@ -4092,11 +4315,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .as_ref()
                 .and_then(|actual| actual_field(actual, "status"))
                 .and_then(Value::as_str);
-            let harness_state = actual
-                .as_ref()
-                .and_then(|actual| actual_field(actual, "state"))
-                .and_then(Value::as_str);
-            if matches!(harness_state, Some("ready" | "working" | "idle")) {
+            let harness = self.store.current_harness(&subject.subject)?;
+            let harness_state = harness.as_ref().map(|harness| harness.state.as_str());
+            if harness.as_ref().is_some_and(|harness| harness.is_ready()) {
                 continue;
             }
 
@@ -6029,6 +6250,59 @@ fn expand_gate(
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
     reconcile_notify.notify_one();
     event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
+}
+
+fn harness_incarnation_key(incarnation: &str) -> String {
+    hex::encode(sha2::Sha256::digest(incarnation.as_bytes()))[..12].to_owned()
+}
+
+fn should_notify_work_message(
+    step: &crate::model::StepRunView,
+    work: &[crate::model::StepRunView],
+) -> bool {
+    !work.iter().any(|candidate| {
+        candidate.run == step.run
+            && candidate.assigned_to == step.assigned_to
+            && candidate.available_to == step.available_to
+            && candidate.step.len() < step.step.len()
+            && step.step.starts_with(&format!("{}/", candidate.step))
+    })
+}
+
+fn work_message_target(message: &crate::model::MessageView) -> Option<(&str, u32, u32, &str)> {
+    message.tags.iter().find_map(|tag| {
+        let mut parts = tag.strip_prefix("st3-work:")?.rsplitn(4, '@');
+        let incarnation = parts.next()?;
+        let readiness_epoch = parts.next()?.parse::<u32>().ok()?;
+        let attempt = parts.next()?.parse::<u32>().ok()?;
+        let step_subject = parts.next()?;
+        Some((step_subject, attempt, readiness_epoch, incarnation))
+    })
+}
+
+fn work_message_should_close(
+    work: &[crate::model::StepRunView],
+    step_subject: &str,
+    attempt: u32,
+    readiness_epoch: u32,
+    message_incarnation: &str,
+    current_incarnation: &str,
+) -> bool {
+    let current = work.iter().any(|step| {
+        step.subject == step_subject
+            && step.attempt == attempt
+            && step.readiness_epoch == readiness_epoch
+    });
+    let acknowledged = work.iter().any(|step| {
+        step.subject == step_subject
+            && step.attempt == attempt
+            && step.readiness_epoch == readiness_epoch
+            && matches!(
+                step.status.as_str(),
+                "claimed" | "working" | "completed" | "failed" | "cancelled"
+            )
+    });
+    !current || acknowledged || message_incarnation != current_incarnation
 }
 
 fn structured_token_usage(log: &str) -> Option<u64> {
@@ -11117,5 +11391,274 @@ version 2
                 .unwrap()["status"],
             "healthy"
         );
+    }
+
+    #[test]
+    fn a_readiness_deadline_alerts_once_without_restarting_and_then_resolves() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "readiness-deadline");
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let member = desired.member.as_ref().unwrap();
+        let observation = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        };
+        let runtime_claim = store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: member_fields(member, "running", Some("worker-one"), true),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("runtime-worker-one".into()),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let after_deadline = runtime_claim.accepted_at_unix_ms + HARNESS_READINESS_DEADLINE_MS + 1;
+
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &observation, after_deadline)
+            .unwrap();
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &observation, after_deadline + 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .claims_for(
+                    "agent/node.worker",
+                    Some("runtime.readiness-deadline-reached")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let attention = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert!(runtime.kills.lock().unwrap().is_empty());
+        assert!(runtime.starts.lock().unwrap().is_empty());
+
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("worker-one-ready".into()),
+            })
+            .unwrap();
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &observation, after_deadline + 2)
+            .unwrap();
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .claims_for(&attention[0].subject, Some("attention.resolved"))
+                .unwrap()[0]
+                .actor
+                .as_deref(),
+            Some("daemon/runtime")
+        );
+    }
+
+    #[test]
+    fn the_reconciler_recreates_ready_work_once_for_each_runtime_incarnation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+mission "work-alert" state="ready" {
+  goal "Do the work."
+  step "work" {
+    assigned-to "agent/node.worker"
+    title "Build the change"
+    goal "Keep this detailed instruction out of the alert."
+  }
+}
+"#;
+        apply_source(&store, source, "work-alert-mission");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "work-alert".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "work-alert-run".into(),
+            })
+            .unwrap();
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let messages = store.messages(Some("agent/node.worker"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].status, "sent");
+        assert_eq!(messages[0].from, "daemon/runtime");
+        assert_eq!(messages[0].to, "agent/node.worker");
+        assert_eq!(
+            messages[0].content,
+            format!(
+                "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: Build the change",
+                run.steps[0].subject
+            )
+        );
+        assert!(!messages[0].content.contains("detailed instruction"));
+        assert_eq!(
+            messages[0].tags,
+            [
+                format!(
+                    "st3-work:{}@1@1@{}",
+                    run.steps[0].subject,
+                    harness_incarnation_key("worker-one")
+                ),
+                format!("mission-run:{}", run.subject),
+            ]
+        );
+
+        runtime.ptys.lock().unwrap()[0].incarnation_id = Some("worker-two".into());
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let messages = store.messages(Some("agent/node.worker"), true).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.status == "sent")
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.status == "closed")
+                .count(),
+            1
+        );
+
+        let step = &run.steps[0];
+        store
+            .work_action(
+                &step.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some("agent/node.worker".into()),
+                    incarnation: Some("worker-two".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-work-alert".into(),
+                },
+            )
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .messages(Some("agent/node.worker"), true)
+                .unwrap()
+                .iter()
+                .filter(|message| message.status == "closed")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn inherited_nested_work_keeps_one_parent_alert() {
+        let step = |subject: &str, path: &str, assignee: &str| crate::model::StepRunView {
+            subject: subject.into(),
+            run: "mission-run/run-1".into(),
+            generation: "run-generation/run-1".into(),
+            step: path.into(),
+            queue: None,
+            queue_position: None,
+            definition_hash: "definition".into(),
+            status: "ready".into(),
+            attempt: 1,
+            assigned_to: Some(assignee.into()),
+            available_to: Vec::new(),
+            agentless: false,
+            title: None,
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            under: Vec::new(),
+            worker_reported: false,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            readiness_epoch: 1,
+            blocked_reason: None,
+            not_before_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let parent = step("step-run/run-1/build", "build", "agent/builder");
+        let inherited = step(
+            "step-run/run-1/build/work/inspect",
+            "build/work/inspect",
+            "agent/builder",
+        );
+        let reassigned = step(
+            "step-run/run-1/build/work/review",
+            "build/work/review",
+            "agent/reviewer",
+        );
+        let work = vec![parent.clone(), inherited.clone(), reassigned.clone()];
+
+        assert!(should_notify_work_message(&parent, &work));
+        assert!(!should_notify_work_message(&inherited, &work));
+        assert!(should_notify_work_message(&reassigned, &work));
     }
 }

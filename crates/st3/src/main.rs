@@ -2144,7 +2144,7 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
         }
         let events: Vec<EventRecord> = client
             .get(&format!(
-                "/v1/events?after={cursor}&subject={}&wait=false",
+                "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
                 urlencoding::encode(subject)
             ))
             .await?;
@@ -2154,7 +2154,6 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
                 anyhow::bail!("{} failed: {}", subject, event.body);
             }
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -2524,16 +2523,16 @@ fn wait_interruption_reason(
     ready: &[String],
     unread: &[String],
 ) -> Option<String> {
-    if !unread.is_empty() {
-        return Some(format!(
-            "the wait stopped because {actor} has a new message: {}. Run `st3 message ls`",
-            unread.join(", ")
-        ));
-    }
     if !ready.is_empty() {
         return Some(format!(
             "the wait stopped because {actor} has ready work: {}. Run `st3 work ls`",
             ready.join(", ")
+        ));
+    }
+    if !unread.is_empty() {
+        return Some(format!(
+            "the wait stopped because {actor} has a new message: {}. Run `st3 message ls`",
+            unread.join(", ")
         ));
     }
     (!has_claimed_work).then(|| {
@@ -3141,13 +3140,19 @@ async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Res
                 .and_then(|value| value.get("incarnation_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("-");
+            let harness = agent
+                .harness
+                .as_ref()
+                .map(|harness| harness.state.as_str())
+                .unwrap_or("-");
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 agent.subject,
                 display_name.unwrap_or("-"),
                 state,
                 agent.reachability,
                 driver,
+                harness,
                 agent.owner_run.as_deref().unwrap_or("-"),
             );
             println!("  incarnation {incarnation}");
@@ -4440,6 +4445,21 @@ async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Optio
         .map(str::to_owned))
 }
 
+async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(incarnation) = current_agent_incarnation(client, actor).await? {
+            return Ok(incarnation);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the current runtime incarnation for `{actor}` did not appear within 15 seconds"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn run_message(client: &Client, command: MessageCommand, json_output: bool) -> Result<()> {
     sync_message_projection(client).await?;
     match command {
@@ -5462,12 +5482,18 @@ async fn run_quick(
         .await?;
     let ready = status.subjects.first().is_some_and(|subject| {
         subject
+            .harness
+            .as_ref()
+            .is_some_and(st3::model::CurrentHarnessView::is_ready)
+    });
+    let incarnation_id = status.subjects.first().and_then(|subject| {
+        subject
             .actual
             .as_ref()
             .map(|actual| actual.get("fields").unwrap_or(actual))
-            .and_then(|actual| actual.get("state"))
+            .and_then(|actual| actual.get("incarnation_id"))
             .and_then(Value::as_str)
-            == Some("ready")
+            .map(str::to_owned)
     });
     let created = QuickAgentResponse {
         subject,
@@ -5476,7 +5502,7 @@ async fn run_quick(
         generation: run.generation,
         runtime_id: format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', ".")),
         event_cursor: cursor,
-        incarnation_id: None,
+        incarnation_id,
         ready,
     };
     if json_output {
@@ -5485,24 +5511,27 @@ async fn run_quick(
         println!("waiting for {}", created.subject);
     }
     let mut cursor = created.event_cursor;
-    if !created.ready {
+    if created.incarnation_id.is_none() {
         loop {
             let events: Vec<EventRecord> = client
                 .get(&format!(
-                    "/v1/events?after={cursor}&subject={}",
+                    "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
                     urlencoding::encode(&created.subject)
                 ))
                 .await?;
-            let mut ready = false;
+            let mut runtime_available = false;
             for event in events {
                 cursor = cursor.max(event.store_index);
-                if (event.kind == "harness.observed"
-                    && event.body.pointer("/fields/state").and_then(Value::as_str) == Some("ready"))
-                    || (event.kind == "runtime.observed"
-                        && event.body.pointer("/fields/status").and_then(Value::as_str)
-                            == Some("ready"))
+                if event.kind == "runtime.observed"
+                    && event.body.pointer("/fields/status").and_then(Value::as_str)
+                        == Some("running")
+                    && event
+                        .body
+                        .pointer("/fields/incarnation_id")
+                        .and_then(Value::as_str)
+                        .is_some()
                 {
-                    ready = true;
+                    runtime_available = true;
                 }
                 if matches!(
                     event.kind.as_str(),
@@ -5511,7 +5540,7 @@ async fn run_quick(
                     anyhow::bail!("{} became unreachable: {}", created.subject, event.body);
                 }
             }
-            if ready {
+            if runtime_available {
                 break;
             }
         }
@@ -5826,13 +5855,13 @@ async fn run_st2_native_driver(
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
-    let incarnation = current_agent_incarnation(client, subject).await?;
+    let incarnation = wait_for_agent_incarnation(client, subject).await?;
     publish_harness_state(
         client,
         subject,
         driver,
         "starting",
-        incarnation.as_deref(),
+        Some(&incarnation),
         None,
     )
     .await?;
@@ -5846,11 +5875,11 @@ async fn run_st2_native_driver(
                     subject,
                     driver,
                     "blocked",
-                    incarnation.as_deref(),
+                    Some(&incarnation),
                     Some(&reason),
                 )
                 .await?;
-                request_claude_channel_attention(client, subject, incarnation.as_deref(), &reason)
+                request_claude_channel_attention(client, subject, Some(&incarnation), &reason)
                     .await?;
                 return Err(error);
             }
@@ -5929,10 +5958,11 @@ async fn run_st2_native_driver(
                                     ("state".into(), Value::String("ready".into())),
                                     ("driver".into(), Value::String(driver.into())),
                                     ("transport".into(), Value::String("native".into())),
+                                    ("incarnation_id".into(), Value::String(incarnation.clone())),
                                 ]),
                                 evidence: Vec::new(),
                                 expected_subject: None,
-                                idempotency_key: Some(format!("native-ready:{subject}:{driver}")),
+                                idempotency_key: Some(format!("native-ready:{subject}:{driver}:{incarnation}")),
                             }).await?;
                             ready = true;
                         }
@@ -5940,7 +5970,7 @@ async fn run_st2_native_driver(
                             client,
                             subject,
                             driver,
-                            incarnation.as_deref(),
+                            Some(&incarnation),
                             &observed,
                             &mut last_activity_fingerprint,
                         )
@@ -5957,7 +5987,6 @@ async fn run_st2_native_driver(
             }
             _ = work_interval.tick(), if driver != "claude" => {
                 let tick: Result<()> = async {
-                    sync_work_messages(client, subject).await?;
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
                         renew_claimed_work(client, subject, minute).await?;
@@ -6237,6 +6266,7 @@ async fn request_claude_channel_attention(
 async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
+    let incarnation = wait_for_agent_incarnation(client, subject).await?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
     let context_name = format!("doc/context/{identity}/now");
     let context = latest_document_text(client, &context_name)
@@ -6299,10 +6329,11 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                                 ("state".into(), Value::String(status.into())),
                                 ("driver".into(), Value::String("pi".into())),
                                 ("transport".into(), Value::String("pi-channel".into())),
+                                ("incarnation_id".into(), Value::String(incarnation.clone())),
                             ]),
                             evidence: Vec::new(),
                             expected_subject: None,
-                            idempotency_key: Some(format!("pi-state:{subject}:{session}:{frame_sequence}")),
+                            idempotency_key: Some(format!("pi-state:{subject}:{incarnation}:{session}:{frame_sequence}")),
                         }).await?;
                     }
                     Some("delivered") => {
@@ -6347,7 +6378,6 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                 }
             }
             _ = work_interval.tick() => {
-                sync_work_messages(client, subject).await?;
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
                     renew_claimed_work(client, subject, minute).await?;
@@ -6392,6 +6422,7 @@ async fn message_content(client: &Client, message: &MessageView) -> Result<Strin
 
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
+    let incarnation = wait_for_agent_incarnation(client, subject).await?;
     let root = PathBuf::from(
         std::env::var_os("ST3_DRIVER_STATE_DIR")
             .context("the Codex driver has no ST3_DRIVER_STATE_DIR")?,
@@ -6440,10 +6471,11 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                                 ("state".into(), Value::String("ready".into())),
                                 ("driver".into(), Value::String("codex".into())),
                                 ("transport".into(), Value::String("app-server".into())),
+                                ("incarnation_id".into(), Value::String(incarnation.clone())),
                             ]),
                             evidence: Vec::new(),
                             expected_subject: None,
-                            idempotency_key: Some(format!("codex-ready:{subject}")),
+                            idempotency_key: Some(format!("codex-ready:{subject}:{incarnation}")),
                         }).await?;
                         ready = true;
                     }
@@ -6463,6 +6495,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         let fields = BTreeMap::from([
                             ("state".into(), Value::String(status.into())),
                             ("driver".into(), Value::String("codex".into())),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
                             ("blocked_on".into(), Value::String(observed.blocked_on.as_str().into())),
                             ("ask".into(), Value::String(observed.ask.as_str().into())),
                             ("input_buffer".into(), Value::String(observed.input_buffer.as_str().into())),
@@ -6491,7 +6524,6 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
             }
             _ = work_interval.tick() => {
                 let tick: Result<()> = async {
-                    sync_work_messages(client, subject).await?;
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
                         renew_claimed_work(client, subject, minute).await?;
@@ -6516,6 +6548,7 @@ fn tolerate_driver_api_outage(
         let message = cause.to_string();
         message.contains("connect to the st3 API")
             || message.contains("incomplete HTTP response")
+            || message.contains("retry the command")
             || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
                 matches!(
                     error.kind(),
@@ -6540,170 +6573,11 @@ fn tolerate_driver_api_outage(
     Ok(())
 }
 
-async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
-    const TAG_PREFIX: &str = "st3-work:";
-    let incarnation = current_agent_incarnation(client, subject).await?;
-    let incarnation_key = work_incarnation_key(incarnation.as_deref());
-    let messages: Vec<MessageView> = client
-        .get(&format!(
-            "/v1/messages?to={}&include_closed=true",
-            urlencoding::encode(subject)
-        ))
-        .await?;
-    let present = messages
-        .iter()
-        .cloned()
-        .flat_map(|message| message.tags)
-        .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
-        .collect::<BTreeSet<_>>();
-    let work: Vec<StepRunView> = client
-        .get(&format!(
-            "/v1/work?actor={}&include_terminal=true",
-            urlencoding::encode(subject)
-        ))
-        .await?;
-    for message in messages
-        .iter()
-        .filter(|message| matches!(message.status.as_str(), "delivered" | "read"))
-    {
-        let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
-            work_message_target(message)
-        else {
-            continue;
-        };
-        if !work_message_should_close(
-            &work,
-            step_subject,
-            attempt,
-            readiness_epoch,
-            message_incarnation,
-            &incarnation_key,
-        ) {
-            continue;
-        }
-        if message.status == "delivered" {
-            accept_message(client, message, Some(subject)).await?;
-        }
-        close_message(client, &message.subject, Some(subject)).await?;
-    }
-    for step in work
-        .iter()
-        .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
-    {
-        let tag_value = format!(
-            "{}@{}@{}@{}",
-            step.subject, step.attempt, step.readiness_epoch, incarnation_key
-        );
-        if present.contains(&tag_value) {
-            continue;
-        }
-        let _: MessageView = client
-            .post(
-                "/v1/messages",
-                &work_message_request(subject, step, tag_value),
-            )
-            .await?;
-    }
-    Ok(())
-}
-
-fn should_notify_work_message(step: &StepRunView, work: &[StepRunView]) -> bool {
-    !work.iter().any(|candidate| {
-        candidate.run == step.run
-            && candidate.assigned_to == step.assigned_to
-            && candidate.available_to == step.available_to
-            && candidate.step.len() < step.step.len()
-            && step.step.starts_with(&format!("{}/", candidate.step))
-    })
-}
-
-fn work_message_target(message: &MessageView) -> Option<(&str, u32, u32, &str)> {
-    message.tags.iter().find_map(|tag| {
-        let mut parts = tag.strip_prefix("st3-work:")?.rsplitn(4, '@');
-        let incarnation = parts.next()?;
-        let readiness_epoch = parts.next()?.parse::<u32>().ok()?;
-        let attempt = parts.next()?.parse::<u32>().ok()?;
-        let step_subject = parts.next()?;
-        Some((step_subject, attempt, readiness_epoch, incarnation))
-    })
-}
-
-fn work_message_was_acknowledged(
-    work: &[StepRunView],
-    step_subject: &str,
-    attempt: u32,
-    readiness_epoch: u32,
-) -> bool {
-    work.iter().any(|step| {
-        step.subject == step_subject
-            && step.attempt == attempt
-            && step.readiness_epoch == readiness_epoch
-            && matches!(
-                step.status.as_str(),
-                "claimed" | "working" | "completed" | "failed" | "cancelled"
-            )
-    })
-}
-
-fn work_message_should_close(
-    work: &[StepRunView],
-    step_subject: &str,
-    attempt: u32,
-    readiness_epoch: u32,
-    message_incarnation: &str,
-    current_incarnation: &str,
-) -> bool {
-    let current = work.iter().any(|step| {
-        step.subject == step_subject
-            && step.attempt == attempt
-            && step.readiness_epoch == readiness_epoch
-    });
-    !current
-        || message_incarnation != current_incarnation
-        || work_message_was_acknowledged(work, step_subject, attempt, readiness_epoch)
-}
-
 fn work_incarnation_key(incarnation: Option<&str>) -> String {
     incarnation.map_or_else(
         || "unknown".into(),
         |value| hex::encode(Sha256::digest(value.as_bytes()))[..12].to_owned(),
     )
-}
-
-fn work_message_request(
-    subject: &str,
-    step: &StepRunView,
-    tag_value: String,
-) -> MessageSendRequest {
-    MessageSendRequest {
-        idempotency_key: format!("work-message:{subject}:{tag_value}"),
-        from: "daemon/runtime".into(),
-        to: subject.into(),
-        content: work_notification(step),
-        title: Some(format!(
-            "Mission step ready: {}",
-            step.title.as_deref().unwrap_or(&step.step)
-        )),
-        in_reply_to: None,
-        tags: vec![
-            format!("st3-work:{tag_value}"),
-            format!("mission-run:{}", step.run),
-        ],
-    }
-}
-
-fn work_notification(step: &StepRunView) -> String {
-    let queue = step
-        .queue
-        .as_deref()
-        .zip(step.queue_position)
-        .map(|(queue, position)| format!("\nQueue: {queue} #{position}"))
-        .unwrap_or_default();
-    format!(
-        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}",
-        step.subject,
-        step.title.as_deref().unwrap_or(&step.step),
-    ) + &queue
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
@@ -6966,16 +6840,14 @@ async fn sync_claude_mcp_state(
     use tokio::io::AsyncWriteExt as _;
 
     if !*ready {
-        let incarnation = current_agent_incarnation(client, subject).await?;
-        let incarnation_key = work_incarnation_key(incarnation.as_deref());
+        let incarnation = wait_for_agent_incarnation(client, subject).await?;
+        let incarnation_key = work_incarnation_key(Some(&incarnation));
         let mut fields = BTreeMap::from([
             ("state".into(), Value::String("ready".into())),
             ("driver".into(), Value::String("claude".into())),
             ("transport".into(), Value::String("claude-channel".into())),
         ]);
-        if let Some(incarnation) = incarnation {
-            fields.insert("incarnation_id".into(), Value::String(incarnation));
-        }
+        fields.insert("incarnation_id".into(), Value::String(incarnation));
         let _: ClaimRecord = client
             .post(
                 "/v1/claims",
@@ -7033,7 +6905,7 @@ async fn sync_claude_mcp_state(
         .await?;
         announced.remove(&message.subject);
     }
-    sync_work_messages(client, subject).await
+    Ok(())
 }
 
 fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
@@ -7334,6 +7206,18 @@ mod tests {
         );
         assert_eq!(
             wait_interruption_reason(actor, true, &["step-run/new".into()], &[]),
+            Some(
+                "the wait stopped because agent/worker has ready work: step-run/new. Run `st3 work ls`"
+                    .into()
+            )
+        );
+        assert_eq!(
+            wait_interruption_reason(
+                actor,
+                true,
+                &["step-run/new".into()],
+                &["message/new".into()]
+            ),
             Some(
                 "the wait stopped because agent/worker has ready work: step-run/new. Run `st3 work ls`"
                     .into()
@@ -7943,154 +7827,6 @@ mod tests {
 
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
-    }
-
-    #[test]
-    fn ready_work_is_an_idempotent_graph_message() {
-        let mut step = StepRunView {
-            subject: "step-run/run-1/build".into(),
-            run: "mission-run/run-1".into(),
-            generation: "run-generation/run-1".into(),
-            step: "build".into(),
-            queue: None,
-            queue_position: None,
-            definition_hash: "definition".into(),
-            status: "ready".into(),
-            attempt: 2,
-            assigned_to: Some("agent/worker".into()),
-            available_to: Vec::new(),
-            agentless: false,
-            title: Some("Build the change".into()),
-            goals: vec!["Implement and test the requested change.".into()],
-            constraints: Vec::new(),
-            under: Vec::new(),
-            worker_reported: false,
-            claimant: None,
-            claim_incarnation: None,
-            claim_expires_at_unix_ms: None,
-            readiness_epoch: 1,
-            blocked_reason: None,
-            not_before_unix_ms: None,
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-        };
-
-        let request = work_message_request(
-            "agent/worker",
-            &step,
-            "step-run/run-1/build@2@1@incarnation".into(),
-        );
-
-        assert_eq!(request.from, "daemon/runtime");
-        assert_eq!(request.to, "agent/worker");
-        assert_eq!(
-            request.idempotency_key,
-            "work-message:agent/worker:step-run/run-1/build@2@1@incarnation"
-        );
-        assert_eq!(
-            request.tags,
-            [
-                "st3-work:step-run/run-1/build@2@1@incarnation",
-                "mission-run:mission-run/run-1"
-            ]
-        );
-        assert_eq!(
-            request.content,
-            "A mission step is ready: step-run/run-1/build. Run `st3 work claim step-run/run-1/build` to read and claim it.\n\nTitle: Build the change"
-        );
-        assert!(!request.content.contains(&step.goals[0]));
-
-        let message = MessageView {
-            subject: "message/work".into(),
-            from: request.from,
-            to: request.to,
-            content: request.content,
-            status: "delivered".into(),
-            title: request.title,
-            in_reply_to: request.in_reply_to,
-            tags: request.tags,
-            created_index: 1,
-        };
-        assert_eq!(
-            work_message_target(&message),
-            Some(("step-run/run-1/build", 2, 1, "incarnation"))
-        );
-        assert!(!work_message_was_acknowledged(
-            std::slice::from_ref(&step),
-            "step-run/run-1/build",
-            2,
-            1,
-        ));
-        assert!(!work_message_should_close(
-            std::slice::from_ref(&step),
-            "step-run/run-1/build",
-            2,
-            1,
-            "incarnation",
-            "incarnation",
-        ));
-        assert!(work_message_should_close(
-            std::slice::from_ref(&step),
-            "step-run/old-generation/build",
-            2,
-            1,
-            "incarnation",
-            "incarnation",
-        ));
-        step.status = "claimed".into();
-        assert!(work_message_was_acknowledged(
-            &[step],
-            "step-run/run-1/build",
-            2,
-            1,
-        ));
-    }
-
-    #[test]
-    fn inherited_nested_work_uses_the_parent_message() {
-        let step = |subject: &str, path: &str, assignee: &str| StepRunView {
-            subject: subject.into(),
-            run: "mission-run/run-1".into(),
-            generation: "run-generation/run-1".into(),
-            step: path.into(),
-            queue: None,
-            queue_position: None,
-            definition_hash: "definition".into(),
-            status: "ready".into(),
-            attempt: 1,
-            assigned_to: Some(assignee.into()),
-            available_to: Vec::new(),
-            agentless: false,
-            title: None,
-            goals: Vec::new(),
-            constraints: Vec::new(),
-            under: Vec::new(),
-            worker_reported: false,
-            claimant: None,
-            claim_incarnation: None,
-            claim_expires_at_unix_ms: None,
-            readiness_epoch: 1,
-            blocked_reason: None,
-            not_before_unix_ms: None,
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-        };
-        let parent = step("step-run/run-1/build", "build", "agent/builder");
-        let inherited = step(
-            "step-run/run-1/build/work/inspect",
-            "build/work/inspect",
-            "agent/builder",
-        );
-        let reassigned = step(
-            "step-run/run-1/build/work/review",
-            "build/work/review",
-            "agent/reviewer",
-        );
-        let work = vec![parent.clone(), inherited.clone(), reassigned.clone()];
-
-        assert!(should_notify_work_message(&parent, &work));
-        assert!(!should_notify_work_message(&inherited, &work));
-        assert!(should_notify_work_message(&reassigned, &work));
     }
 
     #[test]

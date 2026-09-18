@@ -72,6 +72,10 @@ not start a duplicate runtime.
 Every started member records its desired declaration, runtime identity, process identity, and
 incarnation. Stop and adoption operations compare the exact incarnation before they act.
 
+Status keeps process facts in `actual`. It keeps the current native harness observation in
+`harness`. The harness view accepts only the current runtime incarnation or a legacy observation
+recorded inside that runtime epoch.
+
 A daemon restart observes the PTY and exec registries. It adopts a matching survivor and starts only
 a missing desired member. Final work and explicit cancellation stop owned members.
 
@@ -80,8 +84,11 @@ repository context. It cannot replace the runtime contract.
 
 ## Messages and attention
 
-Small Talk messages are durable claims. Delivery is a separate lifecycle with desired, delivered,
-read, and archived facts.
+Small Talk messages are durable claims. Delivery is a separate lifecycle with sent, delivered,
+read, and closed facts.
+
+The reconciler creates ready-work messages. A driver transports them and renews claimed work. This
+split lets a ready step survive a daemon outage, a driver outage, and a failed delivery.
 
 An agent notification only indicates that ready work or a message may exist. It does not authorize
 new work. The work queue and message record remain authoritative.

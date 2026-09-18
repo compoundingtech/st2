@@ -4620,6 +4620,7 @@ impl Store {
         for subject in subject_names {
             let desired = desired_row_at(&connection, &subject, at_index)?;
             let actual = latest_actual_at(&connection, &subject, at_index)?;
+            let harness = current_harness_at(&connection, &subject, at_index)?;
             let claims = claim_ids_at(&connection, &subject, at_index)?;
             let conflicts = desired_conflicts_at(
                 &connection,
@@ -4708,6 +4709,7 @@ impl Store {
                 desired_revision: desired.as_ref().map(|row| row.revision.clone()),
                 desired: desired_value,
                 actual,
+                harness,
                 conflicts,
                 claims,
                 owner_run,
@@ -5226,6 +5228,44 @@ impl Store {
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(request.idempotency_key.clone()),
+        })?;
+        self.attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("internal", "the attention resolution was not stored"))
+    }
+
+    pub(crate) fn resolve_attention_automatically(
+        &self,
+        subject: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<AttentionRequestView, St3Error> {
+        let subject = if subject.starts_with("attention/") {
+            subject.to_owned()
+        } else {
+            format!("attention/{subject}")
+        };
+        let current = self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-attention-request",
+                    format!("attention request `{subject}` does not exist"),
+                )
+            })?;
+        self.append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "attention.resolved".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(current.request)),
+                ("outcome".into(), Value::String("resolved".into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key.into()),
         })?;
         self.attention_request(&subject)
             .map_err(internal)?
@@ -5929,6 +5969,14 @@ impl Store {
                 .insert(subject.to_owned(), (after, value.clone()));
         }
         Ok(value)
+    }
+
+    pub fn current_harness(
+        &self,
+        subject: &str,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        let connection = self.readers.get();
+        current_harness_at(&connection, subject, None)
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
@@ -9363,7 +9411,10 @@ fn validate_message_transition(
             | (Some("delivered"), "read")
             | (Some("read"), "closed")
     );
-    if !valid {
+    let daemon_withdrawal = current == Some("sent")
+        && requested == "closed"
+        && input.actor.as_deref() == Some("daemon/runtime");
+    if !valid && !daemon_withdrawal {
         return Err(St3Error::new(
             "invalid-message-transition",
             format!(
@@ -9606,7 +9657,13 @@ fn latest_actual_at(
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare(
-        "SELECT kind, body FROM claims WHERE subject=?1 AND kind!='intent.desired' AND store_index<=?2 ORDER BY store_index",
+        "SELECT kind, body FROM claims
+         WHERE subject=?1
+           AND kind!='intent.desired'
+           AND kind NOT LIKE 'harness.%'
+           AND kind!='runtime.readiness-deadline-reached'
+           AND store_index<=?2
+         ORDER BY store_index",
     )?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
@@ -9640,6 +9697,100 @@ fn latest_actual_at(
         }
     }
     Ok(Some(Value::Object(merged)))
+}
+
+fn current_harness_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
+    let at_index = at_index.unwrap_or(i64::MAX as u64);
+    let runtime = connection
+        .query_row(
+            "SELECT store_index, body FROM claims
+             WHERE subject=?1 AND kind='runtime.observed' AND store_index<=?2
+             ORDER BY store_index DESC LIMIT 1",
+            params![subject, at_index],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((runtime_index, runtime_body)) = runtime else {
+        return Ok(None);
+    };
+    let runtime_body: Value = serde_json::from_str(&runtime_body)?;
+    let runtime_fields = runtime_body.get("fields").unwrap_or(&runtime_body);
+    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
+        return Ok(None);
+    }
+    let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let mut statement = connection.prepare(
+        "SELECT id, store_index, body, accepted_at_unix_ms FROM claims
+         WHERE subject=?1 AND kind='harness.observed' AND store_index<=?2
+         ORDER BY store_index DESC",
+    )?;
+    let rows = statement.query_map(params![subject, at_index], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut current = None;
+    let mut optional = BTreeMap::<&'static str, Option<String>>::new();
+    for row in rows {
+        let (claim, store_index, body, observed_at_unix_ms) = row?;
+        let observed_at_unix_ms = observed_at_unix_ms.parse::<u128>()?;
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let observed_incarnation = fields.get("incarnation_id").and_then(Value::as_str);
+        let belongs_to_epoch = match observed_incarnation {
+            Some(value) => value == incarnation_id,
+            None => store_index > runtime_index,
+        };
+        if !belongs_to_epoch {
+            continue;
+        }
+        if current.is_none()
+            && let Some(state) = fields.get("state").and_then(Value::as_str)
+        {
+            current = Some((state.to_owned(), claim, observed_at_unix_ms));
+        }
+        for name in [
+            "driver",
+            "transport",
+            "reason",
+            "blocked_on",
+            "ask",
+            "input_buffer",
+            "exit",
+        ] {
+            if !optional.contains_key(name)
+                && let Some(value) = fields.get(name)
+            {
+                optional.insert(name, value.as_str().map(str::to_owned));
+            }
+        }
+    }
+    let Some((state, claim, observed_at_unix_ms)) = current else {
+        return Ok(None);
+    };
+    Ok(Some(crate::model::CurrentHarnessView {
+        state,
+        driver: optional.remove("driver").flatten(),
+        incarnation_id: incarnation_id.to_owned(),
+        transport: optional.remove("transport").flatten(),
+        reason: optional.remove("reason").flatten(),
+        blocked_on: optional.remove("blocked_on").flatten(),
+        ask: optional.remove("ask").flatten(),
+        input_buffer: optional.remove("input_buffer").flatten(),
+        exit: optional.remove("exit").flatten(),
+        claim,
+        observed_at_unix_ms,
+    }))
 }
 
 fn claim_ids_at(
@@ -19019,5 +19170,135 @@ message "human-attention" {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn harness_projection_is_bound_to_the_current_runtime_epoch() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let runtime = |incarnation: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("runtime_id".into(), Value::String("node.worker".into())),
+                        ("terminal".into(), Value::Bool(true)),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+        let harness = |incarnation: Option<&str>, key: &str| {
+            let mut fields = BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                ("driver".into(), Value::String("codex".into())),
+                ("transport".into(), Value::String("app-server".into())),
+            ]);
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+
+        runtime("old", "runtime-old");
+        harness(Some("old"), "harness-old");
+        assert_eq!(
+            store
+                .current_harness(subject)
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "old"
+        );
+
+        runtime("new", "runtime-new");
+        assert!(store.current_harness(subject).unwrap().is_none());
+        assert!(
+            store
+                .latest_actual_value(subject)
+                .unwrap()
+                .unwrap()
+                .get("state")
+                .is_none()
+        );
+
+        harness(Some("wrong"), "harness-wrong");
+        assert!(store.current_harness(subject).unwrap().is_none());
+        harness(None, "harness-legacy-current-epoch");
+        assert_eq!(
+            store
+                .current_harness(subject)
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "new"
+        );
+        harness(Some("new"), "harness-new");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("new".into())),
+                    ("reason".into(), Value::Null),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("harness-new-activity".into()),
+            })
+            .unwrap();
+        let current = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(current.incarnation_id, "new");
+        assert_eq!(current.state, "working");
+        assert!(current.is_ready());
+        assert_eq!(current.driver.as_deref(), Some("codex"));
+        assert_eq!(current.transport.as_deref(), Some("app-server"));
+        assert_eq!(current.reason, None);
+
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.readiness-deadline-reached".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("new".into())),
+                    (
+                        "deadline_unix_ms".into(),
+                        Value::String("1700000000000".into()),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String("the harness did not become ready".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("readiness-deadline".into()),
+            })
+            .unwrap();
+        let actual = store.latest_actual_value(subject).unwrap().unwrap();
+        assert!(actual.get("deadline_unix_ms").is_none());
+        assert!(actual.get("reason").is_none());
     }
 }
