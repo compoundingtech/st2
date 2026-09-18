@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `413f501864fe1e01e49b1906eddd0f8efe8c804670941f0a1ee0fd149abdb5b4`
+Digest: `3cdc8affcc2b3e6e8016c59c468243d37dd12fdc433a581ad62202e47380e8b1`
 
 ## Subject families
 
@@ -48,7 +48,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `vcs.commit` | `author:string`, `committed_at:string`, `committer:string`, `message:string`, `parents:array`, `repository:subject-reference immutable`, `sha:string immutable`, `state:string`, `tree:string immutable`, `url:string` | An immutable version control commit. |
 | `vcs.issue` | `author:string`, `created_at:string`, `labels:array`, `number:integer`, `repository:subject-reference`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control issue. |
 | `vcs.pull-request` | `author:string`, `base:subject-reference`, `checks:array`, `created_at:string`, `draft:boolean`, `head:subject-reference`, `merged:boolean`, `number:integer`, `repository:subject-reference`, `reviews:array`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control pull request. |
-| `vcs.ref` | `name:string immutable`, `ref_type:string`, `repository:subject-reference immutable`, `target:subject-reference`, `url:string` | A named version control reference. |
+| `vcs.ref` | `ancestors:array`, `head:string`, `name:string immutable`, `ref_type:string`, `repository:subject-reference immutable`, `target:subject-reference`, `url:string` | A named version control reference. |
 | `vcs.repository` | `default_ref:subject-reference`, `head:subject-reference`, `issues:array`, `pull_requests:array`, `state:string`, `url:string`, `vcs:string` | A version control repository. |
 | `custom.NAMESPACE.NAME` | open fact bag | A namespaced custom resource. |
 

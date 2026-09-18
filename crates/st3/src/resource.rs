@@ -43,11 +43,164 @@ impl ResourceProvider for RegisteredResourceProvider {
             match request.provider.as_str() {
                 "github.pull-request" => observe_github_pull_request(request).await,
                 "github.repository" => observe_github_repository(request).await,
+                "github.ref" => observe_github_ref(request).await,
                 "local.file" => observe_local_file(request),
                 provider => bail!("resource provider `{provider}` is not registered"),
             }
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GithubRefLocator {
+    owner: String,
+    repository: String,
+    name: String,
+}
+
+fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
+    let (repository, name) = locator
+        .rsplit_once('@')
+        .context("a GitHub ref locator needs OWNER/REPO@REF")?;
+    let (owner, repository) = repository
+        .split_once('/')
+        .context("a GitHub ref locator needs OWNER/REPO@REF")?;
+    anyhow::ensure!(
+        !owner.is_empty()
+            && !repository.is_empty()
+            && !repository.contains('/')
+            && !name.is_empty(),
+        "a GitHub ref locator needs OWNER/REPO@REF"
+    );
+    Ok(GithubRefLocator {
+        owner: owner.into(),
+        repository: repository.into(),
+        name: name.into(),
+    })
+}
+
+async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
+    let locator = parse_github_ref_locator(&request.locator)?;
+    let client = reqwest::Client::builder()
+        .user_agent("st3-resource-observer/0.1")
+        .build()?;
+    let token = github_token().await;
+    let request_json = |url: String| {
+        let request = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = &token {
+            request.bearer_auth(token)
+        } else {
+            request
+        }
+    };
+    let base = format!(
+        "https://api.github.com/repos/{}/{}",
+        locator.owner, locator.repository
+    );
+    let branch: Value = request_json(format!(
+        "{base}/branches/{}",
+        urlencoding::encode(&locator.name)
+    ))
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let head = branch
+        .pointer("/commit/sha")
+        .and_then(Value::as_str)
+        .context("the GitHub ref has no head SHA")?
+        .to_owned();
+
+    let mut ancestors = Vec::new();
+    if request.fields.contains("ancestors") {
+        let mut page = 1_u64;
+        loop {
+            let branches: Vec<Value> =
+                request_json(format!("{base}/branches?per_page=100&page={page}"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+            let count = branches.len();
+            for candidate in branches {
+                let Some(name) = candidate.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if name == locator.name {
+                    continue;
+                }
+                let Some(candidate_head) = candidate.pointer("/commit/sha").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let merged = if candidate_head == head {
+                    true
+                } else {
+                    let comparison: Value =
+                        request_json(format!("{base}/compare/{candidate_head}...{head}"))
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?;
+                    comparison
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(github_comparison_is_merged)
+                };
+                if merged {
+                    ancestors.push(format!("refs/heads/{name}"));
+                }
+            }
+            if count < 100 {
+                break;
+            }
+            page = page
+                .checked_add(1)
+                .context("the GitHub branch page number overflowed")?;
+        }
+    }
+
+    let facts = normalize_github_ref(&head, ancestors, &request.fields);
+    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(ProviderObservation {
+        facts,
+        cursor,
+        next_check_unix_ms: now.saturating_add(60_000),
+    })
+}
+
+fn github_comparison_is_merged(status: &str) -> bool {
+    matches!(status, "ahead" | "identical")
+}
+
+fn normalize_github_ref(
+    head: &str,
+    mut ancestors: Vec<String>,
+    fields: &BTreeSet<String>,
+) -> Value {
+    let mut facts = serde_json::Map::new();
+    if fields.contains("head") {
+        facts.insert("head".into(), Value::String(head.into()));
+    }
+    if fields.contains("ancestors") {
+        ancestors.sort();
+        ancestors.dedup();
+        facts.insert(
+            "ancestors".into(),
+            Value::Array(ancestors.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(facts)
 }
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
@@ -382,6 +535,60 @@ mod tests {
             .unwrap();
         assert_eq!(observation.cursor.as_deref(), Some("fake-cursor"));
         assert_eq!(observation.facts["provider"], "fake.issue");
+    }
+
+    #[test]
+    fn github_ref_locators_name_one_repository_branch() {
+        assert_eq!(
+            parse_github_ref_locator("shareup/app-web@feature/instant-items").unwrap(),
+            GithubRefLocator {
+                owner: "shareup".into(),
+                repository: "app-web".into(),
+                name: "feature/instant-items".into(),
+            }
+        );
+        for invalid in [
+            "shareup/app-web",
+            "shareup@app-web",
+            "shareup/app-web@",
+            "/app-web@main",
+            "shareup/a/b@main",
+        ] {
+            assert!(
+                parse_github_ref_locator(invalid).is_err(),
+                "accepted invalid locator {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_ref_facts_are_selected_sorted_and_deduplicated() {
+        let fields = BTreeSet::from(["head".into(), "ancestors".into()]);
+        let facts = normalize_github_ref(
+            "abc123",
+            vec![
+                "refs/heads/topic-b".into(),
+                "refs/heads/topic-a".into(),
+                "refs/heads/topic-b".into(),
+            ],
+            &fields,
+        );
+        assert_eq!(facts["head"], "abc123");
+        assert_eq!(
+            facts["ancestors"],
+            json!(["refs/heads/topic-a", "refs/heads/topic-b"])
+        );
+        assert!(github_comparison_is_merged("ahead"));
+        assert!(github_comparison_is_merged("identical"));
+        assert!(!github_comparison_is_merged("behind"));
+        assert!(!github_comparison_is_merged("diverged"));
+
+        let head_only = normalize_github_ref(
+            "def456",
+            vec!["refs/heads/ignored".into()],
+            &BTreeSet::from(["head".into()]),
+        );
+        assert_eq!(head_only, json!({"head": "def456"}));
     }
 
     #[tokio::test]
