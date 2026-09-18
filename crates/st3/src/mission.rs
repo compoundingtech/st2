@@ -3425,10 +3425,63 @@ mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" {
             r#"version 2
 mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; mission-authority { publish "work/*"; publish "work/*" } } }"#,
         ] {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
-            let declarations = intent.missions["bad"].declarations_kdl.as_deref().unwrap();
-            assert!(crate::graph::parse_execution_intent(declarations, "node", "bad").is_err());
+            assert!(crate::graph::parse_intent(source, "node").is_err());
         }
+    }
+
+    #[test]
+    fn nested_declarations_are_fully_validated_before_publication() {
+        let declarations = [
+            r#"agent "worker" { command "true"; unexpected "value" }"#,
+            r#"exec "worker" { command "true"; unexpected "value" }"#,
+            r#"pty "worker" { command "true"; unexpected "value" }"#,
+            r#"host "node" { unexpected "value" }"#,
+            r#"doc "proof" { hash "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; unexpected "value" }"#,
+            r#"resource "source" { kind "vcs.repository"; unexpected "value" }"#,
+            r#"observer "source" { resource "resource/source"; provider "local.file"; locator "/tmp/source"; field "state"; unexpected "value" }"#,
+            r#"subscription "source" { observer "observer/source"; to "agent/worker"; on "state"; delivery "message"; unexpected "value" }"#,
+            r#"person "reviewer" unexpected=#true"#,
+            r#"message "review" { to "agent/worker"; subject "wrong"; body "wrong" }"#,
+            r#"schedule "daily" { every "1d"; work { mission "mission/work@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; workspace "/tmp/work" }; unexpected "value" }"#,
+            r#"stop "agent/worker" unexpected=#true"#,
+        ];
+
+        for declaration in declarations {
+            let source = format!(
+                "version 2\nmission \"bad\" state=\"ready\" {{ goal \"Reject an invalid nested declaration.\"; step \"work\" {{ agentless; {declaration} }} }}"
+            );
+            let error = crate::graph::parse_intent(&source, "node")
+                .expect_err("a nested declaration must use its full validator");
+            assert!(
+                matches!(
+                    error.code,
+                    "unknown-child" | "unknown-property" | "invalid-host-child"
+                ),
+                "{declaration}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_validation_uses_typed_input_placeholders() {
+        crate::graph::parse_intent(
+            r#"version 2
+mission "observed" state="ready" {
+  input "source" kind="resource"
+  goal "Observe the supplied resource."
+  step "observe" {
+    agentless
+    observer "source" {
+      resource "${input.source}"
+      provider "local.file"
+      locator "/tmp/source"
+      field "state"
+    }
+  }
+}"#,
+            "node",
+        )
+        .expect("a resource input must remain valid during nested declaration validation");
     }
 
     #[test]

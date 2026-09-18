@@ -64,7 +64,9 @@ struct ParseContext {
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
-    parse_intent_with_owner(source, default_host, None, false)
+    let intent = parse_intent_with_owner(source, default_host, None, false)?;
+    validate_mission_runtimes(&intent, default_host)?;
+    Ok(intent)
 }
 
 pub(crate) fn parse_internal_intent(
@@ -145,12 +147,15 @@ pub fn validate_mission_runtimes(
             ("candidate.index".into(), "1".into()),
             ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
         ]);
-        variables.extend(
-            mission
-                .inputs
-                .keys()
-                .map(|name| (format!("input.{name}"), format!("migration-{name}"))),
-        );
+        variables.extend(mission.inputs.iter().map(|(name, input)| {
+            let value = match input.kind {
+                crate::model::MissionInputKind::Text => format!("migration-{name}"),
+                crate::model::MissionInputKind::Resource => {
+                    format!("resource/migration-{name}")
+                }
+            };
+            (format!("input.{name}"), value)
+        }));
         if let Some(source) = &mission.declarations_kdl {
             validate_source(source, &variables, default_host, subjects)?;
         }

@@ -5460,6 +5460,63 @@ version 2
     }
 
     #[tokio::test]
+    async fn preview_and_publish_reject_invalid_nested_declarations_without_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let before = store.index().unwrap();
+        let kdl = r#"version 2
+mission "invalid-message" state="ready" {
+  goal "Reject this declaration before the mission runs."
+  step "send" {
+    agentless
+    message "notice" {
+      to "agent/worker"
+      subject "This field is not valid."
+      body "This field is not valid."
+    }
+  }
+}"#;
+
+        let (preview_status, preview_error) = json_request(
+            app.clone(),
+            "/v1/intent/mission",
+            serde_json::to_value(MissionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: Some("invalid-message.kdl".into()),
+                },
+                at_index: None,
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(preview_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(preview_error["code"], "unknown-child");
+        assert_eq!(store.index().unwrap(), before);
+
+        let (publish_status, publish_error) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(ApplyRequest {
+                intent: crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: Some("invalid-message.kdl".into()),
+                },
+                expected_subjects: BTreeMap::new(),
+                idempotency_key: "reject-invalid-nested-message".into(),
+                actor: Some("person/nathan".into()),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(publish_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(publish_error["code"], "unknown-child");
+        assert_eq!(store.index().unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn planning_requires_an_exact_preview_and_publishes_without_a_run() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
