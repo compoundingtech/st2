@@ -142,6 +142,31 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
 }
 
 #[test]
+fn the_declarative_gates_dream_fixture_previews_without_rewriting() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/declarative-gates.kdl");
+    let source = fs::read_to_string(&fixture).expect("read declarative gates fixture");
+    let intent = st3::parse_intent(&source, "local")
+        .unwrap_or_else(|error| panic!("{}: {error}", fixture.display()));
+    let store = st3::store::Store::open_memory("local").unwrap();
+    let preview = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: Some(fixture.display().to_string()),
+            },
+        )
+        .unwrap();
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    assert!(
+        preview
+            .mission_revisions
+            .contains_key("mission/fleet/app-web/one-space-gets-instant-new-items")
+    );
+}
+
+#[test]
 fn every_native_st3_eval_uses_the_normative_grammar() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

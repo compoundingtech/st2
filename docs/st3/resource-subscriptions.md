@@ -8,11 +8,16 @@ An agent or a person can request a message or mission when selected external fac
 
 The request is durable graph state. A supervised observer checks the external resource without using an agent turn.
 
-The providers observe one GitHub pull request, one GitHub repository, or one local file.
+The providers observe one GitHub pull request, one GitHub repository, one GitHub branch ref, or one
+local file.
 
 The GitHub provider supports `head`, `state`, `review`, and `checks`.
 
 The repository provider supports `pull_requests` and `issues`. It retains discoveries and filters draft pull requests.
+
+The `github.ref` provider supports `head` and `ancestors`. `head` is the selected branch's commit SHA.
+`ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
+reachable from the selected branch.
 
 Each newly ready pull request becomes one `vcs.pull-request` resource. Each new issue becomes one `vcs.issue` resource.
 
@@ -75,6 +80,24 @@ The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
 The subscription stores the selected changes and delivery intent. The agent declaration does not change.
 
 A provider locator is an opaque provider value. st3 does not assign meaning to it outside the registered provider.
+
+The `github.ref` locator is `OWNER/REPOSITORY@BRANCH`. Branch names can contain `/`. For example:
+
+```kdl
+resource "github/shareup/app-web/ref/one-space-at-a-time" {
+  kind "vcs.ref"
+}
+
+observer "one-space" {
+  resource "resource/github/shareup/app-web/ref/one-space-at-a-time"
+  provider "github.ref"
+  locator "shareup/app-web@one-space-at-a-time"
+  field "head"
+  field "ancestors"
+}
+```
+
+`ancestors` does not include the selected branch itself. The provider sorts and deduplicates the returned refs.
 
 The GitHub providers read `GH_TOKEN` first and `GITHUB_TOKEN` second. They then try `gh auth token`.
 
@@ -172,6 +195,34 @@ A scheduled unchanged observation creates no durable observer claim. A manual re
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
 
+An optional `when` block changes this from delivery on every selected change to delivery on a
+false-to-true predicate transition:
+
+```kdl
+subscription "green" {
+  observer "observer/pull-request"
+  on "checks"
+  when {
+    every "checks" {
+      field "status" "is" "completed"
+      field "conclusion" "is" "success"
+    }
+  }
+  to "agent/fleet/cos/standing/cos"
+  delivery "message"
+}
+```
+
+The condition reads the observer's current resource facts, so its predicates omit a subject. It
+accepts `field`, `every`, and `not-every` with the same `is`, `starts-with`, and `contains` operators
+as graph predicates. `every` and `not-every` apply all nested field predicates to each item in the
+selected list.
+
+The baseline never delivers. A later selected-field change delivers only when the prior facts did
+not satisfy the condition and the new facts do. Further changes while the condition remains true do
+not deliver again. If it becomes false and later true, that new transition delivers. The same rule
+applies to message and mission delivery.
+
 A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same mission run.
 
 A daemon restart can repeat an external request. It cannot create a duplicate observation or message.
@@ -190,7 +241,8 @@ Cleanup stops the owned observer and subscription before the watch run becomes c
 
 The GitHub pull request provider observes the final merge or closure change. The subscription remains active until an explicit unwatch in the MVP.
 
-A later version can add an `until` predicate or one deadline. This option is not part of the MVP.
+A `when` condition gates delivery; it does not stop the subscription. Use an explicit unwatch or
+mission cancellation to stop it.
 
 ## Acceptance proof
 
@@ -209,6 +261,8 @@ A later version can add an `until` predicate or one deadline. This option is not
 - The local file provider reports metadata and never reports file content.
 - A direct observer without a subscription records observations and sends no message.
 - A manual refresh waits for its exact attempt and reports an unchanged success without a new resource claim.
+- A GitHub ref observation records the selected branch head and its sorted merged branch refs.
+- A conditional subscription sends once on each false-to-true transition and stays quiet while the condition remains true.
 
 ## Observer process isolation to evaluate
 
