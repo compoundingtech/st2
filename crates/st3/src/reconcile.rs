@@ -5461,18 +5461,46 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let Some(actual) = self.subject_value(subject)? else {
                     return Ok(GateOutcome::Pending);
                 };
-                let found = if subject.starts_with("file/") {
-                    actual_field(&actual, "content")
-                        .and_then(Value::as_str)
-                        .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                        .and_then(|content| owned_field(content, path))
-                } else {
-                    actual_field(&actual, path).cloned()
-                };
+                let found = observed_field_value(&actual, subject, path);
                 let Some(found) = found.as_ref() else {
                     return Ok(GateOutcome::Pending);
                 };
                 if compare_value(found, operator, value) {
+                    GateOutcome::Pass
+                } else {
+                    GateOutcome::Pending
+                }
+            }
+            GateSpec::Every {
+                path,
+                subject,
+                fields,
+                ..
+            }
+            | GateSpec::NotEvery {
+                path,
+                subject,
+                fields,
+                ..
+            } => {
+                self.ensure_file_observation(subject)?;
+                let Some(actual) = self.subject_value(subject)? else {
+                    return Ok(GateOutcome::Pending);
+                };
+                let Some(items) = observed_field_value(&actual, subject, path)
+                    .and_then(|value| value.as_array().cloned())
+                else {
+                    return Ok(GateOutcome::Pending);
+                };
+                let every = items.iter().all(|item| {
+                    fields.iter().all(|field| {
+                        actual_field(item, &field.path).is_some_and(|found| {
+                            compare_value(found, &field.operator, &field.value)
+                        })
+                    })
+                });
+                let pass = matches!(gate, GateSpec::Every { .. }) == every;
+                if pass {
                     GateOutcome::Pass
                 } else {
                     GateOutcome::Pending
@@ -6313,6 +6341,19 @@ fn expand_gate(
                 expand(value)?;
             }
         }
+        GateSpec::Every {
+            subject, fields, ..
+        }
+        | GateSpec::NotEvery {
+            subject, fields, ..
+        } => {
+            expand(subject)?;
+            for field in fields {
+                if let Value::String(value) = &mut field.value {
+                    expand(value)?;
+                }
+            }
+        }
         GateSpec::Has { subject, text, .. } | GateSpec::Lacks { subject, text, .. } => {
             expand(subject)?;
             expand(text)?;
@@ -6707,6 +6748,22 @@ fn owned_field(mut value: Value, path: &str) -> Option<Value> {
     Some(value)
 }
 
+fn observed_field_value(actual: &Value, subject: &str, path: &str) -> Option<Value> {
+    if subject.starts_with("file/") {
+        actual_field(actual, "content")
+            .and_then(Value::as_str)
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+            .and_then(|content| owned_field(content, path))
+    } else {
+        let actual = if subject.starts_with("resource/") {
+            actual.get("facts").unwrap_or(actual)
+        } else {
+            actual
+        };
+        actual_field(actual, path).cloned()
+    }
+}
+
 fn compare_value(found: &Value, operator: &str, expected: &Value) -> bool {
     match operator {
         "is" => found == expected,
@@ -6828,6 +6885,147 @@ mod tests {
         fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
             Ok(self.logs.lock().unwrap().get(runtime_id).cloned())
         }
+    }
+
+    #[test]
+    fn quantified_field_predicates_evaluate_lists_and_their_negation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let fields = vec![
+            crate::model::QuantifiedFieldSpec {
+                path: "status".into(),
+                operator: "is".into(),
+                value: Value::String("completed".into()),
+            },
+            crate::model::QuantifiedFieldSpec {
+                path: "conclusion".into(),
+                operator: "is".into(),
+                value: Value::String("success".into()),
+            },
+        ];
+        let every = GateSpec::Every {
+            name: "all checks passed".into(),
+            path: "checks".into(),
+            subject: "resource/pull".into(),
+            fields: fields.clone(),
+        };
+        let not_every = GateSpec::NotEvery {
+            name: "a check did not pass".into(),
+            path: "checks".into(),
+            subject: "resource/pull".into(),
+            fields,
+        };
+        let stage = GateContext {
+            subject: "step-run/test/checks".into(),
+            name: "checks".into(),
+            started_at_unix_ms: now_ms(),
+        };
+
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &every).unwrap(),
+            GateOutcome::Pending
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &not_every).unwrap(),
+            GateOutcome::Pending
+        ));
+
+        let observe = |checks: Value, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "resource/pull".into(),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("vcs.pull-request".into())),
+                        ("facts".into(), serde_json::json!({"checks": checks})),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+
+        observe(
+            serde_json::json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "success"}
+            ]),
+            "all-pass",
+        );
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &every).unwrap(),
+            GateOutcome::Pass
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &not_every).unwrap(),
+            GateOutcome::Pending
+        ));
+
+        observe(
+            serde_json::json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "failure"}
+            ]),
+            "one-failed",
+        );
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &every).unwrap(),
+            GateOutcome::Pending
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &not_every).unwrap(),
+            GateOutcome::Pass
+        ));
+
+        observe(Value::Array(Vec::new()), "empty-list");
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &every).unwrap(),
+            GateOutcome::Pass
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &not_every).unwrap(),
+            GateOutcome::Pending
+        ));
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/wrong".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("custom.st3.test".into())),
+                    ("facts".into(), serde_json::json!({"checks": "not-a-list"})),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("wrong-shape".into()),
+            })
+            .unwrap();
+        let mut wrong_every = every.clone();
+        let GateSpec::Every { subject, .. } = &mut wrong_every else {
+            unreachable!()
+        };
+        *subject = "resource/wrong".into();
+        let mut wrong_not_every = not_every.clone();
+        let GateSpec::NotEvery { subject, .. } = &mut wrong_not_every else {
+            unreachable!()
+        };
+        *subject = "resource/wrong".into();
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &wrong_every).unwrap(),
+            GateOutcome::Pending
+        ));
+        assert!(matches!(
+            reconciler.evaluate_gate(&stage, &wrong_not_every).unwrap(),
+            GateOutcome::Pending
+        ));
     }
 
     fn apply_source(store: &Store, source: &str, idempotency_key: &str) {

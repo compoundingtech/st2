@@ -536,6 +536,13 @@ pub struct ScheduledWork {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QuantifiedFieldSpec {
+    pub path: String,
+    pub operator: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "predicate", rename_all = "kebab-case")]
 pub enum GateSpec {
     Exists {
@@ -552,6 +559,18 @@ pub enum GateSpec {
         subject: String,
         operator: String,
         value: Value,
+    },
+    Every {
+        name: String,
+        path: String,
+        subject: String,
+        fields: Vec<QuantifiedFieldSpec>,
+    },
+    NotEvery {
+        name: String,
+        path: String,
+        subject: String,
+        fields: Vec<QuantifiedFieldSpec>,
     },
     Has {
         name: String,
