@@ -8,9 +8,9 @@ use crate::model::{
     DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
     MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
     NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
-    PlanningSessionCreation, PlanningSessionDeclaration, ReplicaRepairDeclaration,
-    ResourceRefreshOperation, RestartIntensity, RestartType, RuntimeResetOperation, ScheduleSpec,
-    St3Error, SubscriptionSpec,
+    PlanningSessionCreation, PlanningSessionDeclaration, QuantifiedFieldSpec,
+    ReplicaRepairDeclaration, ResourceRefreshOperation, RestartIntensity, RestartType,
+    RuntimeResetOperation, ScheduleSpec, St3Error, SubscriptionConditionSpec, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -2666,7 +2666,7 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
     }
     reject_unknown_children(
         body,
-        &["observer", "to", "on", "delivery"],
+        &["observer", "to", "on", "when", "delivery"],
         "subscription",
         "subscription",
     )?;
@@ -2691,6 +2691,9 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
             "duplicate-subscription-field",
             "a subscription field repeats",
         ));
+    }
+    if let Some(condition) = unique_child(body, "when")? {
+        parse_subscription_condition(condition)?;
     }
     let delivery = unique_child(body, "delivery")?.ok_or_else(|| {
         St3Error::new(
@@ -2756,6 +2759,124 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
         }
     }
     Ok(())
+}
+
+fn parse_subscription_condition(node: &KdlNode) -> Result<SubscriptionConditionSpec, St3Error> {
+    ensure_bare(node)?;
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "missing-subscription-condition",
+            "subscription `when` needs one predicate",
+        )
+    })?;
+    let [predicate] = body.nodes() else {
+        return Err(St3Error::new(
+            "invalid-subscription-condition",
+            "subscription `when` needs exactly one predicate",
+        ));
+    };
+    reject_type(predicate)?;
+    ensure_no_properties(predicate)?;
+    let entries = positional_values(predicate);
+    match predicate.name().value() {
+        "field" => {
+            ensure_no_children(predicate)?;
+            if entries.len() != 3 {
+                return Err(St3Error::new(
+                    "invalid-subscription-condition",
+                    "a subscription field condition requires path, operator, and value",
+                ));
+            }
+            let path = value_string(entries[0])?;
+            validate_field_path(&path)?;
+            let operator = predicate_operator(entries[1])?;
+            Ok(SubscriptionConditionSpec::Field {
+                path,
+                operator,
+                value: json_value(entries[2])?,
+            })
+        }
+        "every" | "not-every" => {
+            if entries.len() != 1 {
+                return Err(St3Error::new(
+                    "invalid-subscription-condition",
+                    "a quantified subscription condition requires one list field path",
+                ));
+            }
+            let path = value_string(entries[0])?;
+            validate_field_path(&path)?;
+            let body = predicate.children().ok_or_else(|| {
+                St3Error::new(
+                    "empty-subscription-condition",
+                    "a quantified subscription condition needs at least one field predicate",
+                )
+            })?;
+            if body.nodes().is_empty() {
+                return Err(St3Error::new(
+                    "empty-subscription-condition",
+                    "a quantified subscription condition needs at least one field predicate",
+                ));
+            }
+            let mut fields = Vec::with_capacity(body.nodes().len());
+            for field in body.nodes() {
+                if field.name().value() != "field" {
+                    return Err(St3Error::new(
+                        "invalid-subscription-condition",
+                        "every and not-every accept only field predicates",
+                    ));
+                }
+                reject_type(field)?;
+                ensure_no_properties(field)?;
+                ensure_no_children(field)?;
+                let entries = positional_values(field);
+                if entries.len() != 3 {
+                    return Err(St3Error::new(
+                        "invalid-subscription-condition",
+                        "a quantified field requires path, operator, and value",
+                    ));
+                }
+                let path = value_string(entries[0])?;
+                validate_field_path(&path)?;
+                fields.push(QuantifiedFieldSpec {
+                    path,
+                    operator: predicate_operator(entries[1])?,
+                    value: json_value(entries[2])?,
+                });
+            }
+            if predicate.name().value() == "every" {
+                Ok(SubscriptionConditionSpec::Every { path, fields })
+            } else {
+                Ok(SubscriptionConditionSpec::NotEvery { path, fields })
+            }
+        }
+        other => Err(St3Error::new(
+            "unknown-subscription-condition",
+            format!("unknown subscription condition `{other}`"),
+        )),
+    }
+}
+
+fn validate_field_path(path: &str) -> Result<(), St3Error> {
+    if valid_field_path(path) {
+        Ok(())
+    } else {
+        Err(St3Error::new(
+            "invalid-field-path",
+            format!("invalid field path `{path}`"),
+        ))
+    }
+}
+
+fn predicate_operator(value: &KdlValue) -> Result<String, St3Error> {
+    let operator = value_string(value)?;
+    if matches!(operator.as_str(), "is" | "starts-with" | "contains") {
+        Ok(operator)
+    } else {
+        Err(St3Error::new(
+            "invalid-field-operator",
+            format!("invalid field operator `{operator}`"),
+        ))
+    }
 }
 
 fn validate_message(node: &KdlNode) -> Result<(), St3Error> {
@@ -3188,6 +3309,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             observer: String::new(),
             to: String::new(),
             fields: Vec::new(),
+            condition: None,
             delivery: String::new(),
             mission: None,
             revision: None,
@@ -3226,6 +3348,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             .unwrap_or_default()
             .to_owned(),
         fields: canonical_child_values(value, "on"),
+        condition: canonical_subscription_condition(value),
         delivery,
         mission,
         revision,
@@ -3240,6 +3363,68 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             .map(str::to_owned),
         stopped: false,
     })
+}
+
+fn canonical_subscription_condition(value: &Value) -> Option<SubscriptionConditionSpec> {
+    let when = value
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("when"))?;
+    let predicates = when.get("children")?.as_array()?;
+    let [predicate] = predicates.as_slice() else {
+        return None;
+    };
+    let name = predicate.get("name")?.as_str()?;
+    let arguments = predicate.get("arguments")?.as_array()?;
+    match name {
+        "field" => {
+            let [path, operator, value] = arguments.as_slice() else {
+                return None;
+            };
+            Some(SubscriptionConditionSpec::Field {
+                path: path.as_str()?.to_owned(),
+                operator: operator.as_str()?.to_owned(),
+                value: value.clone(),
+            })
+        }
+        "every" | "not-every" => {
+            let [path] = arguments.as_slice() else {
+                return None;
+            };
+            let fields = predicate
+                .get("children")?
+                .as_array()?
+                .iter()
+                .map(|field| {
+                    if field.get("name").and_then(Value::as_str) != Some("field") {
+                        return None;
+                    }
+                    let [path, operator, value] = field.get("arguments")?.as_array()?.as_slice()
+                    else {
+                        return None;
+                    };
+                    Some(QuantifiedFieldSpec {
+                        path: path.as_str()?.to_owned(),
+                        operator: operator.as_str()?.to_owned(),
+                        value: value.clone(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if name == "every" {
+                Some(SubscriptionConditionSpec::Every {
+                    path: path.as_str()?.to_owned(),
+                    fields,
+                })
+            } else {
+                Some(SubscriptionConditionSpec::NotEvery {
+                    path: path.as_str()?.to_owned(),
+                    fields,
+                })
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn agent_under(value: &Value) -> Vec<crate::model::UnderSpec> {
@@ -4708,6 +4893,56 @@ subscription "reviews" {{
         assert_eq!(
             spec.requester.as_deref(),
             Some("agent/fleet/repository/standing/owner")
+        );
+    }
+
+    #[test]
+    fn a_subscription_can_wait_until_every_observed_item_matches() {
+        let source = r#"version 2
+resource "pull" { kind "vcs.pull-request" }
+observer "pull" { resource "resource/pull"; provider "github.pull-request"; locator "owner/repo#1"; field "checks" }
+subscription "green" {
+  observer "observer/pull"
+  to "agent/fleet/cos/standing/cos"
+  on "checks"
+  when {
+    every "checks" {
+      field "status" "is" "completed"
+      field "conclusion" "is" "success"
+    }
+  }
+  delivery "message"
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let subscription = intent
+            .subjects
+            .values()
+            .find(|item| item.kind == "subscription")
+            .unwrap();
+        let spec = subscription_spec(&subscription.desired).unwrap();
+        assert_eq!(
+            spec.condition,
+            Some(SubscriptionConditionSpec::Every {
+                path: "checks".into(),
+                fields: vec![
+                    QuantifiedFieldSpec {
+                        path: "status".into(),
+                        operator: "is".into(),
+                        value: Value::String("completed".into()),
+                    },
+                    QuantifiedFieldSpec {
+                        path: "conclusion".into(),
+                        operator: "is".into(),
+                        value: Value::String("success".into()),
+                    },
+                ],
+            })
+        );
+
+        let invalid = source.replace("every \"checks\" {", "some \"checks\" {");
+        assert_eq!(
+            parse_test_intent(&invalid, "node").unwrap_err().code,
+            "unknown-subscription-condition"
         );
     }
 }

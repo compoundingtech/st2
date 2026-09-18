@@ -29,7 +29,7 @@ use crate::model::{
     ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
     St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
-    UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
+    SubscriptionConditionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -6484,6 +6484,15 @@ impl Store {
                 if selected.is_empty() {
                     continue;
                 }
+                if let Some(condition) = &subscription.condition {
+                    let condition_is_true = subscription_condition_matches(condition, &facts);
+                    let condition_was_true = previous
+                        .as_ref()
+                        .is_some_and(|facts| subscription_condition_matches(condition, facts));
+                    if !condition_is_true || condition_was_true {
+                        continue;
+                    }
+                }
                 let stable = canonical_hash(&(
                     observation_claim.as_ref().map(|claim| claim.id.as_str()),
                     subscription_subject,
@@ -12622,6 +12631,54 @@ fn collect_hash_fields(value: &Value, output: &mut BTreeSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+fn subscription_condition_matches(condition: &SubscriptionConditionSpec, facts: &Value) -> bool {
+    match condition {
+        SubscriptionConditionSpec::Field {
+            path,
+            operator,
+            value,
+        } => value_at_path(facts, path)
+            .is_some_and(|found| predicate_value_matches(found, operator, value)),
+        SubscriptionConditionSpec::Every { path, fields }
+        | SubscriptionConditionSpec::NotEvery { path, fields } => {
+            let Some(items) = value_at_path(facts, path).and_then(Value::as_array) else {
+                return false;
+            };
+            let every = items.iter().all(|item| {
+                fields.iter().all(|field| {
+                    value_at_path(item, &field.path).is_some_and(|found| {
+                        predicate_value_matches(found, &field.operator, &field.value)
+                    })
+                })
+            });
+            matches!(condition, SubscriptionConditionSpec::Every { .. }) == every
+        }
+    }
+}
+
+fn value_at_path<'a>(mut value: &'a Value, path: &str) -> Option<&'a Value> {
+    for segment in path.split('.') {
+        value = value.get(segment)?;
+    }
+    Some(value)
+}
+
+fn predicate_value_matches(found: &Value, operator: &str, expected: &Value) -> bool {
+    match operator {
+        "is" => found == expected,
+        "starts-with" => found
+            .as_str()
+            .zip(expected.as_str())
+            .is_some_and(|(found, expected)| found.starts_with(expected)),
+        "contains" => match (found, expected) {
+            (Value::String(found), Value::String(expected)) => found.contains(expected),
+            (Value::Array(found), expected) => found.contains(expected),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -22104,6 +22161,133 @@ version 2
             .unwrap();
         assert_eq!(unselected.changed_fields, ["checks"]);
         assert!(unselected.message_subjects.is_empty());
+    }
+
+    #[test]
+    fn a_subscription_condition_delivers_only_when_it_becomes_true() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+
+agent "target" { workspace "."; command "true" }
+resource "pull" { kind "vcs.pull-request" }
+observer "pull" {
+  resource "resource/pull"
+  provider "github.pull-request"
+  locator "acme/demo#1"
+  field "checks"
+}
+subscription "green" {
+  observer "observer/pull"
+  to "agent/node.target"
+  on "checks"
+  when {
+    every "checks" {
+      field "status" "is" "completed"
+      field "conclusion" "is" "success"
+    }
+  }
+  delivery "message"
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(planned.blockers.is_empty());
+        store
+            .apply(&intent, &planned.subject_tokens, "publish-green-watch")
+            .unwrap();
+        let subscriptions = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .filter(|desired| desired.kind == "subscription")
+            .map(|desired| {
+                let spec = crate::graph::subscription_spec(&desired.desired).unwrap();
+                (desired.subject, spec)
+            })
+            .collect::<Vec<_>>();
+        let observer_revision = store
+            .selected_desired_revision("observer/pull")
+            .unwrap()
+            .unwrap();
+        let observe = |cursor: &str, checks: Value| {
+            store
+                .record_resource_observation(
+                    "observer/pull",
+                    &observer_revision,
+                    None,
+                    "resource/pull",
+                    Some(cursor),
+                    &json!({"checks": checks}),
+                    100,
+                    &subscriptions,
+                )
+                .unwrap()
+        };
+
+        let baseline = observe(
+            "baseline",
+            json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "in_progress", "conclusion": null}
+            ]),
+        );
+        assert!(baseline.baseline);
+        assert!(baseline.message_subjects.is_empty());
+
+        let still_pending = observe(
+            "still-pending",
+            json!([
+                {"status": "completed", "conclusion": "success", "completed_at": "one"},
+                {"status": "in_progress", "conclusion": null}
+            ]),
+        );
+        assert!(still_pending.message_subjects.is_empty());
+
+        let green = observe(
+            "green",
+            json!([
+                {"status": "completed", "conclusion": "success", "completed_at": "one"},
+                {"status": "completed", "conclusion": "success", "completed_at": "two"}
+            ]),
+        );
+        assert_eq!(green.message_subjects.len(), 1);
+
+        let still_green = observe(
+            "still-green",
+            json!([
+                {"status": "completed", "conclusion": "success", "completed_at": "updated"},
+                {"status": "completed", "conclusion": "success", "completed_at": "two"}
+            ]),
+        );
+        assert!(still_green.message_subjects.is_empty());
+
+        let red = observe(
+            "red",
+            json!([
+                {"status": "completed", "conclusion": "failure"},
+                {"status": "completed", "conclusion": "success"}
+            ]),
+        );
+        assert!(red.message_subjects.is_empty());
+        let green_again = observe(
+            "green-again",
+            json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "success"}
+            ]),
+        );
+        assert_eq!(green_again.message_subjects.len(), 1);
+        assert_ne!(green_again.message_subjects, green.message_subjects);
+        assert_eq!(store.messages(None, true).unwrap().len(), 2);
     }
 
     #[test]

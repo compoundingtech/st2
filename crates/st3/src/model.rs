@@ -535,11 +535,29 @@ pub struct ScheduledWork {
     pub inputs: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QuantifiedFieldSpec {
     pub path: String,
     pub operator: String,
     pub value: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "predicate", rename_all = "kebab-case")]
+pub enum SubscriptionConditionSpec {
+    Field {
+        path: String,
+        operator: String,
+        value: Value,
+    },
+    Every {
+        path: String,
+        fields: Vec<QuantifiedFieldSpec>,
+    },
+    NotEvery {
+        path: String,
+        fields: Vec<QuantifiedFieldSpec>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -752,6 +770,8 @@ pub struct SubscriptionSpec {
     #[serde(default)]
     pub to: String,
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<SubscriptionConditionSpec>,
     pub delivery: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<String>,
