@@ -3583,9 +3583,7 @@ mod tests {
         let before = project(root.path(), ProjectionSource::Current, root.path())
             .unwrap()
             .root_sha256;
-        let legacy = root
-            .path()
-            .join("agents/host/.harness-context.tmp-123-456");
+        let legacy = root.path().join("agents/host/.harness-context.tmp-123-456");
         fs::write(&legacy, b"stale legacy staging bytes").unwrap();
 
         let after = project(root.path(), ProjectionSource::Current, root.path())

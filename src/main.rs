@@ -2085,13 +2085,26 @@ fn selected_route(
     }
 }
 
+/// Load the message authority that the eval runner injects into one canonical participant.
+fn eval_message_authority(root: &Path) -> Result<Option<message::ExternalInbox>> {
+    let Some(identity) = std::env::var("ST2_EVAL_REQUESTER").ok() else {
+        anyhow::ensure!(
+            std::env::var_os("ST2_EVAL_SENDER").is_none(),
+            "ST2_EVAL_SENDER requires ST2_EVAL_REQUESTER"
+        );
+        return Ok(None);
+    };
+    let mut external = message::ExternalInbox::new(root, &identity)?;
+    if let Ok(sender) = std::env::var("ST2_EVAL_SENDER") {
+        external = external.with_sender(&sender)?;
+    }
+    Ok(Some(external))
+}
+
 /// Resolve ordinary declared messaging authority plus the exact external requester capability
 /// injected only into canonical eval seats.
 fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
-    let external = std::env::var("ST2_EVAL_REQUESTER")
-        .ok()
-        .map(|identity| message::ExternalInbox::new(root, &identity))
-        .transpose()?;
+    let external = eval_message_authority(root)?;
     message::resolve_inbox_with_external(root, id, host, external.as_ref())
 }
 
@@ -2417,10 +2430,7 @@ fn send_resolved_message(
     body: &str,
     idempotency_key: Option<&str>,
 ) -> Result<String> {
-    let external = std::env::var("ST2_EVAL_REQUESTER")
-        .ok()
-        .map(|identity| message::ExternalInbox::new(root, &identity))
-        .transpose()?;
+    let external = eval_message_authority(root)?;
     message::send_to_resolved_inbox(
         root,
         &route_selector(to),
@@ -3560,7 +3570,10 @@ fn ls(root: &Path) -> Result<()> {
                 a.id,
                 a.workspace.as_deref().unwrap_or("<none>")
             );
-            println!("      command: {}", a.command);
+            println!(
+                "      command: {}",
+                a.command.as_deref().unwrap_or("<none>")
+            );
             for ex in &a.execs {
                 println!("      + exec {}: {}", ex.id, ex.command);
             }

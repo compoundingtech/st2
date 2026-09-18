@@ -66,7 +66,10 @@ const CODEX_COMPACTION_MEMORY: usize = 4;
 /// property of mirroring Codex, not a clamp of st2's — the record still carries what a producer
 /// computes, unclamped (HC-R02), and the harnesses that can report an overrun are the ones
 /// publishing a float of their own.
-pub(super) fn codex_used_percent(window_tokens: Option<i64>, last_total_tokens: i64) -> Option<f64> {
+pub(super) fn codex_used_percent(
+    window_tokens: Option<i64>,
+    last_total_tokens: i64,
+) -> Option<f64> {
     let window = window_tokens?;
     if window <= CODEX_BASELINE_TOKENS {
         return None;

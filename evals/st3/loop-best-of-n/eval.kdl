@@ -1,0 +1,74 @@
+version 2
+
+resource "eval/loop-best-of-n/candidate-1" { kind "custom.eval.loop-candidate" }
+resource "eval/loop-best-of-n/candidate-2" { kind "custom.eval.loop-candidate" }
+resource "eval/loop-best-of-n/candidate-3" { kind "custom.eval.loop-candidate" }
+
+mission "eval/loop-best-of-n" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Select the best candidate and project the keep and discard decisions."
+
+  loop "choose" timeout="2m" {
+    max-rounds 1
+    metric "quality" direction="higher" {
+      field "score" "resource/eval/loop-best-of-n/candidate-${candidate.index}"
+    }
+    candidates 3 max-parallel=2 { select metric="quality" }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "create" {
+        agentless
+        exec "create-candidate" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "bash ./create-candidate.sh"
+          restart "never"
+        }
+        gate "the candidate was published" {
+          field "exit_code" "exec/${ST_MISSION_RUN}/create-candidate" "is" 0
+        }
+      }
+    }
+    on-keep {
+      completion { when "all-steps-exhausted" }
+      step "project" {
+        agentless
+        exec "keep-candidate" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "bash ./keep-candidate.sh"
+          restart "never"
+        }
+        gate "the keep projection passed" {
+          field "exit_code" "exec/${ST_MISSION_RUN}/keep-candidate" "is" 0
+        }
+      }
+    }
+    on-discard {
+      completion { when "all-steps-exhausted" }
+      step "project" {
+        agentless
+        exec "discard-candidate" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "bash ./discard-candidate.sh"
+          restart "never"
+        }
+        gate "the discard projection passed" {
+          field "exit_code" "exec/${ST_MISSION_RUN}/discard-candidate" "is" 0
+        }
+      }
+    }
+  }
+
+  step "verify" timeout="1m" {
+    agentless
+    depends-on { step "choose" completed }
+    gate "the best candidate was kept and all others were discarded" {
+      exec "test -f winner-3.txt && test -f discarded-1.txt && test -f discarded-2.txt && test ! -e winner-1.txt && test ! -e winner-2.txt"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
+  }
+}

@@ -220,6 +220,64 @@
           };
         };
 
+        st3 = pkgs.rustPlatform.buildRustPackage {
+          pname = "st3";
+          inherit version;
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+          ];
+          cargoTestFlags = [
+            "-p"
+            "st-runtime"
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+            "-p"
+            "st3-schema"
+          ];
+          # Render tests create throwaway repositories and call Git to protect
+          # tracked files. Keep that dependency in the hermetic check sandbox.
+          nativeBuildInputs = [
+            pkgs.git
+            pkgs.installShellFiles
+          ];
+          # The daemon survival suite exercises the packaged PTY boundary.
+          nativeCheckInputs = [
+            pkgs.bashInteractive
+            pkgs.jq
+            pkgs.which
+            pty.packages.${system}.default
+          ];
+          postInstall = ''
+            ln -s st3 $out/bin/st
+            $out/bin/st3 completions bash > st3.bash
+            $out/bin/st3 completions zsh > _st3
+            $out/bin/st3 completions fish > st3.fish
+            installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
+          '';
+          meta = {
+            description = "Small Talk claims-graph runtime and the st2 KDL migration tool";
+            homepage = "https://github.com/compoundingtech/st2";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "st3";
+          };
+        };
+
+        st3Help = pkgs.runCommand "st3-help-${version}" { } ''
+          test "$(readlink ${st3}/bin/st)" = st3
+          ${st3}/bin/st3 --help > st3.help
+          ${st3}/bin/st --help > st.help
+          cmp st3.help st.help
+          ${st3}/bin/st3-migrate --help > /dev/null
+          touch $out
+        '';
+
         # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
         # default package lightweight; consumers opt into the wasmtime closure explicitly.
         #
@@ -436,6 +494,8 @@
       in
       {
         packages.st2 = st2;
+        packages.st3 = st3;
+        packages.st3-migrate = st3;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -455,6 +515,8 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+        checks.st3 = st3;
+        checks.st3-help = st3Help;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.wasm-resolver-feature = st2WasmResolver;

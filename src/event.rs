@@ -354,10 +354,9 @@ fn resolve_stream(
         other => other.map(|entry| (entry.id.clone(), entry.bus_identity.clone())),
     };
     let (agent_id, bus_identity) = selected.map_err(|error| match error {
-        crate::identity::ResolveError::Unknown { .. } => anyhow::anyhow!(
-            "no agent '{reference}' found in catalog {}",
-            root.display()
-        ),
+        crate::identity::ResolveError::Unknown { .. } => {
+            anyhow::anyhow!("no agent '{reference}' found in catalog {}", root.display())
+        }
         error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::new(
             RefusalKind::Permanent,
             format!("agent recipient '{reference}' is ambiguous; {error}"),
@@ -1255,10 +1254,7 @@ mod tests {
     #[test]
     fn a_declared_address_routes_an_event_while_ownership_stays_on_the_bus_identity() {
         let root = tempfile::tempdir().unwrap();
-        let agent = declare_worker(
-            root.path(),
-            "  address \"chat\"\n  stream \"gh-ci\" {}\n",
-        );
+        let agent = declare_worker(root.path(), "  address \"chat\"\n  stream \"gh-ci\" {}\n");
 
         for reference in ["hetz.chat", "chat"] {
             let receipt = emit(

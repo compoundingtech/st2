@@ -217,7 +217,10 @@ impl Reason {
                 matches!(source, Source::QuestionSnapshot)
             }
             Self::MissingAskId => {
-                matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
+                matches!(
+                    source,
+                    Source::PermissionSnapshot | Source::QuestionSnapshot
+                )
             }
             Self::ProviderAuthRejected => matches!(source, Source::TurnResult),
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
@@ -383,14 +386,22 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::VersionGate => "install a supported producer version and restart the seat",
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
-            Stage::Seed => "restore readable producer state snapshots; recovery clears this advisory",
+            Stage::Seed => {
+                "restore readable producer state snapshots; recovery clears this advisory"
+            }
             // The one boundary whose repair is neither an st2-side nor a producer-side restore:
             // nothing in the seat is broken, the account's credential was refused. The text stays
             // generic on purpose — which client owns which credential home is declared outside
             // st2, and no credential knowledge enters this crate (Q12).
-            Stage::ProviderAuth => "the seat's provider credential was rejected; re-login with the account's own client and unpark",
-            Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
-            Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
+            Stage::ProviderAuth => {
+                "the seat's provider credential was rejected; re-login with the account's own client and unpark"
+            }
+            Stage::Delivery => {
+                "restore the native prompt transport; the queued message remains retryable"
+            }
+            Stage::ReadBack => {
+                "restore message read-back; st2 will reconcile without duplicating the prompt"
+            }
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
         },
     }
@@ -529,8 +540,23 @@ impl Publisher {
             recovery: RECOVERY.to_string(),
         };
         self.failures[index] = Some(record);
-        crate::metrics::record_driver_diagnostic(self.driver, stage, reason, source, self.support, false);
-        emit(self.driver, stage, reason, source, self.support, "failure", self.producer_version.as_deref());
+        crate::metrics::record_driver_diagnostic(
+            self.driver,
+            stage,
+            reason,
+            source,
+            self.support,
+            false,
+        );
+        emit(
+            self.driver,
+            stage,
+            reason,
+            source,
+            self.support,
+            "failure",
+            self.producer_version.as_deref(),
+        );
         self.persist();
     }
 
@@ -731,9 +757,15 @@ mod tests {
         };
         assert_eq!(failure.evidence_age_ms, 25);
         assert_eq!(failure.stage, Stage::Seed);
-        assert_eq!(read_at(b"not json", 0), Observed::Indeterminate(InvalidReason::MalformedRecord));
         assert_eq!(
-            read_at(&valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"), 0),
+            read_at(b"not json", 0),
+            Observed::Indeterminate(InvalidReason::MalformedRecord)
+        );
+        assert_eq!(
+            read_at(
+                &valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"),
+                0
+            ),
             Observed::Indeterminate(InvalidReason::UnsupportedSchema)
         );
         assert_eq!(
@@ -818,18 +850,35 @@ mod tests {
             Some("codex-cli 0.153.0".to_string()),
             Support::Supported,
         );
-        publisher.publish(Stage::ReadBack, Reason::ReadBackUnavailable, Source::MessageReadBack);
-        publisher.publish(Stage::Delivery, Reason::DeliveryUnavailable, Source::PromptTransport);
-        publisher.publish(Stage::ProviderAuth, Reason::ProviderAuthRejected, Source::TurnResult);
+        publisher.publish(
+            Stage::ReadBack,
+            Reason::ReadBackUnavailable,
+            Source::MessageReadBack,
+        );
+        publisher.publish(
+            Stage::Delivery,
+            Reason::DeliveryUnavailable,
+            Source::PromptTransport,
+        );
+        publisher.publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
         let Observed::Failure(failure) = read(&path(tmp.path())) else {
             panic!("the credential boundary must be the projected failure")
         };
         assert_eq!(failure.stage, Stage::ProviderAuth);
         assert_eq!(failure.driver, Driver::Codex);
-        assert_eq!(failure.producer_version.as_deref(), Some("codex-cli 0.153.0"));
+        assert_eq!(
+            failure.producer_version.as_deref(),
+            Some("codex-cli 0.153.0")
+        );
 
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(
             failure.stage,
             Stage::Sse,
@@ -837,11 +886,15 @@ mod tests {
         );
 
         publisher.clear(Stage::Sse);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(failure.stage, Stage::ProviderAuth);
 
         publisher.clear(Stage::ProviderAuth);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(
             failure.stage,
             Stage::Delivery,
@@ -860,12 +913,20 @@ mod tests {
         );
         publisher.publish(Stage::ReadBack, Reason::NotDurable, Source::MessageReadBack);
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(failure.stage, Stage::Sse, "earliest boundary wins");
 
         publisher.clear(Stage::ReadBack);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
-        assert_eq!(failure.stage, Stage::Sse, "unrelated recovery cannot clear SSE");
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
+        assert_eq!(
+            failure.stage,
+            Stage::Sse,
+            "unrelated recovery cannot clear SSE"
+        );
 
         publisher.clear(Stage::Sse);
         assert_eq!(read(&path(tmp.path())), Observed::Absent);
@@ -894,7 +955,10 @@ mod tests {
 
     impl ReplaceBytes for [u8] {
         fn replace(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
-            let at = self.windows(from.len()).position(|window| window == from).unwrap();
+            let at = self
+                .windows(from.len())
+                .position(|window| window == from)
+                .unwrap();
             let mut out = Vec::with_capacity(self.len() - from.len() + to.len());
             out.extend_from_slice(&self[..at]);
             out.extend_from_slice(to);
@@ -955,10 +1019,14 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.starts_with(".driver-diagnostic.tmp-") && name != ".driver-diagnostic.tmp-planted"
+                name.starts_with(".driver-diagnostic.tmp-")
+                    && name != ".driver-diagnostic.tmp-planted"
             })
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     /// The directory sync is strict since the fold onto `fsatomic`: a parent that cannot be opened

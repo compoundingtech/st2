@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${1:-${ST3_TRANSLATED_EVALS:-}}
+if [ -z "$root" ] || [ ! -d "$root" ]; then
+  echo "usage: run-all-st3-evals TRANSLATED_EVALS" >&2
+  echo "This command spends model tokens. Run it only after a human approves the corpus gate." >&2
+  exit 2
+fi
+
+mapfile -t evals < <(find "$root" -mindepth 2 -maxdepth 2 -name eval.kdl -printf '%h\n' | sort)
+if [ "${#evals[@]}" -eq 0 ]; then
+  echo "no translated evals exist under $root" >&2
+  exit 2
+fi
+
+for eval_dir in "${evals[@]}"; do
+  name=$(basename "$eval_dir")
+  echo "running $name"
+  if [ "$name" = mission-inputs ]; then
+    message=$'A "quoted" input\nand a second line.'
+    st3 claim resource/mission-inputs/source resource.observed \
+      --field state=ready >/dev/null
+    st3 eval "$eval_dir" \
+      --input "message=$message" \
+      --input source=resource/mission-inputs/source
+  else
+    st3 eval "$eval_dir"
+  fi
+done

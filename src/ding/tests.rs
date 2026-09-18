@@ -345,8 +345,7 @@ fn supervisor_depth_limit_fails_soft() {
     let catalog = tempfile::tempdir().unwrap();
     for depth in 0..=SUPERVISOR_CHAIN_LIMIT {
         let identity = format!("agent-{depth}");
-        let supervisor =
-            (depth < SUPERVISOR_CHAIN_LIMIT).then(|| format!("agent-{}", depth + 1));
+        let supervisor = (depth < SUPERVISOR_CHAIN_LIMIT).then(|| format!("agent-{}", depth + 1));
         declare_agent(catalog.path(), "h", &identity, supervisor.as_deref());
     }
 
@@ -2168,8 +2167,7 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
         .map(PendingNotice::message)
         .collect();
     assert_eq!(pending.len(), 1);
-    let failure_bytes =
-        std::fs::read(inbox.join(&failure_filename)).expect("staged event bytes");
+    let failure_bytes = std::fs::read(inbox.join(&failure_filename)).expect("staged event bytes");
     let failure_text = pending[0].text(
         DingContext {
             catalog_root: root,
@@ -2203,8 +2201,8 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
         "the successor is never pasted on top of a retained payload"
     );
     assert!(!inbox.join(&failure_filename).exists(), "head was archived");
-    let receipt = std::fs::read(archive.join(&failure_filename))
-        .expect("byte-copy archive receipt exists");
+    let receipt =
+        std::fs::read(archive.join(&failure_filename)).expect("byte-copy archive receipt exists");
     assert_eq!(
         receipt, failure_bytes,
         "the copy receipt carries exactly the validated bytes"

@@ -178,7 +178,9 @@ fn confirm_pty_generation(
     initial: &PtyListEntry,
     stats: &[PtyStatsEntry],
 ) -> Result<(), ResourceTargetUnavailableReason> {
-    let mut matching = stats.iter().filter(|candidate| candidate.name == initial.name);
+    let mut matching = stats
+        .iter()
+        .filter(|candidate| candidate.name == initial.name);
     let Some(current) = matching.next() else {
         return Err(ResourceTargetUnavailableReason::ProcessUnavailable);
     };
@@ -555,10 +557,7 @@ impl PtyCli {
                                             );
                                         match final_start {
                                             Ok(final_start) if final_start == start_time_ticks => {
-                                                observe_resource_target(
-                                                    pid,
-                                                    Some(start_time_ticks),
-                                                )
+                                                observe_resource_target(pid, Some(start_time_ticks))
                                             }
                                             Ok(_) => ResourceTarget::unavailable(
                                                 ResourceTargetUnavailableReason::GenerationChanged,
@@ -1329,7 +1328,6 @@ fn execute_with_presentation_cursor(
     report: &mut UpReport,
     on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
-
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1948,9 +1946,7 @@ fn reconcile_pass_with_residency(
             .errors
             .iter()
             .map(|error| error.path.clone())
-            .filter(|path| {
-                !catalog_profile_error || *path != crate::catalog::config_path(root)
-            })
+            .filter(|path| !catalog_profile_error || *path != crate::catalog::config_path(root))
             .collect::<Vec<_>>();
         let (config, profiles) = match loaded {
             Ok(loaded) => loaded,
@@ -2477,14 +2473,7 @@ fn reconcile_specs_with_sessions_in_span(
     match crate::reconcile(specs, sessions, this_host) {
         Ok(mut plan) => {
             report.deferred = debounce.defer_flickers(&mut plan, now);
-            execute_reconcile(
-                &plan,
-                runner,
-                cap,
-                presentation_cursor,
-                report,
-                &mut |_| {},
-            );
+            execute_reconcile(&plan, runner, cap, presentation_cursor, report, &mut |_| {});
         }
         Err(error) => report.errors.push(error.to_string()),
     }
@@ -3164,8 +3153,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     // `st2 unpark` relaunches into the identical failure when the cause is structural, so the
     // notice must not offer it as a recovery verb: acting on that advice restarts the storm. The
     // test is the same predicate admission uses, not the wording of a spawn error.
-    let unbindable_socket =
-        session_socket_overage(&effective_pty_root(catalog_root), &cl.pty_id);
+    let unbindable_socket = session_socket_overage(&effective_pty_root(catalog_root), &cl.pty_id);
     let body = match &unbindable_socket {
         Some((socket, over)) => format!(
             "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \

@@ -31,6 +31,7 @@ pub const AGENT_SPEC_REVISION: &str = env!("AGENT_SPEC_REVISION");
 pub mod declared;
 pub mod discovery;
 mod kdl_format;
+pub mod kdl_version;
 pub mod profile;
 #[cfg(feature = "wasm-resolver")]
 pub mod profile_wasm;
@@ -45,7 +46,6 @@ pub use discovery::{
     Declared, Discovered, SpecError, discover, discover_file, discover_strict, is_catalog_path,
     parse_declared, path_defaults,
 };
-
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,
     ProfileCapability, ProfileClass, ProfileDescriptor, ProfileRuntime, ProfileSnapshot,

@@ -320,8 +320,11 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     // failure is visible through try_resolve rather than swallowed.
     let broken = tempfile::tempdir().unwrap();
     let broken_dir = write_agent_with_goal_scheme(broken.path());
-    fs::write(st2::catalog::config_path(broken.path()),
-        "profile \"dev.schickling.agent-goal\" { wasm \"broken.wasm\" }\n").unwrap();
+    fs::write(
+        st2::catalog::config_path(broken.path()),
+        "profile \"dev.schickling.agent-goal\" { wasm \"broken.wasm\" }\n",
+    )
+    .unwrap();
     fs::write(broken.path().join("broken.wasm"), b"not a module").unwrap();
     let registry = st2::catalog::declared_profiles(broken.path()).unwrap();
     let spec = &st2::discover_strict(broken.path()).specs[0];
@@ -331,7 +334,12 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
         "a failing resolver must not produce a carrier"
     );
     assert!(set.carriers.iter().any(|c| c.label == "declaration"));
-    assert!(registry
-        .try_resolve(broken_dir.parent().unwrap(), "dev.schickling.agent-goal://hetz/w")
-        .is_err());
+    assert!(
+        registry
+            .try_resolve(
+                broken_dir.parent().unwrap(),
+                "dev.schickling.agent-goal://hetz/w"
+            )
+            .is_err()
+    );
 }

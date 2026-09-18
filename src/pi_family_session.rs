@@ -141,7 +141,10 @@ pub(crate) fn run_for_with_environment(
                 kind.extension
             )
         })?;
-        Ok((env, with_channel_extension(provider_argv, &set, kind.extension)?))
+        Ok((
+            env,
+            with_channel_extension(provider_argv, &set, kind.extension)?,
+        ))
     })();
     let (env, provider_argv) = match prepared {
         Ok(prepared) => prepared,

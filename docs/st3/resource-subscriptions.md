@@ -1,0 +1,219 @@
+# Resource subscriptions
+
+Status: current design.
+
+## Outcome
+
+An agent or a person can request a message or mission when selected external facts change.
+
+The request is durable graph state. A supervised observer checks the external resource without using an agent turn.
+
+The providers observe one GitHub pull request, one GitHub repository, or one local file.
+
+The GitHub provider supports `head`, `state`, `review`, and `checks`.
+
+The repository provider supports `pull_requests` and `issues`. It retains discoveries and filters draft pull requests.
+
+Each newly ready pull request becomes one `vcs.pull-request` resource. Each new issue becomes one `vcs.issue` resource.
+
+The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
+
+## Agent command
+
+This command creates one watch operation:
+
+```sh
+st3 resource watch github.pull-request compoundingtech/st2#403 \
+  --on head --on state --on review --on checks
+```
+
+`ST_AGENT` supplies the delivery target. A person can use `--to agent/HOST.IDENTITY`.
+
+The command returns the resource, observer, and subscription subjects. It also creates one standing watch mission run.
+
+The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
+
+## Graph shape
+
+The command publishes this graph shape:
+
+```kdl
+resource "github/compoundingtech/st2/pull/403" {
+  kind "vcs.pull-request"
+}
+
+mission "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
+  goal "Observe one resource and send its selected changes."
+  observer "watch" {
+    resource "resource/github/compoundingtech/st2/pull/403"
+    provider "github.pull-request"
+    locator "compoundingtech/st2#403"
+    field "head"
+    field "state"
+    field "review"
+    field "checks"
+  }
+
+  subscription "watch" {
+    observer "observer/watch"
+    to "agent/example.worker"
+    on "head"
+    on "state"
+    on "review"
+    on "checks"
+    delivery "message"
+  }
+}
+```
+
+The resource begins unbound. The resource stores normalized external facts after its first observation.
+
+The mission run owns the observer and subscription.
+
+The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
+
+The subscription stores the selected changes and delivery intent. The agent declaration does not change.
+
+A provider locator is an opaque provider value. st3 does not assign meaning to it outside the registered provider.
+
+The GitHub providers read `GH_TOKEN` first and `GITHUB_TOKEN` second. They then try `gh auth token`.
+
+It uses public API access when no authenticated token is available.
+
+## Observation without delivery
+
+An observer does not need a subscription. This form records one resource without sending a message:
+
+```kdl
+resource "workspace/config" {
+  kind "filesystem.file"
+}
+
+mission "observe-config" state="ready" {
+  goal "Keep the configuration metadata current."
+  observer "config" {
+    resource "resource/workspace/config"
+    provider "local.file"
+    locator "/work/project/config.toml"
+    field "status"
+    field "content_hash"
+    field "size"
+    field "mode"
+  }
+}
+```
+
+The mission run owns the observer. Mission cancellation stops the observer.
+
+Use this command to request an immediate observation and wait for that exact attempt:
+
+```sh
+st3 resource refresh resource/workspace/config --timeout 30s
+```
+
+The command returns `changed=false` when the provider confirms the same facts. That success adds no resource claim.
+
+The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
+
+## Provider contract
+
+A registered provider converts one locator into normalized resource fields.
+
+The provider returns an unchanged result or one complete observation. A partial response cannot replace the last good observation.
+
+The provider can use a webhook, a stream, or a conditional request. A conditional provider returns one next-check deadline.
+
+The daemon records that deadline as a one-shot wake. It does not run a periodic discovery sweep.
+
+Conditional requests use provider cursors such as an ETag. Cursors are local progress state, not resource facts.
+
+The daemon keeps each next-check deadline and cursor in local scheduler memory. A daemon restart performs one immediate observation.
+
+The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
+
+An unchanged failure creates no new claim. A later success replaces the complete observer health state and clears the old failure reason.
+
+An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
+
+st3 does not fetch once for each target. A subscription update can expand or reduce the observer field set.
+
+## Change and delivery rules
+
+The first successful observation establishes the baseline. It sends no update message and starts no mission.
+
+A mission delivery starts one exact mission revision with the observed resource as a run input.
+
+```kdl
+subscription "new-ready-pull-requests" {
+  observer "observer/repository"
+  on "pull_requests"
+  delivery "mission" {
+    mission "review/pull-request@REVISION"
+    resource "pull-request"
+    workspace "/work/pull-request-reviews"
+    requester "agent/fleet/repository/standing/owner"
+  }
+}
+```
+
+The repository provider creates one mission request for each newly discovered item. The run input pins that item's exact discovery claim.
+
+An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs its matching `mission-authority` rule.
+
+A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
+
+The GitHub issues endpoint also returns pull requests. The provider removes those records from the issue collection.
+
+The delivery cites the discovery claim. A retry uses the same run. A capacity limit leaves the request pending.
+
+A later observed field change creates one `resource.observed` claim. An unchanged observation creates no resource claim.
+
+A scheduled unchanged observation creates no durable observer claim. A manual refresh creates one `observer.observed` receipt for its exact attempt.
+
+Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
+
+A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same mission run.
+
+A daemon restart can repeat an external request. It cannot create a duplicate observation or message.
+
+The normalized observation is the resource authority. A raw provider response can be immutable evidence, but it cannot accept a separate resource mutation.
+
+A missing delivery target creates a warning and keeps the subscription pending. It does not block the observer or another subscription.
+
+The subscription becomes active when its delivery target appears.
+
+## Lifecycle
+
+`st3 resource unwatch SUBSCRIPTION` cancels its watch mission run. It does not remove the resource or other watch runs.
+
+Cleanup stops the owned observer and subscription before the watch run becomes cancelled.
+
+The GitHub pull request provider observes the final merge or closure change. The subscription remains active until an explicit unwatch in the MVP.
+
+A later version can add an `until` predicate or one deadline. This option is not part of the MVP.
+
+## Acceptance proof
+
+- An exact command retry creates no duplicate graph subject.
+- The first observation creates a baseline and no message.
+- An unchanged provider result creates no claim and no message.
+- A selected scalar field change creates one observation claim and one message.
+- Each new repository collection item creates one resource and one mission request.
+- A draft-to-ready transition creates one pull request resource and one mission request.
+- Pull requests from the GitHub issues endpoint do not create issue resources.
+- An unselected field change creates an observation claim and no message for that subscription.
+- A daemon restart creates no duplicate message.
+- Two subscriptions share one observer and receive separate messages.
+- A missing target stays pending without blocking observation.
+- A provider failure changes observer health without changing the last good resource facts.
+- The local file provider reports metadata and never reports file content.
+- A direct observer without a subscription records observations and sends no message.
+- A manual refresh waits for its exact attempt and reports an unchanged success without a new resource claim.
+
+## Observer process isolation to evaluate
+
+The daemon can schedule observations and accept their results.
+
+An external worker process can run each provider operation. This boundary can keep a provider failure outside the daemon.
+
+The design must test crashes, hangs, time limits, bounded results, and failed observation records before it selects this boundary.

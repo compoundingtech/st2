@@ -280,9 +280,10 @@ pub(crate) enum CodexTerminalError {
 /// The `CodexErrorInfo` word that names a rejected provider credential.
 ///
 /// It is the 401/invalid-credential arm of Codex's own closed error vocabulary and is distinct
-/// from both quota words (`usageLimitExceeded`, `rateLimitExceeded`) — the protocol gate pins all
-/// three present so a release that merged them refuses the launch instead of silently making st2
-/// call an exhausted allowance a rejected credential.
+/// from `usageLimitExceeded`. Some supported Codex releases do not expose the later
+/// `rateLimitExceeded` word. The protocol gate pins the credential and stable quota words so a
+/// release that merges them refuses the launch instead of reporting an exhausted allowance as a
+/// rejected credential.
 const CODEX_PROVIDER_AUTH_REJECTED: &str = "unauthorized";
 
 /// What one `turn/completed` notification proves about this thread's provider credential.
@@ -1587,6 +1588,65 @@ fn run_controlled_with_required_resume(
                     "persisting Codex wrapper failure diagnostic: {diagnostic_error:#}"
                 ));
             }
+            Err(error)
+        }
+    }
+}
+
+/// Run the native Codex driver with explicit private state paths.
+///
+/// The claims-graph runtime uses this entry point without an st2 catalog. The driver keeps the
+/// app-server protocol, thread binding, delivery receipts, and harness records unchanged.
+pub fn run_controlled_paths(
+    driver_root: &Path,
+    state_dir: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !codex_argv.is_empty(),
+        "Codex controlled launch argv is empty"
+    );
+    let producer_version = ensure_supported_protocol(&codex_argv[0])?;
+    secure_dir(driver_root)?;
+    secure_dir(state_dir)?;
+    secure_dir(agent_dir)?;
+    let inbox = message::inbox_dir(agent_dir);
+    secure_dir(&inbox)?;
+    secure_dir(&message::archive_dir(agent_dir))?;
+    let delivery = CodexDeliveryConfig {
+        catalog_root: driver_root.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        inbox,
+        identity: identity.clone(),
+        this_host: run::detect_host(),
+        supervisor: None,
+        producer_version: Some(producer_version),
+    };
+    let _owner_lock = acquire_owner_lock(state_dir)?;
+    let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
+    diagnostics.record("ownerAcquired", json!({ "mode": "explicit-paths" }))?;
+    let result = run_controlled_owned(
+        driver_root,
+        state_dir,
+        identity,
+        runtime_id,
+        codex_argv,
+        delivery,
+        None,
+        None,
+        &mut diagnostics,
+    );
+    match result {
+        Ok(()) => {
+            diagnostics.record("completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let text = format!("{error:#}");
+            let _ = diagnostics.record("failed", json!({ "error": text }));
             Err(error)
         }
     }
@@ -3043,11 +3103,8 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
     // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
     // claim for the next runtime to trip over.
-    match crate::flock::FileLock::hold(
-        file,
-        crate::flock::Mode::Exclusive,
-        crate::flock::Wait::Now,
-    ) {
+    match crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)
+    {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(anyhow::anyhow!(
             "Codex runtime already has an owner at {}",

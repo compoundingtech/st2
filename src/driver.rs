@@ -582,9 +582,10 @@ mod tests {
         assert_eq!(settings[0], ".claude/settings.local.json");
         let settings: serde_json::Value = serde_json::from_str(settings[1]).unwrap();
         assert_eq!(settings, crate::hooks::claude_settings_registration());
+        let argv = strings(output.get("argv").unwrap());
         assert_eq!(
-            strings(output.get("argv").unwrap()),
-            [
+            &argv[..17],
+            &[
                 "st2",
                 "--catalog",
                 "$CATALOG",
@@ -601,11 +602,9 @@ mod tests {
                 "--effort",
                 "xhigh",
                 "--channels",
-                "plugin:st2-channel@st2",
-                "--model",
-                "override",
-                "Start work."
+                "plugin:st2-channel@st2"
             ]
         );
+        assert_eq!(&argv[17..], &["--model", "override", "Start work."]);
     }
 }

@@ -143,8 +143,12 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-        let mut diagnostics =
-            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            producer_version,
+            support,
+        );
         if let Some(reason) = version_failure {
             diagnostics.publish(
                 DiagnosticStage::VersionGate,
@@ -369,11 +373,8 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_with_diagnostics(
-                &session.client,
-                &mut machine,
-                &mut session.diagnostics,
-            );
+            evidence =
+                seed_with_diagnostics(&session.client, &mut machine, &mut session.diagnostics);
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -764,7 +765,9 @@ fn seed_from_server(
             DiagnosticSource::QuestionSnapshot,
         ),
     ] {
-        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let pending = client
+            .get_json(endpoint)
+            .map_err(|_| (unavailable, source))?;
         let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
             // An unreadable id could never be released by its id-matched exit.
@@ -1423,7 +1426,11 @@ impl Delivery {
         };
         // A newly selected session is a different delivery binding (the Codex thread rule): the
         // old binding's receipt may neither suppress nor acknowledge delivery to this one.
-        if self.ledger.binding().is_some_and(|binding| binding != target) {
+        if self
+            .ledger
+            .binding()
+            .is_some_and(|binding| binding != target)
+        {
             self.ledger.rebind(&target)?;
         }
         // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
@@ -1550,8 +1557,10 @@ impl Delivery {
         }
         // The transport call succeeded. That is a fact about the call, not about the server's
         // state, so it grades no higher than `transportAccepted`.
-        self.ledger
-            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
+        self.ledger.record(
+            &entry.filename,
+            delivery_ledger::Evidence::TransportAccepted,
+        )?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
@@ -1579,10 +1588,7 @@ impl Delivery {
     }
 }
 
-fn report_read_back(
-    read_back: ReadBack,
-    diagnostics: &mut Option<&mut DiagnosticPublisher>,
-) {
+fn report_read_back(read_back: ReadBack, diagnostics: &mut Option<&mut DiagnosticPublisher>) {
     let Some(diagnostics) = diagnostics.as_deref_mut() else {
         return;
     };
@@ -2281,7 +2287,10 @@ mod tests {
             [expected_id.clone()]
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
-        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
+        let entry = reopen_ledger(&state_path)
+            .entry(&filename)
+            .cloned()
+            .unwrap();
         assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
         assert_eq!(entry.correlation.value, expected_id);
         assert_eq!(
@@ -2302,8 +2311,6 @@ mod tests {
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
-
-
 
     #[test]
     fn a_failed_transport_retries_the_same_identity_never_a_second_one() {

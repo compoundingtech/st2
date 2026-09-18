@@ -900,10 +900,7 @@ mod tests {
         .unwrap();
         assert_eq!(question.blocked_on, harness_state::BlockedOn::Human);
         assert_eq!(question.ask, harness_state::Ask::Question);
-        assert_eq!(
-            question.reason.as_deref(),
-            Some("Which deployment target?")
-        );
+        assert_eq!(question.reason.as_deref(), Some("Which deployment target?"));
 
         let unknown_ask = state_observation(&json!({
             "type":"state","state":"active","blockedOn":"human",
