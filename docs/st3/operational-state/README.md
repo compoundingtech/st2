@@ -166,7 +166,14 @@ The fixtures under `crates/st3/tests/fixtures/operational-state` cover:
 - two versions of the same reminder;
 - an eval message addressed to a person identity;
 - the enriched running-agent filter and canonical reply-ID CLI regressions.
+- a ready but never-claimed step expiring on wall time;
+- a terminal root whose nested child run remains ready after cancellation;
+- a live idle harness that accepts terminal input but does not start a turn until a full prompt is
+  injected.
 
 The passing tests validate fixture completeness and deterministic contract rules. Ignored red tests
 exercise current projections and are expected to fail until behavior work lands. Implementations
 must turn them green without rewriting the expected fixture outcome or removing immutable history.
+
+The evidence, root causes, preserved-commit proof, and goal-by-goal recovery disposition are in
+[`recovery-audit-2026-09-20.md`](recovery-audit-2026-09-20.md).

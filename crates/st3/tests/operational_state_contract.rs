@@ -51,8 +51,11 @@ fn regression_fixture_set_is_small_complete_and_deterministic() {
         "cli-regressions.json",
         "eval-person-message.json",
         "expired-lease.json",
+        "ready-idle-wake.json",
+        "ready-step-timeout.json",
         "stopped-agents.json",
         "superseded-attention.json",
+        "terminal-nested-orphan.json",
         "terminal-sig-sup.json",
         "versioned-reminders.json",
     ])
@@ -305,4 +308,64 @@ fn cli_release_blocker_observations_match_the_contract() {
     let reply = &value["cases"][1];
     assert_eq!(reply["printed_id"], reply["expected_printed_id"]);
     assert_eq!(reply["accepted_input"], reply["expected_accepted_input"]);
+}
+
+#[test]
+fn recovery_failure_observations_are_exact_and_self_consistent() {
+    let timeout = fixture("ready-step-timeout.json");
+    assert_eq!(timeout["claim_events"], 0);
+    assert!(timeout["execution_started_at_unix_ms"].is_null());
+    assert_eq!(
+        timeout["timeline"][1]["accepted_at_unix_ms"]
+            .as_u64()
+            .unwrap()
+            - timeout["timeline"][0]["accepted_at_unix_ms"]
+                .as_u64()
+                .unwrap(),
+        timeout["elapsed_ms"].as_u64().unwrap()
+    );
+    assert!(timeout["elapsed_ms"].as_u64().unwrap() >= timeout["timeout_ms"].as_u64().unwrap());
+
+    let orphan = fixture("terminal-nested-orphan.json");
+    assert_eq!(orphan["observed"]["root_run_status"], "failed");
+    assert_eq!(orphan["observed"]["root_run_phase"], "terminal");
+    assert_eq!(orphan["observed"]["child_run_status"], "running");
+    assert_eq!(orphan["observed"]["step_status_after_cancel"], "ready");
+
+    let wake = fixture("ready-idle-wake.json");
+    let attempts = wake["observed"]["attempts"].as_array().unwrap();
+    assert!(
+        attempts[..4]
+            .iter()
+            .all(|attempt| { attempt["accepted"] == true && attempt["turn_started"] == false })
+    );
+    assert_eq!(attempts[4]["method"], "full-boot-prompt");
+    assert_eq!(attempts[4]["turn_started"], true);
+}
+
+#[test]
+#[ignore = "red recovery baseline: timeout, terminal descendant, and driver wake fixes are pending"]
+fn recovery_release_blockers_match_the_required_contract() {
+    let timeout = fixture("ready-step-timeout.json");
+    assert_eq!(timeout["observed"]["status"], timeout["expected"]["status"]);
+
+    let orphan = fixture("terminal-nested-orphan.json");
+    assert_eq!(
+        orphan["observed"]["child_run_status"],
+        orphan["expected"]["child_run_status"]
+    );
+    assert_eq!(
+        orphan["observed"]["work_default_visible"],
+        orphan["expected"]["work_default_visible"]
+    );
+
+    let wake = fixture("ready-idle-wake.json");
+    for field in [
+        "automatic_driver_wake",
+        "bounded_retry",
+        "diagnostic_after_exhaustion",
+        "manual_wake_command",
+    ] {
+        assert_eq!(wake["observed"][field], wake["expected"][field]);
+    }
 }
