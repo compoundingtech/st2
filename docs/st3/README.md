@@ -14,6 +14,8 @@ Use these documents for implementation details:
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
 - [Product roadmap](roadmap.md) records accepted future work.
+- [Client v0 contract](client-v0/README.md) defines the shared TUI and mobile JSON, event, action,
+  pairing, and terminal protocols.
 
 The [examples](../../examples/st3/README.md) show small, tested mission patterns. Use the evals for
 failure proof, not as introductory examples.

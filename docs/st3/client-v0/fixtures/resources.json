@@ -1,0 +1,66 @@
+[
+  {
+    "id": "attention/release-review", "kind": "attention", "revision": "a1", "updated_at": "2026-09-20T11:00:00Z",
+    "title": "Review release", "detail": "Choose a launch variant", "priority": "high", "state": "open",
+    "requested_at": "2026-09-20T11:00:00Z", "targets": ["launch/release"], "actions": ["attention.resolve"]
+  },
+  {
+    "id": "message/release-ready", "kind": "message", "revision": "m1", "updated_at": "2026-09-20T11:01:00Z",
+    "from": "agent/release", "to": "person/alex", "title": "Ready", "content": "The preview is ready.",
+    "state": "delivered", "sent_at": "2026-09-20T11:01:00Z", "in_reply_to": null, "tags": ["launch"]
+  },
+  {
+    "id": "launch/release", "kind": "launch", "revision": "l2", "updated_at": "2026-09-20T11:02:00Z",
+    "title": "Release", "phase": "review", "request": "Prepare the release mission.", "target": { "type": "new-mission" },
+    "variants": ["launch-variant/release/default"], "decisions": ["launch-decision/release/region"], "approvals": ["launch-approval/release/alex"]
+  },
+  {
+    "id": "launch-variant/release/default", "kind": "launch-variant", "revision": "lv2", "updated_at": "2026-09-20T11:03:00Z",
+    "launch_id": "launch/release", "ordinal": 0, "candidate_revision": 2, "status": "previewable", "target_generation": null,
+    "normalized_mission": { "goals": ["Ship release"], "id": "mission/release", "steps": [{ "id": "build", "needs": [] }, { "id": "deploy", "needs": ["build"] }] },
+    "diagnostics": [], "preview_token": "lpv0:384d84e556c1c3705f80ea0aaff63f232d579d8d9f348cbfef2b7f24740031f0"
+  },
+  {
+    "id": "launch-decision/release/region", "kind": "launch-decision", "revision": "ld1", "updated_at": "2026-09-20T11:04:00Z",
+    "launch_id": "launch/release", "question": "Which region?", "state": "answered", "requested_at": "2026-09-20T11:03:30Z",
+    "choices": ["eu", "us"], "answer": "eu"
+  },
+  {
+    "id": "launch-approval/release/alex", "kind": "launch-approval", "revision": "la1", "updated_at": "2026-09-20T11:05:00Z",
+    "launch_id": "launch/release", "variant_id": "launch-variant/release/default", "reviewer": "person/alex", "state": "approved",
+    "preview_token": "lpv0:384d84e556c1c3705f80ea0aaff63f232d579d8d9f348cbfef2b7f24740031f0", "decided_at": "2026-09-20T11:05:00Z"
+  },
+  {
+    "id": "mission/release", "kind": "mission", "revision": "mr7", "updated_at": "2026-09-20T11:06:00Z",
+    "title": "Release", "state": "running", "mission_revision": "sha256:mission7", "runs": ["mission-run/release/1"]
+  },
+  {
+    "id": "work/release/1/build", "kind": "work", "revision": "w4", "updated_at": "2026-09-20T11:07:00Z",
+    "mission_run_id": "mission-run/release/1", "generation_id": "run-generation/release/1/g1", "definition_id": "def-build",
+    "path": "build", "state": "claimed", "attempt": 1, "readiness_epoch": 3, "claimant": "agent/release",
+    "claim_incarnation": "runtime-9:2026-09-20T11:06:30Z", "goals": ["Build artifacts"], "constraints": ["Use the pinned toolchain"]
+  },
+  {
+    "id": "agent/release", "kind": "agent", "revision": "ag3", "updated_at": "2026-09-20T11:08:00Z",
+    "name": "Release agent", "state": "running", "reachability": "local", "runtime_ids": ["runtime/release-agent"]
+  },
+  {
+    "id": "runtime/release-agent", "kind": "runtime", "revision": "rt5", "updated_at": "2026-09-20T11:09:00Z",
+    "runtime_kind": "agent", "owner_id": "agent/release", "state": "running", "runtime_id": "runtime-9",
+    "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3"
+  },
+  {
+    "id": "operation/transport-host-b", "kind": "operation", "revision": "op2", "updated_at": "2026-09-20T11:10:00Z",
+    "component": "transport", "severity": "warning", "state": "degraded", "summary": "Peer is retrying", "targets": ["host/host-b"]
+  },
+  {
+    "id": "history/1842", "kind": "history", "revision": "h1", "updated_at": "2026-09-20T11:11:00Z",
+    "event_type": "work.claimed", "occurred_at": "2026-09-20T11:11:00Z", "store_index": 1842,
+    "summary": "Release agent claimed build", "targets": ["work/release/1/build", "agent/release"]
+  },
+  {
+    "id": "session/release-agent/9", "kind": "session", "revision": "s8", "updated_at": "2026-09-20T11:12:00Z",
+    "owner_id": "agent/release", "state": "running", "started_at": "2026-09-20T11:06:30Z", "ended_at": null,
+    "timeline_cursor": "timeline-cursor/release-agent/9/8"
+  }
+]
