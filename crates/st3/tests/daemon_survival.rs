@@ -274,7 +274,7 @@ fn structured_cli_views_offer_human_and_json_surfaces() {
     let surfaces: &[(&str, &[&str], &str)] = &[
         ("doctor", &["doctor"], "pass"),
         ("status", &["status"], "RESULT"),
-        ("agent list", &["agents"], ""),
+        ("agent list", &["agents", "ls"], ""),
         ("runtime list", &["runtime", "ls"], ""),
         ("document list", &["doc", "list"], ""),
         ("resource list", &["resource", "ls"], ""),
@@ -1244,7 +1244,7 @@ mission "survival" state="ready" {{
         "{}",
         String::from_utf8_lossy(&sent.stderr)
     );
-    let message = format!("message/{}", String::from_utf8_lossy(&sent.stdout).trim());
+    let message = String::from_utf8_lossy(&sent.stdout).trim().to_owned();
     wait_for(
         || {
             st3_command(binary)

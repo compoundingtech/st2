@@ -147,7 +147,7 @@ because they exist. Commands with the same why are merged; legacy aliases are re
 
 Two CLI reproductions are release-blocking:
 
-- `st3 agents --status running --enrich` and its JSON form must select the same enriched running
+- `st3 agents ls --status running --enrich` and its JSON form must select the same enriched running
   agents. Enrichment cannot run after a destructive filter that makes valid rows disappear.
 - A short ID printed by `st3 conversations send` must be accepted unchanged by
   `--in-reply-to`. If the canonical value is `message/ID`, both display and parser use it; callers

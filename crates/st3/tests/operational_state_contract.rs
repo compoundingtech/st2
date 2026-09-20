@@ -299,7 +299,6 @@ fn only_the_selected_reminder_version_is_actionable() {
 }
 
 #[test]
-#[ignore = "red baseline: installed CLI does not yet satisfy the captured release blockers"]
 fn cli_release_blocker_observations_match_the_contract() {
     let value = fixture("cli-regressions.json");
     let enrich = &value["cases"][0];

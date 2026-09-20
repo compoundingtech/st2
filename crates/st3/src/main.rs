@@ -129,8 +129,11 @@ enum Command {
     Graph(GraphArgs),
     /// Show the current claims view.
     Status(StatusArgs),
-    /// Show declared agents and their current graph state.
-    Agents(AgentsArgs),
+    /// Inspect current agents or explicit agent history.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
+    },
     /// Inspect and recover mission-owned runtimes.
     Runtime {
         #[command(subcommand)]
@@ -643,6 +646,19 @@ struct AgentsArgs {
 }
 
 #[derive(Subcommand)]
+enum AgentsCommand {
+    /// List operational agents; use --all for stopped and historical agents.
+    Ls(AgentsArgs),
+    /// Show one exact agent, including its owner and operational annotation.
+    Show {
+        subject: String,
+        /// Include a historical agent that is absent from the operational default.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum RuntimeCommand {
     /// List agent, exec, and PTY runtimes.
     Ls,
@@ -965,12 +981,7 @@ struct MessageSendArgs {
     in_reply_to: Option<String>,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
-    #[arg(
-        long = "from",
-        alias = "as",
-        env = "ST_AGENT",
-        default_value = "person/requester"
-    )]
+    #[arg(long = "from", alias = "as", env = "ST_AGENT")]
     from: String,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
@@ -991,8 +1002,8 @@ struct MessageListArgs {
 
 #[derive(Args)]
 struct MessageReadArgs {
-    #[arg(num_args = 1..=2)]
-    values: Vec<String>,
+    #[arg(num_args = 1..)]
+    references: Vec<String>,
     #[arg(long)]
     raw: bool,
     #[arg(long)]
@@ -1008,12 +1019,7 @@ struct MessageReplyArgs {
     body: String,
     #[arg(long)]
     subject: Option<String>,
-    #[arg(
-        long = "from",
-        alias = "as",
-        env = "ST_AGENT",
-        default_value = "person/requester"
-    )]
+    #[arg(long = "from", alias = "as", env = "ST_AGENT")]
     from: String,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
@@ -1030,10 +1036,7 @@ struct MessageArchiveArgs {
 
 #[derive(Args)]
 struct MessageReferenceArgs {
-    #[arg(num_args = 1..=2)]
-    values: Vec<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
+    reference: String,
     #[arg(long)]
     tree: bool,
 }
@@ -1043,7 +1046,7 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long)]
+    #[arg(long = "as", env = "ST_AGENT")]
     actor: Option<String>,
 }
 
@@ -1187,7 +1190,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Eval(args) => run_eval(&client, args, cli.json).await,
         Command::Graph(args) => run_graph(&client, args, cli.json).await,
         Command::Status(args) => run_status(&client, args, cli.json).await,
-        Command::Agents(args) => run_agents(&client, args, cli.json).await,
+        Command::Agents { command } => run_agents(&client, command, cli.json).await,
         Command::Runtime { command } => run_runtime(&client, command, cli.json).await,
         Command::Context { command } => run_context(&client, command, cli.json).await,
         Command::Resource { command } => run_resource(&client, command, cli.json).await,
@@ -3104,7 +3107,36 @@ async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Res
     Ok(())
 }
 
-async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Result<()> {
+async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) -> Result<()> {
+    let args = match command {
+        AgentsCommand::Ls(args) => args,
+        AgentsCommand::Show { subject, all } => {
+            let subject = if subject.starts_with("agent/") {
+                subject
+            } else {
+                format!("agent/{subject}")
+            };
+            let mut path = format!("/v1/status?subject={}", urlencoding::encode(&subject));
+            if all {
+                path.push_str("&history=true");
+            }
+            let response: StatusResponse = client.get(&path).await?;
+            let agent = response
+                .subjects
+                .into_iter()
+                .find(|candidate| candidate.subject == subject)
+                .with_context(|| {
+                    if all {
+                        format!("agent `{subject}` does not exist")
+                    } else {
+                        format!(
+                            "agent `{subject}` is not operational; use `st3 agents show {subject} --all` for history"
+                        )
+                    }
+                })?;
+            return print_value(&agent, json_output);
+        }
+    };
     let path = if args.all {
         "/v1/status?history=true"
     } else {
@@ -4492,7 +4524,7 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             if json_output {
                 print_value(&message, true)
             } else {
-                println!("{}", message.subject.trim_start_matches("message/"));
+                println!("{}", message.subject);
                 Ok(())
             }
         }
@@ -4529,7 +4561,7 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             for message in messages {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    message.subject.trim_start_matches("message/"),
+                    message.subject,
                     message.status,
                     message.from,
                     message.title.as_deref().unwrap_or("message")
@@ -4538,24 +4570,45 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             Ok(())
         }
         MessageCommand::Read(args) => {
-            let (reference, actor) = positional_identity_and_reference(args.values, args.actor)?;
-            let message = read_message(client, &reference).await?;
-            accept_message(client, &message, actor.as_deref()).await?;
-            if json_output {
-                print_value(&message, true)?;
-            } else if args.raw {
-                print!("{}", message.content);
-            } else {
-                println!("From: {}", message.from);
-                println!("To: {}", message.to);
-                if let Some(title) = &message.title {
-                    println!("Subject: {title}");
+            let actor = args
+                .actor
+                .context("message read needs --as or ST_AGENT to record its lifecycle")?;
+            let mut messages = Vec::with_capacity(args.references.len());
+            for reference in args.references {
+                let message = read_message(client, &reference).await?;
+                accept_message(client, &message, &actor).await?;
+                if args.archive {
+                    close_message(client, &reference, &actor).await?;
                 }
-                println!();
-                println!("{}", message.content);
+                messages.push(message);
             }
-            if args.archive {
-                close_message(client, &reference, actor.as_deref()).await?;
+            if json_output {
+                if messages.len() == 1 {
+                    print_value(&messages[0], true)?;
+                } else {
+                    print_value(&messages, true)?;
+                }
+            } else {
+                for (index, message) in messages.iter().enumerate() {
+                    if index > 0 && !args.raw {
+                        println!("\n---\n");
+                    }
+                    if args.raw {
+                        print!("{}", message.content);
+                        if index + 1 < messages.len() && !message.content.ends_with('\n') {
+                            println!();
+                        }
+                    } else {
+                        println!("Message: {}", message.subject);
+                        println!("From: {}", message.from);
+                        println!("To: {}", message.to);
+                        if let Some(title) = &message.title {
+                            println!("Subject: {title}");
+                        }
+                        println!();
+                        println!("{}", message.content);
+                    }
+                }
             }
             sync_message_projection(client).await?;
             Ok(())
@@ -4583,16 +4636,19 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             if json_output {
                 print_value(&message, true)
             } else {
-                println!("{}", message.subject.trim_start_matches("message/"));
+                println!("{}", message.subject);
                 Ok(())
             }
         }
         MessageCommand::Archive(args) => {
+            let actor = args
+                .actor
+                .context("message archive needs --as or ST_AGENT to record its lifecycle")?;
             let mut claims = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 let message = read_message(client, &reference).await?;
-                accept_message(client, &message, args.actor.as_deref()).await?;
-                claims.push(close_message(client, &reference, args.actor.as_deref()).await?);
+                accept_message(client, &message, &actor).await?;
+                claims.push(close_message(client, &reference, &actor).await?);
             }
             sync_message_projection(client).await?;
             if json_output {
@@ -4606,8 +4662,7 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             }
         }
         MessageCommand::Thread(args) => {
-            let (reference, _) = positional_identity_and_reference(args.values, args.actor)?;
-            let selected = read_message(client, &reference).await?;
+            let selected = read_message(client, &args.reference).await?;
             let all: Vec<MessageView> = client.get("/v1/messages?include_closed=true").await?;
             let root = thread_root(&selected, &all);
             let mut thread = all
@@ -4747,17 +4802,23 @@ async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
         .await
 }
 
-async fn accept_message(client: &Client, message: &MessageView, actor: Option<&str>) -> Result<()> {
+async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> Result<()> {
+    let actor = normalize_message_subject(actor);
+    anyhow::ensure!(
+        actor == message.to,
+        "message `{}` belongs to `{}`, not `{actor}`",
+        message.subject,
+        message.to
+    );
     if !matches!(message.status.as_str(), "sent" | "delivered") {
         return Ok(());
     }
     let reference = message.subject.trim_start_matches("message/");
-    let actor = actor.unwrap_or(&message.to);
     if message.status == "sent" {
         deliver_message(
             client,
             reference,
-            actor,
+            &actor,
             format!("message-delivered-by-read:{}", message.subject),
         )
         .await?;
@@ -4767,7 +4828,7 @@ async fn accept_message(client: &Client, message: &MessageView, actor: Option<&s
             &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
                 lifecycle: "read".into(),
-                actor: Some(actor.to_owned()),
+                actor: Some(actor),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-read:{}", message.subject),
@@ -4799,18 +4860,14 @@ async fn deliver_message(
     Ok(())
 }
 
-async fn close_message(
-    client: &Client,
-    reference: &str,
-    actor: Option<&str>,
-) -> Result<ClaimRecord> {
+async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<ClaimRecord> {
     let reference = normalize_message_reference(reference);
     client
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
                 lifecycle: "closed".into(),
-                actor: actor.map(str::to_owned),
+                actor: Some(normalize_message_subject(actor)),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-closed:{reference}"),
@@ -7441,6 +7498,76 @@ mod tests {
     }
 
     #[test]
+    fn message_read_accepts_multiple_canonical_references() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "message",
+            "read",
+            "message/first",
+            "message/second",
+            "--as",
+            "agent/sup",
+            "--archive",
+        ])
+        .unwrap();
+        let Command::Message {
+            command: MessageCommand::Read(args),
+        } = cli.command
+        else {
+            panic!("the read command did not parse");
+        };
+        assert_eq!(args.references, ["message/first", "message/second"]);
+        assert_eq!(args.actor.as_deref(), Some("agent/sup"));
+        assert!(args.archive);
+    }
+
+    #[test]
+    fn agents_requires_an_explicit_list_or_show_subcommand() {
+        assert!(Cli::try_parse_from(["st3", "agents"]).is_err());
+
+        let cli = Cli::try_parse_from(["st3", "agents", "ls", "--status", "running", "--enrich"])
+            .unwrap();
+        let Command::Agents {
+            command: AgentsCommand::Ls(args),
+        } = cli.command
+        else {
+            panic!("agents ls did not parse");
+        };
+        assert_eq!(args.status.as_deref(), Some("running"));
+        assert!(args.enrich);
+
+        let cli = Cli::try_parse_from(["st3", "agents", "show", "worker", "--all"]).unwrap();
+        let Command::Agents {
+            command: AgentsCommand::Show { subject, all },
+        } = cli.command
+        else {
+            panic!("agents show did not parse");
+        };
+        assert_eq!(subject, "worker");
+        assert!(all);
+    }
+
+    #[test]
+    fn review_mutations_use_the_explicit_as_actor() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "review",
+            "approve",
+            "attention/item",
+            "--as",
+            "person/reviewer",
+        ])
+        .unwrap();
+        let Command::Review {
+            command: ReviewCommand::Approve(args),
+        } = cli.command
+        else {
+            panic!("review approve did not parse");
+        };
+        assert_eq!(args.actor.as_deref(), Some("person/reviewer"));
+    }
+
+    #[test]
     fn publish_accepts_a_file_and_actor() {
         let cli = Cli::try_parse_from(["st3", "publish", "mission.kdl", "--as", "agent/operator"])
             .unwrap();
@@ -7566,7 +7693,7 @@ mod tests {
             "review",
             "approve",
             "mission-run/release/one",
-            "--actor",
+            "--as",
             "person/nathan",
         ])
         .unwrap();

@@ -10,7 +10,7 @@
     "launch": { "job": "Author and approve a mission launch", "why": "Expose the human launch workflow, not internal planning", "actor": "person", "mode": "read-or-fenced-mutation", "model": "launch.v0", "inputs": "request launch variant token", "defaults": "current variant", "output": "launch screen", "success": "approved revision or explicit state", "actions": "start revise preview approve cancel", "authority": "named person", "recovery": "refresh stale preview", "human_example": "st3 launch show launch/demo", "json_example": "st3 launch show launch/demo --json", "workflow": "product/launch" },
     "attention": { "job": "Review person-authorized items", "why": "Keep decisions and faults in one inbox", "actor": "person", "mode": "read-or-fenced-mutation", "model": "attention.v0", "inputs": "person filters target", "defaults": "session person and unresolved", "output": "attention screen", "success": "item resolved or listed", "actions": "approve reject resolve read", "authority": "named person", "recovery": "refresh stale item", "human_example": "st3 attention", "json_example": "st3 attention --json", "workflow": "product/attention" },
     "machines": { "job": "Assess fleet machines and capacity", "why": "Placement needs health and capacity together", "actor": "person or operator", "mode": "read", "model": "machines.v0", "inputs": "fleet host filters", "defaults": "current reachable fleet", "output": "machines screen", "success": "fresh labeled topology", "actions": "open diagnostic or replication", "authority": "read scope", "recovery": "show unreachable reason", "human_example": "st3 machines", "json_example": "st3 machines --json", "workflow": "product/machines" },
-    "agents": { "job": "Find live agents and typed ownership", "why": "Agent state needs list detail and tree parity", "actor": "person or agent", "mode": "read", "model": "agents-tree.v0", "inputs": "status role owner filters", "defaults": "live actionable agents", "output": "agent list detail or tree", "success": "filters and enrichment preserve membership", "actions": "open conversation runtime or work", "authority": "read scope", "recovery": "use --all for history", "human_example": "st3 agents --status running --tree", "json_example": "st3 agents --status running --tree --json", "workflow": "product/agents" },
+    "agents": { "job": "Find live agents and typed ownership", "why": "Agent state needs list and detail parity", "actor": "person or agent", "mode": "read", "model": "agents-tree.v0", "inputs": "status and history filters", "defaults": "live actionable agents", "output": "agent list or detail", "success": "filters and enrichment preserve membership", "actions": "open conversation runtime or work", "authority": "read scope", "recovery": "use show --all for history", "human_example": "st3 agents ls --status running --enrich", "json_example": "st3 agents ls --status running --enrich --json", "workflow": "product/agents" },
     "conversations": { "job": "Read follow and send conversations", "why": "Messages and sessions form one timeline", "actor": "person or agent", "mode": "read-or-fenced-mutation", "model": "conversations.v0", "inputs": "conversation or canonical message ID", "defaults": "current sessions", "output": "timeline", "success": "ordered turn or durable message", "actions": "follow send reply read close", "authority": "participant scope", "recovery": "resume cursor or resync", "human_example": "st3 conversations reply message/abc -m ok", "json_example": "st3 conversations show conversation/abc --json", "workflow": "product/conversations" },
     "activity": { "job": "See changes since a cursor", "why": "Resume bounded typed activity", "actor": "person or agent", "mode": "read", "model": "activity.v0", "inputs": "cursor filters wait", "defaults": "latest bounded page", "output": "activity page", "success": "resume cursor returned", "actions": "open subject follow resync", "authority": "read scope", "recovery": "full resync on gap", "human_example": "st3 activity --follow", "json_example": "st3 activity --after CURSOR --json", "workflow": "product/activity" },
     "devices": { "job": "Pair scope and revoke devices", "why": "Remote identity needs explicit person control", "actor": "person", "mode": "read-or-fenced-mutation", "model": "devices.v0", "inputs": "device or pairing code", "defaults": "paired current devices", "output": "device screen", "success": "scoped credential state", "actions": "pair revoke", "authority": "local named person", "recovery": "repeat pairing after expiry", "human_example": "st3 devices pair", "json_example": "st3 devices --json", "workflow": "product/devices" },
@@ -50,7 +50,7 @@
     { "path": "st3 eval", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st3 graph", "purpose_id": "missions", "disposition": "merge-into-missions-show" },
     { "path": "st3 status", "purpose_id": "now", "disposition": "rename-now-no-alias" },
-    { "path": "st3 agents", "purpose_id": "agents", "disposition": "keep" },
+    { "path": "st3 agents", "purpose_id": "agents", "disposition": "canonicalize-subcommands" },
     { "path": "st3 runtime", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st3 context", "purpose_id": "subject", "disposition": "merge-into-subject" },
     { "path": "st3 resource", "purpose_id": "subject", "disposition": "merge-into-subject" },
@@ -70,6 +70,7 @@
     { "path": "st3 claude-channel install|status|uninstall", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st3 doc put|get|list", "purpose_id": "documents", "disposition": "rename-documents" },
     { "path": "st3 runtime ls|reset", "purpose_id": "debug", "disposition": "demote-expert" },
+    { "path": "st3 agents ls|show", "purpose_id": "agents", "disposition": "canonicalize-subcommands" },
     { "path": "st3 context read|write|append", "purpose_id": "subject", "disposition": "merge-into-subject" },
     { "path": "st3 resource add|ls|read|remove|watch|unwatch|refresh", "purpose_id": "subject", "disposition": "merge-into-subject" },
     { "path": "st3 schema subjects|resources|claims|show|export", "purpose_id": "schema", "disposition": "keep-expert" },
@@ -80,7 +81,7 @@
     { "path": "st3 message send|ls|read|reply|archive|thread|export", "purpose_id": "conversations", "disposition": "rename-conversations" }
   ],
   "release_blocking_regressions": [
-    { "id": "agents-running-enrich", "argv": ["st3", "agents", "--status", "running", "--enrich"], "rule": "human and JSON retain every enriched running agent" },
+    { "id": "agents-running-enrich", "argv": ["st3", "agents", "ls", "--status", "running", "--enrich"], "rule": "human and JSON retain every enriched running agent" },
     { "id": "canonical-message-reply-id", "rule": "the ID printed by send is accepted unchanged by --in-reply-to" }
   ]
 }

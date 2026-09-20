@@ -167,6 +167,23 @@ fn poke_id_extracts_rand6() {
 }
 
 #[test]
+fn st3_message_ding_uses_its_canonical_graph_reference() {
+    let mut message = msg(
+        "1785070000000-abc123.md",
+        "daemon/runtime",
+        Some("Mission step ready"),
+    );
+    message
+        .tags
+        .push("st3-message:message/0199abcdef0123456789abcdef012345".into());
+
+    assert_eq!(
+        render_without_catalog(&message),
+        "[DING] ? daemon/runtime: Mission step ready [id:message/0199abcdef0123456789abcdef012345]"
+    );
+}
+
+#[test]
 fn ancestor_depth_is_encoded_in_the_marker_run() {
     let catalog = tempfile::tempdir().unwrap();
     declare_agent(catalog.path(), "h", "root", None);

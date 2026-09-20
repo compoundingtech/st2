@@ -226,7 +226,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
-        .route("/v1/messages/close/{*subject}", post(close_message))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/status", get(status))
         .route("/v1/events", get(events))
@@ -3760,23 +3759,35 @@ async fn post_message_claim(
             )));
         }
     };
-    let actor = if let Some(actor) = request.actor {
-        Some(normalize_message_party(&actor))
-    } else {
-        state
-            .store
-            .messages(None, true)
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .find(|message| message.subject == subject)
-            .map(|message| message.to)
-    };
+    let message = state
+        .store
+        .messages(None, true)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|message| message.subject == subject)
+        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+    let actor = request.actor.ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-message-actor",
+            "message lifecycle transitions require the recipient actor",
+        ))
+    })?;
+    let actor = normalize_message_party(&actor);
+    if actor != message.to {
+        return Err(ApiError::bad(St3Error::new(
+            "wrong-message-recipient",
+            format!(
+                "message `{subject}` belongs to `{}`, not `{actor}`",
+                message.to
+            ),
+        )));
+    }
     let record = state
         .store
         .append_claim(&ClaimInput {
             subject,
             kind: kind.into(),
-            actor,
+            actor: Some(actor),
             fields: BTreeMap::from([("status".into(), Value::String(request.lifecycle))]),
             evidence: request.evidence,
             expected_subject: request.expected_subject,
@@ -3785,35 +3796,6 @@ async fn post_message_claim(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(record))
-}
-
-async fn close_message(
-    State(state): State<AppState>,
-    AxumPath(subject): AxumPath<String>,
-) -> Result<Json<ClaimRecord>, ApiError> {
-    let subject = message_subject(&subject);
-    let idempotency_key = format!("message-close:{subject}");
-    let actor = state
-        .store
-        .messages(None, true)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|message| message.subject == subject)
-        .map(|message| message.to);
-    let response = state
-        .store
-        .append_claim(&ClaimInput {
-            subject,
-            kind: "message.closed".into(),
-            actor,
-            fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
 }
 
 fn message_subject(value: &str) -> String {
@@ -7282,6 +7264,94 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["from"], "person/requester");
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_requires_the_exact_recipient_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, message) = json_request(
+            app.clone(),
+            "/v1/messages",
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: "recipient-authority-message".into(),
+                from: "agent/sender".into(),
+                to: "person/receiver".into(),
+                content: "Please review this.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{message}");
+        let message_id = message["subject"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("message/");
+        let path = format!("/v1/messages/{message_id}/claims");
+
+        let (status, missing) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(MessageLifecycleRequest {
+                lifecycle: "read".into(),
+                actor: None,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: "missing-message-actor".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{missing}");
+        assert_eq!(missing["code"], "missing-message-actor");
+
+        let (status, wrong) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(MessageLifecycleRequest {
+                lifecycle: "read".into(),
+                actor: Some("person/intruder".into()),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: "wrong-message-actor".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{wrong}");
+        assert_eq!(wrong["code"], "wrong-message-recipient");
+
+        let (status, read) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(MessageLifecycleRequest {
+                lifecycle: "delivered".into(),
+                actor: Some("person/receiver".into()),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: "right-message-actor".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["actor"], "person/receiver");
+
+        let legacy = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/close/obsolete")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

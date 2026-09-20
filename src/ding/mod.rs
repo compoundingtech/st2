@@ -62,6 +62,16 @@ pub fn poke_id(filename: &str) -> &str {
     }
 }
 
+/// Prefer the canonical st3 message subject carried across the compatibility inbox boundary.
+/// Native st2 messages retain their stable filename-derived identifier.
+fn poke_reference(msg: &Message) -> &str {
+    msg.tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("st3-message:"))
+        .filter(|reference| reference.starts_with("message/") && reference.len() > "message/".len())
+        .unwrap_or_else(|| poke_id(&msg.filename))
+}
+
 /// Convert arbitrary text into one printable line.
 ///
 /// Every control or whitespace run becomes at most one ordinary space. Removing terminal control
@@ -188,7 +198,7 @@ fn poke_text_with_resolver(
     };
     format!(
         "[DING] {marker} {from}: {subject} [id:{}]",
-        poke_id(&msg.filename)
+        poke_reference(msg)
     )
 }
 
