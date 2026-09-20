@@ -837,12 +837,7 @@ impl Store {
             .map_err(internal)?;
         planning_session_view_tx(&connection, id)
             .map_err(internal)?
-            .ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    "the planning session was not stored",
-                )
-            })
+            .ok_or_else(|| St3Error::new("missing-launch", "the launch was not stored"))
     }
 
     pub fn planning_session(&self, id: &str) -> Result<Option<PlanningSessionView>> {
@@ -887,15 +882,12 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    format!("planning session `{id}` does not exist"),
-                )
+                St3Error::new("missing-launch", format!("launch `{id}` does not exist"))
             })?;
         if planner != normalize_actor(actor, "agent") {
             return Err(St3Error::new(
                 "wrong-planner",
-                format!("`{actor}` does not own planning session `{id}`"),
+                format!("`{actor}` does not own launch `{id}`"),
             ));
         }
         if !matches!(
@@ -903,8 +895,8 @@ impl Store {
             "planning" | "revision-requested" | "review"
         ) {
             return Err(St3Error::new(
-                "planning-session-terminal",
-                format!("planning session `{id}` is {status}"),
+                "launch-terminal",
+                format!("launch `{id}` is {status}"),
             ));
         }
         let current = transaction
@@ -929,12 +921,10 @@ impl Store {
         {
             transaction.commit().map_err(internal)?;
             drop(connection);
-            return self.planning_session(id).map_err(internal)?.ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    "the planning session disappeared",
-                )
-            });
+            return self
+                .planning_session(id)
+                .map_err(internal)?
+                .ok_or_else(|| St3Error::new("missing-launch", "the launch disappeared"));
         }
         let revision: u32 = transaction
             .query_row(
@@ -965,12 +955,9 @@ impl Store {
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
         drop(connection);
-        self.planning_session(id).map_err(internal)?.ok_or_else(|| {
-            St3Error::new(
-                "missing-planning-session",
-                "the planning session disappeared",
-            )
-        })
+        self.planning_session(id)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("missing-launch", "the launch disappeared"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1009,12 +996,7 @@ impl Store {
             .map_err(internal)?;
         planning_session_view_tx(&connection, id)
             .map_err(internal)?
-            .ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    format!("planning session `{id}` does not exist"),
-                )
-            })
+            .ok_or_else(|| St3Error::new("missing-launch", format!("launch `{id}` does not exist")))
     }
 
     pub fn request_planning_revision(
@@ -1034,7 +1016,7 @@ impl Store {
     ) -> Result<PlanningSessionView, St3Error> {
         if !matches!(status, "approved" | "cancelled") {
             return Err(St3Error::new(
-                "invalid-planning-status",
+                "invalid-launch-status",
                 "invalid terminal planning status",
             ));
         }
@@ -1059,15 +1041,12 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    format!("planning session `{id}` does not exist"),
-                )
+                St3Error::new("missing-launch", format!("launch `{id}` does not exist"))
             })?;
         if requester != normalize_actor(actor, "person") {
             return Err(St3Error::new(
-                "planning-review-not-authorized",
-                format!("`{actor}` cannot review planning session `{id}`"),
+                "launch-review-not-authorized",
+                format!("`{actor}` cannot review launch `{id}`"),
             ));
         }
         let transition_is_valid = match status {
@@ -1083,19 +1062,14 @@ impl Store {
         };
         if !transition_is_valid {
             return Err(St3Error::new(
-                "invalid-planning-transition",
-                format!("planning session `{id}` cannot move from {current} to {status}"),
+                "invalid-launch-transition",
+                format!("launch `{id}` cannot move from {current} to {status}"),
             ));
         }
         if current == status {
             return planning_session_view_tx(&connection, id)
                 .map_err(internal)?
-                .ok_or_else(|| {
-                    St3Error::new(
-                        "missing-planning-session",
-                        "the planning session disappeared",
-                    )
-                });
+                .ok_or_else(|| St3Error::new("missing-launch", "the launch disappeared"));
         }
         connection
             .execute(
@@ -1110,12 +1084,7 @@ impl Store {
         }
         planning_session_view_tx(&connection, id)
             .map_err(internal)?
-            .ok_or_else(|| {
-                St3Error::new(
-                    "missing-planning-session",
-                    "the planning session disappeared",
-                )
-            })
+            .ok_or_else(|| St3Error::new("missing-launch", "the launch disappeared"))
     }
 
     pub fn create_mission_run(
@@ -3968,10 +3937,7 @@ impl Store {
             if actual != *expected {
                 return Err(St3Error::new(
                     "stale-subject",
-                    format!(
-                        "planning session `{}` changed after planning",
-                        declaration.subject
-                    ),
+                    format!("launch `{}` changed after planning", declaration.subject),
                 ));
             }
         }
@@ -7660,7 +7626,7 @@ fn prepare_planning_session_declaration(
                         .map(|value| value.strip_prefix("run-generation/").unwrap_or(value))
             {
                 blockers.push(format!(
-                    "planning session `{}` already exists with different creation fields",
+                    "launch `{}` already exists with different creation fields",
                     declaration.subject
                 ));
             }
@@ -7682,23 +7648,20 @@ fn prepare_planning_session_declaration(
                     .map_err(internal)?;
                 if actual.as_deref() != Some(expected_generation) {
                     blockers.push(format!(
-                        "planning session `{}` names a stale target generation",
+                        "launch `{}` names a stale target generation",
                         declaration.subject
                     ));
                 }
             }
             actions.push(PlannedAction {
                 subject: declaration.subject.clone(),
-                action: "start-planning".into(),
-                reason: "the named planning session does not exist".into(),
+                action: "start-launch".into(),
+                reason: "the named launch does not exist".into(),
             });
         }
     }
     if current.is_none() && declaration.creation.is_none() {
-        blockers.push(format!(
-            "planning session `{}` does not exist",
-            declaration.subject
-        ));
+        blockers.push(format!("launch `{}` does not exist", declaration.subject));
     }
     for feedback in declaration.feedback.values() {
         match publication_operation_is_new(
@@ -7711,7 +7674,7 @@ fn prepare_planning_session_declaration(
             Ok(true) => actions.push(PlannedAction {
                 subject: declaration.subject.clone(),
                 action: format!("feedback:{}", feedback.id),
-                reason: "the publication supplies planning feedback".into(),
+                reason: "the publication supplies launch feedback".into(),
             }),
             Ok(false) => {}
             Err(error) => blockers.push(error.message),
@@ -8498,15 +8461,15 @@ fn apply_planning_session_declaration_tx(
         claim_ids.push(claim.id);
         receipts.push(PlannedAction {
             subject: declaration.subject.clone(),
-            action: "start-planning".into(),
-            reason: "the named planning session was created".into(),
+            action: "start-launch".into(),
+            reason: "the named launch was created".into(),
         });
         exists = Some((creation.requester.clone(), "planning".into()));
     }
     let Some((requester, mut status)) = exists else {
         return Err(St3Error::new(
-            "missing-planning-session",
-            format!("planning session `{}` does not exist", declaration.subject),
+            "missing-launch",
+            format!("launch `{}` does not exist", declaration.subject),
         ));
     };
     let actor = actor.map(normalize_actor_for_publication);
@@ -8514,9 +8477,9 @@ fn apply_planning_session_declaration_tx(
         && actor.as_deref() != Some(requester.as_str())
     {
         return Err(St3Error::new(
-            "planning-review-not-authorized",
+            "launch-review-not-authorized",
             format!(
-                "the publication actor cannot change planning session `{}`",
+                "the publication actor cannot change launch `{}`",
                 declaration.subject
             ),
         ));
@@ -8533,9 +8496,9 @@ fn apply_planning_session_declaration_tx(
         }
         if !matches!(status.as_str(), "review" | "revision-requested") {
             return Err(St3Error::new(
-                "invalid-planning-transition",
+                "invalid-launch-transition",
                 format!(
-                    "planning session `{}` cannot accept feedback while {status}",
+                    "launch `{}` cannot accept feedback while {status}",
                     declaration.subject
                 ),
             ));
@@ -8584,7 +8547,7 @@ fn apply_planning_session_declaration_tx(
                 "status": "sent",
                 "title": "Planning feedback",
                 "in_reply_to": Value::Null,
-                "tags": ["planning"],
+                "tags": ["launch"],
             }}),
             &[],
             Some(batch_id),
@@ -8594,7 +8557,7 @@ fn apply_planning_session_declaration_tx(
         receipts.push(PlannedAction {
             subject: declaration.subject.clone(),
             action: format!("feedback:{}", feedback.id),
-            reason: "the planning feedback was published".into(),
+            reason: "the launch feedback was published".into(),
         });
         let receipt = append_publication_operation_tx(
             transaction,
@@ -8634,7 +8597,7 @@ fn apply_planning_session_declaration_tx(
             receipts.push(PlannedAction {
                 subject: declaration.subject.clone(),
                 action: format!("cancel:{}", cancellation.id),
-                reason: "the planning session was already cancelled".into(),
+                reason: "the launch was already cancelled".into(),
             });
             continue;
         }
@@ -9603,10 +9566,10 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                 let revision = fields
                     .get("candidate_revision")
                     .and_then(Value::as_u64)
-                    .context("a planning preview has no candidate revision")?;
+                    .context("a launch preview has no candidate revision")?;
                 let mission = fields
                     .get("mission")
-                    .context("a planning preview has no mission response")?;
+                    .context("a launch preview has no mission response")?;
                 transaction.execute(
                     "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -9617,10 +9580,10 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                         id,
                         variant,
                         revision,
-                        text("preview_hash").context("a planning preview has no hash")?,
-                        fields.get("store_index").and_then(Value::as_u64).context("a planning preview has no store index")?,
-                        text("graph").context("a planning preview has no graph")?,
-                        text("diff").context("a planning preview has no diff")?,
+                        text("preview_hash").context("a launch preview has no hash")?,
+                        fields.get("store_index").and_then(Value::as_u64).context("a launch preview has no store index")?,
+                        text("graph").context("a launch preview has no graph")?,
+                        text("diff").context("a launch preview has no diff")?,
                         serde_json::to_string(mission)?,
                         accepted,
                     ],
@@ -10727,11 +10690,11 @@ fn attention_item_from_planning(
     preview: &PlanningPreviewView,
 ) -> AttentionItemView {
     AttentionItemView {
-        kind: "planning-approval".into(),
+        kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
         title: format!("Approve mission/{}", session.mission),
-        detail: "The current planning preview is ready for approval.".into(),
+        detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
         mission_run: session.target_mission_run.clone(),
         step: None,
@@ -10742,7 +10705,7 @@ fn attention_item_from_planning(
         ],
         requested_at_unix_ms: preview.created_at_unix_ms,
         actions: vec![
-            attention_action("show", &["st3", "planning", "show", &session.id]),
+            attention_action("show", &["st3", "launch", "show", &session.id]),
             attention_action(
                 "approve",
                 &[
@@ -15884,7 +15847,7 @@ planning-session "planning/release/one" {{
             applied
                 .operations
                 .iter()
-                .any(|operation| operation.action == "start-planning")
+                .any(|operation| operation.action == "start-launch")
         );
         assert!(store.selected_desired_token(&planner).unwrap().is_some());
 

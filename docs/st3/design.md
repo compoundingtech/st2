@@ -93,7 +93,7 @@ split lets a ready step survive a daemon outage, a driver outage, and a failed d
 An agent notification only indicates that ready work or a message may exist. It does not authorize
 new work. The work queue and message record remain authoritative.
 
-`st3 attention ls` combines current human gates, planning approvals, revision approvals, unread
+`st3 attention ls` combines current human gates, launch approvals, revision approvals, unread
 person messages, and explicit fault requests. It is the machine source for future user interfaces.
 
 ## Resources and observers
@@ -118,12 +118,13 @@ winner. Invalid envelopes remain inspectable and do not halt later replication.
 
 See [fleet replication](replication.md) for configuration, convergence, diagnostics, and repair.
 
-## Planning
+## Launches
 
-A planning session is graph state. It stores the exact request document, planner, candidate mission,
-feedback, preview, and human decision.
+A launch is graph state. It stores the exact request document, planner, candidate mission,
+feedback, preview, and human decision. Its internal durable claims use the `planning-session`
+subject family; clients and operators use only the launch noun.
 
-Planning approval publishes a mission revision. It does not start the mission. A targeted planning
+Launch approval publishes a mission revision. It does not start the mission. A targeted launch
 session can also propose a new generation for one active run.
 
 The session can pause on one machine and continue on another after replication.

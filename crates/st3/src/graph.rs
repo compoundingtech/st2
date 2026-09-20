@@ -865,7 +865,7 @@ fn parse_planning_session_declaration(
         if target_run.is_some() != target_generation.is_some() {
             return Err(St3Error::new(
                 "incomplete-planning-target",
-                "a targeted planning session needs both target-run and target-generation",
+                "a targeted launch needs both target-run and target-generation",
             ));
         }
         if let Some(target) = &target_run {
@@ -958,7 +958,7 @@ fn parse_planning_session_declaration(
             return Err(St3Error::new(
                 "immutable-planning-session",
                 format!(
-                    "planning session `{}` repeats with different creation fields",
+                    "launch `{}` repeats with different creation fields",
                     current.subject
                 ),
             ));
@@ -999,7 +999,7 @@ fn parse_planning_session_declaration(
             harness_body.nodes_mut().push(string_node(
                 "prompt",
                 &format!(
-                    "You are the durable Codex planner for planning session `{id}`. Read `{}` with `st3 doc get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 planning submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+                    "You are the durable Codex planner for launch `{id}`. Read `{}` with `st3 doc get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
                     creation.request, creation.mission
                 ),
             ));
@@ -4567,7 +4567,7 @@ planning-session "planning/release/revise" {{
         let planner = &intent.subjects[&planner_subject];
         let desired = serde_json::to_string(&planner.desired).unwrap();
         assert!(
-            desired.contains("st3 planning submit planning/release/revise"),
+            desired.contains("st3 launch submit planning/release/revise"),
             "{desired}"
         );
         assert!(

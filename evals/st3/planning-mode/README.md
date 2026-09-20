@@ -2,7 +2,7 @@
 
 This paid st3 eval proves the first planning-mode workflow with one native Codex planner.
 
-The controller starts a durable planning session. It waits on the planning-session event stream until the planner submits Markdown and KDL documents. It then renders the static graph and graph diff and directly approves the exact preview hash.
+The controller starts a durable launch. It waits on the internal authoring event stream until the planner submits Markdown and KDL documents. It then renders the static graph and graph diff and directly approves the exact preview token.
 
 Mechanical gates prove these boundaries:
 
@@ -14,6 +14,6 @@ Mechanical gates prove these boundaries:
 - The planner stops after approval.
 - The planning workspace does not change.
 
-The revision path and stale-preview refusal are deterministic API tests. This paid eval uses direct approval so the model budget measures planning, not a forced rewrite.
+The revision path and stale-preview refusal are deterministic API tests. This paid eval uses direct approval so the model budget measures authoring, not a forced rewrite.
 
 Run it with `st3 eval ./evals/st3/planning-mode`.

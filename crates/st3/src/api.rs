@@ -32,19 +32,20 @@ use crate::model::{
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
     ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck, DoctorReport,
     DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus,
-    EventRecord, GateResultRequest, HumanReviewView, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
-    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
-    ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
-    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
-    St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    EventRecord, GateResultRequest, HumanReviewView, LaunchApproveAndStartRequest,
+    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionRequest,
+    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
+    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
+    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationRepairRequest, ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest,
+    ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -124,7 +125,7 @@ impl ApiError {
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
-            | "stale-planning-preview" => StatusCode::CONFLICT,
+            | "stale-launch-preview" => StatusCode::CONFLICT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -174,7 +175,31 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/client/messages", get(client_messages))
         .route("/v1/client/messages/{*id}", get(client_messages_detail))
         .route("/v1/client/launches", get(client_launches))
-        .route("/v1/client/launches/{*id}", get(client_launches_detail))
+        .route(
+            "/v1/client/launches/{id}/variants",
+            get(client_launch_variants),
+        )
+        .route(
+            "/v1/client/launches/{id}/variants/{variant}",
+            get(client_launch_variant_detail),
+        )
+        .route(
+            "/v1/client/launches/{id}/decisions",
+            get(client_launch_decisions),
+        )
+        .route(
+            "/v1/client/launches/{id}/decisions/{decision}",
+            get(client_launch_decision_detail),
+        )
+        .route(
+            "/v1/client/launches/{id}/approvals",
+            get(client_launch_approvals),
+        )
+        .route(
+            "/v1/client/launches/{id}/approvals/{approval}",
+            get(client_launch_approval_detail),
+        )
+        .route("/v1/client/launches/{id}", get(client_launches_detail))
         .route("/v1/client/work", get(client_work))
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
@@ -187,35 +212,42 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/missions/{id}", get(get_mission))
-        .route("/v1/planning-sessions/{id}", get(get_planning_session))
+        .route("/v1/launches/{id}", get(get_planning_session))
+        .route("/v1/launches/{id}/submit", post(submit_planning_candidate))
         .route(
-            "/v1/planning-sessions/{id}/submit",
-            post(submit_planning_candidate),
-        )
-        .route(
-            "/v1/planning-sessions/{id}/variants/{variant}/submit",
+            "/v1/launches/{id}/variants/{variant}/submit",
             post(submit_named_planning_candidate),
         )
         .route(
-            "/v1/planning-sessions/{id}/preview",
+            "/v1/launches/{id}/preview",
             post(preview_planning_candidate),
         )
         .route(
-            "/v1/planning-sessions/{id}/variants/{variant}/preview",
+            "/v1/launches/{id}/variants/{variant}/preview",
             post(preview_named_planning_candidate),
         )
         .route(
-            "/v1/planning-sessions/{id}/variants/{left}/compare/{right}",
+            "/v1/launches/{id}/variants/{left}/compare/{right}",
             get(compare_planning_variants),
         )
         .route(
-            "/v1/planning-sessions/{id}/variants/{variant}/propose",
+            "/v1/launches/{id}/variants/{variant}/propose",
             post(propose_planning_variant),
         )
+        .route("/v1/launches/{id}/approve", post(approve_planning_session))
         .route(
-            "/v1/planning-sessions/{id}/approve",
-            post(approve_planning_session),
+            "/v1/launches/{id}/approve-and-launch",
+            post(approve_and_start_launch),
         )
+        .route("/v1/launches/{id}/start", post(start_approved_launch))
+        .route("/v1/launches/{id}/decisions", post(request_launch_decision))
+        .route(
+            "/v1/launches/{id}/decisions/{decision}/answer",
+            post(answer_launch_decision),
+        )
+        .route("/v1/launches", post(start_planning_session))
+        .route("/v1/launches/{id}/revise", post(revise_planning_session))
+        .route("/v1/launches/{id}/cancel", post(cancel_planning_session))
         .route("/v1/documents", get(list_documents).post(put_document))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/claims", get(list_claims).post(post_claim))
@@ -289,15 +321,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
     #[cfg(test)]
     let app = app
-        .route("/v1/planning-sessions", post(start_planning_session))
-        .route(
-            "/v1/planning-sessions/{id}/revise",
-            post(revise_planning_session),
-        )
-        .route(
-            "/v1/planning-sessions/{id}/cancel",
-            post(cancel_planning_session),
-        )
         .route("/v1/resource-watches", post(watch_resource))
         .route(
             "/v1/resource-watches/{*subscription}",
@@ -1004,6 +1027,379 @@ fn client_message_resources(
     Ok(resources)
 }
 
+fn launch_session_id(id: &str) -> &str {
+    id.strip_prefix("launch/")
+        .or_else(|| id.strip_prefix("planning-session/"))
+        .unwrap_or(id)
+}
+
+fn client_launch_decision_resources(
+    store: &Store,
+    session: &PlanningSessionView,
+) -> anyhow::Result<Vec<Value>> {
+    let claims = store.claims_for(&session.subject, None)?;
+    let answers = claims
+        .iter()
+        .filter(|claim| claim.kind == "planning-session.question-answered")
+        .filter_map(|claim| {
+            let id = claim.body.pointer("/fields/decision_id")?.as_str()?;
+            Some((id.to_owned(), claim))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut decisions = claims
+        .iter()
+        .filter(|claim| claim.kind == "planning-session.question-requested")
+        .filter_map(|claim| {
+            let fields = claim.body.get("fields")?;
+            let id = fields.get("decision_id")?.as_str()?;
+            let answer = answers.get(id);
+            Some(json!({
+                "id": id,
+                "kind": "launch-decision",
+                "revision": answer.map(|answer| answer.id.as_str()).unwrap_or(claim.id.as_str()),
+                "updated_at": client_timestamp(answer.map(|answer| answer.accepted_at_unix_ms).unwrap_or(claim.accepted_at_unix_ms)),
+                "launch_id": format!("launch/{}", session.id),
+                "question": fields.get("question").cloned().unwrap_or(Value::Null),
+                "state": if answer.is_some() { "answered" } else { "open" },
+                "requested_at": client_timestamp(claim.accepted_at_unix_ms),
+                "choices": fields.get("choices").cloned().unwrap_or_else(|| json!([])),
+                "answer": answer.and_then(|answer| answer.body.pointer("/fields/answer")).cloned(),
+                "operational": { "layer": if answer.is_some() { "history" } else { "current" }, "actionable": answer.is_none(), "reasons": if answer.is_some() { vec!["answered"] } else { Vec::<&str>::new() } }
+            }))
+        })
+        .collect::<Vec<_>>();
+    decisions.sort_by(|left, right| {
+        left["requested_at"]
+            .as_str()
+            .cmp(&right["requested_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(decisions)
+}
+
+fn launch_diagnostics(blockers: &[String], warnings: &[String]) -> Vec<Value> {
+    blockers
+        .iter()
+        .map(|message| json!({"code": "preview-blocker", "severity": "error", "message": message, "path": null}))
+        .chain(warnings.iter().map(|message| {
+            json!({"code": "preview-warning", "severity": "warning", "message": message, "path": null})
+        }))
+        .collect()
+}
+
+fn client_launch_diagnostics(preview: &crate::model::PlanningPreviewView) -> Vec<Value> {
+    launch_diagnostics(&preview.mission.blockers, &preview.mission.warnings)
+}
+
+fn client_safe_json(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("declarations_kdl");
+            object.remove("kdl");
+            object.remove("markdown");
+            for value in object.values_mut() {
+                client_safe_json(value);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(client_safe_json),
+        _ => {}
+    }
+}
+
+fn canonical_json(value: &Value, output: &mut String) -> anyhow::Result<()> {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(object) => {
+            output.push('{');
+            let mut fields = object.iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| left.0.cmp(right.0));
+            for (index, (name, value)) in fields.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(name)?);
+                output.push(':');
+                canonical_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn launch_preview_token(
+    session: &PlanningSessionView,
+    variant: &crate::model::PlanningVariantView,
+    normalized_mission: &Value,
+    diagnostics: &[Value],
+) -> anyhow::Result<String> {
+    launch_preview_token_values(
+        &session.id,
+        &variant.name,
+        variant.candidate.revision,
+        session.source_generation.as_deref(),
+        normalized_mission,
+        diagnostics,
+    )
+}
+
+fn launch_preview_token_values(
+    launch_id: &str,
+    variant: &str,
+    candidate_revision: u32,
+    target_generation: Option<&str>,
+    normalized_mission: &Value,
+    diagnostics: &[Value],
+) -> anyhow::Result<String> {
+    let input = json!({
+        "api_version": CLIENT_API_VERSION,
+        "launch_id": format!("launch/{launch_id}"),
+        "variant_id": format!("launch-variant/{launch_id}/{variant}"),
+        "candidate_revision": candidate_revision,
+        "target_generation": target_generation,
+        "normalized_mission": normalized_mission,
+        "diagnostics": diagnostics,
+    });
+    let mut canonical = String::new();
+    canonical_json(&input, &mut canonical)?;
+    Ok(format!(
+        "lpv0:{}",
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    ))
+}
+
+fn launch_visualization(
+    mission: &crate::model::MissionSpec,
+    session: &PlanningSessionView,
+    preview: &crate::model::PlanningPreviewView,
+) -> Value {
+    let nodes = mission.display_order.iter().filter_map(|id| mission.steps.get(id)).map(|step| {
+        json!({
+            "id": format!("step/{}", step.path),
+            "kind": "step",
+            "label": step.title.as_deref().unwrap_or(&step.id),
+            "path": step.path,
+            "goals": step.goals,
+            "constraints": step.constraints,
+            "assignment": step.work_selector,
+            "timeout_ms": step.timeout_ms,
+            "retry": step.retry,
+            "gates": step.gates,
+            "loop": step.loop_spec,
+            "resources": step.documents,
+            "source_references": step.documents,
+            "runtime": { "attempt": null, "lease": null, "progress": null, "blockers": [], "attention": [], "errors": [], "cursor": null }
+        })
+    }).collect::<Vec<_>>();
+    let edges = mission
+        .steps
+        .values()
+        .flat_map(|step| {
+            step.dependencies
+                .iter()
+                .map(move |dependency| match dependency {
+                    crate::model::DependencySpec::Step {
+                        step: dependency, ..
+                    } => json!({
+                        "id": format!("edge/{}/{}", dependency, step.path),
+                        "kind": "dependency",
+                        "from": format!("step/{dependency}"),
+                        "to": format!("step/{}", step.path),
+                        "gate": dependency,
+                    }),
+                    crate::model::DependencySpec::Predicate { .. } => json!({
+                        "id": format!("edge/predicate/{}", step.path),
+                        "kind": "gate",
+                        "from": null,
+                        "to": format!("step/{}", step.path),
+                        "gate": dependency,
+                    }),
+                })
+        })
+        .collect::<Vec<_>>();
+    let timeline = mission
+        .display_order
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, id)| mission.steps.get(id).map(|step| (ordinal, step)))
+        .map(|(ordinal, step)| {
+            json!({
+                "id": format!("timeline/{}", step.path),
+                "node": format!("step/{}", step.path),
+                "ordinal": ordinal,
+                "dependencies": step.dependencies,
+                "timeout_ms": step.timeout_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut lanes = BTreeMap::<String, Vec<String>>::new();
+    for step in mission.steps.values() {
+        let assignment = step
+            .work_selector
+            .as_ref()
+            .map(|selector| serde_json::to_string(selector).unwrap_or_else(|_| "assigned".into()))
+            .unwrap_or_else(|| "unassigned".into());
+        lanes
+            .entry(assignment)
+            .or_default()
+            .push(format!("step/{}", step.path));
+    }
+    json!({
+        "version": "st3.visualization.v0",
+        "views": ["graph", "timeline", "swimlane", "revision", "risk", "live-progress"],
+        "mission": format!("mission/{}", mission.id),
+        "nodes": nodes,
+        "edges": edges,
+        "groups": mission.steps.values().filter(|step| step.queue.is_some() || step.nested_mission.is_some()).map(|step| json!({
+            "id": step.queue.clone().unwrap_or_else(|| step.path.clone()),
+            "kind": if step.queue.is_some() { "queue" } else { "nested-mission" },
+            "members": [format!("step/{}", step.path)]
+        })).collect::<Vec<_>>(),
+        "timeline": { "entries": timeline },
+        "swimlanes": lanes.into_iter().enumerate().map(|(ordinal, (assignment, nodes))| json!({
+            "id": format!("lane/{ordinal}"), "assignment": assignment, "nodes": nodes
+        })).collect::<Vec<_>>(),
+        "goals": mission.goals,
+        "constraints": mission.constraints,
+        "gates": mission.gates,
+        "resources": mission.products,
+        "revision": { "candidate": mission.revision, "target_generation": session.source_generation },
+        "risk": { "blockers": preview.mission.blockers, "warnings": preview.mission.warnings, "gates": mission.gates },
+        "live_progress": { "state": session.status, "cursor": null, "updated_at": client_timestamp(session.updated_at_unix_ms) }
+    })
+}
+
+fn client_launch_variant_resources(
+    state: &AppState,
+    session: &PlanningSessionView,
+) -> anyhow::Result<Vec<Value>> {
+    let mut resources = Vec::new();
+    for (ordinal, variant) in session.variants.iter().enumerate() {
+        let (normalized, diagnostics, visualization, structured_diff) = if let Some(preview) =
+            &variant.preview
+        {
+            let intent = parse_intent(&preview.mission.resolved_intent.kdl, &state.node)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let mission = intent
+                .missions
+                .get(&session.mission)
+                .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
+            let mut normalized = serde_json::to_value(mission)?;
+            client_safe_json(&mut normalized);
+            (
+                normalized,
+                client_launch_diagnostics(preview),
+                launch_visualization(mission, session, preview),
+                json!({"changes": preview.mission.changes, "predicted_actions": preview.mission.predicted_actions}),
+            )
+        } else {
+            (
+                json!({}),
+                Vec::new(),
+                json!({"version": "st3.visualization.v0", "views": [], "nodes": [], "edges": [], "groups": [], "timeline": {"entries": []}, "swimlanes": []}),
+                json!({"changes": [], "predicted_actions": []}),
+            )
+        };
+        let preview_token = variant
+            .preview
+            .as_ref()
+            .map(|_| launch_preview_token(session, variant, &normalized, &diagnostics))
+            .transpose()?;
+        let blocked = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["severity"] == "error");
+        let approved = session.status == "approved"
+            && session.candidate.as_ref().is_some_and(|candidate| {
+                candidate.variant == variant.name
+                    && candidate.revision == variant.candidate.revision
+            });
+        resources.push(json!({
+            "id": format!("launch-variant/{}/{}", session.id, variant.name),
+            "kind": "launch-variant",
+            "revision": format!("launch-variant-revision/{}/{}/{}", session.id, variant.name, variant.candidate.revision),
+            "updated_at": client_timestamp(variant.preview.as_ref().map(|preview| preview.created_at_unix_ms).unwrap_or(variant.candidate.submitted_at_unix_ms)),
+            "launch_id": format!("launch/{}", session.id),
+            "ordinal": ordinal,
+            "candidate_revision": variant.candidate.revision,
+            "status": if approved { "approved" } else if blocked { "blocked" } else if variant.preview.is_some() { "previewable" } else { "draft" },
+            "target_generation": session.source_generation,
+            "normalized_mission": normalized,
+            "diagnostics": diagnostics,
+            "preview_token": preview_token,
+            "structured_diff": structured_diff,
+            "visualization": visualization,
+            "operational": { "layer": if approved { "history" } else { "current" }, "actionable": !approved && !blocked, "reasons": if blocked { vec!["blocked"] } else if approved { vec!["approved"] } else { Vec::<&str>::new() } }
+        }));
+    }
+    Ok(resources)
+}
+
+fn client_launch_approval_resources(
+    state: &AppState,
+    session: &PlanningSessionView,
+) -> anyhow::Result<Vec<Value>> {
+    let variants = client_launch_variant_resources(state, session)?;
+    let tokens = variants
+        .into_iter()
+        .filter_map(|variant| {
+            Some((
+                variant["candidate_revision"].as_u64()?,
+                (
+                    variant["preview_token"].as_str()?.to_owned(),
+                    variant["id"].as_str()?.to_owned(),
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let claims = state.store.claims_for(&session.subject, None)?;
+    let mut approvals = claims
+        .into_iter()
+        .filter(|claim| claim.kind == "planning-session.approved")
+        .filter_map(|claim| {
+            let revision = claim.body.pointer("/fields/candidate_revision")?.as_u64()?;
+            let (token, variant_id) = tokens.get(&revision)?;
+            let reviewer = claim
+                .body
+                .pointer("/fields/requester")
+                .and_then(Value::as_str)
+                .or(claim.actor.as_deref())?;
+            Some(json!({
+                "id": format!("launch-approval/{}/{}", session.id, revision),
+                "kind": "launch-approval",
+                "revision": claim.id,
+                "updated_at": client_timestamp(claim.accepted_at_unix_ms),
+                "launch_id": format!("launch/{}", session.id),
+                "variant_id": variant_id,
+                "reviewer": reviewer,
+                "state": "approved",
+                "preview_token": token,
+                "decided_at": client_timestamp(claim.accepted_at_unix_ms),
+                "operational": { "layer": "history", "actionable": false, "reasons": ["approved"] }
+            }))
+        })
+        .collect::<Vec<_>>();
+    approvals.sort_by(|left, right| {
+        left["decided_at"]
+            .as_str()
+            .cmp(&right["decided_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(approvals)
+}
+
 fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<Value>> {
     let sessions = store.planning_sessions(history)?;
     let mut resources = sessions
@@ -1025,7 +1421,9 @@ fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<V
                 }),
                 _ => json!({ "type": "new-mission" }),
             };
-            json!({
+            let decisions = client_launch_decision_resources(store, &session)?;
+            let approval_ids = store.claims_for(&session.subject, None)?.into_iter().filter(|claim| claim.kind == "planning-session.approved").filter_map(|claim| claim.body.pointer("/fields/candidate_revision").and_then(Value::as_u64).map(|revision| format!("launch-approval/{}/{revision}", session.id))).collect::<Vec<_>>();
+            Ok(json!({
                 "id": format!("launch/{}", session.id),
                 "kind": "launch",
                 "revision": format!("launch/{}", session.updated_at_unix_ms),
@@ -1035,12 +1433,12 @@ fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<V
                 "request": session.request,
                 "target": target,
                 "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
-                "decisions": Vec::<String>::new(),
-                "approvals": Vec::<String>::new(),
+                "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
+                "approvals": approval_ids,
                 "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     resources.sort_by(|left, right| {
         right["updated_at"]
             .as_str()
@@ -1227,6 +1625,105 @@ async fn client_launches_detail(
         client_launch_resources(&state.store, query.history).map_err(ApiError::internal)?,
         "launch",
         &id,
+    )
+}
+
+fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    state
+        .store
+        .planning_session(launch_session_id(id))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
+}
+
+async fn client_launch_variants(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    let items = client_launch_variant_resources(&state, &session).map_err(ApiError::internal)?;
+    client_page(
+        &state,
+        &snapshot,
+        &format!("launches/{id}/variants"),
+        items,
+        &query,
+    )
+    .map(Json)
+}
+
+async fn client_launch_variant_detail(
+    State(state): State<AppState>,
+    AxumPath((id, variant)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    client_detail(
+        client_launch_variant_resources(&state, &session).map_err(ApiError::internal)?,
+        "launch-variant",
+        &format!("{}/{variant}", session.id),
+    )
+}
+
+async fn client_launch_decisions(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    let items =
+        client_launch_decision_resources(&state.store, &session).map_err(ApiError::internal)?;
+    client_page(
+        &state,
+        &snapshot,
+        &format!("launches/{id}/decisions"),
+        items,
+        &query,
+    )
+    .map(Json)
+}
+
+async fn client_launch_decision_detail(
+    State(state): State<AppState>,
+    AxumPath((id, decision)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    client_detail(
+        client_launch_decision_resources(&state.store, &session).map_err(ApiError::internal)?,
+        "launch-decision",
+        &decision,
+    )
+}
+
+async fn client_launch_approvals(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    let items = client_launch_approval_resources(&state, &session).map_err(ApiError::internal)?;
+    client_page(
+        &state,
+        &snapshot,
+        &format!("launches/{id}/approvals"),
+        items,
+        &query,
+    )
+    .map(Json)
+}
+
+async fn client_launch_approval_detail(
+    State(state): State<AppState>,
+    AxumPath((id, approval)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = client_launch_session(&state, &id)?;
+    client_detail(
+        client_launch_approval_resources(&state, &session).map_err(ApiError::internal)?,
+        "launch-approval",
+        &format!("{}/{approval}", session.id),
     )
 }
 
@@ -1791,14 +2288,14 @@ async fn start_planning_session(
 ) -> Result<Json<PlanningSessionView>, ApiError> {
     let request_text = std::str::from_utf8(&request.request).map_err(|_| {
         ApiError::bad(St3Error::new(
-            "planning-request-not-text",
-            "a planning request must contain valid UTF-8",
+            "launch-request-not-text",
+            "a launch request must contain valid UTF-8",
         ))
     })?;
     if request_text.trim().is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "empty-planning-request",
-            "a planning request cannot be empty",
+            "empty-launch-request",
+            "a launch request cannot be empty",
         )));
     }
     let target_run = request
@@ -1875,7 +2372,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 planning submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
+        "You are the durable Codex planner for launch {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
     );
     let planner = quick_agent(
         &state,
@@ -1917,7 +2414,7 @@ async fn start_planning_session(
             .as_ref()
             .map(|context| format!("{request_reference}\n{context}"))
             .unwrap_or_else(|| request_reference.clone()),
-        "Planning request",
+        "Launch request",
     )?;
     let mut started_fields = BTreeMap::from([
         (
@@ -1959,7 +2456,7 @@ async fn get_planning_session(
     blocking_store(move || store.planning_session(&id_for_read))
         .await?
         .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("planning session `{id}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
 }
 
 async fn submit_planning_candidate(
@@ -1988,19 +2485,19 @@ async fn submit_planning_variant(
     let session = required_planning_session(&state, &id)?;
     let markdown = std::str::from_utf8(&request.markdown).map_err(|_| {
         ApiError::bad(St3Error::new(
-            "planning-markdown-not-text",
+            "launch-markdown-not-text",
             "planning Markdown must contain valid UTF-8",
         ))
     })?;
     if markdown.trim().is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "empty-planning-markdown",
+            "empty-launch-markdown",
             "planning Markdown cannot be empty",
         )));
     }
     let kdl = std::str::from_utf8(&request.kdl).map_err(|_| {
         ApiError::bad(St3Error::new(
-            "planning-kdl-not-text",
+            "launch-kdl-not-text",
             "planning KDL must contain valid UTF-8",
         ))
     })?;
@@ -2010,7 +2507,7 @@ async fn submit_planning_variant(
         || !intent.missions.contains_key(&session.mission)
     {
         return Err(ApiError::bad(St3Error::new(
-            "wrong-planning-mission",
+            "wrong-launch-mission",
             format!(
                 "a candidate must contain only ready mission `{}` and no immediate desired state",
                 session.mission
@@ -2020,7 +2517,7 @@ async fn submit_planning_variant(
     let mission = &intent.missions[&session.mission];
     if mission.state != crate::model::MissionState::Ready {
         return Err(ApiError::bad(St3Error::new(
-            "planning-mission-not-ready",
+            "launch-mission-not-ready",
             "a planning candidate must contain a ready mission",
         )));
     }
@@ -2118,8 +2615,8 @@ async fn preview_planning_variant(
     let session = required_planning_session(&state, &id)?;
     if session.status != "review" {
         return Err(ApiError::bad(St3Error::new(
-            "planning-session-not-reviewable",
-            format!("planning session `{}` is {}", session.id, session.status),
+            "launch-not-reviewable",
+            format!("launch `{}` is {}", session.id, session.status),
         )));
     }
     let candidate = session
@@ -2129,8 +2626,8 @@ async fn preview_planning_variant(
         .map(|variant| &variant.candidate)
         .ok_or_else(|| {
             ApiError::bad(St3Error::new(
-                "missing-planning-candidate",
-                "the planning session has no candidate",
+                "missing-launch-candidate",
+                "the launch has no candidate",
             ))
         })?;
     let kdl = planning_document_text(&state, &candidate.kdl)?;
@@ -2138,18 +2635,29 @@ async fn preview_planning_variant(
     let mission = &intent.missions[&session.mission];
     let graph = render_planning_graph(mission);
     let diff = render_planning_diff(&mission_response);
-    let hash = hex::encode(Sha256::digest(
-        serde_json::to_vec(&json!({
-            "candidate_revision": candidate.revision,
-            "markdown": candidate.markdown,
-            "kdl": candidate.kdl,
-            "mission_revision": candidate.mission_revision,
-            "graph": graph,
-            "diff": diff,
-            "mission": mission_response,
-        }))
-        .map_err(ApiError::internal)?,
-    ));
+    let mut normalized = serde_json::to_value(mission).map_err(ApiError::internal)?;
+    client_safe_json(&mut normalized);
+    let diagnostics = launch_diagnostics(&mission_response.blockers, &mission_response.warnings);
+    let hash = launch_preview_token_values(
+        &session.id,
+        &variant,
+        candidate.revision,
+        session.source_generation.as_deref(),
+        &normalized,
+        &diagnostics,
+    )
+    .map_err(ApiError::internal)?;
+    if session
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)
+        .and_then(|variant| variant.preview.as_ref())
+        .is_some_and(|preview| {
+            preview.candidate_revision == candidate.revision && preview.hash == hash
+        })
+    {
+        return Ok(Json(session));
+    }
     let response = state
         .store
         .save_planning_preview(
@@ -2167,7 +2675,7 @@ async fn preview_planning_variant(
         .iter()
         .find(|candidate| candidate.name == variant)
         .and_then(|variant| variant.preview.as_ref())
-        .expect("the saved planning preview is visible");
+        .expect("the saved launch preview is visible");
     record_planning_event(
         &state,
         &response,
@@ -2204,7 +2712,7 @@ async fn compare_planning_variants(
             .variants
             .iter()
             .find(|variant| variant.name == name)
-            .ok_or_else(|| ApiError::not_found(format!("planning variant `{name}` does not exist")))
+            .ok_or_else(|| ApiError::not_found(format!("launch variant `{name}` does not exist")))
     };
     let left = variant(&left)?;
     let right = variant(&right)?;
@@ -2231,8 +2739,8 @@ async fn propose_planning_variant(
     let session = required_planning_session(&state, &id)?;
     let run_subject = session.target_mission_run.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
-            "planning-session-has-no-run",
-            "this planning session creates a new mission and cannot propose a run revision",
+            "launch-has-no-run",
+            "this launch creates a new mission and cannot propose a run revision",
         ))
     })?;
     let current = state
@@ -2242,26 +2750,24 @@ async fn propose_planning_variant(
         .ok_or_else(|| ApiError::not_found("the target mission run does not exist"))?;
     if session.source_generation.as_deref() != Some(current.generation.as_str()) {
         return Err(ApiError::bad(St3Error::new(
-            "stale-planning-generation",
-            "the planning variants target a superseded generation",
+            "stale-launch-generation",
+            "the launch variants target a superseded generation",
         )));
     }
     let variant = session
         .variants
         .iter()
         .find(|candidate| candidate.name == variant)
-        .ok_or_else(|| {
-            ApiError::not_found(format!("planning variant `{variant}` does not exist"))
-        })?;
+        .ok_or_else(|| ApiError::not_found(format!("launch variant `{variant}` does not exist")))?;
     let preview = variant.preview.as_ref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
-            "missing-planning-preview",
+            "missing-launch-preview",
             "preview the named variant before proposal",
         ))
     })?;
     if !preview.mission.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "planning-preview-blocked",
+            "launch-preview-blocked",
             preview.mission.blockers.join("; "),
         )));
     }
@@ -2338,8 +2844,8 @@ fn validate_planning_variant(variant: &str) -> Result<(), ApiError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-planning-variant",
-            "a planning variant must use 1 through 80 letters, digits, dots, dashes, or underscores",
+            "invalid-launch-variant",
+            "a launch variant must use 1 through 80 letters, digits, dots, dashes, or underscores",
         )));
     }
     Ok(())
@@ -2354,14 +2860,14 @@ async fn revise_planning_session(
     authorize_planning_reviewer(&session, &request.actor)?;
     if request.feedback.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "empty-planning-feedback",
-            "planning feedback cannot be empty",
+            "empty-launch-feedback",
+            "launch feedback cannot be empty",
         )));
     }
     std::str::from_utf8(&request.feedback).map_err(|_| {
         ApiError::bad(St3Error::new(
-            "planning-feedback-not-text",
-            "planning feedback must contain valid UTF-8",
+            "launch-feedback-not-text",
+            "launch feedback must contain valid UTF-8",
         ))
     })?;
     let feedback_hash = hex::encode(Sha256::digest(&request.feedback));
@@ -2396,7 +2902,7 @@ async fn revise_planning_session(
         &request.actor,
         &session.planner,
         &format!("{}@{}", document.name, document.hash),
-        "Planning revision requested",
+        "Launch revision requested",
     )?;
     signal_changed(&state);
     Ok(Json(response))
@@ -2411,25 +2917,41 @@ async fn approve_planning_session(
     authorize_planning_reviewer(&session, &request.actor)?;
     if session.status != "review" && session.status != "approved" {
         return Err(ApiError::bad(St3Error::new(
-            "planning-session-not-reviewable",
-            format!("planning session `{}` is {}", session.id, session.status),
+            "launch-not-reviewable",
+            format!("launch `{}` is {}", session.id, session.status),
         )));
     }
     let candidate = session.candidate.as_ref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
-            "missing-planning-candidate",
-            "the planning session has no candidate",
+            "missing-launch-candidate",
+            "the launch has no candidate",
         ))
     })?;
     let preview = session.preview.as_ref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
-            "missing-planning-preview",
+            "missing-launch-preview",
             "preview the candidate before approval",
         ))
     })?;
-    if preview.hash != request.preview_hash || preview.candidate_revision != candidate.revision {
+    let variant = session
+        .variants
+        .iter()
+        .find(|variant| variant.name == candidate.variant)
+        .ok_or_else(|| ApiError::internal("the selected launch variant is unavailable"))?;
+    let projected =
+        client_launch_variant_resources(&state, &session).map_err(ApiError::internal)?;
+    let approval_token = projected
+        .iter()
+        .find(|resource| {
+            resource["id"] == format!("launch-variant/{}/{}", session.id, variant.name)
+        })
+        .and_then(|resource| resource["preview_token"].as_str())
+        .ok_or_else(|| ApiError::internal("the selected launch preview has no approval token"))?;
+    if (preview.hash != request.preview_hash && approval_token != request.preview_hash)
+        || preview.candidate_revision != candidate.revision
+    {
         return Err(ApiError::bad(St3Error::new(
-            "stale-planning-preview",
+            "stale-launch-preview",
             "the approval does not name the current preview",
         )));
     }
@@ -2441,13 +2963,13 @@ async fn approve_planning_session(
             return Ok(Json(session));
         }
         return Err(ApiError::internal(format!(
-            "planning session `{}` has inconsistent approved revision state",
+            "launch `{}` has inconsistent approved revision state",
             session.id
         )));
     }
     if !preview.mission.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "planning-preview-blocked",
+            "launch-preview-blocked",
             preview.mission.blockers.join("; "),
         )));
     }
@@ -2459,8 +2981,8 @@ async fn approve_planning_session(
             .ok_or_else(|| ApiError::not_found("the target mission run does not exist"))?;
         if session.source_generation.as_deref() != Some(current.generation.as_str()) {
             return Err(ApiError::bad(St3Error::new(
-                "stale-planning-generation",
-                "the planning approval targets a superseded generation",
+                "stale-launch-generation",
+                "the launch approval targets a superseded generation",
             )));
         }
         Some((run_subject.to_owned(), current))
@@ -2500,7 +3022,7 @@ async fn approve_planning_session(
                     &run_subject,
                     mission,
                     &request.actor,
-                    "the requester approved the planning revision",
+                    "the requester approved the launch revision",
                     &format!("{approval_key}:cutover"),
                 )
                 .map_err(ApiError::bad)?;
@@ -2511,7 +3033,7 @@ async fn approve_planning_session(
                     &run_subject,
                     mission,
                     &request.actor,
-                    "the requester approved the planning revision",
+                    "the requester approved the launch revision",
                     &format!("{approval_key}:proposal"),
                 )
                 .map_err(ApiError::bad)?;
@@ -2549,9 +3071,10 @@ async fn approve_planning_session(
         BTreeMap::from([
             ("variant".into(), Value::String(candidate.variant.clone())),
             ("candidate_revision".into(), Value::from(candidate.revision)),
+            ("preview_hash".into(), Value::String(preview.hash.clone())),
             (
-                "preview_hash".into(),
-                Value::String(request.preview_hash.clone()),
+                "preview_token".into(),
+                Value::String(approval_token.to_owned()),
             ),
             (
                 "mission_revision".into(),
@@ -2569,6 +3092,237 @@ async fn approve_planning_session(
     stop_planning_agent(&state, &session.planner, &approval_key)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn start_approved_launch(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<LaunchStartRequest>,
+) -> Result<Json<MissionRunView>, ApiError> {
+    let session = required_planning_session(&state, &id)?;
+    authorize_planning_reviewer(&session, &request.actor)?;
+    if session.status != "approved" {
+        return Err(ApiError::bad(St3Error::new(
+            "launch-not-approved",
+            format!("launch `{}` is {}", session.id, session.status),
+        )));
+    }
+    if session.target_mission_run.is_some() {
+        return Err(ApiError::bad(St3Error::new(
+            "launch-target-already-running",
+            "a launch targeting an existing run is applied in place and cannot start another run",
+        )));
+    }
+    let revision = session.published_revision.clone().ok_or_else(|| {
+        ApiError::internal(format!(
+            "approved launch `{}` has no published revision",
+            session.id
+        ))
+    })?;
+    require_agent_mission_authority(&state, &request.actor, "start", &session.mission)?;
+    let response = state
+        .store
+        .create_mission_run(&MissionRunRequest {
+            mission: session.mission,
+            revision: Some(revision),
+            workspace: request.workspace,
+            requester: Some(normalize_message_party(&request.actor)),
+            mode: None,
+            inputs: request.inputs,
+            idempotency_key: format!("launch-start:{}:{}", session.id, request.idempotency_key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+async fn approve_and_start_launch(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<LaunchApproveAndStartRequest>,
+) -> Result<Json<LaunchApproveAndStartView>, ApiError> {
+    let Json(launch) = approve_planning_session(
+        State(state.clone()),
+        AxumPath(id.clone()),
+        Json(PlanningApprovalRequest {
+            actor: request.actor.clone(),
+            preview_hash: request.preview_hash,
+            idempotency_key: format!("{}:approve", request.idempotency_key),
+        }),
+    )
+    .await?;
+    // Approval is intentionally committed before start. If runtime creation fails, the durable
+    // approved launch remains recoverable through this same idempotent request or `/start`.
+    let Json(mission_run) = start_approved_launch(
+        State(state),
+        AxumPath(id),
+        Json(LaunchStartRequest {
+            actor: request.actor,
+            workspace: request.workspace,
+            inputs: request.inputs,
+            idempotency_key: format!("{}:start", request.idempotency_key),
+        }),
+    )
+    .await?;
+    Ok(Json(LaunchApproveAndStartView {
+        launch,
+        mission_run,
+    }))
+}
+
+async fn request_launch_decision(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<LaunchDecisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = required_planning_session(&state, &id)?;
+    if normalize_message_party(&request.actor) != session.planner {
+        return Err(ApiError::bad(St3Error::new(
+            "launch-decision-not-authorized",
+            "only the launch planner can request a decision",
+        )));
+    }
+    let question = request.question.trim();
+    if question.is_empty() || question.len() > 2_000 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-launch-question",
+            "a launch question must contain 1 through 2000 bytes",
+        )));
+    }
+    let choices = request
+        .choices
+        .iter()
+        .map(|choice| choice.trim().to_owned())
+        .collect::<Vec<_>>();
+    let unique = choices.iter().collect::<std::collections::BTreeSet<_>>();
+    if choices.is_empty()
+        || choices.len() > 20
+        || choices.iter().any(String::is_empty)
+        || unique.len() != choices.len()
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-launch-choices",
+            "a launch question needs 1 through 20 distinct non-empty choices",
+        )));
+    }
+    let digest = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
+    let decision_id = format!("launch-decision/{}", &digest[..32]);
+    record_planning_event(
+        &state,
+        &session,
+        "planning-session.question-requested",
+        Some(&request.actor),
+        BTreeMap::from([
+            ("decision_id".into(), Value::String(decision_id.clone())),
+            ("revision".into(), Value::from(1)),
+            ("question".into(), Value::String(question.to_owned())),
+            (
+                "choices".into(),
+                serde_json::to_value(&choices).map_err(ApiError::internal)?,
+            ),
+            ("requester".into(), Value::String(session.requester.clone())),
+            ("planner".into(), Value::String(session.planner.clone())),
+        ]),
+        &format!("launch-question:{}:{}", session.id, request.idempotency_key),
+    )?;
+    send_planning_message(
+        &state,
+        &format!("launch-question-message:{}:{decision_id}", session.id),
+        &session.planner,
+        &session.requester,
+        &format!(
+            "{decision_id}\n{question}\nChoices: {}",
+            choices.join(" | ")
+        ),
+        "Launch decision requested",
+    )?;
+    signal_changed(&state);
+    let value = client_launch_decision_resources(&state.store, &session)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|value| value["id"] == decision_id)
+        .ok_or_else(|| ApiError::internal("the recorded launch decision is unavailable"))?;
+    Ok(Json(value))
+}
+
+async fn answer_launch_decision(
+    State(state): State<AppState>,
+    AxumPath((id, decision)): AxumPath<(String, String)>,
+    Json(request): Json<LaunchDecisionAnswerRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = required_planning_session(&state, &id)?;
+    authorize_planning_reviewer(&session, &request.actor)?;
+    let decision_id = client_detail_id("launch-decision", &decision);
+    let decisions =
+        client_launch_decision_resources(&state.store, &session).map_err(ApiError::internal)?;
+    let current = decisions
+        .iter()
+        .find(|value| value["id"] == decision_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("launch decision `{decision_id}` does not exist"))
+        })?;
+    if request.expected_revision != 1 {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-launch-decision",
+            "the launch decision revision changed",
+        )));
+    }
+    if current["state"] == "answered" {
+        if current["answer"].as_str() == Some(request.answer.as_str()) {
+            return Ok(Json(current.clone()));
+        }
+        return Err(ApiError::bad(St3Error::new(
+            "launch-decision-immutable",
+            "a launch decision answer is immutable",
+        )));
+    }
+    let choices = current["choices"].as_array().cloned().unwrap_or_default();
+    if !choices
+        .iter()
+        .any(|choice| choice.as_str() == Some(request.answer.as_str()))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-launch-answer",
+            "the answer must equal one of the question choices",
+        )));
+    }
+    record_planning_event(
+        &state,
+        &session,
+        "planning-session.question-answered",
+        Some(&request.actor),
+        BTreeMap::from([
+            ("decision_id".into(), Value::String(decision_id.clone())),
+            (
+                "expected_revision".into(),
+                Value::from(request.expected_revision),
+            ),
+            ("answer".into(), Value::String(request.answer.clone())),
+            ("requester".into(), Value::String(session.requester.clone())),
+        ]),
+        &format!("launch-answer:{}:{}", session.id, request.idempotency_key),
+    )?;
+    send_planning_message(
+        &state,
+        &format!("launch-answer-message:{}:{decision_id}", session.id),
+        &session.requester,
+        &session.planner,
+        &format!("{decision_id}\nAnswer: {}", request.answer),
+        "Launch decision answered",
+    )?;
+    close_planning_message(
+        &state,
+        &format!("launch-question-message:{}:{decision_id}", session.id),
+        &session.requester,
+        &request.idempotency_key,
+    )?;
+    signal_changed(&state);
+    let value = client_launch_decision_resources(&state.store, &session)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|value| value["id"] == decision_id)
+        .ok_or_else(|| ApiError::internal("the answered launch decision is unavailable"))?;
+    Ok(Json(value))
 }
 
 async fn cancel_planning_session(
@@ -2614,11 +3368,12 @@ async fn cancel_planning_session(
 }
 
 fn required_planning_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    let id = launch_session_id(id);
     state
         .store
         .planning_session(id)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("planning session `{id}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("launch `{id}` does not exist")))
 }
 
 fn normalize_planning_reviewer(value: &str) -> String {
@@ -2634,8 +3389,8 @@ fn authorize_planning_reviewer(session: &PlanningSessionView, actor: &str) -> Re
         return Ok(());
     }
     Err(ApiError::bad(St3Error::new(
-        "planning-review-not-authorized",
-        format!("`{actor}` cannot review planning session `{}`", session.id),
+        "launch-review-not-authorized",
+        format!("`{actor}` cannot review launch `{}`", session.id),
     )))
 }
 
@@ -2794,7 +3549,7 @@ fn send_planning_message(
                 ("in_reply_to".into(), Value::Null),
                 (
                     "tags".into(),
-                    Value::Array(vec![Value::String("planning".into())]),
+                    Value::Array(vec![Value::String("launch".into())]),
                 ),
             ]),
             evidence: Vec::new(),
@@ -2802,6 +3557,37 @@ fn send_planning_message(
             idempotency_key: Some(key.into()),
         })
         .map_err(ApiError::bad)?;
+    Ok(())
+}
+
+fn close_planning_message(
+    state: &AppState,
+    message_key: &str,
+    actor: &str,
+    operation_key: &str,
+) -> Result<(), ApiError> {
+    let subject = format!(
+        "message/{}",
+        &hex::encode(Sha256::digest(message_key.as_bytes()))[..16]
+    );
+    for (kind, status) in [
+        ("message.delivered", "delivered"),
+        ("message.read", "read"),
+        ("message.closed", "closed"),
+    ] {
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: kind.into(),
+                actor: Some(normalize_message_party(actor)),
+                fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{operation_key}:{status}")),
+            })
+            .map_err(ApiError::bad)?;
+    }
     Ok(())
 }
 
@@ -2820,7 +3606,7 @@ fn stop_planning_agent(state: &AppState, planner: &str, key: &str) -> Result<(),
         .map(|run| run.subject)
         .map(|run| {
             format!(
-                "mission-run {:?} {{ cancellation \"planning-session-ended\" {{ reason \"the planning session ended\" }} }}\n",
+                "mission-run {:?} {{ cancellation \"planning-session-ended\" {{ reason \"the launch ended\" }} }}\n",
                 run
             )
         })
@@ -6362,10 +7148,19 @@ version 2
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let envelope: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(envelope["api_version"], "st3.v1");
-        assert_eq!(envelope["snapshot_host"], "node");
+        if path.starts_with("/v1/client/") {
+            assert_eq!(envelope["api_version"], CLIENT_API_VERSION);
+            assert_eq!(envelope["snapshot"]["host_id"], "host/node");
+        } else {
+            assert_eq!(envelope["api_version"], "st3.v1");
+            assert_eq!(envelope["snapshot_host"], "node");
+        }
         assert!(envelope["request_id"].as_str().unwrap().contains('-'));
-        assert!(envelope["store_index"].is_u64());
+        if path.starts_with("/v1/client/") {
+            assert!(envelope["snapshot"]["store_index"].is_u64());
+        } else {
+            assert!(envelope["store_index"].is_u64());
+        }
         let value = if status.is_success() {
             envelope["value"].clone()
         } else {
@@ -6388,10 +7183,19 @@ version 2
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let envelope: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(envelope["api_version"], "st3.v1");
-        assert_eq!(envelope["snapshot_host"], "node");
+        if path.starts_with("/v1/client/") {
+            assert_eq!(envelope["api_version"], CLIENT_API_VERSION);
+            assert_eq!(envelope["snapshot"]["host_id"], "host/node");
+        } else {
+            assert_eq!(envelope["api_version"], "st3.v1");
+            assert_eq!(envelope["snapshot_host"], "node");
+        }
         assert!(envelope["request_id"].as_str().unwrap().contains('-'));
-        assert!(envelope["store_index"].is_u64());
+        if path.starts_with("/v1/client/") {
+            assert!(envelope["snapshot"]["store_index"].is_u64());
+        } else {
+            assert!(envelope["store_index"].is_u64());
+        }
         let value = if status.is_success() {
             envelope["value"].clone()
         } else {
@@ -6503,7 +7307,7 @@ mission "invalid-message" state="ready" {
 
         let (status, started) = json_request(
             app.clone(),
-            "/v1/planning-sessions",
+            "/v1/launches",
             serde_json::to_value(PlanningSessionStartRequest {
                 mission: "planned/work".into(),
                 run: None,
@@ -6593,7 +7397,7 @@ version 2
         side_effect.extend_from_slice(&first[b"version 2\n".len()..]);
         let (status, rejected) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/submit"),
+            &format!("/v1/launches/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
                 markdown: b"# Mission with a side effect".to_vec(),
@@ -6615,7 +7419,7 @@ version 2
 
         let (status, submitted) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/submit"),
+            &format!("/v1/launches/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
                 markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n".to_vec(),
@@ -6630,7 +7434,7 @@ version 2
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
         let (status, resubmitted) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/submit"),
+            &format!("/v1/launches/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
                 markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n".to_vec(),
@@ -6655,7 +7459,7 @@ version 2
 
         let (status, previewed) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/preview"),
+            &format!("/v1/launches/{session}/preview"),
             json!({}),
         )
         .await;
@@ -6672,7 +7476,7 @@ version 2
         );
         let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
-        assert_eq!(attention[0]["kind"], "planning-approval");
+        assert_eq!(attention[0]["kind"], "launch-approval");
         assert_eq!(
             attention[0]["subject"],
             format!("planning-session/{session}")
@@ -6680,7 +7484,7 @@ version 2
 
         let (status, revised) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/revise"),
+            &format!("/v1/launches/{session}/revise"),
             serde_json::to_value(PlanningRevisionRequest {
                 actor: "person/nathan".into(),
                 feedback: b"Add a verification step.".to_vec(),
@@ -6715,7 +7519,7 @@ version 2
 "#;
         let (status, resubmitted) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/submit"),
+            &format!("/v1/launches/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
                 markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n3. Verify.\n".to_vec(),
@@ -6730,20 +7534,113 @@ version 2
 
         let (status, previewed) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/preview"),
+            &format!("/v1/launches/{session}/preview"),
             json!({}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{previewed}");
         let current_hash = previewed["preview"]["hash"].as_str().unwrap().to_owned();
         assert_ne!(current_hash, first_hash);
+        let (status, variants) = get_request(
+            app.clone(),
+            &format!("/v1/client/launches/{session}/variants"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{variants}");
+        let variant = &variants["items"][0];
+        let preview_token = variant["preview_token"].as_str().unwrap().to_owned();
+        assert!(preview_token.starts_with("lpv0:"));
+        assert_eq!(current_hash, preview_token);
+        assert_eq!(variant["normalized_mission"]["id"], "planned/work");
+        assert!(
+            !serde_json::to_string(&variant["normalized_mission"])
+                .unwrap()
+                .contains("declarations_kdl")
+        );
+        assert_eq!(
+            variant["visualization"]["views"],
+            json!([
+                "graph",
+                "timeline",
+                "swimlane",
+                "revision",
+                "risk",
+                "live-progress"
+            ])
+        );
+        assert_eq!(
+            variant["visualization"]["timeline"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            variant["visualization"]["swimlanes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            variant["structured_diff"]["changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (status, decision) = json_request(
+            app.clone(),
+            &format!("/v1/launches/{session}/decisions"),
+            serde_json::to_value(LaunchDecisionRequest {
+                actor: planner.into(),
+                question: "Which verification level?".into(),
+                choices: vec!["focused".into(), "full".into()],
+                idempotency_key: "launch-decision-verification".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{decision}");
+        let decision_id = decision["id"].as_str().unwrap();
+        let decision_path = decision_id.trim_start_matches("launch-decision/");
+        let (status, answered) = json_request(
+            app.clone(),
+            &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
+            serde_json::to_value(LaunchDecisionAnswerRequest {
+                actor: "person/nathan".into(),
+                answer: "full".into(),
+                expected_revision: 1,
+                idempotency_key: "launch-decision-verification-answer".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answered}");
+        assert_eq!(answered["state"], "answered");
+        assert_eq!(answered["answer"], "full");
+        let (status, immutable) = json_request(
+            app.clone(),
+            &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
+            serde_json::to_value(LaunchDecisionAnswerRequest {
+                actor: "person/nathan".into(),
+                answer: "focused".into(),
+                expected_revision: 1,
+                idempotency_key: "launch-decision-verification-conflict".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{immutable}");
+        assert_eq!(immutable["code"], "launch-decision-immutable");
         let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
-        assert_eq!(attention[0]["kind"], "planning-approval");
+        assert_eq!(attention[0]["kind"], "launch-approval");
 
         let (status, unauthorized) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/approve"),
+            &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/intruder".into(),
                 preview_hash: current_hash.clone(),
@@ -6753,12 +7650,12 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unauthorized}");
-        assert_eq!(unauthorized["code"], "planning-review-not-authorized");
+        assert_eq!(unauthorized["code"], "launch-review-not-authorized");
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
         let (status, stale) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/approve"),
+            &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/nathan".into(),
                 preview_hash: first_hash,
@@ -6768,15 +7665,15 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{stale}");
-        assert_eq!(stale["code"], "stale-planning-preview");
+        assert_eq!(stale["code"], "stale-launch-preview");
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
         let (status, approved) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/approve"),
+            &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/nathan".into(),
-                preview_hash: current_hash,
+                preview_hash: preview_token.clone(),
                 idempotency_key: "planning-approve-current".into(),
             })
             .unwrap(),
@@ -6822,8 +7719,8 @@ version 2
         );
 
         let (status, approved_again) = json_request(
-            app,
-            &format!("/v1/planning-sessions/{session}/approve"),
+            app.clone(),
+            &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/nathan".into(),
                 preview_hash: approved["preview"]["hash"].as_str().unwrap().into(),
@@ -6834,6 +7731,43 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{approved_again}");
         assert_eq!(approved_again["status"], "approved");
+        let (status, started_run) = json_request(
+            app.clone(),
+            &format!("/v1/launches/{session}/approve-and-launch"),
+            serde_json::to_value(LaunchApproveAndStartRequest {
+                actor: "person/nathan".into(),
+                preview_hash: preview_token.clone(),
+                workspace: workspace.display().to_string(),
+                inputs: BTreeMap::new(),
+                idempotency_key: "approved-launch-combined".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{started_run}");
+        assert_eq!(
+            started_run["mission_run"]["revision"],
+            approved["published_revision"]
+        );
+        assert_eq!(started_run["launch"]["status"], "approved");
+        let (status, started_again) = json_request(
+            app,
+            &format!("/v1/launches/{session}/approve-and-launch"),
+            serde_json::to_value(LaunchApproveAndStartRequest {
+                actor: "person/nathan".into(),
+                preview_hash: preview_token,
+                workspace: workspace.display().to_string(),
+                inputs: BTreeMap::new(),
+                idempotency_key: "approved-launch-combined".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{started_again}");
+        assert_eq!(
+            started_again["mission_run"]["subject"],
+            started_run["mission_run"]["subject"]
+        );
         assert_eq!(
             store
                 .claims_for("mission/planned/work", Some("mission.published"))
@@ -6952,7 +7886,7 @@ mission "planned/direct" state="ready" {
 "#;
         let (status, submitted) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{encoded_session}/submit"),
+            &format!("/v1/launches/{encoded_session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.clone(),
                 markdown: b"# Mission\n\nInspect the release input.\n".to_vec(),
@@ -6965,7 +7899,7 @@ mission "planned/direct" state="ready" {
         assert_eq!(status, StatusCode::OK, "{submitted}");
         let (status, previewed) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{encoded_session}/preview"),
+            &format!("/v1/launches/{encoded_session}/preview"),
             json!({}),
         )
         .await;
@@ -6973,7 +7907,7 @@ mission "planned/direct" state="ready" {
         let preview_hash = previewed["preview"]["hash"].as_str().unwrap();
         let (status, approved) = json_request(
             app,
-            &format!("/v1/planning-sessions/{encoded_session}/approve"),
+            &format!("/v1/launches/{encoded_session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/operator".into(),
                 preview_hash: preview_hash.into(),
@@ -7030,7 +7964,7 @@ mission "targeted" state="ready" revisions="human-only" {
         let app = router(state);
         let (status, session) = json_request(
             app.clone(),
-            "/v1/planning-sessions",
+            "/v1/launches",
             serde_json::to_value(PlanningSessionStartRequest {
                 mission: "ignored".into(),
                 run: Some(run.subject.clone()),
@@ -7059,7 +7993,7 @@ mission "targeted" state="ready" revisions="human-only" {
 "#;
         let (status, submitted) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session_id}/submit"),
+            &format!("/v1/launches/{session_id}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
                 markdown: b"# Targeted mission\n".to_vec(),
@@ -7073,7 +8007,7 @@ mission "targeted" state="ready" revisions="human-only" {
         let preview_hash = submitted["preview"]["hash"].as_str().unwrap();
         let (status, approved) = json_request(
             app,
-            &format!("/v1/planning-sessions/{session_id}/approve"),
+            &format!("/v1/launches/{session_id}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
                 actor: "person/operator".into(),
                 preview_hash: preview_hash.into(),
@@ -7139,7 +8073,7 @@ version 2
         let app = router(state);
         let (status, started) = json_request(
             app.clone(),
-            "/v1/planning-sessions",
+            "/v1/launches",
             serde_json::to_value(PlanningSessionStartRequest {
                 mission: "ignored-when-run-is-present".into(),
                 run: Some(run.subject.clone()),
@@ -7189,7 +8123,7 @@ version 2
         {
             let (status, submitted) = json_request(
                 app.clone(),
-                &format!("/v1/planning-sessions/{session}/variants/{name}/submit"),
+                &format!("/v1/launches/{session}/variants/{name}/submit"),
                 serde_json::to_value(PlanningCandidateSubmitRequest {
                     actor: planner.into(),
                     markdown: format!("# {name} mission\n").into_bytes(),
@@ -7203,7 +8137,7 @@ version 2
             assert_eq!(submitted["variants"].as_array().unwrap().len(), index + 1);
             let (status, previewed) = json_request(
                 app.clone(),
-                &format!("/v1/planning-sessions/{session}/variants/{name}/preview"),
+                &format!("/v1/launches/{session}/variants/{name}/preview"),
                 json!({}),
             )
             .await;
@@ -7221,7 +8155,7 @@ version 2
         );
         let (status, compared) = get_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/variants/compact/compare/extended"),
+            &format!("/v1/launches/{session}/variants/compact/compare/extended"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{compared}");
@@ -7230,7 +8164,7 @@ version 2
 
         let (status, proposed) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/variants/extended/propose"),
+            &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
                 actor: "person/nathan".into(),
                 reason: "the extended variant has the required check".into(),
@@ -7245,7 +8179,7 @@ version 2
 
         let (status, retried) = json_request(
             app.clone(),
-            &format!("/v1/planning-sessions/{session}/variants/extended/propose"),
+            &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
                 actor: "person/nathan".into(),
                 reason: "the extended variant has the required check".into(),
@@ -7262,7 +8196,7 @@ version 2
 
         let (status, stale) = json_request(
             app,
-            &format!("/v1/planning-sessions/{session}/variants/compact/propose"),
+            &format!("/v1/launches/{session}/variants/compact/propose"),
             serde_json::to_value(PlanningProposalRequest {
                 actor: "person/nathan".into(),
                 reason: "try the stale compact variant".into(),
@@ -7272,7 +8206,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{stale}");
-        assert_eq!(stale["code"], "stale-planning-generation");
+        assert_eq!(stale["code"], "stale-launch-generation");
     }
 
     #[tokio::test]

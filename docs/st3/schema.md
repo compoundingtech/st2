@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `cb6fed41db8cf909e98c8e4b90fe729117532c70c3b7f95b69d756fa50a3fe1c`
+Digest: `7e6bdde6852ee882e0b056c45058dff434eba40e7d543f1f770f3b99094b817b`
 
 ## Subject families
 
@@ -86,10 +86,12 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `observer.observed` | `observer` | `system-only` | `append` | `attempt:string`, `changed:boolean`, `changed_fields:array`, `cursor:string`, `locator:string`, `next_check_unix_ms:string`, `observation:subject-reference`, `provider:string`, `resource:subject-reference`, `revision:string`, `status:string` | `observer` |
 | `observer.refresh-requested` | `observer` | `system-only` | `append` | `attempt!:string`, `revision!:string` | `refresh` |
 | `observer.state` | `observer` | `system-only` | `state-transition` | `attempt:string`, `next_check_unix_ms:string`, `reason:string`, `revision:string`, `state!:string` | `observer` |
-| `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `preview_hash:string`, `requester:subject-reference`, `variant:string` |  |
+| `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `preview_hash:string`, `preview_token:string`, `requester:subject-reference`, `variant:string` |  |
 | `planning-session.cancelled` | `planning-session` | `authorized-requester` | `once` | `reason:string`, `requester:subject-reference` | `cancellation` |
 | `planning-session.candidate-submitted` | `planning-session` | `authorized-participant` | `append` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `revision:integer`, `variant:string` |  |
 | `planning-session.previewed` | `planning-session` | `system-only` | `append` | `candidate_revision:integer`, `diff:string`, `graph:string`, `mission:object`, `preview_hash:string`, `store_index:integer`, `variant:string` |  |
+| `planning-session.question-answered` | `planning-session` | `authorized-requester` | `append` | `answer:string`, `decision_id:string`, `expected_revision:integer`, `requester:subject-reference` |  |
+| `planning-session.question-requested` | `planning-session` | `authorized-participant` | `append` | `choices:array`, `decision_id:string`, `planner:subject-reference`, `question:string`, `requester:subject-reference`, `revision:integer` |  |
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
 | `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |

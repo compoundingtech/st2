@@ -248,11 +248,11 @@ The resource must already have an active observer. `st3 resource refresh` publis
 
 ## Planning a new mission
 
-Planning uses an immutable request document and a declarative planning session.
+Planning uses an immutable request document and a declarative launch.
 
 ```sh
 st3 doc put request.md --as doc/planning/release/request
-st3 planning start --id release request.md \
+st3 launch start --id release request.md \
   --workspace /work/release \
   --as person/operator
 ```
@@ -275,34 +275,34 @@ The session creates a session-scoped Codex planner with a bounded runtime ID. Ca
 
 Human approval is also observed input. It publishes the approved mission revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new mission separately with `st3 mission start`.
 
-`st3 planning start --print-kdl` does not store the request. It prints the required `st3 doc put` command and the planning-session KDL.
+`st3 launch start --print-kdl` does not store the request. It prints the required `st3 doc put` command and the planning-session KDL.
 
-### Review or resume a planning session
+### Review or resume a launch
 
-The planning session and its document references are durable graph state. A reviewer can continue from another client after the state replicates.
+The launch and its document references are durable graph state. A reviewer can continue from another client after the state replicates.
 
 ```sh
-st3 planning show planning/release/SESSION_ID
-st3 planning preview planning/release/SESSION_ID --variant default
-st3 planning revise planning/release/SESSION_ID feedback.md --as person/operator
-st3 planning approve planning/release/SESSION_ID PREVIEW_HASH --as person/operator
+st3 launch show launch/release/SESSION_ID
+st3 launch preview launch/release/SESSION_ID --variant default
+st3 launch revise launch/release/SESSION_ID feedback.md --as person/operator
+st3 launch approve launch/release/SESSION_ID PREVIEW_TOKEN --as person/operator
 ```
 
-`show` returns the current candidate and preview. `revise` stores the exact feedback document and publishes a named feedback operation. `approve` accepts only the current preview hash. It cannot approve a replaced candidate.
+`show` returns the current candidate and preview. `revise` stores the exact feedback document and publishes a named feedback operation. `approve` accepts only the current preview token. It cannot approve a replaced candidate.
 
-Use `st3 planning cancel SESSION --reason TEXT --as ACTOR` to end an unwanted session. Use `--print-kdl` to inspect the cancellation declaration before publication.
+Use `st3 launch cancel SESSION --reason TEXT --as ACTOR` to end an unwanted session. Use `--print-kdl` to inspect the cancellation declaration before publication.
 
 ## Revising a mission through planning mode
 
 Use `--run` to bind the session to one exact run generation.
 
 ```sh
-st3 planning start --run mission-run/release/demo feedback.md \
+st3 launch start --run mission-run/release/demo feedback.md \
   --workspace /work/release \
   --as person/operator
 ```
 
-The declaration contains both `target-run` and `target-generation`. If the run moves before publication, the planning session is rejected as stale.
+The declaration contains both `target-run` and `target-generation`. If the run moves before publication, the launch is rejected as stale.
 
 Feedback reopens an existing session with a named operation:
 
@@ -319,7 +319,7 @@ planning-session "planning/release/01990000000070008000000000000000" {
 
 The exact feedback document is stored first. The session returns to the planner and replaces the prior preview.
 
-Approval of a targeted planning preview publishes the candidate mission and creates its revision proposal. When the same person is the required revision reviewer, that one approval counts at both boundaries.
+Approval of a targeted launch preview publishes the candidate mission and creates its revision proposal. When the same person is the required revision reviewer, that one approval counts at both boundaries.
 
 ## Human gates
 
@@ -351,7 +351,7 @@ The decision target is the mission run or step run that owns the gate. The comma
 `st3 attention ls` is the complete human inbox. It includes these current items:
 
 - pending human gates;
-- planning previews that have no blockers;
+- launch previews that have no blockers;
 - pending mission revision approvals;
 - unread messages to a person;
 - explicit fault attention requests.
@@ -365,7 +365,7 @@ The formatted view shows each item with its age, graph context, targets, and exa
 
 `st3 review ls` remains the narrow view for KDL human gates. Use `st3 attention ls` when a person wants all current work that needs a decision or reading.
 
-A message leaves attention when the person reads it. Reading a sent message records delivery before the read. The person does not need to archive it. A blocked planning preview does not enter attention.
+A message leaves attention when the person reads it. Reading a sent message records delivery before the read. The person does not need to archive it. A blocked launch preview does not enter attention.
 
 The runtime does not infer a fault request from ordinary diagnostics. A component creates one explicit request when it needs a person:
 
@@ -409,7 +409,7 @@ mission-run "release/demo" {
 
 Cancellation revokes active work claims, enters adjacent `finally` work, and cascades to descendant mission runs. The run becomes terminal only after its owned runtimes stop.
 
-A planning session uses the same noun:
+A launch uses the same noun:
 
 ```kdl
 version 2
@@ -432,7 +432,7 @@ The main helpers are:
 - `st3 message send --print-kdl` and `st3 message reply --print-kdl`;
 - `st3 resource watch`, `unwatch`, and `refresh` with `--print-kdl`;
 - `st3 runtime reset --print-kdl`;
-- `st3 planning start`, `revise`, and `cancel` with `--print-kdl`;
+- `st3 launch start`, `revise`, and `cancel` with `--print-kdl`;
 - `st3 work revise --print-kdl`;
 - `st3 eval --print-kdl`.
 

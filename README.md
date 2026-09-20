@@ -154,7 +154,7 @@ st message read MESSAGE --as agent/fleet/example/standing/worker
 st message archive MESSAGE --as agent/fleet/example/standing/worker
 ```
 
-Human gates, planning approvals, revision approvals, unread person messages, and explicit faults
+Human gates, launch approvals, revision approvals, unread person messages, and explicit faults
 appear in one inbox:
 
 ```sh
@@ -164,23 +164,23 @@ st attention ls --as person/operator --json
 
 The JSON form contains typed items and exact action arguments for a TUI or native application.
 
-## Planning and revision
+## Launch and revision
 
-A planning session stores its request, planner, candidate missions, feedback, and approval in the
+A launch stores its request, planner, candidate missions, feedback, and approval in the
 claims database:
 
 ```sh
-st planning start request.md --id release --as person/operator
-st planning show planning/release/SESSION
-st planning preview planning/release/SESSION --variant default
-st planning revise planning/release/SESSION feedback.md --as person/operator
-st planning approve planning/release/SESSION PREVIEW_HASH --as person/operator
+st launch start request.md --id release --as person/operator
+st launch show launch/release/SESSION
+st launch preview launch/release/SESSION --variant default
+st launch revise launch/release/SESSION feedback.md --as person/operator
+st launch approve launch/release/SESSION PREVIEW_TOKEN --as person/operator
 ```
 
 A running mission can move to a new revision through a successor generation. Compatible completed
 work remains complete. Changed work and its dependants become ready again.
 
-See the [KDL lifecycle guide](docs/st3/kdl-lifecycle.md) for planning, publication, revision, review,
+See the [KDL lifecycle guide](docs/st3/kdl-lifecycle.md) for authoring, publication, revision, review,
 resource refresh, and cancellation workflows.
 
 ## Inspect and repair

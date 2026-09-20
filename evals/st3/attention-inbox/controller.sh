@@ -25,7 +25,7 @@ cancel_run() {
 
 cleanup() {
   if [[ -n "$planning_session" ]]; then
-    st3 planning cancel "$planning_session" --as "$REVIEWER" \
+    st3 launch cancel "$planning_session" --as "$REVIEWER" \
       --reason "the attention inbox eval finished" >/dev/null 2>&1 || true
   fi
   if [[ -n "$fault_subject" ]]; then
@@ -99,7 +99,7 @@ mkdir -p blocked-planner/.st3
 git -C blocked-planner init -q
 printf '%s\n' 'This tracked file blocks the model-free planner.' >blocked-planner/.st3/boot.md
 git -C blocked-planner add .st3/boot.md
-st3 --json planning start \
+st3 --json launch start \
   --id eval/attention-inbox/planned \
   request.md \
   --workspace "$PWD/blocked-planner" \
@@ -107,11 +107,11 @@ st3 --json planning start \
 planning_session=$(jq -er '.id' planning.json)
 planning_subject=$(jq -er '.subject' planning.json)
 planner=$(jq -er '.planner' planning.json)
-st3 planning submit "$planning_session" \
+st3 launch submit "$planning_session" \
   --markdown planned.md \
   --kdl planned.kdl \
   --as "$planner" >/dev/null
-st3 --json planning preview "$planning_session" >planning-preview.json
+st3 --json launch preview "$planning_session" >planning-preview.json
 
 st3 --json message send "$REVIEWER" \
   --from "$REQUESTER" \
@@ -170,7 +170,7 @@ st3 review approve "$human_owner" --actor "$REVIEWER" \
 st3 work revision approve "$proposal_subject" "$proposal_hash" \
   --as "$REVIEWER" >/dev/null
 proposal_subject=""
-st3 planning cancel "$planning_session" --as "$REVIEWER" \
+st3 launch cancel "$planning_session" --as "$REVIEWER" \
   --reason "the model-free planning item is complete" >/dev/null
 planning_session=""
 

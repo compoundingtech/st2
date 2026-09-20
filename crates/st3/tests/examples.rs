@@ -109,11 +109,11 @@ fn planning_mode_eval_uses_one_dynamic_codex_planner() {
     assert_eq!(
         authored_harness_counts(&source, "planning-mode/eval.kdl"),
         (0, 0),
-        "the planning API, not the eval KDL, owns the durable planner"
+        "the launch API, not the eval KDL, owns the durable planner"
     );
     let controller =
         fs::read_to_string(root.join("controller.sh")).expect("read planning controller");
-    assert!(controller.contains("planning start"));
+    assert!(controller.contains("launch start"));
     assert!(controller.contains("--model gpt-5.6-sol"));
     assert!(!controller.contains("claude"));
 }
@@ -375,7 +375,7 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_sixteen_model_backed_evals(
         let has_dynamic_planner = matches!(name, "planning-mode" | "run-generation-revision")
             && fs::read_to_string(root.join(name).join("controller.sh"))
                 .unwrap()
-                .contains("planning start");
+                .contains("launch start");
         assert!(
             has_authored_model || has_dynamic_planner,
             "{name} must use a model"

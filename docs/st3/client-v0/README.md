@@ -1,6 +1,6 @@
 # st3 client v0 contract
 
-Status: contract baseline. The endpoints in this document are not implemented yet. The files in
+Status: contract baseline with operational and launch read projections implemented. The files in
 [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire examples. Rust and Swift
 clients consume the same JSON; neither client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
@@ -117,6 +117,12 @@ lpv0:<lowercase SHA-256 of RFC 8785 canonical JSON {
 The same values always produce the same token on every host. Approval carries that exact token and
 the launch revision fence. Any candidate, target generation, normalized mission, or diagnostic
 change produces another token. Approval publishes a mission revision but does not start it.
+
+Every preview also carries `structured_diff` and a `st3.visualization.v0` model. The model has
+graph nodes and edges, timeline entries, assignment swimlanes, revision and risk summaries, and
+live-progress placeholders with explicit attempts, leases, progress, blockers, attention, errors,
+and cursors. It is the shared input to graphical and textual clients; those clients never recover
+structure from prose.
 
 ## Typed actions and fences
 

@@ -696,7 +696,7 @@ The list excludes resolved requests, old generations, changed definitions, old a
 
 ### Human attention inbox
 
-`st3 attention ls` combines every current item that needs a person. It includes human gates, planning approvals, revision approvals, unread person messages, and explicit fault requests.
+`st3 attention ls` combines every current item that needs a person. It includes human gates, launch approvals, revision approvals, unread person messages, and explicit fault requests.
 
 `st3 attention ls --as person/NAME` selects one person. `--json` returns typed records and exact action argument arrays.
 
@@ -1133,7 +1133,7 @@ st3 checks the current generation. A candidate cannot add itself as an owner and
 
 `revision-reviewer="person/NAME"` selects the human reviewer. The run requester is the reviewer when this property is absent.
 
-All distinct reviewers for the changed paths must approve. Each approval names the exact proposal preview hash.
+All distinct reviewers for the changed paths must approve. Each approval names the exact proposal preview token.
 
 ```sh
 st3 work revise MISSION_RUN replacement.kdl \
@@ -1141,7 +1141,7 @@ st3 work revise MISSION_RUN replacement.kdl \
   --reason "The generated source adds one verification step."
 
 st3 work revision show MISSION_RUN
-st3 work revision approve PROPOSAL PREVIEW_HASH --as person/reviewer
+st3 work revision approve PROPOSAL PREVIEW_TOKEN --as person/reviewer
 st3 work revision cancel PROPOSAL --as person/reviewer --reason "The request changed."
 ```
 
@@ -1233,30 +1233,30 @@ The mission shortcut fails when it finds zero or multiple active runs. The error
 Planning mode asks one durable Codex harness to author Markdown and KDL for review.
 
 ```sh
-st3 planning start --id release-mission request.md \
+st3 launch start --id release-mission request.md \
   --workspace ./project \
   --as person/nathan \
   --model gpt-5.6-sol \
   --effort medium
 
-st3 planning show SESSION
-st3 planning preview SESSION
-st3 planning revise SESSION feedback.md --as person/nathan
-st3 planning approve SESSION PREVIEW_HASH --as person/nathan
-st3 planning cancel SESSION --as person/nathan --reason "The request changed."
+st3 launch show SESSION
+st3 launch preview SESSION
+st3 launch revise SESSION feedback.md --as person/nathan
+st3 launch approve SESSION PREVIEW_TOKEN --as person/nathan
+st3 launch cancel SESSION --as person/nathan --reason "The request changed."
 ```
 
 Planning can also prepare a revision for one current mission run:
 
 ```sh
-st3 planning start --run MISSION_RUN request.md \
+st3 launch start --run MISSION_RUN request.md \
   --workspace ./project \
   --as person/nathan
 
-st3 planning preview SESSION --variant compact
-st3 planning preview SESSION --variant extended
-st3 planning compare SESSION compact extended
-st3 planning propose SESSION extended \
+st3 launch preview SESSION --variant compact
+st3 launch preview SESSION --variant extended
+st3 launch compare SESSION compact extended
+st3 launch propose SESSION extended \
   --as person/nathan \
   --reason "The extended variant covers the discovered risk."
 ```
@@ -1264,7 +1264,7 @@ st3 planning propose SESSION extended \
 The planner uses this command:
 
 ```sh
-st3 planning submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
+st3 launch submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
 ```
 
 The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.
@@ -1284,7 +1284,7 @@ Preview returns these review values:
 - exact subject tokens;
 - one hash over the complete preview.
 
-Revision invalidates the prior preview. Approval requires the current preview hash and current subject tokens.
+Revision invalidates the prior preview. Approval requires the current preview token and current subject tokens.
 
 Approval publishes the ready mission and one `planning-session.approved` claim. It does not start a run. Approval and cancellation stop the planner.
 
@@ -1308,7 +1308,7 @@ The API endpoint is `POST /v1/gate-results`. The durable kinds are `gate.request
 Mission execution uses these important claim kinds:
 
 - `mission.published` records an immutable mission revision.
-- `planning-session.approved` links an approved planning session to Markdown and KDL.
+- `planning-session.approved` links an approved launch to Markdown and KDL.
 - `mission-run.created` and `mission-run.state` record stable run history.
 - `run-generation.created`, `run-generation.superseded`, and `run-generation.state` record revision lineage.
 - `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied` record revision review.
@@ -1327,6 +1327,6 @@ New top-level eval fixtures belong to the eval run and leave the selected graph 
 
 The planning-mode eval uses one real Codex planner. A controller waits on the event stream and directly approves the first valid candidate. Mechanical gates prove that the mission was hidden before approval, the preview graph and diff were rendered, the exact hash was approved, one ready mission was published, no run started, immutable documents were linked, the planner stopped, and the workspace did not change.
 
-The planning variant and stale-generation paths are deterministic API tests. They do not spend a model run.
+The launch variant and stale-generation paths are deterministic API tests. They do not spend a model run.
 
 The run-generation revision eval proves an approved cutover, lineage, state carry-over, and automatic generation context. It uses no model run.

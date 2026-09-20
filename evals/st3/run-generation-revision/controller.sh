@@ -62,7 +62,7 @@ st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --field state=done >/dev/null
 st3 wait "$stable_subject" --for completed --timeout 2m >/dev/null
 
-st3 --json planning start \
+st3 --json launch start \
   --run "$run_subject" \
   "$REQUEST" \
   --workspace "$EVAL_ROOT" \
@@ -85,8 +85,8 @@ jq -e --arg revision "$(jq -er '.mission_run.revision' "$EVAL_ROOT/initial-run.j
   and .revision == $revision
 ' "$EVAL_ROOT/before-approval.json" >/dev/null
 
-variant=$(st3 --json planning show "$session_id" | jq -er '.candidate.variant')
-st3 --json planning preview "$session_id" --variant "$variant" > "$EVAL_ROOT/preview.json"
+variant=$(st3 --json launch show "$session_id" | jq -er '.candidate.variant')
+st3 --json launch preview "$session_id" --variant "$variant" > "$EVAL_ROOT/preview.json"
 preview_hash=$(jq -er '.preview.hash' "$EVAL_ROOT/preview.json")
 jq -e '
   .status == "review"
@@ -97,7 +97,7 @@ jq -e '
   and (.preview.mission.blockers | length == 0)
 ' "$EVAL_ROOT/preview.json" >/dev/null
 
-st3 --json planning approve \
+st3 --json launch approve \
   "$session_id" \
   "$preview_hash" \
   --as "$REQUESTER" \

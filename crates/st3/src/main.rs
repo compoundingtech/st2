@@ -21,15 +21,16 @@ use st3::model::{
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
-    MessageLifecycleRequest, MessageSendRequest, MessageView, MissionOutputView,
-    MissionProductionRequest, MissionRequest, MissionResponse, MissionRevisionRequest,
-    MissionRunView, MissionState, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningSessionView, QuickAgentResponse, ReplicaRecordView,
-    ReplicationRepairRequest, ReplicationStatus, ResourceRefreshView, ResourceWatchView,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
-    StepRunView, WorkRequest, WorkWakeRequest,
+    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
+    LaunchDecisionRequest, LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunView, MissionState, PlanningApprovalRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
+    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
+    ResourceRefreshView, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -72,10 +73,10 @@ enum Command {
     Codex(QuickArgs),
     /// Preview a new-format KDL intent.
     Preview(FileArgs),
-    /// Create and review a durable Codex planning session.
-    Planning {
+    /// Create and review a durable planner-backed launch.
+    Launch {
         #[command(subcommand)]
-        command: PlanningCommand,
+        command: LaunchCommand,
     },
     /// Inspect a mission or its one active run.
     Mission {
@@ -254,13 +255,21 @@ struct FileArgs {
 }
 
 #[derive(Subcommand)]
-enum PlanningCommand {
+enum LaunchCommand {
     Start(PlanningStartArgs),
     Show(PlanningSessionArgs),
     Preview(PlanningPreviewArgs),
     Submit(PlanningSubmitArgs),
     Revise(PlanningReviseArgs),
     Approve(PlanningApproveArgs),
+    /// Atomically request approval, then idempotently start the published mission revision.
+    ApproveAndLaunch(LaunchApproveAndStartArgs),
+    /// Start the exact published revision of an already approved launch.
+    Run(LaunchRunArgs),
+    /// Ask the requester one typed, revisioned question.
+    Question(LaunchQuestionArgs),
+    /// Record the immutable answer to a launch question.
+    Answer(LaunchAnswerArgs),
     Cancel(PlanningCancelArgs),
     Compare(PlanningCompareArgs),
     Propose(PlanningProposeArgs),
@@ -375,6 +384,50 @@ struct PlanningReviseArgs {
 struct PlanningApproveArgs {
     session: String,
     preview_hash: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LaunchApproveAndStartArgs {
+    session: String,
+    preview_hash: String,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LaunchRunArgs {
+    session: String,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LaunchQuestionArgs {
+    session: String,
+    question: String,
+    #[arg(long = "choice", required = true)]
+    choices: Vec<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct LaunchAnswerArgs {
+    session: String,
+    decision: String,
+    answer: String,
+    #[arg(long, default_value_t = 1)]
+    expected_revision: u32,
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -1183,7 +1236,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_quick(&client, endpoint, &config, args, "codex", cli.json).await
         }
         Command::Preview(args) => run_preview(&client, args, cli.json).await,
-        Command::Planning { command } => run_planning(&client, command, cli.json).await,
+        Command::Launch { command } => run_launch(&client, command, cli.json).await,
         Command::Mission { command } => run_mission_view(&client, command, cli.json).await,
         Command::Publish(args) => publish_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
@@ -1350,14 +1403,14 @@ async fn run_preview(client: &Client, args: FileArgs, json_output: bool) -> Resu
     print_mission(&response, json_output)
 }
 
-async fn run_planning(client: &Client, command: PlanningCommand, json_output: bool) -> Result<()> {
+async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) -> Result<()> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let response = match command {
-        PlanningCommand::Start(args) => {
+        LaunchCommand::Start(args) => {
             let (request, _) = read_intent(args.request.as_deref())?;
             anyhow::ensure!(
                 !request.trim().is_empty(),
-                "a planning request cannot be empty"
+                "a launch request cannot be empty"
             );
             let workspace = fs::canonicalize(&args.workspace)
                 .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
@@ -1377,8 +1430,8 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .as_ref()
                 .map(|run| run.mission.trim_start_matches("mission/").to_owned())
                 .or(args.id)
-                .context("planning start needs --id or --run")?;
-            let session_id = format!("planning/{mission_id}/{}", uuid::Uuid::now_v7().simple());
+                .context("launch start needs --id or --run")?;
+            let session_id = format!("launch/{mission_id}/{}", uuid::Uuid::now_v7().simple());
             let request_hash = hex::encode(Sha256::digest(request.as_bytes()));
             let request_name = format!("doc/planning/{session_id}/request");
             let request_reference = format!("{request_name}@{request_hash}");
@@ -1411,36 +1464,36 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
             publish_text(
                 client,
                 kdl,
-                format!("st3 planning start {session_id}"),
+                format!("st3 launch start {session_id}"),
                 requester.clone(),
             )
             .await?;
             client
                 .get::<PlanningSessionView>(&format!(
-                    "/v1/planning-sessions/{}",
+                    "/v1/launches/{}",
                     urlencoding::encode(&session_id)
                 ))
                 .await?
         }
-        PlanningCommand::Show(args) => {
+        LaunchCommand::Show(args) => {
             client
                 .get::<PlanningSessionView>(&format!(
-                    "/v1/planning-sessions/{}",
+                    "/v1/launches/{}",
                     urlencoding::encode(&args.session)
                 ))
                 .await?
         }
-        PlanningCommand::Preview(args) => {
+        LaunchCommand::Preview(args) => {
             let path = args.variant.as_deref().map_or_else(
                 || {
                     format!(
-                        "/v1/planning-sessions/{}/preview",
+                        "/v1/launches/{}/preview",
                         urlencoding::encode(&args.session)
                     )
                 },
                 |variant| {
                     format!(
-                        "/v1/planning-sessions/{}/variants/{}/preview",
+                        "/v1/launches/{}/variants/{}/preview",
                         urlencoding::encode(&args.session),
                         urlencoding::encode(variant)
                     )
@@ -1450,11 +1503,11 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .post::<_, PlanningSessionView>(&path, &json!({}))
                 .await?
         }
-        PlanningCommand::Submit(args) => {
+        LaunchCommand::Submit(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
-                        "/v1/planning-sessions/{}/variants/{}/submit",
+                        "/v1/launches/{}/variants/{}/submit",
                         urlencoding::encode(&args.session),
                         urlencoding::encode(&args.variant)
                     ),
@@ -1470,12 +1523,12 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 )
                 .await?
         }
-        PlanningCommand::Revise(args) => {
+        LaunchCommand::Revise(args) => {
             let actor =
                 normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
             let feedback = fs::read(&args.feedback)
                 .with_context(|| format!("read feedback {}", args.feedback.display()))?;
-            std::str::from_utf8(&feedback).context("planning feedback must be UTF-8 text")?;
+            std::str::from_utf8(&feedback).context("launch feedback must be UTF-8 text")?;
             let hash = hex::encode(Sha256::digest(&feedback));
             let session = args
                 .session
@@ -1495,19 +1548,19 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 return Ok(());
             }
             put_document_bytes(client, document_name, feedback).await?;
-            publish_text(client, kdl, format!("st3 planning revise {session}"), actor).await?;
+            publish_text(client, kdl, format!("st3 launch revise {session}"), actor).await?;
             client
                 .get::<PlanningSessionView>(&format!(
-                    "/v1/planning-sessions/{}",
+                    "/v1/launches/{}",
                     urlencoding::encode(session)
                 ))
                 .await?
         }
-        PlanningCommand::Approve(args) => {
+        LaunchCommand::Approve(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
-                        "/v1/planning-sessions/{}/approve",
+                        "/v1/launches/{}/approve",
                         urlencoding::encode(&args.session)
                     ),
                     &PlanningApprovalRequest {
@@ -1518,7 +1571,78 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 )
                 .await?
         }
-        PlanningCommand::Cancel(args) => {
+        LaunchCommand::ApproveAndLaunch(args) => {
+            let workspace = fs::canonicalize(&args.workspace)
+                .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
+            let response: LaunchApproveAndStartView = client
+                .post(
+                    &format!(
+                        "/v1/launches/{}/approve-and-launch",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &LaunchApproveAndStartRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        preview_hash: args.preview_hash,
+                        workspace: workspace.to_string_lossy().into_owned(),
+                        inputs: args.inputs.into_iter().collect(),
+                        idempotency_key: format!("launch-approve-and-start:{nonce}"),
+                    },
+                )
+                .await?;
+            return print_value(&response, json_output);
+        }
+        LaunchCommand::Run(args) => {
+            let workspace = fs::canonicalize(&args.workspace)
+                .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
+            let response: MissionRunView = client
+                .post(
+                    &format!("/v1/launches/{}/start", urlencoding::encode(&args.session)),
+                    &LaunchStartRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        workspace: workspace.to_string_lossy().into_owned(),
+                        inputs: args.inputs.into_iter().collect(),
+                        idempotency_key: format!("launch-start:{nonce}"),
+                    },
+                )
+                .await?;
+            return print_value(&response, json_output);
+        }
+        LaunchCommand::Question(args) => {
+            let response: Value = client
+                .post(
+                    &format!(
+                        "/v1/launches/{}/decisions",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &LaunchDecisionRequest {
+                        actor: args.actor,
+                        question: args.question,
+                        choices: args.choices,
+                        idempotency_key: format!("launch-question:{nonce}"),
+                    },
+                )
+                .await?;
+            return print_value(&response, json_output);
+        }
+        LaunchCommand::Answer(args) => {
+            let response: Value = client
+                .post(
+                    &format!(
+                        "/v1/launches/{}/decisions/{}/answer",
+                        urlencoding::encode(&args.session),
+                        urlencoding::encode(&args.decision),
+                    ),
+                    &LaunchDecisionAnswerRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        answer: args.answer,
+                        expected_revision: args.expected_revision,
+                        idempotency_key: format!("launch-answer:{nonce}"),
+                    },
+                )
+                .await?;
+            return print_value(&response, json_output);
+        }
+        LaunchCommand::Cancel(args) => {
             let actor =
                 normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
             let session = args
@@ -1529,26 +1653,24 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
             let kdl = planning_cancellation_intent(
                 session,
                 &operation,
-                args.reason
-                    .as_deref()
-                    .unwrap_or("the planning session was cancelled"),
+                args.reason.as_deref().unwrap_or("the launch was cancelled"),
             );
             if args.print_kdl {
                 print!("{kdl}");
                 return Ok(());
             }
-            publish_text(client, kdl, format!("st3 planning cancel {session}"), actor).await?;
+            publish_text(client, kdl, format!("st3 launch cancel {session}"), actor).await?;
             client
                 .get::<PlanningSessionView>(&format!(
-                    "/v1/planning-sessions/{}",
+                    "/v1/launches/{}",
                     urlencoding::encode(session)
                 ))
                 .await?
         }
-        PlanningCommand::Compare(args) => {
+        LaunchCommand::Compare(args) => {
             let response: Value = client
                 .get(&format!(
-                    "/v1/planning-sessions/{}/variants/{}/compare/{}",
+                    "/v1/launches/{}/variants/{}/compare/{}",
                     urlencoding::encode(&args.session),
                     urlencoding::encode(&args.left),
                     urlencoding::encode(&args.right)
@@ -1556,14 +1678,14 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .await?;
             return print_value(&response, json_output);
         }
-        PlanningCommand::Propose(args) => {
+        LaunchCommand::Propose(args) => {
             let actor = args
                 .actor
                 .context("a planning proposal needs --as or ST_AGENT")?;
             let response: RevisionSubmissionView = client
                 .post(
                     &format!(
-                        "/v1/planning-sessions/{}/variants/{}/propose",
+                        "/v1/launches/{}/variants/{}/propose",
                         urlencoding::encode(&args.session),
                         urlencoding::encode(&args.variant)
                     ),
@@ -5798,7 +5920,7 @@ fn normalize_planning_requester(actor: &str) -> Result<String> {
     };
     anyhow::ensure!(
         actor.starts_with("person/"),
-        "a planning requester must be a person subject"
+        "a launch requester must be a person subject"
     );
     Ok(actor)
 }
@@ -7330,8 +7452,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_the_removed_plan_command() {
+    fn cli_exposes_launch_without_removed_planning_aliases() {
         assert!(Cli::try_parse_from(["st3", "plan", "show", "example"]).is_err());
+        assert!(Cli::try_parse_from(["st3", "planning", "show", "example"]).is_err());
+        let cli = Cli::try_parse_from(["st3", "launch", "show", "example"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Launch {
+                command: LaunchCommand::Show(_)
+            }
+        ));
     }
 
     #[test]

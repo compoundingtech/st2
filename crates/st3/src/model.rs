@@ -837,6 +837,47 @@ pub struct PlanningApprovalRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaunchDecisionRequest {
+    pub actor: String,
+    pub question: String,
+    pub choices: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaunchDecisionAnswerRequest {
+    pub actor: String,
+    pub answer: String,
+    pub expected_revision: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaunchStartRequest {
+    pub actor: String,
+    pub workspace: String,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaunchApproveAndStartRequest {
+    pub actor: String,
+    pub preview_hash: String,
+    pub workspace: String,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaunchApproveAndStartView {
+    pub launch: PlanningSessionView,
+    pub mission_run: MissionRunView,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanningCancelRequest {
     pub actor: String,
     #[serde(default)]

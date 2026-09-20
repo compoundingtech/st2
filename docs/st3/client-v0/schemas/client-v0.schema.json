@@ -188,10 +188,102 @@
             "target_generation": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "normalized_mission": { "type": "object" },
             "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/Diagnostic" } },
-            "preview_token": { "type": ["string", "null"], "pattern": "^lpv0:[0-9a-f]{64}$" }
+            "preview_token": { "type": ["string", "null"], "pattern": "^lpv0:[0-9a-f]{64}$" },
+            "structured_diff": { "$ref": "#/$defs/StructuredDiff" },
+            "visualization": { "$ref": "#/$defs/Visualization" }
           }
         }
       ]
+    },
+    "StructuredDiff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changes", "predicted_actions"],
+      "properties": {
+        "changes": { "type": "array", "items": { "type": "object" } },
+        "predicted_actions": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "Visualization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "views", "nodes", "edges", "groups", "timeline", "swimlanes"],
+      "properties": {
+        "version": { "const": "st3.visualization.v0" },
+        "views": {
+          "type": "array",
+          "items": { "enum": ["graph", "timeline", "swimlane", "revision", "risk", "live-progress"] },
+          "uniqueItems": true
+        },
+        "mission": { "type": "string" },
+        "nodes": { "type": "array", "items": { "$ref": "#/$defs/VisualizationNode" } },
+        "edges": { "type": "array", "items": { "$ref": "#/$defs/VisualizationEdge" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/VisualizationGroup" } },
+        "timeline": {
+          "type": "object",
+          "required": ["entries"],
+          "properties": { "entries": { "type": "array", "items": { "type": "object" } } }
+        },
+        "swimlanes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "assignment", "nodes"],
+            "properties": {
+              "id": { "type": "string" },
+              "assignment": { "type": "string" },
+              "nodes": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "gates": { "type": "array", "items": { "type": "object" } },
+        "resources": { "type": "array", "items": { "type": "object" } },
+        "revision": { "type": "object" },
+        "risk": { "type": "object" },
+        "live_progress": { "type": "object" }
+      }
+    },
+    "VisualizationNode": {
+      "type": "object",
+      "required": ["id", "kind", "label", "path", "goals", "constraints", "runtime"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "type": "string" },
+        "label": { "type": "string" },
+        "path": { "type": "string" },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "assignment": {},
+        "timeout_ms": { "type": ["integer", "null"] },
+        "retry": { "type": "object" },
+        "gates": { "type": "array" },
+        "loop": {},
+        "resources": { "type": "array" },
+        "source_references": { "type": "array" },
+        "runtime": { "type": "object" }
+      }
+    },
+    "VisualizationEdge": {
+      "type": "object",
+      "required": ["id", "kind", "from", "to", "gate"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["dependency", "gate"] },
+        "from": { "type": ["string", "null"] },
+        "to": { "type": "string" },
+        "gate": {}
+      }
+    },
+    "VisualizationGroup": {
+      "type": "object",
+      "required": ["id", "kind", "members"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["queue", "nested-mission"] },
+        "members": { "type": "array", "items": { "type": "string" } }
+      }
     },
     "Diagnostic": {
       "type": "object",

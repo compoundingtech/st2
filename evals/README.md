@@ -50,7 +50,7 @@ The ten remaining pairs are model-free.
 
 Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-free.
 
-Run Generation Revision starts one Codex planner through the planning API.
+Run Generation Revision starts one Codex planner through the launch API.
 
 The st3 corpus has 29 evals. Thirteen are model-free, and sixteen use at least one model.
 
@@ -84,8 +84,8 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Mission Document Lift | Codex × 1 | None |
 | st3 | Mixed Worker Pool | Claude Sonnet × 1, Codex × 1 | None |
-| st3 | Planning Mode | Codex × 1, created by the planning API | None |
-| st3 | Run Generation Revision | Codex × 1, created by the planning API | None |
+| st3 | Planning Mode | Codex × 1, created by the launch API | None |
+| st3 | Run Generation Revision | Codex × 1, created by the launch API | None |
 | st3 | Continuous Stewardship | Codex × 1 | None |
 | st3 | Agent Migration Rehearsal | Codex × 1 | None |
 | st3 | Automatic GitHub Intake | Codex × 1 | None |
