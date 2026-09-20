@@ -1659,6 +1659,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             if matches!(view.status.as_str(), "completed" | "cancelled") {
                 continue;
             }
+            if view.status == "ready"
+                && view.blocked_reason.as_deref() == Some("the worker lease expired")
+            {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "ready",
+                    Some("the worker lease expired"),
+                )?;
+                continue;
+            }
             if let Some(expiry) = view.claim_expires_at_unix_ms
                 && expiry <= now_ms()
                 && matches!(view.status.as_str(), "claimed" | "working")

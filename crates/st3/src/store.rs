@@ -2498,6 +2498,15 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        terminalize_generation_steps_tx(
+            &transaction,
+            &self.origin,
+            &predecessor_id,
+            "the owning run generation was superseded",
+            Some(&actor),
+            None,
+            now,
+        )?;
         append_claim_tx(
             &transaction,
             &self.origin,
@@ -2692,28 +2701,38 @@ impl Store {
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
              WHERE agentless=0
-               AND (
-                 ?1 IS NULL
-                 OR assignee=?1
-                 OR lease_owner=?1
-                 OR (status='ready' AND EXISTS (
-                   SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1
-                 ))
-               )
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
-               AND (
-                 (SELECT phase FROM mission_runs WHERE id=step_runs.run_id) != 'revision-draining'
-                 OR status IN ('claimed','working','verifying')
-               )
-               AND (?2 OR status NOT IN ('completed','failed','cancelled'))
              ORDER BY created_at_unix_ms, step_path",
         )?;
-        let rows = statement.query_map(params![actor, include_terminal], step_run_from_row)?;
-        let mut views = rows.collect::<Result<Vec<_>, _>>()?;
-        for view in &mut views {
-            enrich_step_queue(&connection, view)?;
+        let rows = statement.query_map([], step_run_from_row)?;
+        let views = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut visible = Vec::with_capacity(views.len());
+        for mut view in views {
+            enrich_step_queue(&connection, &mut view)?;
+            let run_phase: String = connection.query_row(
+                "SELECT phase FROM mission_runs WHERE id=?1",
+                [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
+                |row| row.get(0),
+            )?;
+            if run_phase == "revision-draining"
+                && !matches!(view.status.as_str(), "claimed" | "working" | "verifying")
+            {
+                continue;
+            }
+            let visible_to_actor = actor.as_ref().is_none_or(|actor| {
+                view.assigned_to.as_deref() == Some(actor.as_str())
+                    || view.claimant.as_deref() == Some(actor.as_str())
+                    || (view.status == "ready"
+                        && view.available_to.iter().any(|candidate| candidate == actor))
+            });
+            if visible_to_actor
+                && (include_terminal
+                    || !matches!(view.status.as_str(), "completed" | "failed" | "cancelled"))
+            {
+                visible.push(view);
+            }
         }
-        Ok(views)
+        Ok(visible)
     }
 
     pub fn step_run(&self, subject: &str) -> Result<Option<StepRunView>> {
@@ -2773,14 +2792,26 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
-        let current_generation: String = transaction
+        let (run_status, run_phase, current_generation, generation_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = transaction
             .query_row(
-                "SELECT current_generation_id FROM mission_runs WHERE id=?1",
-                [current
-                    .run
-                    .strip_prefix("mission-run/")
-                    .unwrap_or(&current.run)],
-                |row| row.get(0),
+                "SELECT mission_runs.status, mission_runs.phase,
+                        mission_runs.current_generation_id, run_generations.status
+                 FROM mission_runs JOIN run_generations
+                   ON run_generations.id=?2
+                 WHERE mission_runs.id=?1",
+                params![
+                    current
+                        .run
+                        .strip_prefix("mission-run/")
+                        .unwrap_or(&current.run),
+                    generation_id_from_subject(&current.generation),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(internal)?;
         if generation_id_from_subject(&current.generation) != current_generation {
@@ -2789,16 +2820,15 @@ impl Store {
                 format!("step run `{subject}` belongs to a superseded generation"),
             ));
         }
-        let run_phase: String = transaction
-            .query_row(
-                "SELECT phase FROM mission_runs WHERE id=?1",
-                [current
-                    .run
-                    .strip_prefix("mission-run/")
-                    .unwrap_or(&current.run)],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
+        if is_terminal_run_state(&run_status)
+            || run_phase == "terminal"
+            || is_terminal_generation_state(&generation_status)
+        {
+            return Err(St3Error::new(
+                "terminal-work-owner",
+                format!("the owner of step run `{subject}` is terminal"),
+            ));
+        }
         if action == "claim" && run_phase == "revision-draining" {
             return Err(St3Error::new(
                 "run-generation-draining",
@@ -2974,21 +3004,40 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<(String, bool, u32)> = transaction
+        let current: Option<(String, bool, u32, String, String, String)> = transaction
             .query_row(
                 "SELECT step_runs.status,
                         step_runs.generation_id=mission_runs.current_generation_id,
-                        step_runs.readiness_epoch
+                        step_runs.readiness_epoch, mission_runs.status, mission_runs.phase,
+                        run_generations.status
                  FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+                 JOIN run_generations ON run_generations.id=step_runs.generation_id
                  WHERE step_runs.subject=?1",
                 [&subject],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((current, is_current, current_epoch)) = current else {
+        let Some((current, is_current, current_epoch, run_status, run_phase, generation_status)) =
+            current
+        else {
             return Ok(false);
         };
-        if !is_current || current == status {
+        if !is_current
+            || current == status
+            || ((is_terminal_run_state(&run_status)
+                || run_phase == "terminal"
+                || is_terminal_generation_state(&generation_status))
+                && !matches!(status, "completed" | "failed" | "cancelled"))
+        {
             return Ok(false);
         }
         let now = now_ms();
@@ -3021,20 +3070,37 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<(String, u32, bool)> = transaction
+        let current: Option<(String, u32, bool, String, String, String)> = transaction
             .query_row(
                 "SELECT step_runs.status, step_runs.attempt,
-                        step_runs.generation_id=mission_runs.current_generation_id
+                        step_runs.generation_id=mission_runs.current_generation_id,
+                        mission_runs.status, mission_runs.phase, run_generations.status
                  FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+                 JOIN run_generations ON run_generations.id=step_runs.generation_id
                  WHERE step_runs.subject=?1",
                 [&subject],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((status, attempt, is_current)) = current else {
+        let Some((status, attempt, is_current, run_status, run_phase, generation_status)) = current
+        else {
             return Ok(false);
         };
-        if !is_current || status != "failed" {
+        if !is_current
+            || status != "failed"
+            || is_terminal_run_state(&run_status)
+            || run_phase == "terminal"
+            || is_terminal_generation_state(&generation_status)
+        {
             return Ok(false);
         }
         let now = now_ms();
@@ -3128,6 +3194,17 @@ impl Store {
             &[],
             None,
         )?;
+        if is_terminal_run_state(status) || phase == "terminal" {
+            terminalize_run_steps_tx(
+                &transaction,
+                &self.origin,
+                run,
+                reason.unwrap_or("the owning mission run is terminal"),
+                None,
+                None,
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(true)
     }
@@ -7870,6 +7947,15 @@ fn adopt_declared_mission_revision_tx(
     )
     .map_err(internal)?;
     claim_ids.push(superseded.id);
+    claim_ids.extend(terminalize_generation_steps_tx(
+        transaction,
+        origin,
+        &predecessor_id,
+        "the owning run generation was superseded",
+        Some(&actor),
+        Some(batch_id),
+        now,
+    )?);
     let created = append_claim_tx(
         transaction,
         origin,
@@ -10427,6 +10513,10 @@ fn is_terminal_run_state(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
 
+fn is_terminal_generation_state(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "superseded")
+}
+
 fn canonical_hash(value: &impl Serialize) -> Result<String> {
     let mut bytes = Vec::new();
     ciborium::into_writer(value, &mut bytes)?;
@@ -11671,12 +11761,38 @@ fn project_mission_run_update(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("superseded");
+        let current_status = transaction
+            .query_row(
+                "SELECT status FROM run_generations WHERE id=?1",
+                [generation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if current_status
+            .as_deref()
+            .is_some_and(is_terminal_generation_state)
+            && !is_terminal_generation_state(status)
+        {
+            return Ok(());
+        }
         transaction
             .execute(
                 "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3 WHERE id=?1",
                 params![generation_id, status, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
+        if is_terminal_generation_state(status) {
+            terminalize_projected_generation_steps_tx(
+                transaction,
+                generation_id,
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the owning run generation is terminal"),
+                claim.accepted_at_unix_ms,
+            )?;
+        }
         return Ok(());
     }
     if claim.kind == "mission-run.state" {
@@ -11690,18 +11806,47 @@ fn project_mission_run_update(
             .get("phase")
             .and_then(Value::as_str)
             .unwrap_or("normal");
+        let current = transaction
+            .query_row(
+                "SELECT status, phase FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if current.is_some_and(|(current_status, current_phase)| {
+            (is_terminal_run_state(&current_status) || current_phase == "terminal")
+                && !(is_terminal_run_state(status) || phase == "terminal")
+        }) {
+            return Ok(());
+        }
         transaction
             .execute(
                 "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
                 params![run_id, status, phase, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
+        if is_terminal_run_state(status) || phase == "terminal" {
+            terminalize_projected_run_steps_tx(
+                transaction,
+                run_id,
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the owning mission run is terminal"),
+                claim.accepted_at_unix_ms,
+            )?;
+        }
         return Ok(());
     }
     if !claim.subject.starts_with("step-run/") {
         return Ok(());
     }
+    let owner_is_terminal = step_owner_is_terminal_tx(transaction, &claim.subject)?;
     if claim.kind == "step-run.retried" {
+        if owner_is_terminal {
+            return Ok(());
+        }
         let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
             return Ok(());
         };
@@ -11722,6 +11867,9 @@ fn project_mission_run_update(
     let Some(status) = fields.get("status").and_then(Value::as_str) else {
         return Ok(());
     };
+    if owner_is_terminal && !matches!(status, "completed" | "failed" | "cancelled") {
+        return Ok(());
+    }
     if claim.kind == "step-run.state" {
         transaction
             .execute(
@@ -11738,6 +11886,9 @@ fn project_mission_run_update(
         return Ok(());
     }
     if claim.kind.starts_with("work.") {
+        if owner_is_terminal {
+            return Ok(());
+        }
         let claim_attempt = fields.get("attempt").and_then(Value::as_u64).unwrap_or(1);
         let current_attempt = transaction
             .query_row(
@@ -12694,6 +12845,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
 }
 
 fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
+    apply_effective_step_state(connection, view)?;
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -12720,6 +12872,63 @@ fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlit
     if let Some(step) = crate::mission::find_step(&mission, &view.step) {
         view.queue.clone_from(&step.queue);
         view.queue_position = step.queue_position;
+    }
+    Ok(())
+}
+
+fn apply_effective_step_state(
+    connection: &Connection,
+    view: &mut StepRunView,
+) -> rusqlite::Result<()> {
+    let owner = connection
+        .query_row(
+            "SELECT mission_runs.status, mission_runs.phase,
+                    mission_runs.current_generation_id, run_generations.status
+             FROM mission_runs JOIN run_generations
+               ON run_generations.id=?2 AND run_generations.run_id=mission_runs.id
+             WHERE mission_runs.id=?1",
+            params![
+                view.run.strip_prefix("mission-run/").unwrap_or(&view.run),
+                generation_id_from_subject(&view.generation),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((run_status, run_phase, current_generation, generation_status)) = owner else {
+        return Ok(());
+    };
+    let generation_id = generation_id_from_subject(&view.generation);
+    if is_terminal_run_state(&run_status)
+        || run_phase == "terminal"
+        || is_terminal_generation_state(&generation_status)
+        || generation_id != current_generation
+    {
+        if !matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
+            view.status = "cancelled".into();
+            view.blocked_reason = Some("the owning mission run or generation is terminal".into());
+        }
+        view.claimant = None;
+        view.claim_incarnation = None;
+        view.claim_expires_at_unix_ms = None;
+        return Ok(());
+    }
+    if matches!(view.status.as_str(), "claimed" | "working")
+        && view
+            .claim_expires_at_unix_ms
+            .is_some_and(|expiry| expiry <= now_ms())
+    {
+        view.status = "ready".into();
+        view.blocked_reason = Some("the worker lease expired".into());
+        view.claimant = None;
+        view.claim_incarnation = None;
+        view.claim_expires_at_unix_ms = None;
     }
     Ok(())
 }
@@ -12927,6 +13136,166 @@ fn descendant_mission_run_ids_tx(
     statement
         .query_map([generation_id], |row| row.get::<_, String>(0))?
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminalize_generation_steps_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    generation_id: &str,
+    reason: &str,
+    actor: Option<&str>,
+    batch_id: Option<&str>,
+    now: u128,
+) -> Result<Vec<String>, St3Error> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT subject FROM step_runs
+             WHERE generation_id=?1 AND status NOT IN ('completed','failed','cancelled')
+             ORDER BY subject",
+        )
+        .map_err(internal)?;
+    let subjects = statement
+        .query_map([generation_id], |row| row.get::<_, String>(0))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    drop(statement);
+
+    let mut claim_ids = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        transaction
+            .execute(
+                "UPDATE step_runs
+                 SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
+                     lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                     updated_at_unix_ms=?3
+                 WHERE subject=?1",
+                params![subject, reason, now.to_string()],
+            )
+            .map_err(internal)?;
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &subject,
+            "step-run.state",
+            actor,
+            &json!({"fields": {"status": "cancelled", "reason": reason}}),
+            &[],
+            batch_id,
+        )
+        .map_err(internal)?;
+        claim_ids.push(claim.id);
+    }
+    Ok(claim_ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminalize_run_steps_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    run_id: &str,
+    reason: &str,
+    actor: Option<&str>,
+    batch_id: Option<&str>,
+    now: u128,
+) -> Result<Vec<String>, St3Error> {
+    let mut statement = transaction
+        .prepare("SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id")
+        .map_err(internal)?;
+    let generations = statement
+        .query_map([run_id], |row| row.get::<_, String>(0))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    drop(statement);
+    let mut claim_ids = Vec::new();
+    for generation in generations {
+        claim_ids.extend(terminalize_generation_steps_tx(
+            transaction,
+            origin,
+            &generation,
+            reason,
+            actor,
+            batch_id,
+            now,
+        )?);
+    }
+    Ok(claim_ids)
+}
+
+fn terminalize_projected_generation_steps_tx(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    reason: &str,
+    updated_at_unix_ms: u128,
+) -> Result<(), St3Error> {
+    transaction
+        .execute(
+            "UPDATE step_runs
+             SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
+                 lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                 updated_at_unix_ms=?3
+             WHERE generation_id=?1 AND status NOT IN ('completed','failed','cancelled')",
+            params![generation_id, reason, updated_at_unix_ms.to_string()],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn terminalize_projected_run_steps_tx(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    reason: &str,
+    updated_at_unix_ms: u128,
+) -> Result<(), St3Error> {
+    transaction
+        .execute(
+            "UPDATE step_runs
+             SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
+                 lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                 updated_at_unix_ms=?3
+             WHERE run_id=?1 AND status NOT IN ('completed','failed','cancelled')",
+            params![run_id, reason, updated_at_unix_ms.to_string()],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn step_owner_is_terminal_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+) -> Result<bool, St3Error> {
+    let owner = transaction
+        .query_row(
+            "SELECT mission_runs.status, mission_runs.phase,
+                    mission_runs.current_generation_id, step_runs.generation_id,
+                    run_generations.status
+             FROM step_runs
+             JOIN mission_runs ON mission_runs.id=step_runs.run_id
+             JOIN run_generations ON run_generations.id=step_runs.generation_id
+             WHERE step_runs.subject=?1",
+            [subject],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal)?;
+    Ok(owner.is_some_and(
+        |(run_status, run_phase, current_generation, generation, generation_status)| {
+            is_terminal_run_state(&run_status)
+                || run_phase == "terminal"
+                || is_terminal_generation_state(&generation_status)
+                || current_generation != generation
+        },
+    ))
 }
 
 fn cancel_mission_run_tx(
@@ -13608,6 +13977,33 @@ mod tests {
         source
             .export_replication_exchange(TEST_FLEET, remote)
             .expect("replication exchange")
+    }
+
+    fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
+        let current = store.step_run(subject).unwrap().unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let claim = append_claim_tx(
+            &transaction,
+            &store.origin,
+            subject,
+            "work.renewed",
+            Some(actor),
+            &json!({"fields": {
+                "attempt": current.attempt,
+                "status": current.status,
+                "worker_reported": current.worker_reported,
+                "claimant": actor,
+                "claim_incarnation": incarnation,
+                "claim_expires_at_unix_ms": 0,
+                "readiness_epoch": current.readiness_epoch,
+            }}),
+            &[],
+            None,
+        )
+        .unwrap();
+        project_mission_run_update(&transaction, &claim).unwrap();
+        transaction.commit().unwrap();
     }
 
     fn simple(command: &str) -> NormalizedIntent {
@@ -16893,15 +17289,10 @@ version 2
             .work_action(subject, "progress", &request("one", "progress-one"))
             .unwrap();
 
-        store
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE step_runs SET lease_expires_at_unix_ms='0' WHERE subject=?1",
-                [subject],
-            )
-            .unwrap();
+        expire_work_lease_by_claim(&store, subject, "agent/node.worker", "one");
+        let reclaimable = store.step_run(subject).unwrap().unwrap();
+        assert_eq!(reclaimable.status, "ready");
+        assert!(reclaimable.claimant.is_none());
         let error = store
             .work_action(subject, "complete", &request("one", "complete-expired"))
             .unwrap_err();
@@ -16913,6 +17304,192 @@ version 2
         assert!(view.claimant.is_none());
         assert!(view.claim_incarnation.is_none());
         assert!(view.claim_expires_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn terminal_owners_retire_every_work_state_across_restart_and_replication() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal-owner.sqlite3");
+        let store = Store::open(&path, "source").unwrap();
+        let source = r#"
+version 2
+
+  mission "terminal-owner" state="ready" {
+    goal "Make terminal ownership authoritative."
+    step "active" { assigned-to "agent/worker" }
+    step "expired" { assigned-to "agent/worker" }
+    step "ready" { assigned-to "agent/worker" }
+    step "blocked" { assigned-to "agent/worker" }
+    step "pending" { assigned-to "agent/worker" }
+  }
+
+"#;
+        let intent = crate::graph::parse_test_intent(source, "source").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "terminal-owner-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "terminal-owner".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "terminal-owner-run".into(),
+            })
+            .unwrap();
+        let subjects = run
+            .steps
+            .iter()
+            .map(|step| (step.step.clone(), step.subject.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/source.worker".into()),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        for path in ["active", "expired", "ready"] {
+            store
+                .set_step_state(&subjects[path], "ready", None)
+                .unwrap();
+        }
+        store
+            .set_step_state(&subjects["blocked"], "blocked", Some("waiting for a gate"))
+            .unwrap();
+        for path in ["active", "expired"] {
+            store
+                .work_action(&subjects[path], "claim", &request(&format!("claim-{path}")))
+                .unwrap();
+        }
+        expire_work_lease_by_claim(
+            &store,
+            &subjects["expired"],
+            "agent/source.worker",
+            "worker-one",
+        );
+        let expired = store.step_run(&subjects["expired"]).unwrap().unwrap();
+        assert_eq!(expired.status, "ready");
+        assert!(expired.claimant.is_none());
+
+        assert!(
+            store
+                .set_mission_run_state(&run.id, "cancelled", "terminal", Some("the owner stopped"),)
+                .unwrap()
+        );
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert!(terminal.steps.iter().all(|step| step.status == "cancelled"));
+        assert!(terminal.steps.iter().all(|step| {
+            step.claimant.is_none()
+                && step.claim_incarnation.is_none()
+                && step.claim_expires_at_unix_ms.is_none()
+        }));
+        assert!(store.work(None, false).unwrap().is_empty());
+        assert_eq!(store.work(None, true).unwrap().len(), 5);
+        for subject in subjects.values() {
+            let claim = store
+                .latest_claim(subject, Some("step-run.state"))
+                .unwrap()
+                .expect("terminal descendant claim");
+            assert_eq!(
+                claim.body.pointer("/fields/status").and_then(Value::as_str),
+                Some("cancelled")
+            );
+        }
+
+        let error = store
+            .work_action(
+                &subjects["active"],
+                "claim",
+                &request("claim-after-terminal"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "terminal-work-owner");
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let stale_owner = append_claim_tx(
+                &transaction,
+                &store.origin,
+                &run.subject,
+                "mission-run.state",
+                None,
+                &json!({"fields": {
+                    "status": "running",
+                    "phase": "normal",
+                    "reason": "a stale replica tried to reopen the owner",
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            project_mission_run_update(&transaction, &stale_owner).unwrap();
+            let stale_work = append_claim_tx(
+                &transaction,
+                &store.origin,
+                &subjects["active"],
+                "work.renewed",
+                Some("agent/source.worker"),
+                &json!({"fields": {
+                    "attempt": 1,
+                    "status": "working",
+                    "worker_reported": false,
+                    "claimant": "agent/source.worker",
+                    "claim_incarnation": "stale-worker",
+                    "claim_expires_at_unix_ms": now_ms() + 600_000,
+                    "readiness_epoch": 1,
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            project_mission_run_update(&transaction, &stale_work).unwrap();
+            transaction.commit().unwrap();
+        }
+        let still_terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(still_terminal.status, "cancelled");
+        assert_eq!(
+            still_terminal
+                .steps
+                .iter()
+                .find(|step| step.step == "active")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        drop(store);
+
+        let reopened = Store::open(&path, "source").unwrap();
+        let restarted = reopened.mission_run(&run.id).unwrap().unwrap();
+        assert!(
+            restarted
+                .steps
+                .iter()
+                .all(|step| step.status == "cancelled")
+        );
+        assert!(reopened.work(None, false).unwrap().is_empty());
+
+        let target = Store::open_memory("target").unwrap();
+        let exchange = exchange_from(&reopened, &ReplicationInventory::default());
+        let admission = receive_and_project(&target, "source", &exchange);
+        assert_eq!(admission.invalid, 0);
+        let replayed = target.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(replayed.status, "cancelled");
+        assert!(replayed.steps.iter().all(|step| step.status == "cancelled"));
+        assert!(replayed.steps.iter().all(|step| step.claimant.is_none()));
+        assert!(target.work(None, false).unwrap().is_empty());
     }
 
     #[test]
@@ -17456,8 +18033,16 @@ version 2
                 .find(|step| step.step == "active")
                 .unwrap()
                 .status,
-            "working"
+            "cancelled"
         );
+        let retired = generations[0]
+            .steps
+            .iter()
+            .find(|step| step.step == "active")
+            .unwrap();
+        assert!(retired.claimant.is_none());
+        assert!(retired.claim_incarnation.is_none());
+        assert!(retired.claim_expires_at_unix_ms.is_none());
         assert_eq!(
             generations[1].predecessor.as_deref(),
             Some(run.generation.as_str())
@@ -17482,7 +18067,10 @@ version 2
             .unwrap_err();
         assert_eq!(error.code, "stale-run-generation");
         assert!(!store.set_step_state(&active, "completed", None).unwrap());
-        assert_eq!(store.step_run(&active).unwrap().unwrap().status, "working");
+        assert_eq!(
+            store.step_run(&active).unwrap().unwrap().status,
+            "cancelled"
+        );
         let retried = store
             .adopt_mission_revision(
                 &run.id,
