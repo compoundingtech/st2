@@ -1564,6 +1564,12 @@ pub struct StepRunView {
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
     pub claim_expires_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started_at_unix_ms: Option<u128>,
+    #[serde(default)]
+    pub execution_elapsed_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     pub not_before_unix_ms: Option<u128>,

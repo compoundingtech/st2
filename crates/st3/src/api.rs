@@ -709,6 +709,10 @@ fn client_work_resources(
                 "readiness_epoch": work.readiness_epoch,
                 "claimant": work.claimant,
                 "claim_incarnation": work.claim_incarnation,
+                "claim_expires_at_unix_ms": work.claim_expires_at_unix_ms,
+                "execution_started_at_unix_ms": work.execution_started_at_unix_ms,
+                "execution_elapsed_ms": work.execution_elapsed_ms,
+                "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
                 "constraints": work.constraints,
                 "operational": operational

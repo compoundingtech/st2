@@ -1662,6 +1662,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             if view.status == "ready"
                 && view.blocked_reason.as_deref() == Some("the worker lease expired")
             {
+                if self.step_timed_out(view, &step)? {
+                    changed |= self.store.set_step_state(
+                        &view.subject,
+                        "failed",
+                        Some("the active execution timeout expired"),
+                    )?;
+                    continue;
+                }
                 changed |= self.store.set_step_state(
                     &view.subject,
                     "ready",
@@ -1772,7 +1780,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 changed |= self.store.set_step_state(
                     &view.subject,
                     "failed",
-                    Some("the step timeout expired"),
+                    Some("the active execution timeout expired"),
                 )?;
                 continue;
             }
@@ -4107,6 +4115,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         claimant: None,
                         claim_incarnation: None,
                         claim_expires_at_unix_ms: None,
+                        execution_started_at_unix_ms: None,
+                        execution_elapsed_ms: 0,
+                        timeout_ms: None,
                         readiness_epoch: 0,
                         blocked_reason: None,
                         not_before_unix_ms: None,
@@ -4594,19 +4605,22 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(timeout) = step.spec.timeout_ms else {
             return Ok(false);
         };
-        let Some(active) = self
-            .store
-            .latest_claim(&view.subject, Some("step-run.state"))?
-        else {
-            return Ok(false);
-        };
-        let elapsed = now_ms().saturating_sub(active.accepted_at_unix_ms);
+        let elapsed = view.execution_elapsed_ms;
         if elapsed >= timeout as u128 {
             return Ok(true);
         }
+        if !matches!(view.status.as_str(), "claimed" | "working")
+            || view.execution_started_at_unix_ms.is_none()
+        {
+            return Ok(false);
+        }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let notify = self.notify.clone();
-            let remaining = (timeout as u128).saturating_sub(elapsed) as u64;
+            let timeout_remaining = (timeout as u128).saturating_sub(elapsed);
+            let lease_remaining = view
+                .claim_expires_at_unix_ms
+                .map_or(timeout_remaining, |expiry| expiry.saturating_sub(now_ms()));
+            let remaining = timeout_remaining.min(lease_remaining).max(1) as u64;
             handle.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(remaining)).await;
                 notify.notify_one();
@@ -9608,17 +9622,17 @@ mission "scheduled-cycle" state="ready" {
     }
 
     #[tokio::test]
-    async fn a_terminal_mission_failure_selects_cleanup() {
+    async fn only_claimed_execution_consumes_a_step_timeout_and_failure_selects_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
 
               mission "eval/demo" state="ready" timeout="1m" {
                 goal "Complete mission eval/demo."
+                agent "worker" { workspace "/tmp"; command "true"; restart "never" }
                 step "result" timeout="1ms" {
-                  agentless
+                  assigned-to "agent/${ST_MISSION_RUN}/worker"
                   title "The result appears"
-                  gate "condition-1" { field "status" "resource/result" "is" "ok" }
                 }
                 step "after" {
                   agentless
@@ -9633,8 +9647,6 @@ mission "scheduled-cycle" state="ready" {
                   }
                 }
               }
-              resource "result" { kind "human.review" }
-
         "#;
         apply_source(&store, source, "mission-cleanup");
         let run = store
@@ -9657,6 +9669,31 @@ mission "scheduled-cycle" state="ready" {
 
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        reconciler.reconcile_once().unwrap();
+        let waiting = store.mission_run(&run.id).unwrap().unwrap();
+        let result = waiting
+            .steps
+            .iter()
+            .find(|step| step.step == "result")
+            .unwrap();
+        assert_eq!(result.status, "ready");
+        assert_eq!(result.execution_started_at_unix_ms, None);
+        assert_eq!(result.execution_elapsed_ms, 0);
+        store
+            .work_action(
+                &result.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: result.assigned_to.clone(),
+                    incarnation: Some("worker-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-timeout-work".into(),
+                },
+            )
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         for _ in 0..20 {
             reconciler.reconcile_once().unwrap();
@@ -11673,6 +11710,9 @@ mission "work-alert" state="ready" {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            execution_started_at_unix_ms: None,
+            execution_elapsed_ms: 0,
+            timeout_ms: None,
             readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,

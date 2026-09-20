@@ -636,6 +636,17 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
             relative_time(expires, now_unix_ms)
         );
     }
+    if let Some(timeout_ms) = step.timeout_ms {
+        let active = step
+            .execution_started_at_unix_ms
+            .map(|started| format!(" · active {}", relative_time(started, now_unix_ms)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            output,
+            "  Execution    {}ms / {timeout_ms}ms{active}",
+            step.execution_elapsed_ms
+        );
+    }
     for grouping in &step.under {
         if let Some(reason) = &grouping.reason {
             let _ = writeln!(output, "  Under        {} ({reason})", grouping.agent);
@@ -1023,6 +1034,17 @@ fn render_work_list_item(output: &mut String, step: &StepRunView, style: OutputS
         let _ = write!(output, " · {}", short_subject(actor, "agent/"));
     }
     let _ = writeln!(output);
+    let _ = writeln!(output, "    owner: {}", step.run);
+    if let Some(timeout_ms) = step.timeout_ms {
+        let _ = writeln!(
+            output,
+            "    execution: {}ms / {timeout_ms}ms{}",
+            step.execution_elapsed_ms,
+            step.execution_started_at_unix_ms
+                .map(|started| format!(" · active since {started}"))
+                .unwrap_or_default()
+        );
+    }
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "    reason: {reason}");
     }
@@ -1135,6 +1157,9 @@ mod tests {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            execution_started_at_unix_ms: None,
+            execution_elapsed_ms: 0,
+            timeout_ms: None,
             readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,
@@ -1465,7 +1490,8 @@ mod tests {
     #[test]
     fn work_list_all_includes_waiting_and_terminal_items() {
         let pending = step("step-run/demo-generation/later", "later", "pending");
-        let completed = step("step-run/demo-generation/done", "done", "completed");
+        let mut completed = step("step-run/demo-generation/done", "done", "completed");
+        completed.blocked_reason = Some("the owning mission run is terminal".into());
 
         let rendered = render_work_list(None, &[pending, completed], true, OutputStyle::plain());
 
@@ -1473,6 +1499,8 @@ mod tests {
         assert!(rendered.contains("COMPLETED"));
         assert!(rendered.contains("step-run/demo-generation/later"));
         assert!(rendered.contains("step-run/demo-generation/done"));
+        assert!(rendered.contains("owner: mission-run/demo/run"));
+        assert!(rendered.contains("reason: the owning mission run is terminal"));
     }
 
     #[test]
@@ -1481,12 +1509,16 @@ mod tests {
         claimed.claimant = Some("agent/demo/worker".into());
         claimed.claim_incarnation = Some("incarnation/exact".into());
         claimed.claim_expires_at_unix_ms = Some(62_000);
+        claimed.execution_started_at_unix_ms = Some(1_000);
+        claimed.execution_elapsed_ms = 1_000;
+        claimed.timeout_ms = Some(60_000);
 
         let rendered = render_step_run(&claimed, OutputStyle::plain(), 2_000);
 
         assert!(rendered.contains("SUBJECT    step-run/demo-generation/build"));
         assert!(rendered.contains("GENERATION run-generation/demo-generation"));
         assert!(rendered.contains("Lease        in 1m"));
+        assert!(rendered.contains("Execution    1000ms / 60000ms · active 1s ago"));
         assert!(rendered.contains("• Complete the work."));
     }
 
