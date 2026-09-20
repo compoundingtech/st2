@@ -24,7 +24,8 @@ use st3::model::{
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
     LaunchDecisionRequest, LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest,
     MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunView, MissionState, PlanningApprovalRequest,
+    MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
     QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
     ResourceRefreshView, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
@@ -104,6 +105,11 @@ enum Command {
     Wait(WaitArgs),
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
+    /// Preview or apply bounded graph-authorized operational repairs.
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
     /// Inspect and repair fleet replication.
     Replication {
         #[command(subcommand)]
@@ -563,6 +569,14 @@ struct WaitArgs {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Subcommand)]
+enum RepairCommand {
+    /// Compute the exact read-only repair plan and approval token.
+    DryRun,
+    /// Apply exactly the plan identified by a dry-run token.
+    Apply { token: String },
 }
 
 #[derive(Subcommand)]
@@ -1247,6 +1261,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace(args) => run_trace(&client, args, cli.json).await,
         Command::Wait(args) => run_wait(&client, args, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
+        Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Service { command } => run_service(command),
         Command::ClaudeChannel { command } => run_claude_channel(command),
@@ -2772,6 +2787,54 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         !args.strict || report.status == "pass",
         "st3 doctor found a warning in strict mode"
     );
+    Ok(())
+}
+
+async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) -> Result<()> {
+    match command {
+        RepairCommand::DryRun => {
+            let plan: OperationalRepairPlan = client.get("/v1/repair").await?;
+            if json_output {
+                print_value(&plan, true)?;
+            } else {
+                println!(
+                    "repair\t{}\titems={}\tsnapshot={}\t{}",
+                    plan.status,
+                    plan.items.len(),
+                    plan.snapshot_index,
+                    plan.token
+                );
+                for item in &plan.items {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        item.class, item.subject, item.reason, item.id
+                    );
+                    for subject in &item.affected_subjects {
+                        println!("  affected\t{subject}");
+                    }
+                }
+            }
+        }
+        RepairCommand::Apply { token } => {
+            let result: OperationalRepairResult = client
+                .post("/v1/repair/apply", &OperationalRepairApplyRequest { token })
+                .await?;
+            if json_output {
+                print_value(&result, true)?;
+            } else {
+                println!(
+                    "repair\tapplied={}\talready_applied={}\t{}",
+                    result.applied, result.already_applied, result.token
+                );
+                for subject in &result.affected_subjects {
+                    println!("  affected\t{subject}");
+                }
+                if let Some(receipt) = &result.receipt_claim_id {
+                    println!("  receipt\t{receipt}");
+                }
+            }
+        }
+    }
     Ok(())
 }
 

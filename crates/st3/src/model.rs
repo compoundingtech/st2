@@ -1439,6 +1439,42 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OperationalRepairItem {
+    pub id: String,
+    pub class: String,
+    pub subject: String,
+    pub affected_subjects: Vec<String>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OperationalRepairPlan {
+    pub api_version: String,
+    pub token: String,
+    pub snapshot_index: u64,
+    pub status: String,
+    pub items: Vec<OperationalRepairItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OperationalRepairApplyRequest {
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OperationalRepairResult {
+    pub api_version: String,
+    pub token: String,
+    pub applied: usize,
+    pub already_applied: bool,
+    pub affected_subjects: Vec<String>,
+    pub claim_ids: Vec<String>,
+    pub receipt_claim_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionControlResponse {
     pub subject: String,

@@ -273,6 +273,7 @@ fn structured_cli_views_offer_human_and_json_surfaces() {
 
     let surfaces: &[(&str, &[&str], &str)] = &[
         ("doctor", &["doctor"], "pass"),
+        ("repair dry-run", &["repair", "dry-run"], "repair"),
         ("status", &["status"], "RESULT"),
         ("agent list", &["agents", "ls"], ""),
         ("runtime list", &["runtime", "ls"], ""),
@@ -328,6 +329,37 @@ fn structured_cli_views_offer_human_and_json_surfaces() {
         serde_json::from_slice::<serde_json::Value>(&json.stdout)
             .unwrap_or_else(|error| panic!("{name} did not print valid JSON: {error}"));
     }
+    let dry_run = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--json",
+            "repair",
+            "dry-run",
+        ])
+        .output()
+        .unwrap();
+    let dry_run: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    let token = dry_run["token"].as_str().unwrap();
+    let apply = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--json",
+            "repair",
+            "apply",
+            token,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "clean repair apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply["applied"], 0);
+    assert_eq!(apply["already_applied"], false);
     daemon.stop();
 }
 

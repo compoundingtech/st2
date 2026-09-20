@@ -21,14 +21,14 @@ use crate::model::{
     LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView,
     MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
     MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
-    OperationalAnnotation, PlannedAction, PlanningCandidateView, PlanningPreviewView,
-    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
-    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
-    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
-    WorkRequest, WorkSelector, WorkWakeView,
+    OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
+    PlannedAction, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
+    PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
+    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
+    ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome,
+    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
+    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -4858,6 +4858,247 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn operational_repair_plan(&self) -> Result<OperationalRepairPlan> {
+        let connection = self.readers.get();
+        operational_repair_plan_tx(&connection, now_ms())
+    }
+
+    pub fn apply_operational_repair(
+        &self,
+        token: &str,
+    ) -> Result<OperationalRepairResult, St3Error> {
+        if !token.starts_with("orpv0:") {
+            return Err(St3Error::new(
+                "invalid-repair-token",
+                "an operational repair token must start with `orpv0:`",
+            ));
+        }
+        let digest = token.trim_start_matches("orpv0:");
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(St3Error::new(
+                "invalid-repair-token",
+                "an operational repair token must contain one lowercase SHA-256 digest",
+            ));
+        }
+        let repair_subject = format!("repair/{digest}");
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        if let Some(receipt) = transaction
+            .query_row(
+                "SELECT id, body FROM claims
+                 WHERE subject=?1 AND kind='repair.applied'
+                 ORDER BY store_index DESC LIMIT 1",
+                [&repair_subject],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            let body = serde_json::from_str::<Value>(&receipt.1).map_err(internal)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            let mut affected_subjects = fields
+                .get("affected_subjects")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            affected_subjects.sort();
+            affected_subjects.dedup();
+            transaction.commit().map_err(internal)?;
+            return Ok(OperationalRepairResult {
+                api_version: "st3.operational-repair.v0".into(),
+                token: token.into(),
+                applied: 0,
+                already_applied: true,
+                affected_subjects,
+                claim_ids: Vec::new(),
+                receipt_claim_id: Some(receipt.0),
+            });
+        }
+
+        let plan = operational_repair_plan_tx(&transaction, now_ms()).map_err(internal)?;
+        if plan.token != token {
+            return Err(St3Error::new(
+                "stale-repair-plan",
+                format!(
+                    "the operational repair plan changed; requested `{token}`, current `{}`",
+                    plan.token
+                ),
+            )
+            .with_detail("requested_token", token)
+            .with_detail("current_token", plan.token));
+        }
+        if plan.items.is_empty() {
+            transaction.commit().map_err(internal)?;
+            return Ok(OperationalRepairResult {
+                api_version: plan.api_version,
+                token: token.into(),
+                applied: 0,
+                already_applied: false,
+                affected_subjects: Vec::new(),
+                claim_ids: Vec::new(),
+                receipt_claim_id: None,
+            });
+        }
+
+        let now = now_ms();
+        let mut claim_ids = Vec::new();
+        let mut affected_subjects = Vec::new();
+        for item in &plan.items {
+            affected_subjects.extend(item.affected_subjects.iter().cloned());
+            match item.class.as_str() {
+                "terminal-descendants" => {
+                    let generation = item
+                        .details
+                        .get("generation")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            St3Error::new(
+                                "invalid-repair-plan",
+                                format!("repair item `{}` has no generation", item.id),
+                            )
+                        })?;
+                    claim_ids.extend(cancel_descendant_mission_runs_tx(
+                        &transaction,
+                        &self.origin,
+                        generation,
+                        "daemon/runtime",
+                        &item.reason,
+                        now,
+                    )?);
+                }
+                "orphaned-readiness" => {
+                    if let Some(claim) = repair_step_state_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        "cancelled",
+                        &item.reason,
+                        now,
+                    )? {
+                        claim_ids.push(claim);
+                    }
+                }
+                "expired-claim" => {
+                    if let Some(claim) = repair_step_state_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        "ready",
+                        &item.reason,
+                        now,
+                    )? {
+                        claim_ids.push(claim);
+                    }
+                }
+                "superseded-attention" => {
+                    let claim = append_claim_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        "attention.resolved",
+                        Some("daemon/runtime"),
+                        &json!({"fields": {
+                            "request": item.subject,
+                            "outcome": "resolved",
+                            "reason": item.reason,
+                        }}),
+                        &[],
+                        None,
+                    )
+                    .map_err(internal)?;
+                    claim_ids.push(claim.id);
+                }
+                "wake-contradiction" => {
+                    let incarnation_id = item
+                        .details
+                        .get("incarnation_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let step_run = item
+                        .details
+                        .get("step_run")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let wake_attempts = item
+                        .details
+                        .get("wake_attempts")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let claim = append_claim_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        "harness.diagnostic",
+                        Some("daemon/runtime"),
+                        &json!({"fields": {
+                            "severity": "warning",
+                            "status": "recovered",
+                            "code": "work-wake-exhausted",
+                            "reason": item.reason,
+                            "incarnation_id": incarnation_id,
+                            "step_run": step_run,
+                            "wake_attempts": wake_attempts,
+                        }}),
+                        &[],
+                        None,
+                    )
+                    .map_err(internal)?;
+                    claim_ids.push(claim.id);
+                }
+                "impossible-state" => {
+                    claim_ids.extend(repair_impossible_run_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        &item.reason,
+                        now,
+                    )?);
+                }
+                class => {
+                    return Err(St3Error::new(
+                        "invalid-repair-plan",
+                        format!("repair class `{class}` is not registered"),
+                    ));
+                }
+            }
+        }
+        affected_subjects.sort();
+        affected_subjects.dedup();
+        let receipt = append_claim_tx(
+            &transaction,
+            &self.origin,
+            &repair_subject,
+            "repair.applied",
+            Some("daemon/runtime"),
+            &json!({"fields": {
+                "token": token,
+                "item_count": plan.items.len(),
+                "affected_subjects": affected_subjects,
+                "reason": "applied the exact graph-authorized operational repair plan",
+            }}),
+            &claim_ids,
+            None,
+        )
+        .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(OperationalRepairResult {
+            api_version: plan.api_version,
+            token: token.into(),
+            applied: plan.items.len(),
+            already_applied: false,
+            affected_subjects,
+            claim_ids,
+            receipt_claim_id: Some(receipt.id),
+        })
     }
 
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
@@ -10863,6 +11104,487 @@ fn is_terminal_generation_state(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "superseded")
 }
 
+fn operational_repair_plan_tx(
+    connection: &Connection,
+    snapshot_unix_ms: u128,
+) -> Result<OperationalRepairPlan> {
+    let snapshot_index = connection.query_row(
+        "SELECT COALESCE(MAX(store_index), 0) FROM claims",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let mut items = Vec::new();
+    let mut covered_descendant_steps = BTreeSet::new();
+
+    let mut terminal_roots = connection.prepare(
+        "SELECT id, current_generation_id FROM mission_runs
+         WHERE status IN ('completed','failed','cancelled') OR phase='terminal'
+         ORDER BY id",
+    )?;
+    let terminal_roots = terminal_roots
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (root_id, generation) in terminal_roots {
+        let descendants = descendant_mission_run_ids_tx(connection, &generation)?;
+        let mut affected = Vec::new();
+        let mut descendant_runs = Vec::new();
+        for descendant in descendants {
+            let (status, phase, child_generation) = connection.query_row(
+                "SELECT status, phase, current_generation_id FROM mission_runs WHERE id=?1",
+                [&descendant],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT subject FROM step_runs
+                 WHERE run_id=?1 AND status NOT IN ('completed','failed','cancelled')
+                 ORDER BY subject",
+            )?;
+            let steps = statement
+                .query_map([&descendant], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let active_run = matches!(status.as_str(), "running" | "standing" | "blocked")
+                || phase != "terminal";
+            if active_run || !steps.is_empty() {
+                descendant_runs.push(format!("mission-run/{descendant}"));
+                if active_run {
+                    affected.push(format!("mission-run/{descendant}"));
+                    affected.push(format!("run-generation/{child_generation}"));
+                }
+                for step in steps {
+                    covered_descendant_steps.insert(step.clone());
+                    affected.push(step);
+                }
+            }
+        }
+        if !affected.is_empty() {
+            affected.sort();
+            affected.dedup();
+            descendant_runs.sort();
+            push_operational_repair_item(
+                &mut items,
+                "terminal-descendants",
+                &format!("mission-run/{root_id}"),
+                affected,
+                "a terminal root still owns active descendant runs or work",
+                BTreeMap::from([
+                    ("generation".into(), Value::String(generation)),
+                    (
+                        "descendant_runs".into(),
+                        Value::Array(descendant_runs.into_iter().map(Value::String).collect()),
+                    ),
+                ]),
+            )?;
+        }
+    }
+
+    let mut orphaned = connection.prepare(
+        "SELECT step_runs.subject
+         FROM step_runs
+         JOIN mission_runs ON mission_runs.id=step_runs.run_id
+         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+         JOIN run_generations ON run_generations.id=step_runs.generation_id
+         WHERE step_runs.status NOT IN ('completed','failed','cancelled')
+           AND (
+             mission_runs.status IN ('completed','failed','cancelled')
+             OR mission_runs.phase='terminal'
+             OR step_runs.generation_id<>mission_runs.current_generation_id
+             OR run_generations.status IN ('completed','failed','cancelled','superseded')
+             OR root_runs.status IN ('completed','failed','cancelled')
+             OR root_runs.phase='terminal'
+           )
+         ORDER BY step_runs.subject",
+    )?;
+    let orphaned = orphaned
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for subject in orphaned {
+        if covered_descendant_steps.contains(&subject) {
+            continue;
+        }
+        push_operational_repair_item(
+            &mut items,
+            "orphaned-readiness",
+            &subject,
+            vec![subject.clone()],
+            "non-terminal work has a terminal, superseded, or non-current owner",
+            BTreeMap::new(),
+        )?;
+    }
+
+    let mut expired = connection.prepare(
+        "SELECT step_runs.subject, step_runs.lease_expires_at_unix_ms
+         FROM step_runs
+         JOIN mission_runs ON mission_runs.id=step_runs.run_id
+         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+         JOIN run_generations ON run_generations.id=step_runs.generation_id
+         WHERE step_runs.status IN ('claimed','working')
+           AND step_runs.lease_expires_at_unix_ms IS NOT NULL
+           AND step_runs.generation_id=mission_runs.current_generation_id
+           AND mission_runs.status NOT IN ('completed','failed','cancelled')
+           AND mission_runs.phase<>'terminal'
+           AND run_generations.status NOT IN ('completed','failed','cancelled','superseded')
+           AND root_runs.status NOT IN ('completed','failed','cancelled')
+           AND root_runs.phase<>'terminal'
+         ORDER BY step_runs.subject",
+    )?;
+    let expired = expired
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (subject, expiry) in expired {
+        let expiry = expiry.parse::<u128>().unwrap_or(u128::MAX);
+        if expiry > snapshot_unix_ms {
+            continue;
+        }
+        push_operational_repair_item(
+            &mut items,
+            "expired-claim",
+            &subject,
+            vec![subject.clone()],
+            "the worker lease expired and its durable claim must be released",
+            BTreeMap::from([(
+                "lease_expires_at_unix_ms".into(),
+                Value::String(expiry.to_string()),
+            )]),
+        )?;
+    }
+
+    for request in pending_attention_requests_tx(connection, None)? {
+        if attention_request_is_current_tx(connection, &request)? {
+            continue;
+        }
+        push_operational_repair_item(
+            &mut items,
+            "superseded-attention",
+            &request.subject,
+            vec![request.subject.clone()],
+            "the attention target is terminal, superseded, or otherwise no longer current",
+            BTreeMap::new(),
+        )?;
+    }
+
+    let mut latest_wake_diagnostics =
+        BTreeMap::<(String, String, String), (String, Value, u128)>::new();
+    let mut wake_statement = connection.prepare(
+        "SELECT id, subject, body, accepted_at_unix_ms FROM claims
+         WHERE kind='harness.diagnostic'
+           AND json_extract(body, '$.fields.code')='work-wake-exhausted'
+           AND accepted_at_unix_ms<=?1
+         ORDER BY store_index",
+    )?;
+    let wake_rows = wake_statement.query_map([snapshot_unix_ms.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in wake_rows {
+        let (claim_id, agent, body, accepted) = row?;
+        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        let step = fields
+            .get("step_run")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let incarnation = fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        latest_wake_diagnostics.insert(
+            (agent, step.into(), incarnation.into()),
+            (claim_id, body, accepted.parse::<u128>().unwrap_or_default()),
+        );
+    }
+    for ((agent, step, incarnation), (diagnostic, body, accepted)) in latest_wake_diagnostics {
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields.get("status").and_then(Value::as_str) != Some("failed") {
+            continue;
+        }
+        let step_state = connection
+            .query_row(
+                "SELECT status, assignee FROM step_runs WHERE subject=?1",
+                [&step],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let harness = current_harness_at(connection, &agent, None)?;
+        let contradicted = step_state.as_ref().is_none_or(|(status, assignee)| {
+            status != "ready" || assignee.as_deref() != Some(agent.as_str())
+        }) || harness.as_ref().is_some_and(|harness| {
+            harness.incarnation_id != incarnation
+                || (harness.state == "working" && harness.observed_at_unix_ms >= accepted)
+        });
+        if !contradicted {
+            continue;
+        }
+        let mut affected = vec![agent.clone()];
+        if !step.is_empty() {
+            affected.push(step.clone());
+        }
+        push_operational_repair_item(
+            &mut items,
+            "wake-contradiction",
+            &agent,
+            affected,
+            "a wake-exhaustion diagnostic is contradicted by current work or harness state",
+            BTreeMap::from([
+                ("diagnostic_claim".into(), Value::String(diagnostic)),
+                ("step_run".into(), Value::String(step)),
+                ("incarnation_id".into(), Value::String(incarnation)),
+                (
+                    "wake_attempts".into(),
+                    fields
+                        .get("wake_attempts")
+                        .cloned()
+                        .unwrap_or_else(|| Value::from(0)),
+                ),
+            ]),
+        )?;
+    }
+
+    let mut impossible = connection.prepare(
+        "SELECT mission_runs.id, mission_runs.status, mission_runs.phase,
+                run_generations.status
+         FROM mission_runs JOIN run_generations
+           ON run_generations.id=mission_runs.current_generation_id
+         WHERE (mission_runs.status IN ('completed','failed','cancelled') AND mission_runs.phase<>'terminal')
+            OR (mission_runs.status IN ('running','standing','blocked') AND mission_runs.phase='terminal')
+            OR (mission_runs.status IN ('running','standing','blocked')
+                AND run_generations.status IN ('completed','failed','cancelled','superseded'))
+         ORDER BY mission_runs.id",
+    )?;
+    let impossible = impossible
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (run, status, phase, generation_status) in impossible {
+        let subject = format!("mission-run/{run}");
+        push_operational_repair_item(
+            &mut items,
+            "impossible-state",
+            &subject,
+            vec![subject.clone()],
+            "the mission run status, phase, and selected generation disagree",
+            BTreeMap::from([
+                ("status".into(), Value::String(status)),
+                ("phase".into(), Value::String(phase)),
+                ("generation_status".into(), Value::String(generation_status)),
+            ]),
+        )?;
+    }
+
+    items.sort_by(|left, right| {
+        (&left.class, &left.subject, &left.id).cmp(&(&right.class, &right.subject, &right.id))
+    });
+    let digest = canonical_hash(&("st3.operational-repair.v0", &items))?;
+    Ok(OperationalRepairPlan {
+        api_version: "st3.operational-repair.v0".into(),
+        token: format!("orpv0:{digest}"),
+        snapshot_index,
+        status: if items.is_empty() {
+            "clean".into()
+        } else {
+            "changes".into()
+        },
+        items,
+    })
+}
+
+fn push_operational_repair_item(
+    items: &mut Vec<OperationalRepairItem>,
+    class: &str,
+    subject: &str,
+    mut affected_subjects: Vec<String>,
+    reason: &str,
+    details: BTreeMap<String, Value>,
+) -> Result<()> {
+    affected_subjects.sort();
+    affected_subjects.dedup();
+    let digest = canonical_hash(&(
+        "st3.operational-repair-item.v0",
+        class,
+        subject,
+        &affected_subjects,
+        reason,
+        &details,
+    ))?;
+    items.push(OperationalRepairItem {
+        id: format!("repair-item/{digest}"),
+        class: class.into(),
+        subject: subject.into(),
+        affected_subjects,
+        reason: reason.into(),
+        details,
+    });
+    Ok(())
+}
+
+fn repair_step_state_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    status: &str,
+    reason: &str,
+    now: u128,
+) -> Result<Option<String>, St3Error> {
+    let current = transaction
+        .query_row(
+            "SELECT status, readiness_epoch FROM step_runs WHERE subject=?1",
+            [subject],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some((current, current_epoch)) = current else {
+        return Ok(None);
+    };
+    if current == status {
+        return Ok(None);
+    }
+    let readiness_epoch = current_epoch.saturating_add(u32::from(status == "ready"));
+    transaction
+        .execute(
+            "UPDATE step_runs SET status=?2, blocked_reason=?3, lease_owner=NULL,
+                    lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                    not_before_unix_ms=CASE WHEN ?2='ready' THEN NULL ELSE not_before_unix_ms END,
+                    activated_at_unix_ms=CASE WHEN ?2='ready' THEN ?4 ELSE activated_at_unix_ms END,
+                    readiness_epoch=?5, updated_at_unix_ms=?4 WHERE subject=?1",
+            params![subject, status, reason, now.to_string(), readiness_epoch],
+        )
+        .map_err(internal)?;
+    let claim = append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "step-run.state",
+        Some("daemon/runtime"),
+        &json!({"fields": {
+            "status": status,
+            "reason": reason,
+            "readiness_epoch": readiness_epoch,
+        }}),
+        &[],
+        None,
+    )
+    .map_err(internal)?;
+    Ok(Some(claim.id))
+}
+
+fn repair_impossible_run_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    reason: &str,
+    now: u128,
+) -> Result<Vec<String>, St3Error> {
+    let run_id = subject.strip_prefix("mission-run/").unwrap_or(subject);
+    let current = transaction
+        .query_row(
+            "SELECT status, phase, current_generation_id FROM mission_runs WHERE id=?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some((status, phase, generation)) = current else {
+        return Ok(Vec::new());
+    };
+    let status = if is_terminal_run_state(&status) {
+        status
+    } else {
+        "cancelled".into()
+    };
+    if phase == "terminal"
+        && transaction
+            .query_row(
+                "SELECT status FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(internal)?
+            == status
+    {
+        return Ok(Vec::new());
+    }
+    transaction
+        .execute(
+            "UPDATE mission_runs SET status=?2, phase='terminal', updated_at_unix_ms=?3 WHERE id=?1",
+            params![run_id, status, now.to_string()],
+        )
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3 WHERE id=?1",
+            params![generation, status, now.to_string()],
+        )
+        .map_err(internal)?;
+    let body = json!({"fields": {"status": status, "phase": "terminal", "reason": reason}});
+    let mut claim_ids = Vec::new();
+    for (claim_subject, kind) in [
+        (format!("mission-run/{run_id}"), "mission-run.state"),
+        (
+            format!("run-generation/{generation}"),
+            "run-generation.state",
+        ),
+    ] {
+        claim_ids.push(
+            append_claim_tx(
+                transaction,
+                origin,
+                &claim_subject,
+                kind,
+                Some("daemon/runtime"),
+                &body,
+                &[],
+                None,
+            )
+            .map_err(internal)?
+            .id,
+        );
+    }
+    claim_ids.extend(cancel_descendant_mission_runs_tx(
+        transaction,
+        origin,
+        &generation,
+        "daemon/runtime",
+        reason,
+        now,
+    )?);
+    claim_ids.extend(terminalize_run_steps_tx(
+        transaction,
+        origin,
+        run_id,
+        reason,
+        Some("daemon/runtime"),
+        None,
+        now,
+    )?);
+    Ok(claim_ids)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn operational_annotation(
     connection: &Connection,
@@ -13438,11 +14160,15 @@ fn enrich_step_wake_at(
         .optional()?
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .and_then(|body| {
-            body.get("fields")
-                .unwrap_or(&body)
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            let fields = body.get("fields").unwrap_or(&body);
+            (fields.get("status").and_then(Value::as_str) == Some("failed"))
+                .then(|| {
+                    fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
         });
     if view.status == "ready" || !attempts.is_empty() || failure.is_some() {
         view.wake = Some(WorkWakeView {
@@ -18494,26 +19220,23 @@ version 2
                 child_step,
             ))
             .unwrap();
-        assert!(
-            store
-                .set_mission_run_state(
-                    &root.id,
-                    "failed",
-                    "terminal",
-                    Some("repair the terminal tree"),
-                )
-                .unwrap()
-        );
-        assert!(
-            !store
-                .set_mission_run_state(
-                    &root.id,
-                    "failed",
-                    "terminal",
-                    Some("duplicate terminal repair"),
-                )
-                .unwrap()
-        );
+        let before_dry_run = store.index().unwrap();
+        let repair = store.operational_repair_plan().unwrap();
+        assert_eq!(store.index().unwrap(), before_dry_run);
+        assert_eq!(repair.status, "changes");
+        assert!(repair.items.iter().any(|item| {
+            item.class == "terminal-descendants"
+                && item.subject == root.subject
+                && item.affected_subjects.contains(&child.subject)
+                && item.affected_subjects.contains(&child_step)
+        }));
+        let applied = store.apply_operational_repair(&repair.token).unwrap();
+        assert!(applied.applied >= 1);
+        assert!(!applied.already_applied);
+        let duplicate = store.apply_operational_repair(&repair.token).unwrap();
+        assert_eq!(duplicate.applied, 0);
+        assert!(duplicate.already_applied);
+        assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
         let history = store.work(None, true).unwrap();
         let nested = history
             .iter()
@@ -18564,6 +19287,185 @@ version 2
             ("cancelled", "terminal")
         );
         assert_eq!(replayed.steps[0].status, "cancelled");
+        assert_eq!(target.operational_repair_plan().unwrap().status, "clean");
+        let replicated_retry = target.apply_operational_repair(&repair.token).unwrap();
+        assert_eq!(replicated_retry.applied, 0);
+        assert!(replicated_retry.already_applied);
+    }
+
+    #[test]
+    fn operational_repair_closes_expired_attention_and_wake_contradictions() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+ agent "worker" { workspace "/tmp"; command "true" }
+ mission "repairable" state="ready" {
+   goal "Exercise bounded operational repair."
+   step "work" { assigned-to "agent/node.worker" }
+ }"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "repairable-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "repairable".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/operator".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "repairable-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        store.set_step_state(&step, "ready", None).unwrap();
+        store
+            .work_action(
+                &step,
+                "claim",
+                &WorkRequest {
+                    actor: Some("agent/node.worker".into()),
+                    incarnation: Some("worker-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "repair-expired-claim".into(),
+                },
+            )
+            .unwrap();
+        expire_work_lease_by_claim(&store, &step, "agent/node.worker", "worker-one");
+
+        store
+            .request_attention(
+                "attention/stale-repair",
+                &AttentionRequest {
+                    reviewer: "person/operator".into(),
+                    title: "Stale repair attention".into(),
+                    reason: "a superseded target still appears pending".into(),
+                    severity: "warning".into(),
+                    targets: vec!["step-run/missing-generation/missing-step".into()],
+                    actor: "person/operator".into(),
+                    idempotency_key: "stale-repair-attention".into(),
+                },
+            )
+            .unwrap();
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("repair-runtime".into()),
+            })
+            .unwrap();
+        let diagnostic = store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("failed".into())),
+                    ("code".into(), Value::String("work-wake-exhausted".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the legacy wake was not acknowledged".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                    ("step_run".into(), Value::String(step.clone())),
+                    ("wake_attempts".into(), Value::from(3)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("repair-wake-diagnostic".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("repair-wake-ack".into()),
+            })
+            .unwrap();
+
+        let plan = store.operational_repair_plan().unwrap();
+        let classes = plan
+            .items
+            .iter()
+            .map(|item| item.class.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(classes.contains("expired-claim"));
+        assert!(classes.contains("superseded-attention"));
+        assert!(classes.contains("wake-contradiction"));
+        let wake = plan
+            .items
+            .iter()
+            .find(|item| item.class == "wake-contradiction")
+            .unwrap();
+        assert_eq!(
+            wake.details.get("diagnostic_claim").and_then(Value::as_str),
+            Some(diagnostic.id.as_str())
+        );
+        assert!(
+            wake.affected_subjects
+                .contains(&"agent/node.worker".to_owned())
+        );
+        assert!(wake.affected_subjects.contains(&step));
+
+        let stale = store
+            .apply_operational_repair(&format!("orpv0:{}", "0".repeat(64)))
+            .unwrap_err();
+        assert_eq!(stale.code, "stale-repair-plan");
+
+        let result = store.apply_operational_repair(&plan.token).unwrap();
+        assert_eq!(result.applied, plan.items.len());
+        assert_eq!(store.step_run(&step).unwrap().unwrap().status, "ready");
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        let recovered = store
+            .latest_claim("agent/node.worker", Some("harness.diagnostic"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered
+                .body
+                .pointer("/fields/status")
+                .and_then(Value::as_str),
+            Some("recovered")
+        );
+        assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
+        let duplicate = store.apply_operational_repair(&plan.token).unwrap();
+        assert_eq!(duplicate.applied, 0);
+        assert!(duplicate.already_applied);
     }
 
     #[test]

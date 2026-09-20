@@ -155,6 +155,22 @@ Two CLI reproductions are release-blocking:
 
 Compact list, detail, human tree, and JSON are renderers of typed models, not independent queries.
 
+## Doctor and operational repair
+
+`st3 doctor` is read-only. Its `operational-repair` check computes the same bounded plan returned by
+`GET /v1/repair` and points to `st3 repair dry-run` when contradictions exist. A plan uses
+`st3.operational-repair.v0`, lists the exact affected subjects and reasons, and carries an
+`orpv0:<sha256>` token over the canonically ordered repair items. Snapshot index is diagnostic and
+is not part of the token.
+
+`st3 repair apply TOKEN` applies only that exact recomputed plan. A changed plan fails with
+`stale-repair-plan`; callers must inspect a new dry-run. Registered classes are terminal
+descendants, orphaned readiness, expired claims, superseded attention, contradicted wake failures,
+and impossible run/generation state. Apply appends normal graph transition claims and one
+`repair.applied` receipt. It never deletes or rewrites claims. Repeating an accepted token returns
+the replicated receipt with zero changes, and a new dry-run is clean once all listed contradictions
+have converged.
+
 ## Regression fixtures
 
 The fixtures under `crates/st3/tests/fixtures/operational-state` cover:

@@ -163,6 +163,7 @@ fn command_inventory_resolves_every_baseline_command_to_a_complete_purpose() {
         "trace",
         "wait",
         "doctor",
+        "repair",
         "replication",
         "service",
         "claude-channel",

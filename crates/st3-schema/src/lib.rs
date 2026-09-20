@@ -601,8 +601,8 @@ fn build_registry() -> Registry {
         ),
         (
             "repair",
-            "repair/RECORD_ID",
-            "An explicit replacement for an invalid replicated record.",
+            "repair/ID",
+            "An immutable receipt for a bounded graph or replication repair.",
             true,
         ),
         (
@@ -1560,6 +1560,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             false,
             &["repair"],
         ),
+        (
+            "repair.applied",
+            &["repair"],
+            WritePolicy::SystemOnly,
+            Cardinality::Once,
+            Some("repairs"),
+            true,
+            &[],
+        ),
     ];
     for (kind, subjects, policy, cardinality, projection, wake, source_kdl) in definitions {
         claims.insert(
@@ -1838,6 +1847,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "record.repaired" => &[
             ("record", required_string()),
             ("replacement", required_string()),
+            ("reason", required_string()),
+        ],
+        "repair.applied" => &[
+            ("token", required_string()),
+            ("item_count", integer()),
+            ("affected_subjects", array()),
             ("reason", required_string()),
         ],
         "runtime.action.requested" => &[
@@ -2384,6 +2399,7 @@ mod tests {
                 "publication.operation",
                 "record.repaired",
                 "render.applied",
+                "repair.applied",
                 "resource.observed",
                 "revision-proposal.applied",
                 "revision-proposal.approved",

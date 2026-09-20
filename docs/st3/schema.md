@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `7e6bdde6852ee882e0b056c45058dff434eba40e7d543f1f770f3b99094b817b`
+Digest: `5a9c0d67d0727b957f6d00ecfe03611f944d36130290203013663022315f12f3`
 
 ## Subject families
 
@@ -27,7 +27,7 @@ Digest: `7e6bdde6852ee882e0b056c45058dff434eba40e7d543f1f770f3b99094b817b`
 | `person` | `person/IDENTITY` | no | A human actor. |
 | `planning-session` | `planning-session/ID` | no | A durable planning session. |
 | `pty` | `pty/RUN/LOCAL_ID` | no | A mission-run terminal runtime. |
-| `repair` | `repair/RECORD_ID` | yes | An explicit replacement for an invalid replicated record. |
+| `repair` | `repair/ID` | yes | An immutable receipt for a bounded graph or replication repair. |
 | `resource` | `resource/NAME` | yes | An observed external or durable fact bag. |
 | `revision-proposal` | `revision-proposal/ID` | no | A mission revision proposal. |
 | `run-generation` | `run-generation/ID` | no | An immutable mission-run generation. |
@@ -97,6 +97,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |
+| `repair.applied` | `repair` | `system-only` | `once` | `affected_subjects:array`, `item_count:integer`, `reason!:string`, `token!:string` |  |
 | `resource.observed` | `resource` | `ordinary-client` | `append` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
 | `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |
 | `revision-proposal.approved` | `revision-proposal` | `authorized-requester` | `once-per-actor` | `all_approved:boolean`, `preview_hash:string`, `reviewer:subject-reference` |  |

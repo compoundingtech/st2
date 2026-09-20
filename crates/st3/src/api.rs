@@ -36,10 +36,11 @@ use crate::model::{
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionRequest,
     LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest,
     MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
-    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
-    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest, PlanningCancelRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
+    ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
     ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
     ReplicationRepairRequest, ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest,
     ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
@@ -262,6 +263,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
+        .route("/v1/repair", get(operational_repair_plan))
+        .route("/v1/repair/apply", post(apply_operational_repair))
         .route("/v1/replication/status", get(replication_status))
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
@@ -1863,6 +1866,27 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    match state.store.operational_repair_plan() {
+        Ok(plan) if plan.items.is_empty() => checks.push(DoctorCheck {
+            name: "operational-repair".into(),
+            status: "pass".into(),
+            message: "the graph has no repairable operational contradictions".into(),
+        }),
+        Ok(plan) => checks.push(DoctorCheck {
+            name: "operational-repair".into(),
+            status: "warn".into(),
+            message: format!(
+                "{} graph-authorized repairs are available; inspect `st3 repair dry-run` token {}",
+                plan.items.len(),
+                plan.token
+            ),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "operational-repair".into(),
+            status: "fail".into(),
+            message: format!("could not compute the operational repair plan: {error}"),
+        }),
+    }
     match tempfile::Builder::new()
         .prefix(".st3-doctor-")
         .tempfile_in(&state.state_dir)
@@ -2107,6 +2131,27 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         status: report_status.into(),
         checks,
     }))
+}
+
+async fn operational_repair_plan(
+    State(state): State<AppState>,
+) -> Result<Json<OperationalRepairPlan>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.operational_repair_plan())
+        .await
+        .map(Json)
+}
+
+async fn apply_operational_repair(
+    State(state): State<AppState>,
+    Json(request): Json<OperationalRepairApplyRequest>,
+) -> Result<Json<OperationalRepairResult>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking_action(move || store.apply_operational_repair(&request.token)).await?;
+    if result.applied != 0 {
+        signal_changed(&state);
+    }
+    Ok(Json(result))
 }
 
 async fn replication_status(
