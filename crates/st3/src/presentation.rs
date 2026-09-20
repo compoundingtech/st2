@@ -1222,6 +1222,7 @@ mod tests {
             reachability: "reachable".into(),
             reason: None,
             under: Vec::new(),
+            projection: Default::default(),
         }
     }
 

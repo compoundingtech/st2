@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -330,7 +330,6 @@ fn test_state(root: &Path) -> AppState {
 }
 
 #[tokio::test]
-#[ignore = "red baseline: enable when the client v0 read surface is implemented"]
 async fn client_v0_read_routes_conform_to_the_manifest() {
     let root = tempfile::tempdir().unwrap();
     let app = st3::api::router(test_state(root.path()));
@@ -344,6 +343,152 @@ async fn client_v0_read_routes_conform_to_the_manifest() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let envelope: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(envelope["api_version"], "st3.client.v0");
+    assert_eq!(
+        envelope["snapshot"]["projection_version"],
+        "client-projection.v0"
+    );
+    assert_eq!(envelope["value"]["kind"], "capabilities");
+    assert_eq!(envelope["value"]["transport"], "unix");
+    assert_eq!(envelope["value"]["limits"]["max_page_items"], 200);
+}
+
+async fn client_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
+#[tokio::test]
+async fn operational_lists_share_one_versioned_paginated_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    for (subject, runtime, incarnation) in [
+        ("agent/alpha", "alpha-runtime", "alpha-runtime:i1"),
+        ("agent/beta", "beta-runtime", "beta-runtime:i1"),
+    ] {
+        store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: std::collections::BTreeMap::from([
+                    ("runtime_id".into(), Value::String(runtime.into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("status".into(), Value::String("running".into())),
+                    ("reachability".into(), Value::String("local".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let app = st3::api::router(state);
+    for collection in [
+        "attention",
+        "messages",
+        "launches",
+        "work",
+        "agents",
+        "history",
+        "sessions",
+    ] {
+        let (status, envelope) =
+            client_json(app.clone(), &format!("/v1/client/{collection}")).await;
+        assert_eq!(status, StatusCode::OK, "{collection}: {envelope}");
+        assert_eq!(envelope["api_version"], "st3.client.v0");
+        assert_eq!(envelope["value"]["kind"], "page");
+        assert_eq!(envelope["value"]["collection"], collection);
+        assert!(envelope["value"]["items"].is_array());
+        assert_eq!(envelope["value"]["page"]["limit"], 50);
+    }
+
+    let (_, first) = client_json(app.clone(), "/v1/client/agents?limit=1").await;
+    assert_eq!(first["value"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["value"]["page"]["has_more"], true);
+    let cursor = first["value"]["page"]["next_cursor"].as_str().unwrap();
+    let uri = format!(
+        "/v1/client/agents?limit=1&cursor={}",
+        urlencoding::encode(cursor)
+    );
+    let (_, second) = client_json(app.clone(), &uri).await;
+    assert_eq!(first["snapshot"]["id"], second["snapshot"]["id"]);
+    assert_ne!(
+        first["value"]["items"][0]["id"],
+        second["value"]["items"][0]["id"]
+    );
+
+    store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "agent/gamma".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/gamma".into()),
+            fields: std::collections::BTreeMap::from([
+                ("runtime_id".into(), Value::String("gamma-runtime".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("gamma-runtime:i1".into()),
+                ),
+                ("status".into(), Value::String("running".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let (status, expired) = client_json(app, &uri).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(expired["code"], "page-cursor-expired");
+    assert_eq!(expired["error_version"], "st3.client.error.v0");
+}
+
+#[tokio::test]
+async fn stopped_agents_are_annotated_history_not_default_membership() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "agent/retired".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/retired".into()),
+            fields: std::collections::BTreeMap::from([
+                ("runtime_id".into(), Value::String("retired-runtime".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("retired-runtime:i1".into()),
+                ),
+                ("status".into(), Value::String("stopped".into())),
+                ("terminal".into(), Value::Bool(true)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let app = st3::api::router(state);
+    let (_, current) = client_json(app.clone(), "/v1/client/agents").await;
+    assert!(current["value"]["items"].as_array().unwrap().is_empty());
+    let (_, history) = client_json(app, "/v1/client/agents?history=true").await;
+    let retired = &history["value"]["items"][0];
+    assert_eq!(retired["id"], "agent/retired");
+    assert_eq!(retired["operational"]["layer"], "history");
+    assert_eq!(retired["operational"]["actionable"], false);
+    assert!(
+        retired["operational"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("stopped".into()))
+    );
 }
 
 #[tokio::test]

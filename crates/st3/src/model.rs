@@ -1019,6 +1019,30 @@ pub struct StatusResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OperationalAnnotation {
+    pub layer: String,
+    pub actionable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_incarnation: Option<String>,
+}
+
+impl Default for OperationalAnnotation {
+    fn default() -> Self {
+        Self {
+            layer: "current".into(),
+            actionable: true,
+            reasons: Vec::new(),
+            owner_generation: None,
+            runtime_incarnation: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubjectStatus {
     pub subject: String,
     pub kind: Option<String>,
@@ -1036,6 +1060,26 @@ pub struct SubjectStatus {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
+    #[serde(default)]
+    pub projection: OperationalAnnotation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientPageInfo {
+    pub limit: usize,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientResourcePage {
+    pub kind: String,
+    pub collection: String,
+    pub items: Vec<Value>,
+    pub page: ClientPageInfo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

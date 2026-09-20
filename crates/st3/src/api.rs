@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -30,20 +30,21 @@ use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
-    EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, GateResultRequest,
-    HumanReviewView, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
-    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
-    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
-    ReplicationRepairRequest, ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest,
-    ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest,
+    ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck, DoctorReport,
+    DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus,
+    EventRecord, GateResultRequest, HumanReviewView, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
+    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
+    ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
+    St3Error, StatusResponse, StepRunView, WorkRequest,
 };
 use crate::store::Store;
 
@@ -58,6 +59,43 @@ pub struct AppState {
     pub pty_binary: std::path::PathBuf,
     pub fleet_id: Option<String>,
     pub configured_peers: Vec<String>,
+}
+
+const CLIENT_API_VERSION: &str = "st3.client.v0";
+const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
+const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
+const CLIENT_MAX_PAGE_ITEMS: usize = 200;
+const CLIENT_PAGE_TTL_MS: u128 = 15 * 60 * 1_000;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ClientSnapshot {
+    id: String,
+    host_id: String,
+    store_index: u64,
+    projection_version: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ClientListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    history: bool,
+    person: Option<String>,
+    actor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ClientPageCursor {
+    snapshot: ClientSnapshot,
+    collection: String,
+    offset: usize,
+    limit: usize,
+    history: bool,
+    person: Option<String>,
+    actor: Option<String>,
+    expires_at_unix_ms: u128,
 }
 
 fn signal_changed(state: &AppState) {
@@ -130,6 +168,21 @@ impl IntoResponse for ApiError {
 pub fn router(state: AppState) -> Router {
     let app = Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/attention", get(client_attention))
+        .route("/v1/client/attention/{*id}", get(client_attention_detail))
+        .route("/v1/client/messages", get(client_messages))
+        .route("/v1/client/messages/{*id}", get(client_messages_detail))
+        .route("/v1/client/launches", get(client_launches))
+        .route("/v1/client/launches/{*id}", get(client_launches_detail))
+        .route("/v1/client/work", get(client_work))
+        .route("/v1/client/work/{*id}", get(client_work_detail))
+        .route("/v1/client/agents", get(client_agents))
+        .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route("/v1/client/history", get(client_history))
+        .route("/v1/client/history/{*id}", get(client_history_detail))
+        .route("/v1/client/sessions", get(client_sessions))
+        .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
@@ -272,9 +325,31 @@ async fn schema() -> Json<Value> {
 
 async fn response_envelope(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let client_request = request.uri().path().starts_with("/v1/client/");
+    let client_snapshot = client_request.then(|| {
+        request
+            .uri()
+            .query()
+            .and_then(|query| {
+                query.split('&').find_map(|pair| {
+                    let (name, value) = pair.split_once('=')?;
+                    (name == "cursor").then(|| {
+                        urlencoding::decode(value)
+                            .map(|value| value.into_owned())
+                            .unwrap_or_else(|_| value.to_owned())
+                    })
+                })
+            })
+            .and_then(|cursor| decode_client_cursor(&cursor).ok())
+            .map(|cursor| cursor.snapshot)
+            .unwrap_or_else(|| new_client_snapshot(&state))
+    });
+    if let Some(snapshot) = &client_snapshot {
+        request.extensions_mut().insert(snapshot.clone());
+    }
     let response = next.run(request).await;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         || !response
@@ -300,8 +375,29 @@ async fn response_envelope(
         }),
     };
     let store_index = state.store.index().unwrap_or_default();
-    let request_id = new_request_id();
-    let envelope = if status.is_success() {
+    let request_id = if client_request {
+        format!("request/{}", new_request_id())
+    } else {
+        new_request_id()
+    };
+    let envelope = if client_request && status.is_success() {
+        json!({
+            "api_version": CLIENT_API_VERSION,
+            "request_id": request_id,
+            "snapshot": client_snapshot.unwrap_or_else(|| new_client_snapshot(&state)),
+            "value": raw,
+        })
+    } else if client_request {
+        json!({
+            "api_version": CLIENT_API_VERSION,
+            "error_version": "st3.client.error.v0",
+            "request_id": request_id,
+            "code": client_error_code(raw.get("code").and_then(Value::as_str)),
+            "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
+            "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE),
+            "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
+        })
+    } else if status.is_success() {
         json!({
             "api_version": "st3.v1",
             "request_id": request_id,
@@ -347,6 +443,806 @@ fn new_request_id() -> String {
         u64::from_be_bytes([
             0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ])
+    )
+}
+
+fn client_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn client_timestamp(unix_ms: u128) -> String {
+    let unix_ms = i64::try_from(unix_ms).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp_millis(unix_ms)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn client_snapshot_time(snapshot: &ClientSnapshot) -> u128 {
+    chrono::DateTime::parse_from_rfc3339(&snapshot.created_at)
+        .map(|time| u128::try_from(time.timestamp_millis()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn new_client_snapshot(state: &AppState) -> ClientSnapshot {
+    let store_index = state.store.index().unwrap_or_default();
+    let created_at = client_timestamp(client_now_ms());
+    let fingerprint = hex::encode(Sha256::digest(
+        format!(
+            "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
+            state.node
+        )
+        .as_bytes(),
+    ));
+    ClientSnapshot {
+        id: format!(
+            "snapshot/{}/{store_index}/{}",
+            state.node.replace(char::is_whitespace, "-"),
+            &fingerprint[..16]
+        ),
+        host_id: format!("host/{}", state.node.replace(char::is_whitespace, "-")),
+        store_index,
+        projection_version: CLIENT_PROJECTION_VERSION.into(),
+        created_at,
+    }
+}
+
+fn client_error_code(code: Option<&str>) -> String {
+    match code.unwrap_or("internal") {
+        "not-found"
+        | "forbidden"
+        | "unsupported-capability"
+        | "validation-failed"
+        | "idempotency-conflict"
+        | "stale-fence"
+        | "cursor-gap"
+        | "page-cursor-expired"
+        | "rate-limited"
+        | "internal" => code.unwrap_or("internal").to_owned(),
+        _ => "internal".into(),
+    }
+}
+
+fn encode_client_cursor(cursor: &ClientPageCursor) -> Result<String, ApiError> {
+    let encoded = serde_json::to_vec(cursor).map_err(ApiError::internal)?;
+    Ok(format!(
+        "page/{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded)
+    ))
+}
+
+fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
+    let encoded = cursor.strip_prefix("page/").ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation-failed".into(),
+        message: "the page cursor is malformed".into(),
+        details: serde_json::Map::new(),
+    })?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation-failed".into(),
+            message: "the page cursor is malformed".into(),
+            details: serde_json::Map::new(),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation-failed".into(),
+        message: "the page cursor is malformed".into(),
+        details: serde_json::Map::new(),
+    })
+}
+
+fn client_page_expired(message: impl Into<String>) -> ApiError {
+    ApiError {
+        status: StatusCode::GONE,
+        code: "page-cursor-expired".into(),
+        message: message.into(),
+        details: serde_json::Map::new(),
+    }
+}
+
+fn client_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    collection: &str,
+    items: Vec<Value>,
+    query: &ClientListQuery,
+) -> Result<ClientResourcePage, ApiError> {
+    let requested_limit = query
+        .limit
+        .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    let (offset, limit, expires_at_unix_ms) = if let Some(cursor) = &query.cursor {
+        let cursor = decode_client_cursor(cursor)?;
+        if cursor.collection != collection
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || query
+                .limit
+                .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+    } else {
+        (0, requested_limit, client_now_ms() + CLIENT_PAGE_TTL_MS)
+    };
+    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+        return Err(client_page_expired(
+            "the snapshot changed; restart pagination from the first page",
+        ));
+    }
+    let end = offset.saturating_add(limit).min(items.len());
+    let page_items = items.get(offset..end).unwrap_or_default().to_vec();
+    let has_more = end < items.len();
+    let next_cursor = if has_more {
+        Some(encode_client_cursor(&ClientPageCursor {
+            snapshot: snapshot.clone(),
+            collection: collection.into(),
+            offset: end,
+            limit,
+            history: query.history,
+            person: query.person.clone(),
+            actor: query.actor.clone(),
+            expires_at_unix_ms,
+        })?)
+    } else {
+        None
+    };
+    Ok(ClientResourcePage {
+        kind: "page".into(),
+        collection: collection.into(),
+        items: page_items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: Some(client_timestamp(expires_at_unix_ms)),
+        },
+    })
+}
+
+fn client_detail_id(kind: &str, id: &str) -> String {
+    if id.starts_with(&format!("{kind}/")) {
+        id.to_owned()
+    } else {
+        format!("{kind}/{id}")
+    }
+}
+
+fn client_detail(items: Vec<Value>, kind: &str, id: &str) -> Result<Json<Value>, ApiError> {
+    let id = client_detail_id(kind, id);
+    items
+        .into_iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("{kind} `{id}` does not exist")))
+}
+
+async fn client_capabilities(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+) -> Json<Value> {
+    let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
+    Json(json!({
+        "kind": "capabilities",
+        "session_actor": "person/local/session/unix",
+        "transport": "unix",
+        "capabilities": [
+            { "id": "read.projections", "version": 0, "state": "granted" },
+            { "id": "terminal.read", "version": 0, "state": "granted" },
+            { "id": "terminal.control", "version": 0, "state": "ungranted" },
+            { "id": "control.launches", "version": 0, "state": "ungranted" }
+        ],
+        "limits": {
+            "max_page_items": CLIENT_MAX_PAGE_ITEMS,
+            "max_event_items": 500,
+            "max_response_bytes": 1_048_576,
+            "max_wait_ms": 30_000
+        },
+        "event_cursor": cursor,
+        "oldest_event_cursor": format!("event-cursor/{}/0", state.node),
+        "schemas": [
+            "../client-v0/schemas/client-v0.schema.json",
+            "../client-v0/schemas/operations.json"
+        ]
+    }))
+}
+
+fn client_work_resources(
+    store: &Store,
+    actor: Option<&str>,
+    history: bool,
+    snapshot_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
+    let mut work = if history {
+        store.work_history_at_snapshot(actor, snapshot_unix_ms)?
+    } else {
+        store.work_at_snapshot(actor, false, snapshot_unix_ms)?
+    };
+    work.sort_by(|left, right| {
+        let priority = |status: &str| match status {
+            "ready" => 0,
+            "claimed" | "working" => 1,
+            "verifying" => 2,
+            "blocked" => 3,
+            "pending" | "waiting" => 4,
+            _ => 5,
+        };
+        priority(&left.status)
+            .cmp(&priority(&right.status))
+            .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
+            .then_with(|| left.step.cmp(&right.step))
+            .then_with(|| left.subject.cmp(&right.subject))
+    });
+    work.into_iter()
+        .map(|work| {
+            let operational = store.work_annotation(&work)?;
+            let state = match work.status.as_str() {
+                "pending" => "waiting",
+                "working" => "claimed",
+                other => other,
+            };
+            Ok(json!({
+                "id": work.subject,
+                "kind": "work",
+                "revision": work.definition_hash,
+                "updated_at": client_timestamp(work.updated_at_unix_ms),
+                "mission_run_id": work.run,
+                "generation_id": work.generation,
+                "definition_id": work.definition_hash,
+                "path": work.step,
+                "state": state,
+                "attempt": work.attempt,
+                "readiness_epoch": work.readiness_epoch,
+                "claimant": work.claimant,
+                "claim_incarnation": work.claim_incarnation,
+                "goals": work.goals,
+                "constraints": work.constraints,
+                "operational": operational
+            }))
+        })
+        .collect()
+}
+
+fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {
+    let status = if history {
+        store.status_history(None, None, None)?
+    } else {
+        store.status(None)?
+    };
+    let mut agents = status
+        .subjects
+        .into_iter()
+        .filter(|subject| {
+            subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
+        })
+        .map(|subject| {
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let observed = fields
+                .and_then(|fields| fields.get("status"))
+                .and_then(Value::as_str);
+            let state = match observed {
+                Some("running" | "ready" | "working" | "idle") => "running",
+                Some("starting" | "pending") => "starting",
+                Some("waiting") => "waiting",
+                Some("failed") => "failed",
+                Some("stopped" | "exited" | "absent") => "stopped",
+                _ if subject.desired.is_some() => "desired",
+                _ => "stopped",
+            };
+            let runtime_ids = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str)
+                .map(|runtime| vec![format!("runtime/{runtime}")])
+                .unwrap_or_default();
+            let name = subject
+                .desired
+                .as_ref()
+                .and_then(|desired| desired.get("display_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    subject
+                        .subject
+                        .strip_prefix("agent/")
+                        .unwrap_or(&subject.subject)
+                })
+                .to_owned();
+            let revision = subject
+                .desired_revision
+                .clone()
+                .or_else(|| subject.claims.last().cloned())
+                .unwrap_or_else(|| format!("agent/{}", subject.subject));
+            let value = json!({
+                "id": subject.subject,
+                "kind": "agent",
+                "revision": revision,
+                "updated_at": at,
+                "name": name,
+                "state": state,
+                "reachability": subject.reachability,
+                "runtime_ids": runtime_ids,
+                "operational": subject.projection
+            });
+            (name, value)
+        })
+        .collect::<Vec<_>>();
+    agents.sort_by(|(left_name, left), (right_name, right)| {
+        left_name
+            .cmp(right_name)
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(agents.into_iter().map(|(_, value)| value).collect())
+}
+
+fn client_session_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {
+    let status = if history {
+        store.status_history(None, None, None)?
+    } else {
+        store.status(None)?
+    };
+    let mut sessions = Vec::new();
+    for subject in status.subjects.into_iter().filter(|subject| {
+        subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
+    }) {
+        let fields = subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual));
+        let incarnation = fields
+            .and_then(|fields| fields.get("incarnation_id"))
+            .and_then(Value::as_str)
+            .or(subject.projection.runtime_incarnation.as_deref());
+        let runtime = fields
+            .and_then(|fields| fields.get("runtime_id"))
+            .and_then(Value::as_str);
+        let Some(identity) = incarnation.or(runtime) else {
+            continue;
+        };
+        let digest = hex::encode(Sha256::digest(
+            format!("{}:{identity}", subject.subject).as_bytes(),
+        ));
+        let observed = fields
+            .and_then(|fields| fields.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("waiting");
+        let state = match observed {
+            "running" | "ready" | "working" | "idle" => "running",
+            "starting" | "pending" | "waiting" => "waiting",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            "stopped" | "exited" | "absent" => "completed",
+            _ => "waiting",
+        };
+        let started = fields
+            .and_then(|fields| fields.get("started_at_unix_ms"))
+            .and_then(|value| value.as_u64().map(u128::from))
+            .map(client_timestamp)
+            .unwrap_or_else(|| at.to_owned());
+        sessions.push(json!({
+            "id": format!("session/{}", &digest[..24]),
+            "kind": "session",
+            "revision": identity,
+            "updated_at": at,
+            "owner_id": subject.subject,
+            "state": state,
+            "started_at": started,
+            "ended_at": if state == "completed" || state == "failed" || state == "cancelled" { Some(at) } else { None },
+            "timeline_cursor": format!("timeline-cursor/{}/0", &digest[..24]),
+            "runtime_incarnation": incarnation,
+            "operational": subject.projection
+        }));
+    }
+    sessions.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .cmp(&left["updated_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(sessions)
+}
+
+fn attention_resource_id(subject: &str) -> String {
+    if subject.starts_with("attention/") {
+        subject.to_owned()
+    } else {
+        let digest = hex::encode(Sha256::digest(subject.as_bytes()));
+        format!("attention/{}", &digest[..24])
+    }
+}
+
+fn client_attention_resources(
+    store: &Store,
+    person: Option<&str>,
+    history: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let current = store.attention_items(person)?;
+    let current_subjects = current
+        .iter()
+        .map(|item| item.subject.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut resources = BTreeMap::new();
+    for item in &current {
+        let id = attention_resource_id(&item.subject);
+        resources.insert(
+            id.clone(),
+            json!({
+                "id": id,
+                "kind": "attention",
+                "revision": item.subject,
+                "updated_at": client_timestamp(item.requested_at_unix_ms),
+                "title": item.title,
+                "detail": item.detail,
+                "priority": if item.kind == "fault" { "high" } else { "normal" },
+                "state": "open",
+                "requested_at": client_timestamp(item.requested_at_unix_ms),
+                "targets": item.targets,
+                "actions": if item.kind == "fault" { vec!["attention.resolve"] } else { Vec::<&str>::new() },
+                "operational": { "layer": "current", "actionable": true, "reasons": [] }
+            }),
+        );
+    }
+    if history {
+        for request in store.attention_requests(person, true)? {
+            let current = current_subjects.contains(request.subject.as_str());
+            let mut reasons = Vec::new();
+            if request.status != "pending" {
+                reasons.push("resolved");
+            } else if !current {
+                reasons.push("superseded");
+            }
+            let id = attention_resource_id(&request.subject);
+            resources.insert(
+                id.clone(),
+                json!({
+                    "id": id,
+                    "kind": "attention",
+                    "revision": request.request,
+                    "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
+                    "title": request.title,
+                    "detail": request.reason,
+                    "priority": match request.severity.as_str() { "critical" => "critical", "error" => "high", "warning" => "normal", _ => "low" },
+                    "state": if request.status == "pending" { "open" } else { "resolved" },
+                    "requested_at": client_timestamp(request.requested_at_unix_ms),
+                    "targets": request.targets,
+                    "actions": if current { vec!["attention.resolve"] } else { Vec::<&str>::new() },
+                    "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
+                }),
+            );
+        }
+    }
+    let mut resources = resources.into_values().collect::<Vec<_>>();
+    let priority = |value: &Value| match value["priority"].as_str() {
+        Some("critical") => 0,
+        Some("high") => 1,
+        Some("normal") => 2,
+        _ => 3,
+    };
+    resources.sort_by(|left, right| {
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| {
+                left["requested_at"]
+                    .as_str()
+                    .cmp(&right["requested_at"].as_str())
+            })
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(resources)
+}
+
+fn client_message_resources(
+    store: &Store,
+    person: Option<&str>,
+    history: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let current_ids = store
+        .operational_messages(person, false)?
+        .into_iter()
+        .map(|message| message.subject)
+        .collect::<std::collections::BTreeSet<_>>();
+    let messages = store.operational_messages(person, history)?;
+    let mut resources = Vec::new();
+    for message in messages {
+        let claims = store.claims_for(&message.subject, None)?;
+        let first = claims.first();
+        let last = claims.last();
+        let sent_at = first
+            .map(|claim| claim.accepted_at_unix_ms)
+            .unwrap_or_default();
+        let updated_at = last
+            .map(|claim| claim.accepted_at_unix_ms)
+            .unwrap_or(sent_at);
+        let mut reasons = Vec::new();
+        if message.status == "closed" {
+            reasons.push("closed");
+        } else if !current_ids.contains(&message.subject) {
+            reasons.push("superseded");
+        }
+        let current = reasons.is_empty();
+        resources.push(json!({
+            "id": message.subject,
+            "kind": "message",
+            "revision": last.map(|claim| claim.id.as_str()).unwrap_or("message/unknown"),
+            "updated_at": client_timestamp(updated_at),
+            "from": message.from,
+            "to": message.to,
+            "title": message.title,
+            "content": message.content,
+            "state": message.status,
+            "sent_at": client_timestamp(sent_at),
+            "in_reply_to": message.in_reply_to,
+            "tags": message.tags,
+            "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
+        }));
+    }
+    resources.sort_by(|left, right| {
+        right["sent_at"]
+            .as_str()
+            .cmp(&left["sent_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(resources)
+}
+
+fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<Value>> {
+    let sessions = store.planning_sessions(history)?;
+    let mut resources = sessions
+        .into_iter()
+        .map(|session| {
+            let phase = match session.status.as_str() {
+                "planning" | "revision-requested" => "authoring",
+                "review" => "review",
+                "approved" => "approved",
+                "cancelled" => "cancelled",
+                _ => "failed",
+            };
+            let historical = matches!(phase, "approved" | "cancelled" | "failed");
+            let target = match (&session.target_mission_run, &session.source_generation) {
+                (Some(run), Some(generation)) => json!({
+                    "type": "mission-run",
+                    "mission_run_id": run,
+                    "generation_id": generation
+                }),
+                _ => json!({ "type": "new-mission" }),
+            };
+            json!({
+                "id": format!("launch/{}", session.id),
+                "kind": "launch",
+                "revision": format!("launch/{}", session.updated_at_unix_ms),
+                "updated_at": client_timestamp(session.updated_at_unix_ms),
+                "title": session.mission,
+                "phase": phase,
+                "request": session.request,
+                "target": target,
+                "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
+                "decisions": Vec::<String>::new(),
+                "approvals": Vec::<String>::new(),
+                "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
+            })
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .cmp(&left["updated_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(resources)
+}
+
+fn client_history_resources(store: &Store) -> anyhow::Result<Vec<Value>> {
+    let index = store.index()?;
+    let page = store.claims_page(None, None, 0, None, true, index as usize + 1)?;
+    Ok(page
+        .claims
+        .into_iter()
+        .map(|claim| {
+            let mut targets = vec![claim.subject.clone()];
+            if let Some(actor) = &claim.actor
+                && actor.contains('/')
+                && !actor.chars().any(char::is_whitespace)
+            {
+                targets.push(actor.clone());
+            }
+            json!({
+                "id": format!("history/{}", claim.store_index),
+                "kind": "history",
+                "revision": claim.id,
+                "updated_at": client_timestamp(claim.accepted_at_unix_ms),
+                "event_type": claim.kind,
+                "occurred_at": client_timestamp(claim.accepted_at_unix_ms),
+                "store_index": claim.store_index,
+                "summary": format!("{} on {}", claim.kind, claim.subject),
+                "targets": targets,
+                "operational": { "layer": "history", "actionable": false, "reasons": ["audit"] }
+            })
+        })
+        .collect())
+}
+
+async fn client_work(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let store = state.store.clone();
+    let actor = query.actor.clone();
+    let history = query.history;
+    let snapshot_unix_ms = client_snapshot_time(&snapshot);
+    let items = blocking_store(move || {
+        client_work_resources(&store, actor.as_deref(), history, snapshot_unix_ms)
+    })
+    .await?;
+    client_page(&state, &snapshot, "work", items, &query).map(Json)
+}
+
+async fn client_work_detail(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_work_resources(
+            &state.store,
+            query.actor.as_deref(),
+            query.history,
+            client_snapshot_time(&snapshot),
+        )
+        .map_err(ApiError::internal)?,
+        "work",
+        &id,
+    )
+}
+
+async fn client_agents(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_agent_resources(&state.store, query.history, &snapshot.created_at)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "agents", items, &query).map(Json)
+}
+
+async fn client_agents_detail(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_agent_resources(&state.store, query.history, &snapshot.created_at)
+            .map_err(ApiError::internal)?,
+        "agent",
+        &id,
+    )
+}
+
+async fn client_sessions(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_session_resources(&state.store, query.history, &snapshot.created_at)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "sessions", items, &query).map(Json)
+}
+
+async fn client_sessions_detail(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_session_resources(&state.store, query.history, &snapshot.created_at)
+            .map_err(ApiError::internal)?,
+        "session",
+        &id,
+    )
+}
+
+async fn client_attention(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_attention_resources(&state.store, query.person.as_deref(), query.history)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "attention", items, &query).map(Json)
+}
+
+async fn client_attention_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_attention_resources(&state.store, query.person.as_deref(), query.history)
+            .map_err(ApiError::internal)?,
+        "attention",
+        &id,
+    )
+}
+
+async fn client_messages(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_message_resources(&state.store, query.person.as_deref(), query.history)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "messages", items, &query).map(Json)
+}
+
+async fn client_messages_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_message_resources(&state.store, query.person.as_deref(), query.history)
+            .map_err(ApiError::internal)?,
+        "message",
+        &id,
+    )
+}
+
+async fn client_launches(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_launch_resources(&state.store, query.history).map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "launches", items, &query).map(Json)
+}
+
+async fn client_launches_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_launch_resources(&state.store, query.history).map_err(ApiError::internal)?,
+        "launch",
+        &id,
+    )
+}
+
+async fn client_history(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let items = client_history_resources(&state.store).map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "history", items, &query).map(Json)
+}
+
+async fn client_history_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    client_detail(
+        client_history_resources(&state.store).map_err(ApiError::internal)?,
+        "history",
+        &id,
     )
 }
 
@@ -2929,6 +3825,8 @@ struct StatusQuery {
     subject: Option<String>,
     owner_run: Option<String>,
     at_index: Option<u64>,
+    #[serde(default)]
+    history: bool,
 }
 
 async fn status(
@@ -2937,11 +3835,19 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        store.status_at(
-            query.subject.as_deref(),
-            query.owner_run.as_deref(),
-            query.at_index,
-        )
+        if query.history {
+            store.status_history(
+                query.subject.as_deref(),
+                query.owner_run.as_deref(),
+                query.at_index,
+            )
+        } else {
+            store.status_at(
+                query.subject.as_deref(),
+                query.owner_run.as_deref(),
+                query.at_index,
+            )
+        }
     })
     .await
     .map(Json)

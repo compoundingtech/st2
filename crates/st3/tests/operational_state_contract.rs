@@ -204,7 +204,6 @@ fn eval_message_keeps_its_explicit_person_identity() {
 }
 
 #[test]
-#[ignore = "red baseline: terminal historical runtime leaks into the default status projection"]
 fn terminal_signal_rename_sig_sup_is_history_not_default_state() {
     let store = Store::open_memory("operational-fixture").unwrap();
     append_fixture_claims(&store, &fixture("terminal-sig-sup.json"));
@@ -219,7 +218,6 @@ fn terminal_signal_rename_sig_sup_is_history_not_default_state() {
 }
 
 #[test]
-#[ignore = "red baseline: stopped historical agents leak into the default status projection"]
 fn stopped_agents_require_explicit_all_or_history() {
     let store = Store::open_memory("operational-fixture").unwrap();
     append_fixture_claims(&store, &fixture("stopped-agents.json"));
@@ -273,7 +271,6 @@ fn expired_lease_is_actionably_ready_at_snapshot_time() {
 }
 
 #[test]
-#[ignore = "red baseline: explicit stale attention is not filtered by generation or incarnation"]
 fn superseded_revision_and_readiness_attention_are_history_only() {
     let store = Store::open_memory("operational-fixture").unwrap();
     append_fixture_claims(&store, &fixture("superseded-attention.json"));
@@ -286,7 +283,6 @@ fn superseded_revision_and_readiness_attention_are_history_only() {
 }
 
 #[test]
-#[ignore = "red baseline: all reminder versions remain actionable"]
 fn only_the_selected_reminder_version_is_actionable() {
     let store = Store::open_memory("operational-fixture").unwrap();
     append_fixture_claims(&store, &fixture("versioned-reminders.json"));

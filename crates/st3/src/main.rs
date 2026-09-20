@@ -624,6 +624,9 @@ struct StatusArgs {
     owner_run: Option<String>,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
+    /// Include stopped, superseded, terminal-owner, and other historical records.
+    #[arg(long)]
+    all: bool,
     #[arg(long, value_parser = ["available", "busy", "dnd", "offline"])]
     set: Option<String>,
 }
@@ -634,6 +637,9 @@ struct AgentsArgs {
     status: Option<String>,
     #[arg(long)]
     enrich: bool,
+    /// Include stopped, superseded, terminal-owner, and historical eval agents.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -3075,6 +3081,9 @@ async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Res
     if let Some(at_index) = args.at_index {
         query.push(format!("at_index={at_index}"));
     }
+    if args.all {
+        query.push("history=true".into());
+    }
     let path = if query.is_empty() {
         "/v1/status".to_owned()
     } else {
@@ -3096,7 +3105,12 @@ async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Res
 }
 
 async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Result<()> {
-    let response: StatusResponse = client.get("/v1/status").await?;
+    let path = if args.all {
+        "/v1/status?history=true"
+    } else {
+        "/v1/status"
+    };
+    let response: StatusResponse = client.get(path).await?;
     let agents = response
         .subjects
         .into_iter()
@@ -3108,6 +3122,13 @@ async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Res
                     .as_ref()
                     .and_then(|actual| actual.get("presence"))
                     .and_then(Value::as_str)
+                    .or_else(|| {
+                        subject
+                            .actual
+                            .as_ref()
+                            .and_then(|actual| actual.get("status"))
+                            .and_then(Value::as_str)
+                    })
                     == Some(selected)
             })
         })
@@ -4131,7 +4152,7 @@ async fn run_attention(
 async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
     match command {
         WorkCommand::Ls { actor, all } => {
-            let include_terminal = if json_output { all } else { true };
+            let include_terminal = all;
             let path = if let Some(actor) = actor.as_deref() {
                 format!(
                     "/v1/work?actor={}&include_terminal={include_terminal}",

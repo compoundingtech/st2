@@ -20,14 +20,15 @@ use crate::model::{
     DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput, LoopRoundView,
     LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView,
     MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
-    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
-    PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView,
-    ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory, ReplicationPeerStatus,
-    ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
-    SubscriptionSpec, WorkRequest, WorkSelector,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    OperationalAnnotation, PlannedAction, PlanningCandidateView, PlanningPreviewView,
+    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
+    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
+    WorkRequest, WorkSelector,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -848,6 +849,21 @@ impl Store {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
         let connection = self.readers.get();
         planning_session_view_tx(&connection, id)
+    }
+
+    pub fn planning_sessions(&self, include_history: bool) -> Result<Vec<PlanningSessionView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id FROM planning_sessions
+             WHERE ?1 OR status NOT IN ('approved','cancelled','failed')
+             ORDER BY updated_at_unix_ms DESC, id",
+        )?;
+        let ids = statement
+            .query_map([include_history], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .filter_map(|id| planning_session_view_tx(&connection, &id).transpose())
+            .collect()
     }
 
     pub fn add_planning_candidate(
@@ -2694,6 +2710,15 @@ impl Store {
     }
 
     pub fn work(&self, actor: Option<&str>, include_terminal: bool) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot(actor, include_terminal, now_ms())
+    }
+
+    pub fn work_at_snapshot(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -2708,7 +2733,7 @@ impl Store {
         let views = rows.collect::<Result<Vec<_>, _>>()?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
-            enrich_step_queue(&connection, &mut view)?;
+            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
             let run_phase: String = connection.query_row(
                 "SELECT phase FROM mission_runs WHERE id=?1",
                 [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
@@ -2727,12 +2752,117 @@ impl Store {
             });
             if visible_to_actor
                 && (include_terminal
-                    || !matches!(view.status.as_str(), "completed" | "failed" | "cancelled"))
+                    || !matches!(
+                        view.status.as_str(),
+                        "pending" | "completed" | "failed" | "cancelled"
+                    ))
             {
                 visible.push(view);
             }
         }
         Ok(visible)
+    }
+
+    pub fn work_history(&self, actor: Option<&str>) -> Result<Vec<StepRunView>> {
+        self.work_history_at_snapshot(actor, now_ms())
+    }
+
+    pub fn work_history_at_snapshot(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<StepRunView>> {
+        let actor = actor.map(|value| normalize_actor(value, "agent"));
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE agentless=0
+             ORDER BY created_at_unix_ms, step_path, subject",
+        )?;
+        let rows = statement.query_map([], step_run_from_row)?;
+        let mut visible = Vec::new();
+        for row in rows {
+            let mut view = row?;
+            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            let visible_to_actor = actor.as_ref().is_none_or(|actor| {
+                view.assigned_to.as_deref() == Some(actor.as_str())
+                    || view.claimant.as_deref() == Some(actor.as_str())
+                    || view.available_to.iter().any(|candidate| candidate == actor)
+            });
+            if visible_to_actor {
+                visible.push(view);
+            }
+        }
+        Ok(visible)
+    }
+
+    pub fn work_annotation(&self, work: &StepRunView) -> Result<OperationalAnnotation> {
+        let connection = self.readers.get();
+        let owner = connection
+            .query_row(
+                "SELECT mission_runs.status, mission_runs.current_generation_id,
+                        mission_runs.mode, run_generations.status
+                 FROM mission_runs
+                 JOIN run_generations ON run_generations.id=?2
+                 WHERE mission_runs.id=?1",
+                params![
+                    work.run.strip_prefix("mission-run/").unwrap_or(&work.run),
+                    generation_id_from_subject(&work.generation),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some((run_status, current_generation, mode, generation_status)) = owner {
+            if is_terminal_run_state(&run_status) {
+                reasons.push("terminal-owner".into());
+                if mode == "eval" {
+                    reasons.push("eval".into());
+                }
+            }
+            if generation_id_from_subject(&work.generation) != current_generation
+                || generation_status == "superseded"
+            {
+                reasons.push("superseded".into());
+            }
+        }
+        if work
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("lease expired"))
+        {
+            reasons.push("expired-lease".into());
+        }
+        if matches!(work.status.as_str(), "completed" | "failed" | "cancelled")
+            && reasons.is_empty()
+        {
+            reasons.push("terminal-work".into());
+        }
+        reasons.sort();
+        reasons.dedup();
+        let historical = reasons.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "terminal-owner" | "superseded" | "eval" | "terminal-work"
+            )
+        });
+        Ok(OperationalAnnotation {
+            layer: if historical { "history" } else { "current" }.into(),
+            actionable: !historical
+                && matches!(work.status.as_str(), "ready" | "claimed" | "working"),
+            reasons,
+            owner_generation: Some(work.generation.clone()),
+            runtime_incarnation: work.claim_incarnation.clone(),
+        })
     }
 
     pub fn step_run(&self, subject: &str) -> Result<Option<StepRunView>> {
@@ -4670,7 +4800,7 @@ impl Store {
     }
 
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
-        self.status_at(selected, None, None)
+        self.status_at_view(selected, None, None, false)
     }
 
     pub fn status_at(
@@ -4678,6 +4808,25 @@ impl Store {
         selected: Option<&str>,
         selected_owner_run: Option<&str>,
         at_index: Option<u64>,
+    ) -> Result<StatusResponse> {
+        self.status_at_view(selected, selected_owner_run, at_index, false)
+    }
+
+    pub fn status_history(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+    ) -> Result<StatusResponse> {
+        self.status_at_view(selected, selected_owner_run, at_index, true)
+    }
+
+    fn status_at_view(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+        include_history: bool,
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
@@ -4707,6 +4856,9 @@ impl Store {
             )?;
             let kind = desired.as_ref().map(|row| row.kind.clone());
             let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
+            let owner_generation = desired
+                .as_ref()
+                .and_then(|row| row.owner_generation.clone());
             if selected_owner_run.is_some_and(|run| owner_run.as_deref() != Some(run)) {
                 continue;
             }
@@ -4750,7 +4902,21 @@ impl Store {
                 (_, Some(_), None) => Some("the desired member has no actual state".to_owned()),
                 _ => None,
             };
-            if let Some(reason) = &gap {
+            let projection = operational_annotation(
+                &connection,
+                &subject,
+                kind.as_deref(),
+                desired.is_some(),
+                owner_run.as_deref(),
+                owner_generation.as_deref(),
+                actual.as_ref(),
+                at_index,
+            )?;
+            let operational = projection.layer == "current";
+            if selected.is_none() && !include_history && !operational {
+                continue;
+            }
+            if operational && let Some(reason) = &gap {
                 pending_actions.push(PlannedAction {
                     subject: subject.clone(),
                     action: if matches!(kind.as_deref(), Some("stop")) {
@@ -4794,6 +4960,7 @@ impl Store {
                 reachability,
                 reason,
                 under,
+                projection,
             });
         }
         Ok(StatusResponse {
@@ -5144,6 +5311,19 @@ impl Store {
         Ok(output)
     }
 
+    pub fn operational_messages(
+        &self,
+        recipient: Option<&str>,
+        include_history: bool,
+    ) -> Result<Vec<MessageView>> {
+        let messages = self.messages(recipient, include_history)?;
+        Ok(if include_history {
+            messages
+        } else {
+            selected_actionable_messages(messages)
+        })
+    }
+
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -5359,6 +5539,31 @@ impl Store {
         attention_request_view_tx(&connection, &subject)
     }
 
+    pub fn attention_requests(
+        &self,
+        person: Option<&str>,
+        include_resolved: bool,
+    ) -> Result<Vec<AttentionRequestView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT subject FROM claims
+             WHERE kind='attention.requested'
+               AND (?1 IS NULL OR json_extract(body, '$.fields.reviewer')=?1)
+             ORDER BY store_index",
+        )?;
+        let subjects = statement
+            .query_map([person], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let requests = subjects
+            .into_iter()
+            .filter_map(|subject| attention_request_view_tx(&connection, &subject).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(requests
+            .into_iter()
+            .filter(|request| include_resolved || request.status == "pending")
+            .collect())
+    }
+
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
@@ -5445,7 +5650,7 @@ impl Store {
             }
         }
 
-        let messages = self.messages(person, false)?;
+        let messages = selected_actionable_messages(self.messages(person, false)?);
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -5469,7 +5674,9 @@ impl Store {
         {
             let connection = self.readers.get();
             for request in pending_attention_requests_tx(&connection, person)? {
-                items.push(attention_item_from_request(request));
+                if attention_request_is_current_tx(&connection, &request)? {
+                    items.push(attention_item_from_request(request));
+                }
             }
         }
         items.sort_by(|left, right| {
@@ -8394,6 +8601,7 @@ struct DesiredRow {
     body: String,
     member: Option<String>,
     owner_run: Option<String>,
+    owner_generation: Option<String>,
 }
 
 fn resolve_mission_run_inputs(
@@ -8542,7 +8750,8 @@ fn enforce_mission_run_capacity(
 fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<DesiredRow>> {
     connection
         .query_row(
-            "SELECT kind, revision, claim_id, body, member, owner_run FROM desired WHERE subject=?1",
+            "SELECT kind, revision, claim_id, body, member, owner_run, owner_generation
+             FROM desired WHERE subject=?1",
             [subject],
             |row| {
                 Ok(DesiredRow {
@@ -8552,6 +8761,7 @@ fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<
                     body: row.get(3)?,
                     member: row.get(4)?,
                     owner_run: row.get(5)?,
+                    owner_generation: row.get(6)?,
                 })
             },
         )
@@ -8636,6 +8846,7 @@ fn desired_row_at(
                     .map(|member| canonical_serialized_json_text(&member))
                     .transpose()?,
                 owner_run: desired.owner_run,
+                owner_generation: desired.owner_generation,
             })
         })
         .transpose()
@@ -8647,7 +8858,8 @@ fn current_desired_row_tx(
 ) -> Result<Option<DesiredRow>> {
     transaction
         .query_row(
-            "SELECT kind, revision, claim_id, body, member, owner_run FROM desired WHERE subject=?1",
+            "SELECT kind, revision, claim_id, body, member, owner_run, owner_generation
+             FROM desired WHERE subject=?1",
             [subject],
             |row| {
                 Ok(DesiredRow {
@@ -8657,6 +8869,7 @@ fn current_desired_row_tx(
                     body: row.get(3)?,
                     member: row.get(4)?,
                     owner_run: row.get(5)?,
+                    owner_generation: row.get(6)?,
                 })
             },
         )
@@ -10288,6 +10501,81 @@ fn pending_attention_requests_tx(
         .collect()
 }
 
+fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> {
+    let mut selected_reminders = BTreeMap::<String, (u64, MessageView)>::new();
+    let mut selected = Vec::new();
+    for message in messages {
+        let reminder = message
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix("reminder:"));
+        let Some(reminder) = reminder else {
+            selected.push(message);
+            continue;
+        };
+        let version = message
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix("version:"))
+            .and_then(|version| version.parse::<u64>().ok())
+            .unwrap_or_default();
+        let replace = selected_reminders
+            .get(reminder)
+            .is_none_or(|(current, selected)| {
+                version > *current || (version == *current && message.subject > selected.subject)
+            });
+        if replace {
+            selected_reminders.insert(reminder.to_owned(), (version, message));
+        }
+    }
+    selected.extend(selected_reminders.into_values().map(|(_, message)| message));
+    selected.sort_by_key(|message| message.created_index);
+    selected
+}
+
+fn attention_request_is_current_tx(
+    connection: &Connection,
+    request: &AttentionRequestView,
+) -> Result<bool> {
+    if request.reason.to_ascii_lowercase().contains("superseded") {
+        return Ok(false);
+    }
+    for target in &request.targets {
+        if let Some(generation) = target.strip_prefix("run-generation/") {
+            let current = connection
+                .query_row(
+                    "SELECT mission_runs.current_generation_id=run_generations.id
+                     FROM run_generations
+                     JOIN mission_runs ON mission_runs.id=run_generations.run_id
+                     WHERE run_generations.id=?1
+                       AND mission_runs.status NOT IN ('completed','failed','cancelled')",
+                    [generation],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if current != Some(true) {
+                return Ok(false);
+            }
+        } else if target.starts_with("step-run/") {
+            let current = connection
+                .query_row(
+                    "SELECT step_runs.generation_id=mission_runs.current_generation_id
+                            AND mission_runs.status NOT IN ('completed','failed','cancelled')
+                     FROM step_runs
+                     JOIN mission_runs ON mission_runs.id=step_runs.run_id
+                     WHERE step_runs.subject=?1",
+                    [target],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if current != Some(true) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
     AttentionActionView {
         label: label.into(),
@@ -10515,6 +10803,87 @@ fn is_terminal_run_state(status: &str) -> bool {
 
 fn is_terminal_generation_state(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "superseded")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn operational_annotation(
+    connection: &Connection,
+    subject: &str,
+    desired_kind: Option<&str>,
+    has_desired: bool,
+    owner_run: Option<&str>,
+    owner_generation: Option<&str>,
+    actual: Option<&Value>,
+    at_index: Option<u64>,
+) -> Result<OperationalAnnotation> {
+    let fields = actual.map(|value| value.get("fields").unwrap_or(value));
+    let status = fields
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    let incarnation = fields
+        .and_then(|value| value.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let runtime_subject = subject.starts_with("agent/")
+        || subject.starts_with("exec/")
+        || subject.starts_with("pty/");
+    let stopped = matches!(status, Some("stopped" | "absent" | "exited"));
+    let mut historical = Vec::new();
+    if runtime_subject && stopped && (!has_desired || desired_kind == Some("stop")) {
+        historical.push("stopped".to_owned());
+    }
+
+    if at_index.is_none()
+        && let Some(owner_run) = owner_run
+    {
+        let run_id = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
+        let owner = connection
+            .query_row(
+                "SELECT status, current_generation_id, mode FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((run_status, current_generation, mode)) = owner {
+            if is_terminal_run_state(&run_status) {
+                historical.push("terminal-owner".to_owned());
+                if mode == "eval" {
+                    historical.push("eval".to_owned());
+                }
+            }
+            if owner_generation.is_some_and(|generation| {
+                generation_id_from_subject(generation) != current_generation
+            }) {
+                historical.push("superseded".to_owned());
+            }
+        }
+    }
+    historical.sort();
+    historical.dedup();
+    let layer = if historical.is_empty() {
+        "current"
+    } else {
+        "history"
+    };
+    let healthy_runtime =
+        !runtime_subject || matches!(status, Some("running" | "ready" | "working" | "idle"));
+    let mut reasons = historical;
+    if layer == "current" && runtime_subject && has_desired && !healthy_runtime {
+        reasons.push("unhealthy".into());
+    }
+    Ok(OperationalAnnotation {
+        layer: layer.into(),
+        actionable: layer == "current" && healthy_runtime,
+        reasons,
+        owner_generation: owner_generation.map(str::to_owned),
+        runtime_incarnation: incarnation,
+    })
 }
 
 fn canonical_hash(value: &impl Serialize) -> Result<String> {
@@ -12845,7 +13214,15 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
 }
 
 fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
-    apply_effective_step_state(connection, view)?;
+    enrich_step_queue_at(connection, view, now_ms())
+}
+
+fn enrich_step_queue_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    apply_effective_step_state(connection, view, snapshot_unix_ms)?;
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -12879,6 +13256,7 @@ fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlit
 fn apply_effective_step_state(
     connection: &Connection,
     view: &mut StepRunView,
+    snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
     let owner = connection
         .query_row(
@@ -12922,7 +13300,7 @@ fn apply_effective_step_state(
     if matches!(view.status.as_str(), "claimed" | "working")
         && view
             .claim_expires_at_unix_ms
-            .is_some_and(|expiry| expiry <= now_ms())
+            .is_some_and(|expiry| expiry <= snapshot_unix_ms)
     {
         view.status = "ready".into();
         view.blocked_reason = Some("the worker lease expired".into());
