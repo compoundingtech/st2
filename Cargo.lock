@@ -3029,6 +3029,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "st3-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "st3-client-codegen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "st3-migrate"
 version = "0.1.0"
 dependencies = [

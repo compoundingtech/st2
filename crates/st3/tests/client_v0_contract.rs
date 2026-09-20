@@ -366,6 +366,130 @@ async fn client_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+async fn client_post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
+async fn client_json_auth(app: axum::Router, uri: &str, credential: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {credential}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
+#[tokio::test]
+async fn completed_read_surface_is_versioned_and_cursor_gaps_require_resync() {
+    let root = tempfile::tempdir().unwrap();
+    let app = st3::api::router(test_state(root.path()));
+    for collection in ["missions", "runtimes", "operations"] {
+        let (status, envelope) =
+            client_json(app.clone(), &format!("/v1/client/{collection}")).await;
+        assert_eq!(status, StatusCode::OK, "{collection}: {envelope}");
+        assert_eq!(envelope["value"]["collection"], collection);
+    }
+    let (status, error) =
+        client_json(app, "/v1/client/events?after=event-cursor/another-host/9").await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(error["code"], "cursor-gap");
+    assert_eq!(error["details"]["full_resync"], true);
+}
+
+#[tokio::test]
+async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let app = st3::api::router(test_state(root.path()));
+    let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let snapshot = capabilities["snapshot"]["id"].as_str().unwrap();
+    let action = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/message-test", "type": "message.send",
+        "idempotency_key": "message-send-test-000001",
+        "fence": { "snapshot_id": snapshot, "subject_revisions": {} },
+        "parameters": { "to": "person/test", "content": "hello" }
+    });
+    let (status, first) = client_post_json(app.clone(), "/v1/client/actions", action.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["value"]["status"], "completed");
+    let (status, repeated) = client_post_json(app.clone(), "/v1/client/actions", action).await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(
+        first["value"]["operation_id"],
+        repeated["value"]["operation_id"]
+    );
+
+    let (status, challenge) = client_post_json(
+        app.clone(),
+        "/v1/client/pairings",
+        serde_json::json!({
+            "api_version": "st3.client.v0", "device_name": "Test phone"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let code = challenge["value"]["code"].as_str().unwrap();
+    let complete = serde_json::json!({ "api_version": "st3.client.v0", "code": code, "device_public_key": "test-public-key-0000000000000000000000000000" });
+    let (status, paired) = client_post_json(
+        app.clone(),
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        complete.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    let credential = paired["value"]["credential"].as_str().unwrap();
+    assert!(credential.len() >= 32);
+    let device = paired["value"]["device_id"].as_str().unwrap();
+    let (status, remote_capabilities) =
+        client_json_auth(app.clone(), "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::OK, "{remote_capabilities}");
+    assert_eq!(remote_capabilities["value"]["transport"], "fabric-loopback");
+    let (status, reused) = client_post_json(
+        app.clone(),
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        complete,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{reused}");
+
+    let (_, local_capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let revoke = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/revoke-test", "type": "pairing.revoke",
+        "idempotency_key": "pairing-revoke-test-0001",
+        "fence": { "snapshot_id": local_capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "target_id": device }
+    });
+    let (status, revoked) = client_post_json(app.clone(), "/v1/client/actions", revoke).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (status, denied) = client_json_auth(app, "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+}
+
 #[tokio::test]
 async fn operational_lists_share_one_versioned_paginated_shape() {
     let root = tempfile::tempdir().unwrap();
@@ -492,7 +616,6 @@ async fn stopped_agents_are_annotated_history_not_default_membership() {
 }
 
 #[tokio::test]
-#[ignore = "red baseline: enable when fenced client v0 actions are implemented"]
 async fn client_v0_action_route_accepts_the_golden_fenced_action() {
     let root = tempfile::tempdir().unwrap();
     let action = std::fs::read(asset_root().join("fixtures/action.json")).unwrap();

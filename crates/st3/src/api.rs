@@ -50,6 +50,8 @@ use crate::model::{
 };
 use crate::store::Store;
 
+mod client_v0;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -209,6 +211,30 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
+        .route("/v1/client/missions", get(client_v0::missions))
+        .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
+        .route("/v1/client/runtimes", get(client_v0::runtimes))
+        .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
+        .route("/v1/client/operations", get(client_v0::operations))
+        .route(
+            "/v1/client/operations/{*id}",
+            get(client_v0::operation_detail),
+        )
+        .route("/v1/client/events", get(client_v0::events))
+        .route("/v1/client/actions", post(client_v0::action))
+        .route("/v1/client/pairings", post(client_v0::pairing_begin))
+        .route(
+            "/v1/client/pairings/{id}/complete",
+            post(client_v0::pairing_complete),
+        )
+        .route(
+            "/v1/client/terminals/{id}/screen",
+            get(client_v0::terminal_screen),
+        )
+        .route(
+            "/v1/client/terminals/{id}/stream",
+            get(client_v0::terminal_stream),
+        )
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
@@ -355,6 +381,12 @@ async fn response_envelope(
     next: Next,
 ) -> Response {
     let client_request = request.uri().path().starts_with("/v1/client/");
+    let client_authentication = client_request
+        .then(|| client_v0::authenticate(&state, &request))
+        .transpose();
+    if let Ok(Some(session)) = &client_authentication {
+        request.extensions_mut().insert(session.clone());
+    }
     let client_snapshot = client_request.then(|| {
         request
             .uri()
@@ -376,7 +408,10 @@ async fn response_envelope(
     if let Some(snapshot) = &client_snapshot {
         request.extensions_mut().insert(snapshot.clone());
     }
-    let response = next.run(request).await;
+    let response = match client_authentication {
+        Ok(_) => next.run(request).await,
+        Err(error) => error.into_response(),
+    };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         || !response
             .headers()
@@ -660,18 +695,15 @@ fn client_detail(items: Vec<Value>, kind: &str, id: &str) -> Result<Json<Value>,
 async fn client_capabilities(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<client_v0::ClientSession>,
 ) -> Json<Value> {
     let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
+    let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
-        "session_actor": "person/local/session/unix",
-        "transport": "unix",
-        "capabilities": [
-            { "id": "read.projections", "version": 0, "state": "granted" },
-            { "id": "terminal.read", "version": 0, "state": "granted" },
-            { "id": "terminal.control", "version": 0, "state": "ungranted" },
-            { "id": "control.launches", "version": 0, "state": "ungranted" }
-        ],
+        "session_actor": session.actor,
+        "transport": session.transport,
+        "capabilities": capabilities,
         "limits": {
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
@@ -1553,9 +1585,13 @@ async fn client_sessions(
 async fn client_sessions_detail(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(id) = id.strip_suffix("/timeline") {
+        return client_v0::timeline_value(&state, &snapshot, &session, id, query.limit);
+    }
     client_detail(
         client_session_resources(&state.store, query.history, &snapshot.created_at)
             .map_err(ApiError::internal)?,

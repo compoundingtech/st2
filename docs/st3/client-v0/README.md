@@ -1,9 +1,16 @@
 # st3 client v0 contract
 
-Status: contract baseline with operational and launch read projections implemented. The files in
+Status: implemented client boundary with operational projections, resumable events, authenticated
+pairing, fenced actions, terminal snapshots/frames, and generated Rust and Swift clients. The files in
 [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire examples. Rust and Swift
 clients consume the same JSON; neither client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
+
+The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
+local Unix socket and authenticated Fabric-loopback HTTP. The Swift package is
+[`clients/swift/St3Client`](../../../clients/swift/St3Client) and uses the authenticated
+Fabric-loopback transport. Regenerate their contract tables with `cargo run -p st3-client-codegen`;
+CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
 
 ## Boundary and transport
 

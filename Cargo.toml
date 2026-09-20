@@ -15,6 +15,8 @@ members = [
   "crates/st2-resource-wasip2",
   "crates/st2-wire",
   "crates/st3",
+  "crates/st3-client",
+  "crates/st3-client-codegen",
   "crates/st3-migrate",
   "crates/st3-schema",
 ]
@@ -25,6 +27,7 @@ default-members = [
   "crates/st2-resource-protocol",
   "crates/st2-wire",
   "crates/st3",
+  "crates/st3-client",
   "crates/st3-migrate",
   "crates/st3-schema",
 ]
