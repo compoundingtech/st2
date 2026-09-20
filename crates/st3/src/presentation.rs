@@ -611,6 +611,9 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "REASON     {reason}");
     }
+    if let Some(ready_age_ms) = step.ready_age_ms {
+        let _ = writeln!(output, "READY AGE  {ready_age_ms}ms");
+    }
 
     let _ = writeln!(output);
     let _ = writeln!(output, "{}", style.heading("WORKER"));
@@ -646,6 +649,25 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
             "  Execution    {}ms / {timeout_ms}ms{active}",
             step.execution_elapsed_ms
         );
+    }
+    if let Some(wake) = &step.wake {
+        let acknowledgement = wake.acknowledged_by.as_deref().unwrap_or("pending");
+        let _ = writeln!(
+            output,
+            "  Wake         {} attempt(s) · {acknowledgement} · assignee {}",
+            wake.attempts, wake.assignee_state
+        );
+        let _ = writeln!(output, "  Wake epoch   {}", wake.incarnation_id);
+        if let Some(last) = wake.last_attempt_at_unix_ms {
+            let _ = writeln!(
+                output,
+                "  Wake last    {}",
+                relative_time(last, now_unix_ms)
+            );
+        }
+        if let Some(failure) = &wake.failure {
+            let _ = writeln!(output, "  Wake failure {failure}");
+        }
     }
     for grouping in &step.under {
         if let Some(reason) = &grouping.reason {
@@ -1045,6 +1067,22 @@ fn render_work_list_item(output: &mut String, step: &StepRunView, style: OutputS
                 .unwrap_or_default()
         );
     }
+    if let Some(ready_age_ms) = step.ready_age_ms {
+        let _ = writeln!(output, "    ready age: {ready_age_ms}ms");
+    }
+    if let Some(wake) = &step.wake {
+        let _ = writeln!(
+            output,
+            "    wake: {} attempt(s) · {} · assignee {}{}",
+            wake.attempts,
+            wake.acknowledged_by.as_deref().unwrap_or("pending"),
+            wake.assignee_state,
+            wake.failure
+                .as_ref()
+                .map(|failure| format!(" · failed: {failure}"))
+                .unwrap_or_default()
+        );
+    }
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "    reason: {reason}");
     }
@@ -1160,6 +1198,8 @@ mod tests {
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            ready_age_ms: None,
+            wake: None,
             readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,

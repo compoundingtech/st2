@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `43b86385a1640efa5f79c02184ecb2fe4c3082b7e6f91866a6630dd90b606d5e`
+Digest: `cb6fed41db8cf909e98c8e4b90fe729117532c70c3b7f95b69d756fa50a3fe1c`
 
 ## Subject families
 
@@ -69,7 +69,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `gate.result` | `gate-operation` | `capability-holder` | `append` | `baseline:boolean`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:string`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
-| `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `reason:string`, `severity:string`, `status:string` |  |
+| `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `reason:string`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
 | `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
 | `harness.usage` | `agent` | `same-subject-actor` | `append` | `incarnation_id:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `total_tokens:integer` |  |
 | `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |

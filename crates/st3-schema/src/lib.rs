@@ -1909,6 +1909,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("code", string()),
             ("reason", string()),
             ("incarnation_id", string()),
+            ("step_run", reference_to(&["step-run"])),
+            ("wake_attempts", integer()),
         ],
         "harness.usage" => &[
             ("input_tokens", integer()),

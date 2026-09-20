@@ -214,6 +214,11 @@ manual command that invokes the same supported path. Terminal composer state is 
 delivery correctness. Recovery must replace terminal-text wakeup rather than add more key or prompt
 variants.
 
+Resolution: automatic and manual work wake now create incarnation-bound durable messages consumed
+by the maintained native drivers. A working-turn observation or work claim acknowledges delivery;
+the reconciler schedules bounded retries and publishes `work-wake-exhausted` after the third
+unacknowledged attempt. The legacy st3 DING driver and terminal-line injection path were removed.
+
 ## Preserved validation
 
 The following focused commands passed on `fb94602` before relying on the preserved commits:

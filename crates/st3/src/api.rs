@@ -44,7 +44,7 @@ use crate::model::{
     ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
     SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
-    St3Error, StatusResponse, StepRunView, WorkRequest,
+    St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -275,6 +275,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/work", get(list_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
+        .route("/v1/work/wake/{*subject}", post(wake_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/sessions", get(list_sessions))
@@ -4706,6 +4707,84 @@ async fn list_work(
     Ok(Json(work))
 }
 
+async fn wake_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<WorkWakeRequest>,
+) -> Result<Json<MessageView>, ApiError> {
+    if request.reason.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-wake-reason",
+            "a manual work wake needs a reason",
+        )));
+    }
+    if let Some(existing) = state
+        .store
+        .operation_claim(&request.idempotency_key)
+        .map_err(ApiError::internal)?
+    {
+        let message = state
+            .store
+            .messages(None, true)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .find(|message| message.subject == existing.subject)
+            .ok_or_else(|| ApiError::internal("the wake operation message is unavailable"))?;
+        return Ok(Json(message));
+    }
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    if step.status != "ready" {
+        return Err(ApiError::bad(St3Error::new(
+            "work-not-ready",
+            format!(
+                "step run `{}` is `{}`, not ready",
+                step.subject, step.status
+            ),
+        )));
+    }
+    let agent = step.assigned_to.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "work-has-no-assignee",
+            format!("step run `{}` has no exact assignee to wake", step.subject),
+        ))
+    })?;
+    let harness = state
+        .store
+        .current_harness(agent)
+        .map_err(ApiError::internal)?
+        .filter(crate::model::CurrentHarnessView::is_ready)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "assignee-harness-not-ready",
+                format!("assignee `{agent}` has no ready current harness"),
+            ))
+        })?;
+    let attempt = step
+        .wake
+        .as_ref()
+        .map(|wake| wake.attempts)
+        .unwrap_or_default()
+        .saturating_add(1);
+    let message = crate::reconcile::append_work_wake_message(
+        &state.store,
+        &step,
+        agent,
+        &harness.incarnation_id,
+        attempt,
+        "manual",
+        &request.actor,
+        &request.reason,
+        request.idempotency_key,
+    )
+    .map_err(ApiError::internal)?;
+    signal_changed(&state);
+    Ok(Json(message))
+}
+
 async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -7722,6 +7801,119 @@ mission "eval/demo" state="ready" timeout="2m" {
             .unwrap()
             .unwrap();
         assert_eq!(run.mission, "mission/eval/demo");
+    }
+
+    #[tokio::test]
+    async fn manual_work_wake_is_idempotent_and_uses_the_durable_driver_inbox() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "wake" state="ready" {
+  goal "Exercise manual work wake."
+  agent "worker" { workspace "/tmp"; command "true" }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "manual-wake-source")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "wake".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "manual-wake-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let step = &run.steps[0];
+        let agent = format!("agent/{}/worker", run.id);
+        state
+            .store
+            .set_step_state(&step.subject, "ready", None)
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("wake-worker".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("wake-incarnation".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("manual-wake-runtime".into()),
+            })
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(agent.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("wake-incarnation".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("manual-wake-harness".into()),
+            })
+            .unwrap();
+
+        let app = router(state.clone());
+        let request = serde_json::to_value(WorkWakeRequest {
+            actor: "person/operator".into(),
+            reason: "the operator requested another delivery".into(),
+            idempotency_key: "manual-wake-request".into(),
+        })
+        .unwrap();
+        let path = format!("/v1/work/wake/{}", urlencoding::encode(&step.subject));
+        let (status, first) = json_request(app.clone(), &path, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["status"], "sent");
+        assert!(
+            first["tags"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("st3-wake-source:manual".into()))
+        );
+        let (status, repeated) = json_request(app, &path, request).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(repeated["subject"], first["subject"]);
+        assert_eq!(state.store.messages(Some(&agent), true).unwrap().len(), 1);
+        let projected = state.store.step_run(&step.subject).unwrap().unwrap();
+        let wake = projected.wake.expect("wake projection");
+        assert_eq!(wake.attempts, 1);
+        assert_eq!(wake.assignee_state, "idle");
     }
 
     #[tokio::test]

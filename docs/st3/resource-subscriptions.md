@@ -172,7 +172,8 @@ A scheduled unchanged observation creates no durable observer claim. A manual re
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
 
-A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same mission run.
+A maintained harness driver delivers that message through its native channel or durable inbox.
+Generic terminal input is not a delivery boundary.
 
 A daemon restart can repeat an external request. It cannot create a duplicate observation or message.
 

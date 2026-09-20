@@ -887,24 +887,25 @@ workspace "${ST_WORKSPACE}/generated" create=#true
 
 The default refusal prevents a spelling error from creating an unintended directory.
 
-## Message delivery for generic harnesses
+## Native message delivery and work wake
 
-A harness driver can implement native message delivery. A generic terminal harness can use an explicit DING child:
+Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
+app-server turn requests, Claude uses its MCP channel, and the other maintained drivers use their
+durable native inbox adapters. st3 does not inject text or Enter into a terminal composer.
 
-```kdl
-agent "worker" {
-  workspace "${ST_WORKSPACE}/worker"
-  command "worker-harness"
-  exec "ding" {
-    argv "st3" "driver" "ding"
-    restart "on-failure"
-  }
-}
+When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
+current harness incarnation. Delivery is acknowledged by a new working turn or by claiming the
+step. An unacknowledged delivery is retried after 15 seconds, at most three times. Exhaustion writes
+a `work-wake-exhausted` harness diagnostic naming the step, incarnation, and attempt count.
+
+`st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
+An operator can request another delivery through the same driver path with:
+
+```sh
+st3 work wake STEP --as person/operator --reason "retry native delivery"
 ```
 
-The nested exec receives the agent subject through `ST_AGENT`. It checks the local st3 API once per second and sends an incarnation-fenced terminal line.
-
-The mission run owns and cleans up both runtimes. No implicit `ding` field exists in st3 KDL.
+Generic terminal programs without a maintained native driver do not have an automatic wake path.
 
 A provider or runtime fault creates a `harness.diagnostic` claim. The roster and mission views show the fault.
 

@@ -1570,11 +1570,29 @@ pub struct StepRunView {
     pub execution_elapsed_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_age_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WorkWakeView>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkWakeView {
+    pub assignee: String,
+    pub assignee_state: String,
+    pub incarnation_id: String,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1589,6 +1607,13 @@ pub struct WorkRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkWakeRequest {
+    pub actor: String,
+    pub reason: String,
     pub idempotency_key: String,
 }
 

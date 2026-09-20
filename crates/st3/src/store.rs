@@ -28,7 +28,7 @@ use crate::model::{
     ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
     St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
-    WorkRequest, WorkSelector,
+    WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -13320,6 +13320,8 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         execution_started_at_unix_ms: None,
         execution_elapsed_ms: 0,
         timeout_ms: None,
+        ready_age_ms: None,
+        wake: None,
         readiness_epoch: row.get(19)?,
         blocked_reason: row.get(15)?,
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
@@ -13347,6 +13349,7 @@ fn enrich_step_queue_at(
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
+    enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -13376,6 +13379,137 @@ fn enrich_step_queue_at(
         view.timeout_ms = step.timeout_ms;
     }
     Ok(())
+}
+
+fn enrich_step_wake_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    view.ready_age_ms =
+        (view.status == "ready").then(|| snapshot_unix_ms.saturating_sub(view.updated_at_unix_ms));
+    let Some(assignee) = view.assigned_to.as_deref() else {
+        return Ok(());
+    };
+    let harness = current_harness_at(connection, assignee, None).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error.to_string())),
+        )
+    })?;
+    let assignee_state = harness
+        .as_ref()
+        .map(|harness| harness.state.clone())
+        .unwrap_or_else(|| "unavailable".into());
+    let incarnation_id = harness
+        .as_ref()
+        .map(|harness| harness.incarnation_id.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let incarnation_key = hex::encode(Sha256::digest(incarnation_id.as_bytes()))[..12].to_owned();
+    let mut attempts = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT body, accepted_at_unix_ms FROM claims
+         WHERE kind='message.sent' AND accepted_at_unix_ms<=?1
+         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, id",
+    )?;
+    let rows = statement.query_map([snapshot_unix_ms.to_string()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (body, accepted) = row?;
+        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        let matches = fields
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|tag| {
+                work_wake_tag_matches(
+                    tag,
+                    &view.subject,
+                    view.attempt,
+                    view.readiness_epoch,
+                    &incarnation_key,
+                )
+            });
+        if matches {
+            attempts.push(accepted.parse::<u128>().unwrap_or(0));
+        }
+    }
+    let first_attempt = attempts.first().copied();
+    let last_attempt_at_unix_ms = attempts.last().copied();
+    let acknowledged_by = if !attempts.is_empty()
+        && matches!(
+            view.status.as_str(),
+            "claimed" | "working" | "verifying" | "completed" | "failed" | "cancelled"
+        ) {
+        Some("claim".into())
+    } else if first_attempt.is_some_and(|requested| {
+        harness.as_ref().is_some_and(|harness| {
+            harness.state == "working" && harness.observed_at_unix_ms >= requested
+        })
+    }) {
+        Some("turn".into())
+    } else {
+        None
+    };
+    let failure = connection
+        .query_row(
+            "SELECT body FROM claims
+             WHERE subject=?1 AND kind='harness.diagnostic' AND accepted_at_unix_ms<=?2
+               AND json_extract(body, '$.fields.code')='work-wake-exhausted'
+               AND json_extract(body, '$.fields.step_run')=?3
+               AND json_extract(body, '$.fields.incarnation_id')=?4
+             ORDER BY store_index DESC LIMIT 1",
+            params![
+                assignee,
+                snapshot_unix_ms.to_string(),
+                view.subject,
+                incarnation_id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|body| {
+            body.get("fields")
+                .unwrap_or(&body)
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if view.status == "ready" || !attempts.is_empty() || failure.is_some() {
+        view.wake = Some(WorkWakeView {
+            assignee: assignee.into(),
+            assignee_state,
+            incarnation_id,
+            attempts: attempts.len().try_into().unwrap_or(u32::MAX),
+            last_attempt_at_unix_ms,
+            acknowledged_by,
+            failure,
+        });
+    }
+    Ok(())
+}
+
+fn work_wake_tag_matches(
+    tag: &str,
+    step_subject: &str,
+    attempt: u32,
+    readiness_epoch: u32,
+    incarnation_key: &str,
+) -> bool {
+    let Some(tag) = tag.strip_prefix("st3-work:") else {
+        return false;
+    };
+    let mut parts = tag.rsplitn(4, '@');
+    parts.next() == Some(incarnation_key)
+        && parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(readiness_epoch)
+        && parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(attempt)
+        && parts.next() == Some(step_subject)
 }
 
 fn step_execution_timing_at(

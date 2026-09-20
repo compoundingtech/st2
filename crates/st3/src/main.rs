@@ -29,7 +29,7 @@ use st3::model::{
     ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
     RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
     SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
-    StepRunView, WorkRequest,
+    StepRunView, WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -883,6 +883,8 @@ enum WorkCommand {
     Complete(WorkActionArgs),
     Fail(WorkActionArgs),
     Release(WorkActionArgs),
+    /// Wake one ready assignee through its supported harness driver.
+    Wake(WorkWakeArgs),
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
     Revise(WorkReviseArgs),
@@ -890,6 +892,15 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkWakeArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long, default_value = "manual wake requested")]
+    reason: String,
 }
 
 #[derive(Subcommand)]
@@ -1064,7 +1075,7 @@ struct GateResultArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "opencode", "ding", "exec"])]
+    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "opencode", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -4230,6 +4241,23 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
         WorkCommand::Complete(args) => post_work(client, "complete", args, json_output).await,
         WorkCommand::Fail(args) => post_work(client, "fail", args, json_output).await,
         WorkCommand::Release(args) => post_work(client, "release", args, json_output).await,
+        WorkCommand::Wake(args) => {
+            let actor = args
+                .actor
+                .context("a manual work wake needs --as or ST_AGENT")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: MessageView = client
+                .post(
+                    &format!("/v1/work/wake/{}", urlencoding::encode(&args.subject)),
+                    &WorkWakeRequest {
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: format!("manual-work-wake:{}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
         WorkCommand::PublishMission(args) => publish_work_mission(client, args, json_output).await,
         WorkCommand::Revise(args) => {
             let actor = args
@@ -5776,14 +5804,6 @@ fn normalize_planning_requester(actor: &str) -> Result<String> {
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
-    if args.driver == "ding" {
-        anyhow::ensure!(
-            args.argv.is_empty(),
-            "the DING driver takes no provider argv"
-        );
-        let target = std::env::var("ST_AGENT").context("the DING exec has no owning ST_AGENT")?;
-        return run_ding_driver(client, &normalize_agent_subject(&target)).await;
-    }
     if args.driver == "pi-channel" {
         let identity = args
             .identity
@@ -5863,66 +5883,6 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
     }
     anyhow::ensure!(status.success(), "{} exited with {status}", args.driver);
     Ok(())
-}
-
-async fn run_ding_driver(client: &Client, target: &str) -> Result<()> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let status: StatusResponse = client
-            .get(&format!(
-                "/v1/status?subject={}",
-                urlencoding::encode(target)
-            ))
-            .await?;
-        let Some(agent) = status.subjects.first() else {
-            anyhow::bail!("DING target `{target}` does not exist");
-        };
-        let incarnation = agent
-            .actual
-            .as_ref()
-            .and_then(|actual| actual.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(incarnation) = incarnation {
-            let messages: Vec<MessageView> = client
-                .get(&format!("/v1/messages?to={}", urlencoding::encode(target)))
-                .await?;
-            for message in messages
-                .into_iter()
-                .filter(|message| message.status == "sent")
-            {
-                let id = message.subject.trim_start_matches("message/");
-                let wake = format!(
-                    "[DING] new st3 message: [id:{id}] {} (from {}); run `st3 message ls`",
-                    message.title.as_deref().unwrap_or("message"),
-                    message.from
-                );
-                let _: SessionControlResponse = client
-                    .post(
-                        &format!("/v1/sessions/input/{}", urlencoding::encode(target)),
-                        &SessionInputRequest {
-                            expected_incarnation: incarnation.clone(),
-                            mode: SessionInputMode::Line,
-                            value: wake,
-                            idempotency_key: format!(
-                                "ding-input:{}:{incarnation}",
-                                message.subject
-                            ),
-                        },
-                    )
-                    .await?;
-                deliver_message(
-                    client,
-                    &message.subject,
-                    target,
-                    format!("ding-delivered:{}:{incarnation}", message.subject),
-                )
-                .await?;
-            }
-        }
-    }
 }
 
 async fn run_st2_native_driver(
@@ -7678,6 +7638,30 @@ mod tests {
     }
 
     #[test]
+    fn work_wake_is_explicit_and_terminal_ding_is_not_a_driver() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "work",
+            "wake",
+            "step-run/example/work",
+            "--as",
+            "person/operator",
+            "--reason",
+            "retry native delivery",
+        ])
+        .unwrap();
+        let Command::Work {
+            command: WorkCommand::Wake(args),
+        } = cli.command
+        else {
+            panic!("the work wake command did not parse");
+        };
+        assert_eq!(args.subject, "step-run/example/work");
+        assert_eq!(args.actor.as_deref(), Some("person/operator"));
+        assert!(Cli::try_parse_from(["st3", "driver", "ding"]).is_err());
+    }
+
+    #[test]
     fn review_commands_parse_a_filter_and_an_owner_target() {
         let list = Cli::try_parse_from(["st3", "review", "ls", "--as", "person/nathan"]).unwrap();
         let Command::Review {
@@ -8156,6 +8140,8 @@ mod tests {
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
+            ready_age_ms: None,
+            wake: None,
             readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,
