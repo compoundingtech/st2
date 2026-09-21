@@ -14,6 +14,10 @@ Use these documents for implementation details:
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
 - [Product roadmap](roadmap.md) records accepted future work.
+- [Guided CLI tour](cli-guided-tour.md) is the complete human walkthrough for every public command
+  and subcommand.
+- [TUI and Expo iOS design-session brief](app-design-session-brief.md) captures the product promise,
+  delivery gates, remote transport research, and autonomous release loop to review before UI work.
 - [Client v0 contract](client-v0/README.md) defines the shared TUI and mobile JSON, event, action,
   pairing, and terminal protocols.
 - [Operational-state contract](operational-state/README.md) separates immutable history, current
