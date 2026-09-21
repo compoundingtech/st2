@@ -369,7 +369,11 @@ fn mission_visualization(
     })))
 }
 
-fn mission_resources(store: &Store, snapshot_index: u64) -> anyhow::Result<Vec<Value>> {
+fn mission_resources(
+    store: &Store,
+    snapshot_index: u64,
+    history: bool,
+) -> anyhow::Result<Vec<Value>> {
     let claims = store.claims_page(None, None, 0, snapshot_index.checked_add(1), false, 100_000)?;
     let mut runs = std::collections::BTreeSet::new();
     for claim in claims.claims {
@@ -411,6 +415,7 @@ fn mission_resources(store: &Store, snapshot_index: u64) -> anyhow::Result<Vec<V
                 .collect::<BTreeSet<_>>();
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let visualization = mission_visualization(store, &mission, &latest.revision, state)?;
+            let historical = matches!(state, "completed" | "failed" | "cancelled");
             Ok::<Value, anyhow::Error>(json!({
                 "id": mission,
                 "kind": "mission",
@@ -423,10 +428,17 @@ fn mission_resources(store: &Store, snapshot_index: u64) -> anyhow::Result<Vec<V
                 "run_generations": run_generations,
                 "visualization": visualization,
                 "usage": usage,
-                "operational": { "layer": "current", "actionable": true, "reasons": [] }
+                "operational": {
+                    "layer": if historical { "history" } else { "current" },
+                    "actionable": !historical,
+                    "reasons": if historical { vec![state] } else { Vec::<&str>::new() }
+                }
             }))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    if !history {
+        values.retain(|value| value["operational"]["actionable"] == true);
+    }
     values.sort_by(|left, right| {
         right["updated_at"]
             .as_str()
@@ -850,7 +862,8 @@ pub(super) async fn missions(
         &state,
         &snapshot,
         "missions",
-        mission_resources(&state.store, snapshot.store_index).map_err(ApiError::internal)?,
+        mission_resources(&state.store, snapshot.store_index, query.history)
+            .map_err(ApiError::internal)?,
         &query,
     )
     .map(Json)
@@ -864,7 +877,7 @@ pub(super) async fn mission_detail(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     client_detail(
-        mission_resources(&state.store, snapshot.store_index).map_err(ApiError::internal)?,
+        mission_resources(&state.store, snapshot.store_index, true).map_err(ApiError::internal)?,
         "mission",
         &id,
     )

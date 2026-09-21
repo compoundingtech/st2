@@ -1236,6 +1236,24 @@ mission "client-action-demo" state="ready" {
         store.mission_run(&run_id).unwrap().unwrap().status,
         "cancelled"
     );
+    let (_, current_missions) = client_json(app.clone(), "/v1/client/missions").await;
+    assert!(
+        current_missions["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "mission/client-action-demo")
+    );
+    let (_, mission_history) = client_json(app, "/v1/client/missions?history=true").await;
+    let cancelled = mission_history["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "mission/client-action-demo")
+        .unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["operational"]["layer"], "history");
+    assert_eq!(cancelled["operational"]["actionable"], false);
 }
 
 #[tokio::test]

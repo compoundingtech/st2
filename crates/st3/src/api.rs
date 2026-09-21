@@ -920,6 +920,7 @@ fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Res
         .filter(|subject| {
             subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
         })
+        .filter(|subject| history || subject.projection.actionable)
         .map(|subject| {
             let fields = subject
                 .actual
@@ -993,9 +994,14 @@ fn client_session_resources(
         store.status(None)?
     };
     let mut sessions = Vec::new();
-    for subject in status.subjects.into_iter().filter(|subject| {
-        subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
-    }) {
+    for subject in status
+        .subjects
+        .into_iter()
+        .filter(|subject| {
+            subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
+        })
+        .filter(|subject| history || subject.projection.actionable)
+    {
         let fields = subject
             .actual
             .as_ref()
@@ -2218,12 +2224,16 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         .map(|items| {
             items
                 .iter()
-                .filter(|item| !desired_runtime_ids.contains(&item.name))
+                .filter(|item| {
+                    item.status == "running" && !desired_runtime_ids.contains(&item.name)
+                })
                 .map(|item| format!("PTY {}", item.name))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let exec_directory = state.state_dir.join("exec");
+    let exec_runtime =
+        st_runtime::ExecRuntime::new(exec_directory.clone(), state.state_dir.join("logs"));
     if let Ok(entries) = fs::read_dir(&exec_directory) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2233,8 +2243,18 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             let Some(runtime_id) = name.strip_suffix(".json") else {
                 continue;
             };
-            if !desired_runtime_ids.contains(runtime_id) {
-                unowned.push(format!("exec {runtime_id}"));
+            if desired_runtime_ids.contains(runtime_id) {
+                continue;
+            }
+            match exec_runtime.observe(runtime_id) {
+                Ok(Some(st_runtime::ExecObservation::Running(_))) => {
+                    unowned.push(format!("exec {runtime_id}"));
+                }
+                Ok(Some(st_runtime::ExecObservation::Indeterminate(reason))) => {
+                    unowned.push(format!("exec {runtime_id} ({reason})"));
+                }
+                Ok(Some(st_runtime::ExecObservation::Exited(_)) | None) => {}
+                Err(error) => unowned.push(format!("exec {runtime_id} ({error})")),
             }
         }
     }
@@ -2242,7 +2262,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         name: "runtime-drift".into(),
         status: if unowned.is_empty() { "pass" } else { "warn" }.into(),
         message: if unowned.is_empty() {
-            "the runtime has no unowned sessions or current records".into()
+            "the runtime has no unowned live sessions or indeterminate records".into()
         } else {
             format!("unowned runtime state: {}", unowned.join(", "))
         },

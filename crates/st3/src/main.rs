@@ -29,7 +29,8 @@ use st3::model::{
     ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
     RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubjectStatus, WorkRequest,
+    WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -240,6 +241,8 @@ enum MissionViewCommand {
     Show(MissionShowArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
+    /// Cancel one exact running mission and stop its owned work and runtimes.
+    Cancel(MissionCancelArgs),
 }
 
 #[derive(Args)]
@@ -265,6 +268,18 @@ struct MissionRunStartArgs {
     /// Print the exact mission-run KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct MissionCancelArgs {
+    /// Exact mission-run subject to cancel.
+    mission_run: String,
+    /// Why the run is no longer wanted.
+    #[arg(long)]
+    reason: String,
+    /// Concrete human authority carried over the trusted local Unix boundary.
+    #[arg(long = "as", env = "ST_PERSON")]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -644,6 +659,8 @@ struct AgentsArgs {
 enum AgentsCommand {
     /// List operational agents; use --all for stopped and historical agents.
     Ls(AgentsArgs),
+    /// Group operational agents beneath the mission runs that own them.
+    Tree(AgentsArgs),
     /// Show one exact agent, including its owner and operational annotation.
     Show {
         subject: String,
@@ -1047,7 +1064,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, args, cli.json).await,
         Command::Launch { command } => run_launch(&client, command, cli.json).await,
-        Command::Missions { command } => run_mission_view(&client, command, cli.json).await,
+        Command::Missions { command } => {
+            run_mission_view(&client, &endpoint, command, cli.json).await
+        }
         Command::Attention { command } => {
             run_attention(
                 &client,
@@ -1538,6 +1557,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
 
 async fn run_mission_view(
     client: &Client,
+    endpoint: &Endpoint,
     command: MissionViewCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -1549,7 +1569,13 @@ async fn run_mission_view(
                 "/v1/client/missions"
             };
             let missions: Value = client.get(path).await?;
-            print_value(&missions, json_output)
+            if json_output {
+                print_value(&missions, true)
+            } else {
+                let page: ClientPage = serde_json::from_value(missions)?;
+                print!("{}", render_product_page("MISSIONS", &page));
+                Ok(())
+            }
         }
         MissionViewCommand::Show(args) => {
             let selected = args.mission_or_run;
@@ -1588,7 +1614,51 @@ async fn run_mission_view(
             Ok(())
         }
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
+        MissionViewCommand::Cancel(args) => {
+            cancel_mission_run(client, endpoint, args, json_output).await
+        }
     }
+}
+
+async fn cancel_mission_run(
+    client: &Client,
+    endpoint: &Endpoint,
+    args: MissionCancelArgs,
+    json_output: bool,
+) -> Result<()> {
+    let subject = normalize_member_subject(&args.mission_run, "mission-run");
+    let run: MissionRunView = client
+        .get(&format!(
+            "/v1/mission-runs/{}",
+            urlencoding::encode(&subject)
+        ))
+        .await?;
+    anyhow::ensure!(
+        !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"),
+        "mission run `{subject}` is already {}",
+        run.status
+    );
+    let actor = normalize_member_subject(&args.actor, "person");
+    let generated = generated_client(endpoint, Some(&actor))?;
+    let capabilities = generated.capabilities().await?;
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let response = generated
+        .mission_cancel(
+            format!("action/{nonce}"),
+            format!("mission-cancel:{subject}:{nonce}"),
+            ClientFence {
+                snapshot_id: capabilities.snapshot.id,
+                mission_generation: Some(run.generation),
+                ..ClientFence::default()
+            },
+            ClientTargetParameters {
+                target_id: subject,
+                reason: Some(args.reason),
+                ..ClientTargetParameters::default()
+            },
+        )
+        .await?;
+    print_client_value(&response, json_output)
 }
 
 async fn start_mission_run(
@@ -2199,6 +2269,22 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     item.header.id, item.state, item.path, item.attempt
                 );
                 let _ = writeln!(output, "  action: st3 work show {}", item.header.id);
+            }
+            ClientResource::Mission(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {} run{}",
+                    item.header.id,
+                    item.state,
+                    item.runs.len(),
+                    if item.runs.len() == 1 { "" } else { "s" }
+                );
+                if let Some(usage) = &item.usage {
+                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                }
+                if let Some(run) = item.runs.last() {
+                    let _ = writeln!(output, "  inspect: st3 missions show {run}");
+                }
             }
             ClientResource::Operation(item) => {
                 let _ = writeln!(
@@ -2903,8 +2989,9 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
 }
 
 async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) -> Result<()> {
-    let args = match command {
-        AgentsCommand::Ls(args) => args,
+    let (args, tree) = match command {
+        AgentsCommand::Ls(args) => (args, false),
+        AgentsCommand::Tree(args) => (args, true),
         AgentsCommand::Show { subject, all } => {
             let subject = if subject.starts_with("agent/") {
                 subject
@@ -2942,6 +3029,7 @@ async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) 
         .subjects
         .into_iter()
         .filter(|subject| subject.subject.starts_with("agent/"))
+        .filter(|subject| args.all || subject.projection.actionable)
         .filter(|subject| {
             args.status.as_deref().is_none_or(|selected| {
                 subject
@@ -2962,6 +3050,10 @@ async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) 
         .collect::<Vec<_>>();
     if json_output {
         return print_value(&agents, true);
+    }
+    if tree {
+        print!("{}", render_agent_tree(&agents));
+        return Ok(());
     }
     for agent in agents {
         let actual = agent.actual.as_ref();
@@ -3020,6 +3112,69 @@ async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) 
         }
     }
     Ok(())
+}
+
+fn render_agent_tree(agents: &[SubjectStatus]) -> String {
+    use std::fmt::Write as _;
+
+    let mut groups = BTreeMap::<String, Vec<&SubjectStatus>>::new();
+    for agent in agents {
+        let owner = agent
+            .owner_run
+            .as_deref()
+            .unwrap_or("unowned")
+            .strip_prefix("mission-run/")
+            .unwrap_or_else(|| agent.owner_run.as_deref().unwrap_or("unowned"));
+        groups.entry(owner.to_owned()).or_default().push(agent);
+    }
+    let mut output = String::new();
+    let _ = writeln!(output, "AGENT TREE  {}", agents.len());
+    if agents.is_empty() {
+        let _ = writeln!(output, "No operational agents.");
+        return output;
+    }
+    let group_count = groups.len();
+    for (group_index, (owner, mut members)) in groups.into_iter().enumerate() {
+        members.sort_by(|left, right| left.subject.cmp(&right.subject));
+        let group_branch = if group_index + 1 == group_count {
+            "└─"
+        } else {
+            "├─"
+        };
+        let _ = writeln!(output, "{group_branch} {owner}");
+        let member_prefix = if group_index + 1 == group_count {
+            "   "
+        } else {
+            "│  "
+        };
+        for (member_index, agent) in members.iter().enumerate() {
+            let branch = if member_index + 1 == members.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let state = agent
+                .harness
+                .as_ref()
+                .map(|harness| harness.state.as_str())
+                .or_else(|| {
+                    agent
+                        .actual
+                        .as_ref()
+                        .and_then(|actual| actual.get("status"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("unknown");
+            let name = agent.subject.rsplit('/').next().unwrap_or(&agent.subject);
+            let _ = writeln!(
+                output,
+                "{member_prefix}{branch} {name}  {state} · {}",
+                agent.reachability
+            );
+            let _ = writeln!(output, "{member_prefix}   {}", agent.subject);
+        }
+    }
+    output
 }
 
 fn desired_child_string<'a>(desired: &'a Value, child_name: &str) -> Option<&'a str> {
@@ -6136,6 +6291,30 @@ mod tests {
     }
 
     #[test]
+    fn mission_cancel_requires_an_exact_actor_and_reason() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "cancel",
+            "mission-run/release/demo",
+            "--reason",
+            "the run was superseded",
+            "--as",
+            "person/nathan",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Cancel(args),
+        } = cli.command
+        else {
+            panic!("the mission cancel command did not parse");
+        };
+        assert_eq!(args.mission_run, "mission-run/release/demo");
+        assert_eq!(args.reason, "the run was superseded");
+        assert_eq!(args.actor, "person/nathan");
+    }
+
+    #[test]
     fn mission_show_accepts_follow() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -6295,6 +6474,15 @@ mod tests {
         };
         assert_eq!(args.status.as_deref(), Some("running"));
         assert!(args.enrich);
+
+        let cli = Cli::try_parse_from(["st3", "agents", "tree", "--all"]).unwrap();
+        let Command::Agents {
+            command: AgentsCommand::Tree(args),
+        } = cli.command
+        else {
+            panic!("agents tree did not parse");
+        };
+        assert!(args.all);
 
         let cli = Cli::try_parse_from(["st3", "agents", "show", "worker", "--all"]).unwrap();
         let Command::Agents {
