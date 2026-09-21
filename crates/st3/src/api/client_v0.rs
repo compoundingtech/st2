@@ -383,18 +383,9 @@ fn mission_resources(
     snapshot_index: u64,
     history: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let claims = store.claims_page(None, None, 0, snapshot_index.checked_add(1), false, 100_000)?;
-    let mut runs = std::collections::BTreeSet::new();
-    for claim in claims.claims {
-        if claim.subject.starts_with("mission-run/") {
-            runs.insert(claim.subject);
-        }
-    }
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
-    for run in runs {
-        if let Some(run) = store.mission_run(&run)? {
-            missions.entry(run.mission.clone()).or_default().push(run);
-        }
+    for run in store.mission_runs()? {
+        missions.entry(run.mission.clone()).or_default().push(run);
     }
     let desired = store.desired_subjects()?;
     let mut values = missions

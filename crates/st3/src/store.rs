@@ -2577,6 +2577,19 @@ impl Store {
             .collect()
     }
 
+    /// Return every materialized mission run without walking the append-only claim log.
+    pub fn mission_runs(&self) -> Result<Vec<MissionRunView>> {
+        let connection = self.readers.get();
+        let mut statement =
+            connection.prepare("SELECT id FROM mission_runs ORDER BY created_at_unix_ms, id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
     pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
