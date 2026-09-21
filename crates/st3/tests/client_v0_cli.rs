@@ -69,6 +69,7 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
+    let store = state.store.clone();
     state
         .store
         .append_claim(&ClaimInput {
@@ -83,6 +84,22 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
                 ),
                 ("status".into(), Value::String("running".into())),
                 ("reachability".into(), Value::String("local".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "host/discovered-history".into(),
+            kind: "transport.observed".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([
+                ("status".into(), Value::String("up".into())),
+                ("protocol".into(), Value::String("fabric-loopback".into())),
+                ("last_success_at".into(), Value::from(1_u64)),
             ]),
             evidence: Vec::new(),
             expected_subject: None,
@@ -176,6 +193,47 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     );
     assert_eq!(machines["value"]["items"][1]["id"], "machine/offline-peer");
     assert_eq!(machines["value"]["items"][1]["state"], "indeterminate");
+    assert!(
+        machines["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "machine/discovered-history")
+    );
+    let local_revision = machines["value"]["items"][0]["revision"].clone();
+    let local_updated_at = machines["value"]["items"][0]["updated_at"].clone();
+    store
+        .append_claim(&ClaimInput {
+            subject: "message/unrelated-machine-revision".into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/sender".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("agent/sender".into())),
+                ("to".into(), Value::String("agent/recipient".into())),
+                ("content".into(), Value::String("unrelated".into())),
+                ("status".into(), Value::String("sent".into())),
+                ("title".into(), Value::Null),
+                ("in_reply_to".into(), Value::Null),
+                ("tags".into(), Value::Array(Vec::new())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let unchanged_machines = value(&run_cli(&socket, &["machines"]).await);
+    assert_eq!(
+        unchanged_machines["value"]["items"],
+        machines["value"]["items"]
+    );
+    assert_eq!(
+        unchanged_machines["value"]["items"][0]["revision"],
+        local_revision
+    );
+    assert_eq!(
+        unchanged_machines["value"]["items"][0]["updated_at"],
+        local_updated_at
+    );
     let machine_history = value(&run_cli(&socket, &["machines", "--all"]).await);
     assert_eq!(
         machine_history["value"]["items"][0]["runtime_ids"]
@@ -187,6 +245,21 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     assert_eq!(
         machine_history["value"]["items"][0]["occupancy"]["running_runtimes"],
         1
+    );
+    let discovered = machine_history["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "machine/discovered-history")
+        .unwrap();
+    assert_eq!(discovered["operational"]["layer"], "history");
+    assert_eq!(discovered["operational"]["actionable"], false);
+    assert!(
+        discovered["operational"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "discovered-history")
     );
 
     let activity = value(&run_cli(&socket, &["activity", "--limit", "10"]).await);

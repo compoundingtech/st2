@@ -35,8 +35,9 @@ use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Envelope as ClientEnvelope,
-    EventPage as ClientEventPage, Fence as ClientFence, Page as ClientPage, PairingBegin,
-    Resource as ClientResource, TargetParameters as ClientTargetParameters,
+    EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
+    Page as ClientPage, PairingBegin, Resource as ClientResource,
+    TargetParameters as ClientTargetParameters,
 };
 use tokio::sync::{Notify, watch};
 
@@ -485,7 +486,7 @@ struct NowArgs {
 
 #[derive(Args)]
 struct MachinesArgs {
-    /// Include unreachable and historical hosts.
+    /// Include historical and discovered hosts beyond the current configured fleet.
     #[arg(long)]
     all: bool,
 }
@@ -2173,6 +2174,7 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     "{}  attention  {}  {}  {}",
                     item.header.id, item.priority, item.state, item.title
                 );
+                let _ = writeln!(output, "  action: st3 attention ls");
             }
             ClientResource::Work(item) => {
                 let _ = writeln!(
@@ -2180,6 +2182,7 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     "{}  work  {}  {}  attempt {}",
                     item.header.id, item.state, item.path, item.attempt
                 );
+                let _ = writeln!(output, "  action: st3 work show {}", item.header.id);
             }
             ClientResource::Operation(item) => {
                 let _ = writeln!(
@@ -2187,17 +2190,42 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     "{}  operation  {}  {}  {}",
                     item.header.id, item.severity, item.state, item.summary
                 );
+                let _ = writeln!(output, "  recovery: st3 doctor");
             }
             ClientResource::Machine(item) => {
+                let _ = writeln!(output, "{}  {}", item.header.id, item.state);
                 let _ = writeln!(
                     output,
-                    "{}  {}  runtimes {}  work {}  transports {}",
-                    item.header.id,
-                    item.state,
-                    item.runtime_ids.len(),
-                    item.work.len(),
-                    item.transports.len()
+                    "  capacity {} — {}",
+                    item.capacity.state, item.capacity.reason
                 );
+                let _ = writeln!(
+                    output,
+                    "  occupancy {} running · inventory {}",
+                    item.occupancy.running_runtimes,
+                    item.runtime_ids.len()
+                );
+                let _ = writeln!(
+                    output,
+                    "  work {} · projects {}",
+                    item.work.len(),
+                    item.projects.len()
+                );
+                for transport in &item.transports {
+                    let _ = write!(
+                        output,
+                        "  transport {} {}",
+                        transport.protocol, transport.status
+                    );
+                    if let Some(last_success_at) = &transport.last_success_at {
+                        let _ = write!(output, " · last success {last_success_at}");
+                    }
+                    let _ = writeln!(output);
+                }
+                let _ = writeln!(output, "  inspect: st3 subject show {}", item.host_id);
+                if !matches!(item.state.as_str(), "local" | "reachable") {
+                    let _ = writeln!(output, "  recovery: st3 replication status");
+                }
             }
             ClientResource::Device(item) => {
                 let _ = writeln!(
@@ -2207,6 +2235,11 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     item.state,
                     item.session_actor,
                     item.scopes.len()
+                );
+                let _ = writeln!(
+                    output,
+                    "  action: st3 devices --as {} revoke {}",
+                    item.person_id, item.header.id
                 );
             }
             item => {
@@ -2250,8 +2283,11 @@ fn render_activity_page(page: &ClientEventPage) -> String {
         };
         let _ = writeln!(
             output,
-            "{}  {:?}  {}  {}",
-            item.next_cursor, item.event_type, resources, item.timestamp
+            "{}  {}  {}  {}",
+            item.next_cursor,
+            client_event_type_label(&item.event_type),
+            resources,
+            item.timestamp
         );
     }
     if page.has_more {
@@ -2262,6 +2298,17 @@ fn render_activity_page(page: &ClientEventPage) -> String {
         );
     }
     output
+}
+
+fn client_event_type_label(event_type: &ClientEventType) -> &'static str {
+    match event_type {
+        ClientEventType::Upsert => "upsert",
+        ClientEventType::Delete => "delete",
+        ClientEventType::TimelineDelta => "timeline.delta",
+        ClientEventType::TerminalAvailable => "terminal.available",
+        ClientEventType::CapabilitiesChanged => "capabilities.changed",
+        ClientEventType::Unknown => "unknown",
+    }
 }
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
@@ -5797,6 +5844,142 @@ mod tests {
                 "legacy server handler {handler} remains compiled"
             );
         }
+    }
+
+    fn fixture_product_page(kinds: &[&str], has_more: bool) -> ClientPage {
+        let resources: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/resources.json"
+        ))
+        .unwrap();
+        let items = resources
+            .into_iter()
+            .filter(|resource| {
+                resource["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kinds.contains(&kind))
+            })
+            .map(|resource| serde_json::from_value(resource).unwrap())
+            .collect();
+        ClientPage {
+            kind: "resource-page".into(),
+            collection: "fixture".into(),
+            items,
+            page: st3_client::PageInfo {
+                limit: 100,
+                has_more,
+                next_cursor: has_more.then(|| "cursor/next".into()),
+                cursor_expires_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn product_renderers_have_exact_empty_and_mixed_now_output() {
+        assert_eq!(
+            render_product_page("NOW", &fixture_product_page(&[], false)),
+            "NOW  0\nNo current items.\n"
+        );
+        assert_eq!(
+            render_product_page(
+                "NOW",
+                &fixture_product_page(&["attention", "work", "operation"], false)
+            ),
+            concat!(
+                "NOW  3\n",
+                "attention/release-review  attention  high  open  Review release\n",
+                "  action: st3 attention ls\n",
+                "work/release/1/build  work  claimed  build  attempt 1\n",
+                "  action: st3 work show work/release/1/build\n",
+                "operation/transport-host-b  operation  warning  degraded  Peer is retrying\n",
+                "  recovery: st3 doctor\n",
+            )
+        );
+    }
+
+    #[test]
+    fn machines_help_and_contract_include_configured_failures_by_default() {
+        let command = Cli::command();
+        let machines = command.find_subcommand("machines").unwrap();
+        let all = machines
+            .get_arguments()
+            .find(|argument| argument.get_id() == "all")
+            .unwrap();
+        assert_eq!(
+            all.get_help().unwrap().to_string(),
+            "Include historical and discovered hosts beyond the current configured fleet"
+        );
+
+        let contract: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/operational-state/cli-commands.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            contract["purposes"]["machines"]["defaults"],
+            "current configured fleet including failures"
+        );
+        assert_eq!(
+            contract["purposes"]["attention"]["human_example"],
+            "st3 attention ls"
+        );
+        assert_eq!(
+            contract["purposes"]["attention"]["json_example"],
+            "st3 attention ls --json"
+        );
+    }
+
+    #[test]
+    fn machine_and_device_renderers_have_exact_operational_output() {
+        assert_eq!(
+            render_product_page("MACHINES", &fixture_product_page(&["machine"], true)),
+            concat!(
+                "MACHINES  1\n",
+                "machine/host-a  local\n",
+                "  capacity unknown — no capacity observation\n",
+                "  occupancy 1 running · inventory 1\n",
+                "  work 1 · projects 0\n",
+                "  transport unix local · last success 2026-09-20T11:09:10Z\n",
+                "  inspect: st3 subject show host/host-a\n",
+                "More items are available; resume with the returned cursor.\n",
+            )
+        );
+        assert_eq!(
+            render_product_page("DEVICES", &fixture_product_page(&["device"], false)),
+            concat!(
+                "DEVICES  1\n",
+                "device/ios-release  active  person/nathan/session/ios-release  scopes 4\n",
+                "  action: st3 devices --as person/nathan revoke device/ios-release\n",
+            )
+        );
+    }
+
+    #[test]
+    fn activity_renderer_uses_exact_contract_labels_and_cursors() {
+        let events: ClientEnvelope<ClientEventPage> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/events.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            render_activity_page(&events.value),
+            concat!(
+                "ACTIVITY  2\n",
+                "event-cursor/epoch-a/92  upsert  work/release/1/build  2026-09-20T12:00:01Z\n",
+                "event-cursor/epoch-a/93  timeline.delta  session/release-agent/9  2026-09-20T12:00:02Z\n",
+            )
+        );
+        assert_eq!(
+            render_activity_page(&ClientEventPage {
+                kind: "event-page".into(),
+                oldest_cursor: "event-cursor/epoch-a/40".into(),
+                resume_cursor: "event-cursor/epoch-a/93".into(),
+                items: Vec::new(),
+                has_more: true,
+            }),
+            concat!(
+                "ACTIVITY  0\n",
+                "No changes after event-cursor/epoch-a/93.\n",
+                "More changes are available after event-cursor/epoch-a/93.\n",
+            )
+        );
     }
 
     #[test]

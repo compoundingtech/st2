@@ -549,7 +549,9 @@ fn machine_resources(
     let runtimes = runtime_resources(state, history, snapshot, session)?;
     let mut host_runtime_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut host_running_runtimes = BTreeMap::<String, usize>::new();
+    let mut host_current_runtime_membership = BTreeSet::<String>::new();
     let mut runtime_owner_hosts = BTreeMap::<String, String>::new();
+    let mut host_updated_at = BTreeMap::<String, String>::new();
     for runtime in &runtimes {
         let Some(host_id) = runtime["owner_host_id"].as_str() else {
             continue;
@@ -563,6 +565,23 @@ fn machine_resources(
             .insert(runtime_id.to_owned());
         if runtime["state"].as_str() == Some("running") {
             *host_running_runtimes.entry(host_id.to_owned()).or_default() += 1;
+        }
+        if runtime
+            .pointer("/operational/layer")
+            .and_then(Value::as_str)
+            == Some("current")
+        {
+            host_current_runtime_membership.insert(host_id.to_owned());
+        }
+        if let Some(updated_at) = runtime["updated_at"].as_str() {
+            host_updated_at
+                .entry(host_id.to_owned())
+                .and_modify(|current| {
+                    if updated_at > current.as_str() {
+                        *current = updated_at.to_owned();
+                    }
+                })
+                .or_insert_with(|| updated_at.to_owned());
         }
         if let Some(owner_id) = runtime["owner_id"].as_str() {
             runtime_owner_hosts.insert(owner_id.to_owned(), host_id.to_owned());
@@ -590,16 +609,26 @@ fn machine_resources(
                 .or_default()
                 .insert(work_id.to_owned());
         }
+        if let Some(updated_at) = item["updated_at"].as_str() {
+            host_updated_at
+                .entry(host_id.clone())
+                .and_modify(|current| {
+                    if updated_at > current.as_str() {
+                        *current = updated_at.to_owned();
+                    }
+                })
+                .or_insert_with(|| updated_at.to_owned());
+        }
     }
 
     let local_host = client_host_id(&state.node);
     let mut host_ids = BTreeSet::from([local_host.clone()]);
-    host_ids.extend(
-        state
-            .configured_peers
-            .iter()
-            .map(|peer| client_host_id(peer)),
-    );
+    let configured_hosts = state
+        .configured_peers
+        .iter()
+        .map(|peer| client_host_id(peer))
+        .collect::<BTreeSet<_>>();
+    host_ids.extend(configured_hosts.iter().cloned());
     host_ids.extend(host_runtime_ids.keys().cloned());
     let status = if history {
         state
@@ -618,21 +647,37 @@ fn machine_resources(
         })
         .map(|subject| (subject.subject.clone(), subject))
         .collect::<BTreeMap<_, _>>();
-    host_ids.extend(host_statuses.keys().cloned());
+    if history {
+        host_ids.extend(host_statuses.keys().cloned());
+    }
 
     let mut machines = Vec::new();
     for host_id in host_ids {
-        let name = host_id.strip_prefix("host/").unwrap_or(&host_id);
-        let (machine_state, transports, updated_at, transport_revision) = if host_id == local_host {
+        let name = host_id.strip_prefix("host/").unwrap_or(&host_id).to_owned();
+        let current_member = host_id == local_host
+            || configured_hosts.contains(&host_id)
+            || host_current_runtime_membership.contains(&host_id);
+        let mut updated_at = host_updated_at
+            .get(&host_id)
+            .cloned()
+            .unwrap_or_else(|| client_timestamp(0));
+        let (
+            machine_state,
+            transports,
+            operational_layer,
+            operational_actionable,
+            operational_reasons,
+        ) = if host_id == local_host {
             (
                 "local",
                 vec![json!({
                     "protocol": "unix",
                     "status": "local",
-                    "last_success_at": snapshot.created_at,
+                    "last_success_at": Value::Null,
                 })],
-                snapshot.created_at.clone(),
-                "local".to_owned(),
+                "current".to_owned(),
+                true,
+                vec!["authoritative-local-host".to_owned()],
             )
         } else if let Some(selected) = host_statuses.remove(&host_id) {
             let actual = selected.actual.as_ref();
@@ -646,27 +691,36 @@ fn machine_resources(
                 .unwrap_or("unknown");
             let conflicted = !selected.conflicts.is_empty()
                 || !matches!(selected.reachability.as_str(), "reachable" | "local");
-            let machine_state = if conflicted {
-                "indeterminate"
-            } else if status == "up" {
-                "reachable"
-            } else {
-                "unreachable"
+            let machine_state = match (conflicted, status) {
+                (true, _) | (false, "unknown") => "indeterminate",
+                (false, "up") => "reachable",
+                (false, "down") => "unreachable",
+                (false, _) => "indeterminate",
             };
-            let revision = selected
-                .actual_claim
-                .as_deref()
-                .unwrap_or("unobserved")
-                .to_owned();
-            let updated_at = if let Some(claim) = selected.actual_claim.as_deref() {
-                state
-                    .store
-                    .claim_by_id(claim)?
-                    .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
-                    .unwrap_or_else(|| snapshot.created_at.clone())
+            if let Some(claim) = selected.actual_claim.as_deref()
+                && let Some(claim) = state.store.claim_by_id(claim)?
+            {
+                let claim_updated_at = client_timestamp(claim.accepted_at_unix_ms);
+                if claim_updated_at > updated_at {
+                    updated_at = claim_updated_at;
+                }
+            }
+            let layer = if current_member {
+                selected.projection.layer.clone()
             } else {
-                snapshot.created_at.clone()
+                "history".to_owned()
             };
+            let mut reasons = selected.projection.reasons.clone();
+            if current_member {
+                reasons.push("replication-transport".to_owned());
+            } else {
+                reasons.push("discovered-history".to_owned());
+            }
+            if conflicted {
+                reasons.push("authority-indeterminate".to_owned());
+            }
+            reasons.sort();
+            reasons.dedup();
             (
                 machine_state,
                 vec![json!({
@@ -674,10 +728,18 @@ fn machine_resources(
                     "status": if matches!(status, "up" | "down") { status } else { "unknown" },
                     "last_success_at": fields.get("last_success_at").and_then(Value::as_u64).map(|value| client_timestamp(u128::from(value))),
                 })],
-                updated_at,
-                revision,
+                layer.clone(),
+                layer == "current"
+                    && selected.projection.actionable
+                    && machine_state != "indeterminate",
+                reasons,
             )
         } else {
+            let reason = if configured_hosts.contains(&host_id) {
+                "configured-unobserved"
+            } else {
+                "runtime-owner-host-unobserved"
+            };
             (
                 "indeterminate",
                 vec![json!({
@@ -685,8 +747,9 @@ fn machine_resources(
                     "status": "unknown",
                     "last_success_at": Value::Null,
                 })],
-                snapshot.created_at.clone(),
-                "unobserved".to_owned(),
+                "current".to_owned(),
+                false,
+                vec![reason.to_owned()],
             )
         };
         let running_runtimes = host_running_runtimes.remove(&host_id).unwrap_or_default();
@@ -700,13 +763,9 @@ fn machine_resources(
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        machines.push(json!({
-            "id": format!("machine/{name}"),
-            "kind": "machine",
-            "revision": format!("{transport_revision}:{}", snapshot.store_index),
-            "updated_at": updated_at,
+        let mut machine = json!({
             "host_id": host_id,
-            "name": name,
+            "name": name.clone(),
             "state": machine_state,
             "fleet_id": state.fleet_id,
             "capacity": {
@@ -721,11 +780,25 @@ fn machine_resources(
             "transports": transports,
             "runtime_ids": runtime_ids,
             "operational": {
-                "layer": "current",
-                "actionable": machine_state != "indeterminate",
-                "reasons": if machine_state == "local" { vec!["authoritative-local-host"] } else { vec!["replication-transport"] },
+                "layer": operational_layer,
+                "actionable": operational_actionable,
+                "reasons": operational_reasons,
             }
-        }));
+        });
+        let revision = format!(
+            "machine:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&machine).expect("machine projection serializes")
+            ))
+        );
+        let fields = machine
+            .as_object_mut()
+            .expect("machine projection is an object");
+        fields.insert("id".into(), Value::String(format!("machine/{name}")));
+        fields.insert("kind".into(), Value::String("machine".into()));
+        fields.insert("revision".into(), Value::String(revision));
+        fields.insert("updated_at".into(), Value::String(updated_at));
+        machines.push(machine);
     }
     machines.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     Ok(machines)

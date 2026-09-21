@@ -12080,34 +12080,76 @@ fn operational_annotation(
         historical.push("stopped".to_owned());
     }
 
-    if at_index.is_none()
-        && let Some(owner_run) = owner_run
-    {
-        let run_id = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
-        let owner = connection
-            .query_row(
-                "SELECT status, current_generation_id, mode FROM mission_runs WHERE id=?1",
-                [run_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+    if let Some(owner_run) = owner_run {
+        let (run_status, current_generation, mode) = if at_index.is_some() {
+            let owner = latest_actual_at(connection, owner_run, at_index)?;
+            let fields = owner
+                .as_ref()
+                .map(|value| value.get("fields").unwrap_or(value));
+            (
+                fields
+                    .and_then(|fields| fields.get("status"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                None,
+                fields
+                    .and_then(|fields| fields.get("mode"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             )
-            .optional()?;
-        if let Some((run_status, current_generation, mode)) = owner {
-            if is_terminal_run_state(&run_status) {
-                historical.push("terminal-owner".to_owned());
-                if mode == "eval" {
-                    historical.push("eval".to_owned());
-                }
+        } else {
+            let run_id = owner_run.strip_prefix("mission-run/").unwrap_or(owner_run);
+            connection
+                .query_row(
+                    "SELECT status, current_generation_id, mode FROM mission_runs WHERE id=?1",
+                    [run_id],
+                    |row| {
+                        Ok((
+                            Some(row.get::<_, String>(0)?),
+                            Some(format!("run-generation/{}", row.get::<_, String>(1)?)),
+                            Some(row.get::<_, String>(2)?),
+                        ))
+                    },
+                )
+                .optional()?
+                .unwrap_or((None, None, None))
+        };
+        if run_status.as_deref().is_some_and(is_terminal_run_state) {
+            historical.push("terminal-owner".to_owned());
+            if mode.as_deref() == Some("eval") {
+                historical.push("eval".to_owned());
             }
-            if owner_generation.is_some_and(|generation| {
-                generation_id_from_subject(generation) != current_generation
-            }) {
+        }
+        if let Some(owner_generation) = owner_generation {
+            let generation_status = if at_index.is_some() {
+                let generation = latest_actual_at(connection, owner_generation, at_index)?;
+                generation
+                    .as_ref()
+                    .map(|value| value.get("fields").unwrap_or(value))
+                    .and_then(|fields| fields.get("status"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                let generation_id = generation_id_from_subject(owner_generation);
+                connection
+                    .query_row(
+                        "SELECT status FROM run_generations WHERE id=?1",
+                        [generation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+            };
+            if current_generation
+                .as_deref()
+                .is_some_and(|current| current != owner_generation)
+                || generation_status.as_deref() == Some("superseded")
+            {
                 historical.push("superseded".to_owned());
+            } else if generation_status
+                .as_deref()
+                .is_some_and(is_terminal_generation_state)
+            {
+                historical.push("terminal-generation".to_owned());
             }
         }
     }
@@ -17673,6 +17715,180 @@ version 2
             first_apply.subject_tokens["exec/work"]
         );
         assert_eq!(historical_mission.changes.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_operational_annotations_follow_owner_claims_at_the_same_index() {
+        let store = Store::open_memory("node").expect("store");
+        publish_mission(
+            &store,
+            r#"version 2
+mission "snapshot-owner" state="ready" {
+  goal "Fence operational history to the selected graph index."
+  step "work" { agentless }
+}"#,
+            "snapshot-owner-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "snapshot-owner".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "snapshot-owner-run".into(),
+            })
+            .unwrap();
+
+        let mut owned = simple("true");
+        let desired = owned.subjects.get_mut("exec/work").unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(run.generation.clone());
+        let planned = store
+            .mission(
+                &owned,
+                IntentInput {
+                    kdl: "owned runtime".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let applied = store
+            .apply(&owned, &planned.subject_tokens, "snapshot-owned-runtime")
+            .unwrap();
+        let current_index = applied.store_index;
+        let current = store
+            .status_at(Some("exec/work"), None, Some(current_index))
+            .unwrap();
+        assert_eq!(current.subjects[0].projection.layer, "current");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: run.generation.clone(),
+                kind: "run-generation.superseded".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("superseded".into())),
+                    (
+                        "successor".into(),
+                        Value::String("run-generation/replacement".into()),
+                    ),
+                    ("reason".into(), Value::String("test revision".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let superseded_index = store.index().unwrap();
+        let superseded = store
+            .status_at(Some("exec/work"), None, Some(superseded_index))
+            .unwrap();
+        assert_eq!(superseded.subjects[0].projection.layer, "history");
+        assert!(!superseded.subjects[0].projection.actionable);
+        assert!(
+            superseded.subjects[0]
+                .projection
+                .reasons
+                .contains(&"superseded".to_owned())
+        );
+
+        let replacement = "run-generation/replacement";
+        store
+            .append_claim(&ClaimInput {
+                subject: replacement.into(),
+                kind: "run-generation.created".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("run".into(), Value::String(run.subject.clone())),
+                    (
+                        "revision".into(),
+                        Value::String("replacement-revision".into()),
+                    ),
+                    ("status".into(), Value::String("running".into())),
+                    ("reason".into(), Value::String("test revision".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut successor_owned = simple("false");
+        let desired = successor_owned.subjects.get_mut("exec/work").unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(replacement.into());
+        let planned = store
+            .mission(
+                &successor_owned,
+                IntentInput {
+                    kdl: "successor-owned runtime".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let successor = store
+            .apply(
+                &successor_owned,
+                &planned.subject_tokens,
+                "snapshot-successor-owned-runtime",
+            )
+            .unwrap();
+        let successor_status = store
+            .status_at(Some("exec/work"), None, Some(successor.store_index))
+            .unwrap();
+        assert_eq!(successor_status.subjects[0].projection.layer, "current");
+        assert!(
+            !successor_status.subjects[0]
+                .projection
+                .reasons
+                .contains(&"superseded".to_owned())
+        );
+
+        assert!(
+            store
+                .set_mission_run_state(
+                    &run.id,
+                    "cancelled",
+                    "terminal",
+                    Some("the owner completed its lifecycle"),
+                )
+                .unwrap()
+        );
+        let terminal_index = store.index().unwrap();
+        let before_terminal = store
+            .status_at(Some("exec/work"), None, Some(current_index))
+            .unwrap();
+        assert_eq!(before_terminal.subjects[0].projection.layer, "current");
+        let terminal = store
+            .status_at(Some("exec/work"), None, Some(terminal_index))
+            .unwrap();
+        assert_eq!(terminal.subjects[0].projection.layer, "history");
+        assert!(!terminal.subjects[0].projection.actionable);
+        assert!(
+            terminal.subjects[0]
+                .projection
+                .reasons
+                .contains(&"terminal-owner".to_owned())
+        );
+        assert!(
+            store
+                .status_at(None, None, Some(terminal_index))
+                .unwrap()
+                .subjects
+                .iter()
+                .all(|subject| subject.subject != "exec/work")
+        );
+        let historical = store
+            .status_history(None, None, Some(terminal_index))
+            .unwrap();
+        let owned = historical
+            .subjects
+            .iter()
+            .find(|subject| subject.subject == "exec/work")
+            .unwrap();
+        assert_eq!(owned.projection.layer, "history");
+        assert!(!owned.projection.actionable);
     }
 
     #[test]
