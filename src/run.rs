@@ -1633,6 +1633,7 @@ fn live_resync_specs(
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
 /// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_pass(
     root: &Path,
     this_host: &str,
@@ -2376,6 +2377,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_specs_with_sessions_in_span(
     specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
@@ -2423,7 +2425,8 @@ pub fn up_once_selected_specs(
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
     let span = reconcile_span(this_host, "selected");
-    let result = {
+
+    {
         let _entered = span.enter();
         let result = up_once_selected_specs_with_gates(
             catalog_root,
@@ -2445,8 +2448,7 @@ pub fn up_once_selected_specs(
             Err(_) => finish_failed_reconcile_pass(&span),
         }
         result
-    };
-    result
+    }
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -2458,7 +2460,8 @@ pub fn up_once_selected(
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
     let span = reconcile_span(this_host, "selected");
-    let result = {
+
+    {
         let _entered = span.enter();
         let result = (|| {
             let _catalog_lock = {
@@ -2560,8 +2563,7 @@ pub fn up_once_selected(
             Err(_) => finish_failed_reconcile_pass(&span),
         }
         result
-    };
-    result
+    }
 }
 
 fn up_once_selected_specs_with_gates<V>(

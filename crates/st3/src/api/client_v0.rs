@@ -133,11 +133,11 @@ impl ClientSession {
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
-    session
-        .authority_actor
-        .starts_with("person/")
-        .then(|| session.authority_actor.clone())
-        .unwrap_or_else(|| "requester".into())
+    if session.authority_actor.starts_with("person/") {
+        session.authority_actor.clone()
+    } else {
+        "requester".into()
+    }
 }
 
 pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
@@ -170,7 +170,7 @@ fn forbidden(message: impl Into<String>) -> ApiError {
         status: StatusCode::FORBIDDEN,
         code: "forbidden".into(),
         message: message.into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     }
 }
 
@@ -183,7 +183,7 @@ fn validation(message: impl Into<String>) -> ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation-failed".into(),
         message: message.into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     }
 }
 
@@ -192,7 +192,7 @@ fn stale(message: impl Into<String>) -> ApiError {
         status: StatusCode::CONFLICT,
         code: "stale-fence".into(),
         message: message.into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     }
 }
 
@@ -1159,8 +1159,8 @@ pub(super) fn timeline_value(
     id: &str,
     query: &ClientListQuery,
 ) -> Result<Json<Value>, ApiError> {
-    require_scope(&session, "read.projections")?;
-    let session_id = client_detail_id("session", &id);
+    require_scope(session, "read.projections")?;
+    let session_id = client_detail_id("session", id);
     let resource = client_session_resources(
         &state.store,
         true,
@@ -1204,7 +1204,10 @@ pub(super) fn timeline_value(
             code: "cursor-gap".into(),
             message: "older timeline history was omitted without a typed truncation interval"
                 .into(),
-            details: serde_json::Map::from_iter([("full_resync".into(), Value::Bool(true))]),
+            details: Box::new(serde_json::Map::from_iter([(
+                "full_resync".into(),
+                Value::Bool(true),
+            )])),
         });
     }
     let mut retained_entries = BTreeSet::new();
@@ -1219,7 +1222,10 @@ pub(super) fn timeline_value(
                 status: StatusCode::GONE,
                 code: "cursor-gap".into(),
                 message: "the retained timeline begins after an entry's append operation".into(),
-                details: serde_json::Map::from_iter([("full_resync".into(), Value::Bool(true))]),
+                details: Box::new(serde_json::Map::from_iter([(
+                    "full_resync".into(),
+                    Value::Bool(true),
+                )])),
             });
         }
         retained_entries.insert(entry_id.to_owned());
@@ -1509,7 +1515,10 @@ fn decode_event_cursor(node: &str, cursor: Option<&str>) -> Result<u64, ApiError
             status: StatusCode::GONE,
             code: "cursor-gap".into(),
             message: "the event cursor belongs to another host or retention epoch".into(),
-            details: serde_json::Map::from_iter([("full_resync".into(), Value::Bool(true))]),
+            details: Box::new(serde_json::Map::from_iter([(
+                "full_resync".into(),
+                Value::Bool(true),
+            )])),
         });
     }
     parts
@@ -1536,7 +1545,7 @@ fn validate_event_cursor(
             status: StatusCode::GONE,
             code: "cursor-gap".into(),
             message: "the event cursor is outside the retained event range".into(),
-            details: serde_json::Map::from_iter([
+            details: Box::new(serde_json::Map::from_iter([
                 ("full_resync".into(), Value::Bool(true)),
                 (
                     "oldest_cursor".into(),
@@ -1546,7 +1555,7 @@ fn validate_event_cursor(
                     "newest_cursor".into(),
                     Value::String(format!("event-cursor/{node}/{newest}")),
                 ),
-            ]),
+            ])),
         });
     }
     Ok(())
@@ -1849,35 +1858,40 @@ pub(super) async fn pairing_complete(
         "control.attention",
         "control.launches",
     ];
-    state
-        .store
-        .append_claim(&ClaimInput {
-            subject: begun.subject.clone(),
-            kind: "custom.client.pairing-completed".into(),
-            actor: Some(person_id.clone()),
-            fields: BTreeMap::from([
-                ("pairing_id".into(), Value::String(pairing_id)),
-                ("device_id".into(), Value::String(device_id.clone())),
-                ("session_actor".into(), Value::String(session_actor.clone())),
-                ("person_id".into(), Value::String(person_id.clone())),
-                ("delegated_by".into(), Value::String(person_id.clone())),
-                (
-                    "credential_hash".into(),
-                    Value::String(credential_digest(&credential)),
-                ),
-                (
-                    "device_public_key".into(),
-                    Value::String(request.device_public_key),
-                ),
-                ("scopes".into(), json!(scopes)),
-                ("delegated_scopes".into(), json!(scopes)),
-                ("expires_at_unix_ms".into(), json!(expires_at)),
-            ]),
-            evidence: vec![begun.id.clone()],
-            expected_subject: None,
-            idempotency_key: None,
-        })
-        .map_err(ApiError::bad)?;
+    let completed = state.store.append_claim(&ClaimInput {
+        subject: begun.subject.clone(),
+        kind: "custom.client.pairing-completed".into(),
+        actor: Some(person_id.clone()),
+        fields: BTreeMap::from([
+            ("pairing_id".into(), Value::String(pairing_id)),
+            ("device_id".into(), Value::String(device_id.clone())),
+            ("session_actor".into(), Value::String(session_actor.clone())),
+            ("person_id".into(), Value::String(person_id.clone())),
+            ("delegated_by".into(), Value::String(person_id.clone())),
+            (
+                "credential_hash".into(),
+                Value::String(credential_digest(&credential)),
+            ),
+            (
+                "device_public_key".into(),
+                Value::String(request.device_public_key),
+            ),
+            ("scopes".into(), json!(scopes)),
+            ("delegated_scopes".into(), json!(scopes)),
+            ("expires_at_unix_ms".into(), json!(expires_at)),
+        ]),
+        evidence: vec![begun.id.clone()],
+        expected_subject: Some(Some(begun.id.clone())),
+        idempotency_key: None,
+    });
+    if let Err(error) = completed {
+        if error.code == "stale-subject" {
+            return Err(forbidden(
+                "the pairing code is invalid, expired, or already used",
+            ));
+        }
+        return Err(ApiError::bad(error));
+    }
     signal_changed(&state);
     Ok(Json(
         json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) }),
@@ -2012,7 +2026,7 @@ pub(super) async fn terminal_stream(
             message: format!(
                 "the terminal WebSocket must request exactly `{TERMINAL_SUBPROTOCOL}` plus one `st3.cap.*` capability protocol"
             ),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         });
     }
     let live = terminal_live_session(&state, &subject, query.incarnation.as_deref())?;
@@ -2078,7 +2092,7 @@ fn existing_terminal_attachment(
             status: StatusCode::CONFLICT,
             code: "idempotency-conflict".into(),
             message: "the idempotency key was already used for a different action".into(),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         });
     }
     terminal_attachment_response(state, session, &attachment_id).map(Some)
@@ -2322,7 +2336,7 @@ fn create_terminal_attachment(
                 status: StatusCode::CONFLICT,
                 code: "idempotency-conflict".into(),
                 message: "the idempotency key was already used for a different action".into(),
-                details: serde_json::Map::new(),
+                details: Box::default(),
             });
         }
     }
@@ -3203,7 +3217,7 @@ async fn dispatch_action(
                 "action `{}` is declared but is not available on this daemon",
                 request.action_type
             ),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         }),
     }
 }
@@ -3260,7 +3274,7 @@ pub(super) async fn action(
                 status: StatusCode::CONFLICT,
                 code: "idempotency-conflict".into(),
                 message: "the idempotency key was already used for a different action".into(),
-                details: serde_json::Map::new(),
+                details: Box::default(),
             });
         }
         let mut result = receipt
@@ -3369,7 +3383,7 @@ pub(super) async fn action(
                 status: StatusCode::CONFLICT,
                 code: "idempotency-conflict".into(),
                 message: "the idempotency key was already used for a different action".into(),
-                details: serde_json::Map::new(),
+                details: Box::default(),
             });
         }
         let mut replay = receipt

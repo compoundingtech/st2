@@ -494,8 +494,7 @@ fn commit_transaction(writes: &[PlannedWrite]) -> Result<()> {
         };
         originals.push((write.destination.clone(), bytes, mode));
     }
-    let mut committed = 0;
-    for write in changes {
+    for (committed, write) in changes.into_iter().enumerate() {
         if let Err(error) = atomic_write_mode(&write.destination, &write.bytes, write.mode) {
             let mut rollback_errors = Vec::new();
             for (path, bytes, mode) in originals[..committed].iter().rev() {
@@ -516,7 +515,6 @@ fn commit_transaction(writes: &[PlannedWrite]) -> Result<()> {
             }
             return Err(error);
         }
-        committed += 1;
     }
     Ok(())
 }

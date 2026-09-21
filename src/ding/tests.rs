@@ -1405,7 +1405,11 @@ fn archive_between_startup_seed_and_adoption_removes_every_stale_candidate() {
         .find_map(|(text, message)| message.as_ref().map(|_| text.clone()))
         .unwrap();
     assert!(
-        exact_staged_candidate(&staged_codex_screen(&stale_text), &[stale_text.clone()]).is_some()
+        exact_staged_candidate(
+            &staged_codex_screen(&stale_text),
+            std::slice::from_ref(&stale_text),
+        )
+        .is_some()
     );
 
     archive_msg(&inbox, &archive, &filename).unwrap();

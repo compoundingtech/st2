@@ -241,6 +241,7 @@ pub struct Reconciler<R = NativeRuntime> {
 }
 
 impl Reconciler<NativeRuntime> {
+    #[allow(clippy::too_many_arguments)]
     pub fn native(
         store: Arc<Store>,
         state_dir: &Path,
@@ -2926,6 +2927,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(format!("{}@{}", document.name, document.hash))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_loop_branch(
         &self,
         run: &MissionRunView,
@@ -3448,10 +3450,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         completed = all_results
             .iter()
-            .cloned()
-            .filter(|claim| {
+            .filter(|&claim| {
                 claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("completed")
             })
+            .cloned()
             .filter_map(|claim| {
                 let candidate = claim
                     .body
@@ -3909,13 +3911,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             claims
                 .iter()
-                .filter(|claim| claim.body.pointer("/fields/candidate").is_none())
-                .filter(|claim| claim.body.pointer("/fields/item").is_none())
-                .filter(|claim| {
-                    claim.body.pointer("/fields/status").and_then(Value::as_str)
-                        == Some("completed")
+                .rfind(|claim| {
+                    claim.body.pointer("/fields/candidate").is_none()
+                        && claim.body.pointer("/fields/item").is_none()
+                        && claim.body.pointer("/fields/status").and_then(Value::as_str)
+                            == Some("completed")
                 })
-                .next_back()
                 .and_then(|claim| {
                     claim
                         .body

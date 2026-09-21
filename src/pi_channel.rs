@@ -273,6 +273,7 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Opti
 /// observed-state heartbeat exactly as fresh as the stdio connection that justifies it. EOF is the
 /// session-lifetime boundary — the loop then returns without writing anything, so the record ages
 /// to `unknown` rather than asserting a state nobody is watching.
+#[allow(clippy::too_many_arguments)]
 fn channel_loop(
     input: &Receiver<io::Result<String>>,
     out: &mut impl Write,
@@ -1113,7 +1114,7 @@ mod tests {
                         "model": "fake-1", "costUsd": 0.010905},
             "compaction": {"trigger": "overflow", "count": 3}});
 
-        let full = record_after(&[before.clone()], harness_context::Harness::Pi);
+        let full = record_after(std::slice::from_ref(&before), harness_context::Harness::Pi);
         assert_eq!(full.used_percent, Some(90.625));
         assert_eq!(full.compactions, 0);
 

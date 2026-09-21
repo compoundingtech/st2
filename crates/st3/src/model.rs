@@ -272,16 +272,14 @@ pub struct LoopStopSpec {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum LoopExhaustionSpec {
+    #[default]
     Fail,
     Succeed,
-    Human { gate: GateSpec },
-}
-
-impl Default for LoopExhaustionSpec {
-    fn default() -> Self {
-        Self::Fail
-    }
+    Human {
+        gate: GateSpec,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

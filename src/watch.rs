@@ -342,7 +342,7 @@ fn watch_catalog_generation(
     };
     let generation = control.join(crate::catalog_lock::GENERATION_FILE);
     let mut watcher = recommended_watcher(move |result: notify::Result<Event>| match result {
-        Ok(event) if is_mutation(&event) && event.paths.iter().any(|path| *path == generation) => {
+        Ok(event) if is_mutation(&event) && event.paths.contains(&generation) => {
             let _ = tx.send(());
         }
         Ok(_) => {}

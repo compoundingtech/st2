@@ -451,7 +451,7 @@ impl Writer {
         // record a reader would trust: one already past the future-skew bound is somebody's
         // garbage (or an overflow probe), and inheriting it would poison every later write —
         // the writer's own clock wins instead.
-        let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+        let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
         let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
@@ -658,7 +658,7 @@ fn duration_ms(duration: Duration) -> u64 {
 enum StoredRecord {
     Absent,
     Unreadable,
-    Parsed(Record),
+    Parsed(Box<Record>),
 }
 
 fn read_stored(path: &Path) -> StoredRecord {
@@ -669,7 +669,7 @@ fn read_stored(path: &Path) -> StoredRecord {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoredRecord::Absent,
         Err(_) => StoredRecord::Unreadable,
         Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(record) => StoredRecord::Parsed(record),
+            Ok(record) => StoredRecord::Parsed(Box::new(record)),
             Err(_) => StoredRecord::Unreadable,
         },
     }
@@ -677,7 +677,7 @@ fn read_stored(path: &Path) -> StoredRecord {
 
 fn read_record(path: &Path) -> Option<Record> {
     match read_stored(path) {
-        StoredRecord::Parsed(record) => Some(record),
+        StoredRecord::Parsed(record) => Some(*record),
         StoredRecord::Absent | StoredRecord::Unreadable => None,
     }
 }
@@ -782,7 +782,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     );
     let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
-    let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+    let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
     let record = Record {
         schema: SCHEMA.to_string(),
         agent: writer.agent.clone(),

@@ -195,9 +195,12 @@ impl SnapshotTarget {
     /// Digest the currently published contained snapshot, if present.
     pub fn current_digest(&self) -> Result<Option<SnapshotDigest>, PublicationError> {
         let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
-        let leaf = self.relative.file_name().ok_or_else(|| {
-            PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf"))
-        })?;
+        let leaf = self
+            .relative
+            .file_name()
+            .ok_or(PublicationError::UnsafeTarget(PathError::UnsafeCarrier(
+                "missing leaf",
+            )))?;
         let directory = match open_absolute_dir_beneath(&self.root, parent) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -713,9 +716,13 @@ impl PreparedPublication<'_> {
             .relative
             .parent()
             .unwrap_or_else(|| Path::new(""));
-        let leaf = self.target.relative.file_name().ok_or_else(|| {
-            PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf"))
-        })?;
+        let leaf = self
+            .target
+            .relative
+            .file_name()
+            .ok_or(PublicationError::UnsafeTarget(PathError::UnsafeCarrier(
+                "missing leaf",
+            )))?;
         let directory =
             open_absolute_dir_beneath(&self.target.root, parent).map_err(PublicationError::Io)?;
         atomic_replace_at(&directory, leaf, self.bytes).map_err(PublicationError::Io)

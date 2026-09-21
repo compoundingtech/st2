@@ -1064,11 +1064,9 @@ impl Worker {
             let wanted = desired.contains(dir);
             let current = dir_identity(dir);
             let stale = !wanted || *identity != current;
-            if stale {
-                if let Some(watcher) = self.watcher.as_mut() {
-                    let _ = watcher.unwatch(dir);
-                    changed = true;
-                }
+            if stale && let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(dir);
+                changed = true;
             }
             !stale
         });

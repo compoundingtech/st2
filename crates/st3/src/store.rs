@@ -34,6 +34,10 @@ use crate::model::{
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 
+type StepStateRow = (String, bool, u32, String, String, String, String, String);
+type StepRetryRow = (String, u32, bool, String, String, String, String, String);
+type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
@@ -515,7 +519,7 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10 | 11 | 12),
+        table_count == 0 || matches!(version, 10..=12),
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
@@ -3162,10 +3166,9 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<(String, bool, u32, String, String, String, String, String)> =
-            transaction
-                .query_row(
-                    "SELECT step_runs.status,
+        let current: Option<StepStateRow> = transaction
+            .query_row(
+                "SELECT step_runs.status,
                         step_runs.generation_id=mission_runs.current_generation_id,
                         step_runs.readiness_epoch, mission_runs.status, mission_runs.phase,
                         run_generations.status, root_runs.status, root_runs.phase
@@ -3173,21 +3176,21 @@ impl Store {
                  JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
                  JOIN run_generations ON run_generations.id=step_runs.generation_id
                  WHERE step_runs.subject=?1",
-                    [&subject],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                        ))
-                    },
-                )
-                .optional()?;
+                [&subject],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((
             current,
             is_current,
@@ -3242,10 +3245,9 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<(String, u32, bool, String, String, String, String, String)> =
-            transaction
-                .query_row(
-                    "SELECT step_runs.status, step_runs.attempt,
+        let current: Option<StepRetryRow> = transaction
+            .query_row(
+                "SELECT step_runs.status, step_runs.attempt,
                         step_runs.generation_id=mission_runs.current_generation_id,
                         mission_runs.status, mission_runs.phase, run_generations.status,
                         root_runs.status, root_runs.phase
@@ -3253,21 +3255,21 @@ impl Store {
                  JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
                  JOIN run_generations ON run_generations.id=step_runs.generation_id
                  WHERE step_runs.subject=?1",
-                    [&subject],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                        ))
-                    },
-                )
-                .optional()?;
+                [&subject],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((
             status,
             attempt,
@@ -6617,7 +6619,7 @@ impl Store {
     ) -> Result<Option<UsageSummary>> {
         #[derive(Default)]
         struct Spend {
-            cumulative: Option<(u64, u64, u64, u64, Option<f64>, Option<String>)>,
+            cumulative: Option<CumulativeUsage>,
             response_total: u64,
             response_input: u64,
             response_output: u64,
@@ -9931,6 +9933,7 @@ fn publication_operation_is_new<T: Serialize>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_publication_operation_tx<T: Serialize>(
     transaction: &Transaction<'_>,
     origin: &str,
@@ -12214,7 +12217,7 @@ fn canonical_json_value(value: &Value) -> Value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
         Value::Object(fields) => {
             let mut fields = fields.iter().collect::<Vec<_>>();
-            fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            fields.sort_unstable_by_key(|(left, _)| *left);
             Value::Object(
                 fields
                     .into_iter()
@@ -12351,7 +12354,7 @@ fn validate_replica_repair(
         .map_err(internal)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(internal)?;
-    for body in bodies {
+    if let Some(body) = bodies.into_iter().next() {
         let body: Value = serde_json::from_str(&body).map_err(internal)?;
         let fields = body.get("fields").unwrap_or(&body);
         let same = fields.get("record").and_then(Value::as_str) == Some(repair.record_ref.as_str())
@@ -13110,9 +13113,9 @@ fn select_replicated_desired(
     let current = current_desired_row_tx(transaction, &claim.subject).map_err(internal)?;
     let revision = desired_revision(desired);
     let select = if let Some(row) = &current {
-        if claim.id == row.claim_id {
-            true
-        } else if claim_descends_from(transaction, &claim.id, &row.claim_id).map_err(internal)? {
+        if claim.id == row.claim_id
+            || claim_descends_from(transaction, &claim.id, &row.claim_id).map_err(internal)?
+        {
             true
         } else if claim_descends_from(transaction, &row.claim_id, &claim.id).map_err(internal)? {
             false
@@ -19850,7 +19853,10 @@ mission "external-blocker" state="ready" {
         let blocked = store.step_run(&subject).unwrap().unwrap();
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.blocked_reason.as_deref(), Some(reason));
-        assert_eq!(blocked.blockers, [attention.subject.clone()]);
+        assert_eq!(
+            blocked.blockers.as_slice(),
+            std::slice::from_ref(&attention.subject)
+        );
         let listed = store.work(Some("agent/source.ios-owner"), false).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "blocked");
@@ -19876,7 +19882,10 @@ mission "external-blocker" state="ready" {
         );
         let replicated = replica.step_run(&subject).unwrap().unwrap();
         assert_eq!(replicated.status, "blocked");
-        assert_eq!(replicated.blockers, [attention.subject.clone()]);
+        assert_eq!(
+            replicated.blockers.as_slice(),
+            std::slice::from_ref(&attention.subject)
+        );
 
         store
             .resolve_attention(

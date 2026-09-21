@@ -608,6 +608,7 @@ mod tests {
         server.abort();
     }
 
+    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn the_unix_terminal_transport_completes_a_real_websocket_handshake() {
         let directory = tempfile::tempdir().unwrap();
@@ -653,6 +654,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn the_http_terminal_transport_completes_a_real_websocket_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

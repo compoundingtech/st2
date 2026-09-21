@@ -1134,7 +1134,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                                 // observed systemError writes reason without an exit — and
                                 // discarding it leaves the operator nothing to act on.
                                 .or_else(|| {
-                                    observed.reason.as_deref().map(|reason| format!("{reason}"))
+                                    observed.reason.as_deref().map(|reason| reason.to_string())
                                 })
                                 .unwrap_or_else(|| "exit unstated".to_string())
                         ),
@@ -2274,6 +2274,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_resolved_message(
     root: &Path,
     to: &str,

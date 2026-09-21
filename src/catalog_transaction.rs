@@ -1401,7 +1401,7 @@ fn inspect_existing_bootstrap(
     let current = project_excluding(
         &retained_catalog,
         ProjectionSource::Current,
-        &catalog,
+        catalog,
         &desired.workspace_dirs,
     )?;
     validate_full_catalog(&retained_catalog)?;
@@ -2140,6 +2140,7 @@ fn collect_templates(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_template_dir(
     root: &Path,
     templates: &Path,

@@ -384,10 +384,10 @@ fn match_declared<'a>(
         })
 }
 
-fn graph_declaration<'a>(
+fn graph_declaration(
     root: &Path,
     declaration: &DiscoveredDeclaration,
-    error_paths: &BTreeSet<&'a str>,
+    error_paths: &BTreeSet<&str>,
 ) -> GraphDeclaration {
     let path = relative(root, &declaration.path);
     let agents = declaration

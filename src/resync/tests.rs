@@ -1285,7 +1285,7 @@ fn transient_permission_error_retries_without_emitting_a_tombstone() {
     let baseline = worker.carriers[&carrier][0].state.clone();
 
     let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
-    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0o0)).unwrap();
     worker.flush_path_publishing(&carrier, None);
     let entry = &worker.carriers[&carrier][0];
     assert_eq!(entry.state, baseline);
@@ -1321,7 +1321,7 @@ fn initial_transient_read_failure_schedules_a_baseline_retry() {
     let carrier = resources.join("goal.md");
     std::fs::write(&carrier, "baseline").unwrap();
     let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
-    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0o0)).unwrap();
     let set = watch_set_for(&discover(root.path()), "host", &Default::default());
     let mut worker = Worker {
         root: root.path().to_path_buf(),

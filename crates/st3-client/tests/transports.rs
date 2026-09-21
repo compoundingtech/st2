@@ -102,6 +102,16 @@ async fn wait_for_socket(socket: &Path) {
     panic!("Unix server socket {} did not appear", socket.display());
 }
 
+fn assert_private_socket(socket: &Path) {
+    let mode = std::fs::metadata(socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode,
+        0o600,
+        "Unix socket {} must be accessible only to its owner",
+        socket.display()
+    );
+}
+
 async fn unix_status(socket: &Path, path: &str, credential: Option<&str>) -> StatusCode {
     let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
@@ -667,6 +677,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
             async move { st3::api::serve_unix(&server_gateway_socket, gateway_app).await },
         );
     wait_for_socket(&gateway_socket).await;
+    assert_private_socket(&gateway_socket);
     assert_eq!(
         unix_status(&gateway_socket, "/v1/health", None).await,
         StatusCode::OK
@@ -847,6 +858,8 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     });
     wait_for_socket(&socket).await;
     wait_for_socket(&gateway_socket).await;
+    assert_private_socket(&socket);
+    assert_private_socket(&gateway_socket);
     Client::unix_as(&socket, "person/nathan")
         .capabilities()
         .await

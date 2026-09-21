@@ -232,7 +232,7 @@ pub enum CodexObservedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CodexHoldReason {
+pub enum CodexHoldReason {
     ActiveWithoutTurn,
     ConflictingTurn,
     Review,
@@ -247,7 +247,7 @@ pub(crate) enum CodexHoldReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CodexTerminalError {
+pub enum CodexTerminalError {
     SystemError,
     ProviderAuthRejected,
 }
@@ -2720,17 +2720,17 @@ fn pump_control(
             subscription_pending = true;
         }
         loop {
-            if !peer_closed {
-                if let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL)) {
-                    if error.kind() == std::io::ErrorKind::InvalidInput {
-                        // Darwin can reject setsockopt after the peer has closed
-                        // the Unix socket. Keep reading: buffered WebSocket
-                        // frames must be processed before EOF is reported.
-                        peer_closed = true;
-                        let _ = websocket.get_ref().set_read_timeout(None);
-                    } else {
-                        return Err(error).context("setting Codex control poll timeout");
-                    }
+            if !peer_closed
+                && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))
+            {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    // Darwin can reject setsockopt after the peer has closed
+                    // the Unix socket. Keep reading: buffered WebSocket
+                    // frames must be processed before EOF is reported.
+                    peer_closed = true;
+                    let _ = websocket.get_ref().set_read_timeout(None);
+                } else {
+                    return Err(error).context("setting Codex control poll timeout");
                 }
             }
             let message =

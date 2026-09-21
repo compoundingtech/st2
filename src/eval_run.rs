@@ -730,6 +730,7 @@ fn from_is(from: Option<&str>, id: &str) -> bool {
 /// singleton instead requires a causally new requester-inbox entry at-or-after the exact kickoff
 /// receipt. Compact singleton semantics remain unchanged. Bounded by `timeout`. Returns whether done
 /// fired.
+#[allow(clippy::too_many_arguments)]
 fn wait_done(
     bus: &Path,
     canonical_routes: Option<&BTreeMap<String, CanonicalRoute>>,

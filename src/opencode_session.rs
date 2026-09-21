@@ -1997,9 +1997,7 @@ mod tests {
                     } else {
                         404
                     }
-                } else if method == "GET" && path == "/session" {
-                    200
-                } else if method == "GET" && path == "/config/providers" {
+                } else if method == "GET" && (path == "/session" || path == "/config/providers") {
                     200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
@@ -2284,7 +2282,7 @@ mod tests {
         let expected_id = stable_message_id("h.worker", "ses_target", &filename);
         assert_eq!(
             server.posts.lock().unwrap().as_slice(),
-            [expected_id.clone()]
+            std::slice::from_ref(&expected_id)
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
         let entry = reopen_ledger(&state_path)

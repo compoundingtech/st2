@@ -407,7 +407,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 fn decode_base64(encoded: &str) -> Result<Vec<u8>, Base64Error> {
-    if encoded.len() % 4 != 0 {
+    if !encoded.len().is_multiple_of(4) {
         return Err(Base64Error("base64 length is not a multiple of four"));
     }
     let maximum_encoded = MAX_SNAPSHOT_BYTES.div_ceil(3) * 4;

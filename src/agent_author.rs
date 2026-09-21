@@ -497,6 +497,7 @@ fn line_indent(text: &str, offset: usize) -> Option<String> {
         .then(|| indent.to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn atomic_replace_checked(
     catalog_lock: &CatalogLock,
     catalog: &Path,

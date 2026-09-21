@@ -284,7 +284,7 @@ pub(crate) struct StreamRefusal {
 }
 
 impl StreamRefusal {
-    fn new(kind: RefusalKind, message: String) -> anyhow::Error {
+    fn error(kind: RefusalKind, message: String) -> anyhow::Error {
         anyhow::Error::new(Self { kind, message })
     }
 }
@@ -357,7 +357,7 @@ fn resolve_stream(
         crate::identity::ResolveError::Unknown { .. } => {
             anyhow::anyhow!("no agent '{reference}' found in catalog {}", root.display())
         }
-        error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::new(
+        error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::error(
             RefusalKind::Permanent,
             format!("agent recipient '{reference}' is ambiguous; {error}"),
         ),
@@ -372,7 +372,7 @@ fn resolve_stream(
     // Two declarations under one key answer nothing decidably: the resolved subject and the spec
     // this walk would publish against could be different files.
     if claimants.next().is_some() {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::Permanent,
             format!(
                 "agent recipient '{reference}' names more than one declaration of '{bus_identity}'"
@@ -381,7 +381,7 @@ fn resolve_stream(
     }
     let key = bus_identity;
     if spec.resolved_host(this_host) != this_host {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::Permanent,
             format!(
                 "agent '{}' is owned by host '{}'; event publication must run on that host",
@@ -393,7 +393,7 @@ fn resolve_stream(
     match admission {
         StreamAdmission::Declared => {
             if !spec.streams.iter().any(|declared| declared.name == stream) {
-                return Err(StreamRefusal::new(
+                return Err(StreamRefusal::error(
                     RefusalKind::Permanent,
                     format!(
                         "agent '{}' does not declare stream '{stream}'",
@@ -408,7 +408,7 @@ fn resolve_stream(
         ),
     }
     if !spec.desired_state.is_running() {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::RecipientNotRunning,
             format!(
                 "agent '{}' is {}; refusing event while its eyes are closed",

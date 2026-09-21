@@ -431,7 +431,7 @@ fn failed_watch_installation_keeps_supervisor_on_timer_cadence() {
             "test-host",
             &SpawnCountingRunner::default(),
             Duration::from_millis(100),
-            &stop,
+            stop,
             |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
             |_| {
                 passes += 1;
@@ -784,7 +784,7 @@ fn persistent_advisory_warnings_surface_once_not_per_pass() {
             "test-host",
             &SpawnCountingRunner::default(),
             Duration::from_millis(50),
-            &stop,
+            stop,
             |_, _| None,
             |report| {
                 passes += 1;

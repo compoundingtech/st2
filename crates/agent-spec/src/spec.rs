@@ -999,7 +999,7 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
 /// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
 fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
     if let Some(colon) = uri.find(':') {
-        let first_separator = uri.find(|character| matches!(character, '/' | '\\'));
+        let first_separator = uri.find(['/', '\\']);
         if first_separator.is_none_or(|separator| colon < separator) {
             return validate_absolute_uri(uri);
         }

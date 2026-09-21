@@ -749,13 +749,16 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
             )
         }
         EntryType::Status => {
-            let status = match value.get("status").and_then(Value::as_str) {
-                Some(
-                    status @ ("queued" | "running" | "waiting" | "completed" | "failed"
-                    | "cancelled"),
-                ) => status,
-                _ => "waiting",
-            };
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .filter(|status| {
+                    matches!(
+                        *status,
+                        "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled"
+                    )
+                })
+                .unwrap_or("waiting");
             let detail = value
                 .get("detail")
                 .and_then(Value::as_str)
@@ -852,8 +855,8 @@ fn normalize_conversation_text(text: &str) -> (String, u64, u64) {
     let mut output = String::with_capacity(bounded.len());
     let mut cursor = 0;
     let mut redact_next = false;
-    let mut words = bounded.match_indices(|character: char| !character.is_whitespace());
-    while let Some((start, _)) = words.next() {
+    let words = bounded.match_indices(|character: char| !character.is_whitespace());
+    for (start, _) in words {
         if start < cursor {
             continue;
         }

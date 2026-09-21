@@ -228,7 +228,8 @@ impl CatalogLock {
                     control.display()
                 );
                 test_control_creation_checkpoint();
-                let branch = match fs::create_dir(&control) {
+
+                match fs::create_dir(&control) {
                     Ok(()) => {
                         test_control_created_checkpoint();
                         "created"
@@ -249,8 +250,7 @@ impl CatalogLock {
                             format!("create catalog control dir {}", control.display())
                         });
                     }
-                };
-                branch
+                }
             }
             Err(error) => {
                 return Err(error)

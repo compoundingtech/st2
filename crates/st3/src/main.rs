@@ -4123,6 +4123,7 @@ fn mission_revision_intent(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn planning_session_intent(
     session_id: &str,
     mission_id: &str,
@@ -4182,9 +4183,7 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
 }
 
 fn normalize_planning_requester(actor: &str) -> Result<String> {
-    let actor = if actor.starts_with("person/") {
-        actor.to_owned()
-    } else if actor.contains('/') {
+    let actor = if actor.contains('/') {
         actor.to_owned()
     } else {
         format!("person/{actor}")

@@ -140,7 +140,7 @@ struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
-    details: serde_json::Map<String, Value>,
+    details: Box<serde_json::Map<String, Value>>,
 }
 
 impl ApiError {
@@ -159,7 +159,7 @@ impl ApiError {
             status,
             code: error.code.into(),
             message: error.message,
-            details: error.details,
+            details: Box::new(error.details),
         }
     }
 
@@ -168,7 +168,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal".into(),
             message: error.to_string(),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         }
     }
 
@@ -177,7 +177,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not-found".into(),
             message: message.into(),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         }
     }
 }
@@ -628,7 +628,7 @@ fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation-failed".into(),
         message: "the page cursor is malformed".into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     })?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
@@ -636,13 +636,13 @@ fn decode_client_cursor(cursor: &str) -> Result<ClientPageCursor, ApiError> {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "validation-failed".into(),
             message: "the page cursor is malformed".into(),
-            details: serde_json::Map::new(),
+            details: Box::default(),
         })?;
     serde_json::from_slice(&bytes).map_err(|_| ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation-failed".into(),
         message: "the page cursor is malformed".into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     })
 }
 
@@ -651,7 +651,7 @@ fn client_page_expired(message: impl Into<String>) -> ApiError {
         status: StatusCode::GONE,
         code: "page-cursor-expired".into(),
         message: message.into(),
-        details: serde_json::Map::new(),
+        details: Box::default(),
     }
 }
 

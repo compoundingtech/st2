@@ -800,8 +800,10 @@ eval {
 
 #[test]
 fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
+    type Case<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+
     let bin = env!("CARGO_BIN_EXE_st2");
-    let cases: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+    let cases: Vec<Case<'_>> = vec![
         (
             "unknown-type",
             "evalhost.worker",

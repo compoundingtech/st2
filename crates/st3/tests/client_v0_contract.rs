@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use st3::api::AppState;
 use st3::store::Store;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Barrier, Notify, watch};
 use tower::ServiceExt as _;
 
 fn asset_root() -> PathBuf {
@@ -220,9 +220,7 @@ fn launch_preview_token_is_deterministic() {
         .find(|item| item["kind"] == "launch-variant")
         .unwrap();
     // RFC 8785 canonical JSON for the normative token input in the fixture.
-    let canonical = concat!(
-        r#"{"api_version":"st3.client.v0","candidate_revision":2,"diagnostics":[],"launch_id":"launch/release","normalized_mission":{"goals":["Ship release"],"id":"mission/release","steps":[{"id":"build","needs":[]},{"id":"deploy","needs":["build"]}]},"target_generation":null,"variant_id":"launch-variant/release/default"}"#,
-    );
+    let canonical = r#"{"api_version":"st3.client.v0","candidate_revision":2,"diagnostics":[],"launch_id":"launch/release","normalized_mission":{"goals":["Ship release"],"id":"mission/release","steps":[{"id":"build","needs":[]},{"id":"deploy","needs":["build"]}]},"target_generation":null,"variant_id":"launch-variant/release/default"}"#;
     let token = format!("lpv0:{:x}", Sha256::digest(canonical.as_bytes()));
     assert_eq!(variant["preview_token"], token);
 }
@@ -551,6 +549,93 @@ async fn unchanged_store_index_names_one_stable_snapshot_and_payload() {
         .unwrap();
     let (_, after) = client_json(app, "/v1/client/capabilities").await;
     assert_ne!(before["snapshot"]["id"], after["snapshot"]["id"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pairing_completion_mints_exactly_one_credential() {
+    const CONTENDERS: usize = 16;
+
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let local = st3::api::router(state.clone());
+    let fabric = st3::api::fabric_router(state.clone());
+    let (status, challenge) = client_post_json(
+        local,
+        "/v1/client/pairings",
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "device_name": "Concurrent phone",
+            "person_id": "person/nathan"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/")
+        .to_owned();
+    let uri = format!("/v1/client/pairings/{pairing}/complete");
+    let code = challenge["value"]["code"].as_str().unwrap().to_owned();
+    // Stretch the work between the read and append enough for every runtime worker to contend on
+    // the same subject head. The CAS, rather than scheduling, determines the sole winner.
+    let public_key = format!("concurrent-public-key-{}", "x".repeat(1024 * 1024));
+    let barrier = Arc::new(Barrier::new(CONTENDERS + 1));
+    let mut requests = Vec::new();
+    for _ in 0..CONTENDERS {
+        let app = fabric.clone();
+        let barrier = barrier.clone();
+        let uri = uri.clone();
+        let body = serde_json::json!({
+            "api_version": "st3.client.v0",
+            "code": code,
+            "device_public_key": public_key
+        });
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client_post_json(app, &uri, body).await
+        }));
+    }
+    barrier.wait().await;
+
+    let mut successes = Vec::new();
+    for request in requests {
+        let (status, envelope) = request.await.unwrap();
+        match status {
+            StatusCode::OK => successes.push(
+                envelope["value"]["credential"]
+                    .as_str()
+                    .expect("successful completion credential")
+                    .to_owned(),
+            ),
+            StatusCode::FORBIDDEN => assert_eq!(envelope["code"], "forbidden"),
+            _ => panic!("unexpected concurrent pairing result {status}: {envelope}"),
+        }
+    }
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one request may mint a credential"
+    );
+
+    let claims = state
+        .store
+        .claims_for(&format!("custom/client/pairing-{pairing}"), None)
+        .unwrap();
+    let begun = claims
+        .iter()
+        .find(|claim| claim.kind == "custom.client.pairing-begun")
+        .unwrap();
+    let completed = claims
+        .iter()
+        .filter(|claim| claim.kind == "custom.client.pairing-completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].predecessors.as_slice(),
+        std::slice::from_ref(&begun.id)
+    );
+    assert_eq!(completed[0].body["evidence"], serde_json::json!([begun.id]));
 }
 
 #[tokio::test]
