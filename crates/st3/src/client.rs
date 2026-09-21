@@ -4,12 +4,15 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
-use pty_core::client::{AttachParams, ClientIo, attach};
+use pty_core::client::tty::{FdWriter, is_tty};
+use pty_core::client::{AttachParams, ClientIo, TERMINAL_SANITIZE, attach};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-use crate::model::{ApiErrorResponse, ApiResponse};
+use crate::model::ApiErrorResponse;
+#[cfg(test)]
+use crate::model::ApiResponse;
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
@@ -154,14 +157,7 @@ impl Client {
                 bytes
             }
         };
-        let response: ApiResponse<O> =
-            serde_json::from_slice(&response).context("decode the st3 API response envelope")?;
-        anyhow::ensure!(
-            response.api_version == "st3.v1",
-            "the st3 API returned unsupported version {}",
-            response.api_version
-        );
-        Ok(response.value)
+        decode_api_response(&response)
     }
 
     pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
@@ -237,21 +233,38 @@ async fn proxy_websocket<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    proxy_websocket_with_io(name, websocket, ClientIo::default()).await
+}
+
+async fn proxy_websocket_with_io<S>(
+    name: &str,
+    websocket: tokio_tungstenite::WebSocketStream<S>,
+    io: ClientIo,
+) -> Result<i32>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (client_stream, bridge_stream) = StdUnixStream::pair()?;
     bridge_stream.set_nonblocking(true)?;
     let bridge_stream = tokio::net::UnixStream::from_std(bridge_stream)?;
     let bridge = tokio::spawn(bridge_terminal_protocol(websocket, bridge_stream));
     let name = name.to_owned();
     let outcome = tokio::task::spawn_blocking(move || {
-        attach(
-            AttachParams::new(&name, client_stream),
-            &ClientIo::default(),
-        )
+        let outcome = attach(AttachParams::new(&name, client_stream), &io);
+        sanitize_interactive_terminal(io);
+        outcome
     })
     .await
     .context("join the terminal client")?;
     bridge.abort();
     Ok(outcome.exit_code())
+}
+
+fn sanitize_interactive_terminal(io: ClientIo) {
+    if is_tty(io.stdout) {
+        use std::io::Write as _;
+        let _ = FdWriter(io.stdout).write_all(TERMINAL_SANITIZE.as_bytes());
+    }
 }
 
 async fn bridge_terminal_protocol<S>(
@@ -417,12 +430,33 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
         && let Some(message) = value.get("message").and_then(|value| value.as_str())
     {
+        if let Some(code) = value.get("code").and_then(|value| value.as_str()) {
+            return anyhow::anyhow!("st3 API returned {status} {code}: {message}");
+        }
         return anyhow::anyhow!("st3 API returned {status}: {message}");
     }
     anyhow::anyhow!(
         "st3 API returned {status}: {}",
         String::from_utf8_lossy(bytes).trim()
     )
+}
+
+fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(bytes).context("decode the st3 API response envelope")?;
+    let version = envelope
+        .get("api_version")
+        .and_then(serde_json::Value::as_str)
+        .context("the st3 API response envelope has no api_version")?;
+    anyhow::ensure!(
+        matches!(version, "st3.v1" | "st3.client.v0"),
+        "the st3 API returned unsupported version {version}"
+    );
+    let value = envelope
+        .as_object_mut()
+        .and_then(|envelope| envelope.remove("value"))
+        .context("the st3 API response envelope has no value")?;
+    serde_json::from_value(value).context("decode the st3 API response value")
 }
 
 #[cfg(test)]
@@ -453,6 +487,10 @@ mod tests {
                     })))
                 }),
             )
+            .route(
+                "/v1/client-test",
+                get(|| async { Json(test_client_envelope(json!({"method": "client"}))) }),
+            )
     }
 
     fn test_envelope(value: Value) -> ApiResponse<Value> {
@@ -463,6 +501,59 @@ mod tests {
             store_index: 1,
             value,
         }
+    }
+
+    fn test_client_envelope(value: Value) -> Value {
+        json!({
+            "api_version": "st3.client.v0",
+            "request_id": "test-client-request",
+            "snapshot": {
+                "id": "snapshot/test-node/1/test",
+                "host_id": "host/test-node",
+                "store_index": 1,
+                "projection_version": "client-projection.v0",
+                "created_at": "2026-09-21T00:00:00.000Z"
+            },
+            "value": value
+        })
+    }
+
+    #[test]
+    fn response_decoding_accepts_internal_and_client_envelopes() {
+        let internal = serde_json::to_vec(&test_envelope(json!({"kind": "internal"}))).unwrap();
+        let client = serde_json::to_vec(&test_client_envelope(json!({"kind": "client"}))).unwrap();
+
+        assert_eq!(
+            decode_api_response::<Value>(&internal).unwrap(),
+            json!({"kind": "internal"})
+        );
+        assert_eq!(
+            decode_api_response::<Value>(&client).unwrap(),
+            json!({"kind": "client"})
+        );
+    }
+
+    #[test]
+    fn response_decoding_rejects_unknown_versions_and_missing_values() {
+        let unknown = serde_json::to_vec(&json!({
+            "api_version": "st3.future.v9",
+            "value": {}
+        }))
+        .unwrap();
+        assert!(
+            decode_api_response::<Value>(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported version")
+        );
+
+        let missing = serde_json::to_vec(&json!({"api_version": "st3.client.v0"})).unwrap();
+        assert!(
+            decode_api_response::<Value>(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("has no value")
+        );
     }
 
     fn fast_client(endpoint: Endpoint) -> Client {
@@ -546,6 +637,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(post, json!({"method": "post"}));
+        let client_value: Value = client.get("/v1/client-test").await.unwrap();
+        assert_eq!(client_value, json!({"method": "client"}));
     }
 
     #[tokio::test]
@@ -652,6 +745,92 @@ mod tests {
                 Some("st3.terminal.v1".into())
             ))
         );
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn terminal_socket_eof_restores_and_sanitizes_the_callers_tty() {
+        use std::fs::File;
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_request: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert("Sec-WebSocket-Protocol", "st3.terminal.v1".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut original) },
+            0
+        );
+
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let request = terminal_request("ws://localhost/v1/terminal-eof").unwrap();
+        let (websocket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        let io = ClientIo {
+            stdin: slave.as_raw_fd(),
+            stdout: slave.as_raw_fd(),
+            stderr: slave.as_raw_fd(),
+        };
+        proxy_websocket_with_io("demo", websocket, io)
+            .await
+            .unwrap();
+
+        let mut restored = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut restored) },
+            0
+        );
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cflag, original.c_cflag);
+        assert_eq!(restored.c_lflag, original.c_lflag);
+
+        drop(slave);
+        let mut output = Vec::new();
+        if let Err(error) = master.read_to_end(&mut output) {
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+        assert!(
+            output
+                .windows(TERMINAL_SANITIZE.len())
+                .any(|window| window == TERMINAL_SANITIZE.as_bytes()),
+            "terminal sanitizer missing from EOF output: {output:?}"
+        );
+        server.await.unwrap();
     }
 
     #[allow(clippy::result_large_err)]
