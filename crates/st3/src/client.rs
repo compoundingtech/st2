@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
 use pty_core::client::tty::{FdWriter, is_tty};
-use pty_core::client::{AttachParams, ClientIo, TERMINAL_SANITIZE, attach};
+use pty_core::client::{AttachParams, CURSOR_TO_BOTTOM, ClientIo, TERMINAL_SANITIZE, attach};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -263,7 +263,14 @@ where
 fn sanitize_interactive_terminal(io: ClientIo) {
     if is_tty(io.stdout) {
         use std::io::Write as _;
-        let _ = FdWriter(io.stdout).write_all(TERMINAL_SANITIZE.as_bytes());
+        let mut output = FdWriter(io.stdout);
+        let _ = output.write_all(TERMINAL_SANITIZE.as_bytes());
+        // TERMINAL_SANITIZE leaves the alternate screen. Repeating that cleanup after the
+        // underlying attach client returns can restore a saved cursor in the middle of the old
+        // main-screen content. Always reposition afterwards so the caller's prompt starts below
+        // the attached session, matching the standalone pty client's detach behavior.
+        let _ = output.write_all(CURSOR_TO_BOTTOM.as_bytes());
+        let _ = output.write_all(b"\r\n");
     }
 }
 
@@ -829,6 +836,16 @@ mod tests {
                 .windows(TERMINAL_SANITIZE.len())
                 .any(|window| window == TERMINAL_SANITIZE.as_bytes()),
             "terminal sanitizer missing from EOF output: {output:?}"
+        );
+        let final_sanitize = output
+            .windows(TERMINAL_SANITIZE.len())
+            .rposition(|window| window == TERMINAL_SANITIZE.as_bytes())
+            .expect("the final terminal sanitizer is present");
+        let after_sanitize = &output[final_sanitize + TERMINAL_SANITIZE.len()..];
+        assert!(
+            after_sanitize.starts_with(CURSOR_TO_BOTTOM.as_bytes())
+                && after_sanitize.ends_with(b"\n"),
+            "terminal cleanup did not return the prompt below stale content: {output:?}"
         );
         server.await.unwrap();
     }
