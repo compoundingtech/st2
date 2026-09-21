@@ -241,9 +241,10 @@ fn swift_operation_methods(
         let id = read["id"].as_str().context("read id")?;
         let path = read["path"].as_str().context("read path")?;
         let method = lower_camel(&pascal(id));
-        if id == "capabilities.get" {
-            continue;
-        } else if id == "timeline.list" || id == "events.list" || id == "terminal.screen" {
+        if matches!(
+            id,
+            "capabilities.get" | "timeline.list" | "events.list" | "terminal.screen"
+        ) {
             continue;
         } else if id.ends_with(".get") {
             let collection = path
@@ -298,7 +299,7 @@ fn struct_block<'a>(source: &'a str, declaration: &str) -> Result<&'a str> {
     Ok(&tail[..end])
 }
 
-fn schema_properties<'a>(definition: &'a Value) -> Option<&'a serde_json::Map<String, Value>> {
+fn schema_properties(definition: &Value) -> Option<&serde_json::Map<String, Value>> {
     definition
         .get("properties")
         .and_then(Value::as_object)
@@ -392,8 +393,8 @@ fn validate_surfaces(
             definition,
             definition,
             &format!("{definition}Resource"),
-            &rust,
-            &swift,
+            rust,
+            swift,
         )?;
         let swift_case = lower_camel(definition);
         if !rust.contains(&format!("    {definition}({definition}),"))
@@ -416,7 +417,7 @@ fn validate_surfaces(
         "VisualizationEdge",
         "VisualizationGroup",
     ] {
-        validate_model(schema, definition, definition, definition, &rust, &swift)?;
+        validate_model(schema, definition, definition, definition, rust, swift)?;
     }
     for token in [
         "pub async fn pairing_begin",
