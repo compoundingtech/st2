@@ -504,6 +504,12 @@ pub struct ReplicationAdmission {
     pub changed: bool,
 }
 
+enum ReplicatedClaimAdmission {
+    Valid,
+    UnknownKind,
+    UnknownField,
+}
+
 struct ChildMissionContext {
     root_revision: String,
     root_run_id: String,
@@ -7632,7 +7638,14 @@ impl Store {
                     WHERE replica_records.writer=replica_envelopes.writer
                       AND replica_records.sequence=replica_envelopes.sequence
                       AND replica_records.envelope_hash=replica_envelopes.envelope_hash
-                      AND replica_records.state='unknown'
+                      AND (
+                          replica_records.state='unknown'
+                          OR (
+                              replica_records.state='invalid'
+                              AND replica_records.error_code='invalid-replicated-claim'
+                              AND replica_records.error_message LIKE '%violates unknown-claim-field:%'
+                          )
+                      )
                 )
              ORDER BY writer, sequence, envelope_hash",
         )?;
@@ -13261,7 +13274,7 @@ fn validate_and_admit_envelope_tx(
             .map_err(internal)?;
         let classification = validate_replicated_claim(transaction, batch, claim);
         match classification {
-            Ok(true) => {
+            Ok(ReplicatedClaimAdmission::Valid) => {
                 let inserted = transaction
                     .execute(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
@@ -13297,19 +13310,33 @@ fn validate_and_admit_envelope_tx(
                 outcome.valid += 1;
                 outcome.changed |= inserted != 0 || previous_state.as_deref() != Some("valid");
             }
-            Ok(false) => {
+            Ok(
+                classification @ (ReplicatedClaimAdmission::UnknownKind
+                | ReplicatedClaimAdmission::UnknownField),
+            ) => {
                 degraded = true;
+                let (error_code, error_message) = match classification {
+                    ReplicatedClaimAdmission::UnknownKind => (
+                        "unknown-claim-kind",
+                        "this st3 build does not know the claim kind",
+                    ),
+                    ReplicatedClaimAdmission::UnknownField => (
+                        "unknown-claim-field",
+                        "this st3 build does not know every field on the claim kind",
+                    ),
+                    ReplicatedClaimAdmission::Valid => unreachable!(),
+                };
                 transaction
                     .execute(
                         "INSERT INTO replica_records(
                              record_ref, writer, sequence, envelope_hash, position, raw, state,
                              claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', ?7, ?8, ?9,
-                                   'unknown-claim-kind', 'this st3 build does not know the claim kind', ?10)
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', ?7, ?8, ?9, ?10, ?11, ?12)
                          ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'unknown' END,
-                            error_code=CASE WHEN state='repaired' THEN error_code ELSE 'unknown-claim-kind' END,
-                            error_message='this st3 build does not know the claim kind', updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now],
+                            error_code=CASE WHEN state='repaired' THEN error_code ELSE excluded.error_code END,
+                            error_message=CASE WHEN state='repaired' THEN error_message ELSE excluded.error_message END,
+                            updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error_code, error_message, now],
                     )
                     .map_err(internal)?;
                 outcome.unknown += 1;
@@ -13375,7 +13402,7 @@ fn validate_replicated_claim(
     transaction: &Transaction<'_>,
     batch: &ReplicaBatch,
     claim: &ClaimRecord,
-) -> Result<bool, St3Error> {
+) -> Result<ReplicatedClaimAdmission, St3Error> {
     if claim.batch_id != batch.id || claim.origin != batch.origin {
         return Err(St3Error::new(
             "claim-batch-mismatch",
@@ -13402,7 +13429,7 @@ fn validate_replicated_claim(
         ));
     }
     if !known_replicated_claim_kind(&claim.kind) {
-        return Ok(false);
+        return Ok(ReplicatedClaimAdmission::UnknownKind);
     }
     let fields = schema_fields_for_body(&claim.kind, &claim.body).map_err(|error| {
         St3Error::new(
@@ -13413,19 +13440,24 @@ fn validate_replicated_claim(
             ),
         )
     })?;
-    st3_schema::registry()
-        .validate_claim(&claim.subject, &claim.kind, &fields)
-        .map_err(|error| {
-            St3Error::new(
-                "invalid-replicated-claim",
-                format!(
-                    "replicated claim `{}` violates {}: {}",
-                    claim.id, error.code, error.message
-                ),
-            )
-        })?;
+    if let Err(error) = st3_schema::registry().validate_claim(&claim.subject, &claim.kind, &fields)
+    {
+        // A peer may already publish a field introduced by a newer schema. Keep
+        // that authenticated record retryable so an upgrade can admit the
+        // original claim without replacing or rewriting it.
+        if error.code == "unknown-claim-field" {
+            return Ok(ReplicatedClaimAdmission::UnknownField);
+        }
+        return Err(St3Error::new(
+            "invalid-replicated-claim",
+            format!(
+                "replicated claim `{}` violates {}: {}",
+                claim.id, error.code, error.message
+            ),
+        ));
+    }
     ensure_claim_blobs(transaction, claim)?;
-    Ok(true)
+    Ok(ReplicatedClaimAdmission::Valid)
 }
 
 fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
@@ -19070,7 +19102,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let mut exchange = exchange_from(&source, &ReplicationInventory::default());
         let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
             let mut invalid = payload.batch.claims[0].clone();
-            invalid.body["fields"]["unexpected"] = Value::Bool(true);
+            invalid.body["fields"]["status"] = Value::Bool(true);
             invalid.id = claim_hash(
                 &invalid.batch_id,
                 &invalid.subject,
@@ -19127,6 +19159,122 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .is_some()
         );
         assert_eq!(target.replica_records(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_field_is_retryable_and_an_old_schema_rejection_is_readmitted() {
+        let source = Store::open_memory("source").unwrap();
+        let claim = source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("schema-upgrade-source".into()),
+            })
+            .unwrap();
+        let exchange = exchange_from(&source, &ReplicationInventory::default());
+        let envelope = &exchange.envelopes[0];
+
+        let target = Store::open_memory("target").unwrap();
+        target.bind_fleet(TEST_FLEET).unwrap();
+        target
+            .receive_replication_exchange("source", TEST_FLEET, &exchange)
+            .unwrap();
+        let record_ref = replica_record_ref(&envelope.writer, envelope.sequence, &envelope.hash, 0);
+        {
+            let connection = target.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE replica_envelopes SET receipt_state='degraded'\n                     WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                    params![envelope.writer, envelope.sequence, envelope.hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO replica_records(\n                         record_ref, writer, sequence, envelope_hash, position, raw, state,\n                         claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms\n                     ) VALUES (?1, ?2, ?3, ?4, 0, X'', 'invalid', ?5, ?6, ?7,\n                               'invalid-replicated-claim', ?8, '1')",
+                    params![
+                        record_ref,
+                        envelope.writer,
+                        envelope.sequence,
+                        envelope.hash,
+                        claim.id,
+                        claim.subject,
+                        claim.kind,
+                        format!(
+                            "replicated claim `{}` violates unknown-claim-field: field `future` is unknown",
+                            claim.id
+                        ),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let admission = target.validate_replication_backlog().unwrap();
+        assert_eq!(admission.valid, 1);
+        assert_eq!(admission.unknown, 0);
+        assert_eq!(admission.invalid, 0);
+        assert!(target.replica_records(true).unwrap().is_empty());
+        assert_eq!(
+            target
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            claim.id
+        );
+    }
+
+    #[test]
+    fn a_claim_field_from_a_newer_schema_is_unknown_instead_of_invalid() {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("future-field-source".into()),
+            })
+            .unwrap();
+        let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+        let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
+            let claim = &mut payload.batch.claims[0];
+            claim.body["fields"]["future"] = Value::Bool(true);
+            claim.id = claim_hash(
+                &claim.batch_id,
+                &claim.subject,
+                &claim.kind,
+                &claim.origin,
+                claim.actor.as_deref(),
+                &claim.body,
+                &claim.predecessors,
+            )
+            .unwrap();
+        });
+        exchange.envelopes = vec![candidate.clone()];
+        exchange.inventory.envelopes = vec![ReplicaEnvelopeId {
+            writer: candidate.writer.clone(),
+            sequence: candidate.sequence,
+            hash: candidate.hash.clone(),
+        }];
+
+        let target = Store::open_memory("target").unwrap();
+        let admission = receive_and_project(&target, "source", &exchange);
+        assert_eq!(admission.valid, 0);
+        assert_eq!(admission.unknown, 1);
+        assert_eq!(admission.invalid, 0);
+        let unresolved = target.replica_records(true).unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].state, "unknown");
+        assert_eq!(
+            unresolved[0].error_code.as_deref(),
+            Some("unknown-claim-field")
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ Each missing envelope contains one base64-encoded CBOR payload. Receipt stores t
 
 An unknown or invalid record stays in `replica_records`. It does not block a valid sibling or a later envelope.
 
-An unknown claim can become valid after a schema upgrade. Admission retries unknown records on each wake and startup.
+An unknown claim kind or field can become valid after a schema upgrade. Admission retries unknown records on each wake and startup. Records that older builds classified as invalid solely because of an unknown field are also reconsidered, preserving and admitting the original signed claim when the upgraded schema recognizes it.
 
 A projection fault keeps the last good projection. The daemon continues to serve status and repair commands.
 
