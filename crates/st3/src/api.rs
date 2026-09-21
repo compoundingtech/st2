@@ -2387,7 +2387,6 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             format!("duplicate runtime owners: {}", duplicates.join("; "))
         },
     });
-    let status = state.store.status(None).map_err(ApiError::internal)?;
     let terminal_owned = state
         .store
         .terminal_owned_runtime_subjects()
@@ -2402,18 +2401,21 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .map(|member| member.runtime_id.clone())
         })
         .collect::<std::collections::BTreeSet<_>>();
-    for subject in &status.subjects {
-        if subject.desired.is_none() || terminal_owned.contains(&subject.subject) {
+    for subject in &desired {
+        if terminal_owned.contains(&subject.subject) {
             continue;
         }
-        if let Some(runtime_id) = subject
-            .actual
+        if let Some(runtime_id) = state
+            .store
+            .latest_actual_value(&subject.subject)
+            .map_err(ApiError::internal)?
             .as_ref()
             .map(|actual| actual.get("fields").unwrap_or(actual))
             .and_then(|fields| fields.get("runtime_id"))
             .and_then(Value::as_str)
+            .map(str::to_owned)
         {
-            desired_runtime_ids.insert(runtime_id.into());
+            desired_runtime_ids.insert(runtime_id);
         }
     }
     let mut unowned = pty_snapshot
@@ -2464,25 +2466,31 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             format!("unowned runtime state: {}", unowned.join(", "))
         },
     });
-    let driver_gaps = status
-        .subjects
-        .iter()
-        .filter(|subject| {
-            desired.iter().any(|desired| {
-                desired.subject == subject.subject
-                    && desired
-                        .member
-                        .as_ref()
-                        .and_then(|member| member.driver.as_ref())
-                        .is_some()
-            }) && (!subject
-                .harness
-                .as_ref()
-                .is_some_and(crate::model::CurrentHarnessView::is_ready)
-                || subject.gap.is_some())
-        })
-        .map(|subject| {
-            format!(
+    let mut driver_gaps = Vec::new();
+    for desired_subject in desired.iter().filter(|desired| {
+        desired
+            .member
+            .as_ref()
+            .and_then(|member| member.driver.as_ref())
+            .is_some()
+    }) {
+        let selected = state
+            .store
+            .status(Some(&desired_subject.subject))
+            .map_err(ApiError::internal)?
+            .subjects
+            .into_iter()
+            .next();
+        let Some(subject) = selected else {
+            continue;
+        };
+        if !subject
+            .harness
+            .as_ref()
+            .is_some_and(crate::model::CurrentHarnessView::is_ready)
+            || subject.gap.is_some()
+        {
+            driver_gaps.push(format!(
                 "{}: {}",
                 subject.subject,
                 subject
@@ -2491,9 +2499,9 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                     .and_then(|harness| harness.reason.as_deref())
                     .or(subject.gap.as_deref())
                     .unwrap_or("the current harness incarnation is not ready")
-            )
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     checks.push(DoctorCheck {
         name: "driver-readiness".into(),
         status: if driver_gaps.is_empty() {
