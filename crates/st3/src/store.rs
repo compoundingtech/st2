@@ -28,8 +28,8 @@ use crate::model::{
     ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
     ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
-    SubscriptionConditionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
