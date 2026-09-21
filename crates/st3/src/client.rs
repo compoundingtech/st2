@@ -1,3 +1,4 @@
+use std::fmt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -96,7 +97,23 @@ impl Client {
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.request::<(), T>("GET", path, None).await
+        let first_page = path.starts_with("/v1/client/") && !request_has_page_cursor(path);
+        for attempt in 0..3 {
+            match self.request::<(), T>("GET", path, None).await {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if first_page
+                        && attempt < 2
+                        && error
+                            .downcast_ref::<ApiResponseError>()
+                            .is_some_and(|error| error.code == "page-cursor-expired") =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded first-page retry loop always returns")
     }
 
     pub async fn post<I: Serialize, O: DeserializeOwned>(&self, path: &str, body: &I) -> Result<O> {
@@ -214,6 +231,34 @@ impl Client {
         }
     }
 }
+
+fn request_has_page_cursor(path: &str) -> bool {
+    path.split_once('?').is_some_and(|(_, query)| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(name, _)| name == "cursor")
+    })
+}
+
+#[derive(Debug)]
+struct ApiResponseError {
+    status: u16,
+    code: String,
+    message: String,
+}
+
+impl fmt::Display for ApiResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "st3 API returned {} {}: {}",
+            self.status, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ApiResponseError {}
 
 fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let mut request = url.into_client_request()?;
@@ -428,17 +473,23 @@ fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>> {
 
 fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
     if let Ok(error) = serde_json::from_slice::<ApiErrorResponse>(bytes) {
-        return anyhow::anyhow!(
-            "st3 API returned {status} {}: {}",
-            error.code,
-            error.message
-        );
+        return ApiResponseError {
+            status,
+            code: error.code,
+            message: error.message,
+        }
+        .into();
     }
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
         && let Some(message) = value.get("message").and_then(|value| value.as_str())
     {
         if let Some(code) = value.get("code").and_then(|value| value.as_str()) {
-            return anyhow::anyhow!("st3 API returned {status} {code}: {message}");
+            return ApiResponseError {
+                status,
+                code: code.into(),
+                message: message.into(),
+            }
+            .into();
         }
         return anyhow::anyhow!("st3 API returned {status}: {message}");
     }
@@ -634,6 +685,67 @@ mod tests {
         assert!(error.contains("request"));
         assert!(error.contains("retry the command"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_first_page_get_retries_snapshot_churn_without_reusing_a_cursor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = attempts.clone();
+        let app = Router::new().route(
+            "/v1/client/test",
+            get(move || {
+                let route_attempts = route_attempts.clone();
+                async move {
+                    if route_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::GONE,
+                            Json(json!({
+                                "api_version": "st3.client.v0",
+                                "error_version": "st3.client.error.v0",
+                                "request_id": "request/expired",
+                                "code": "page-cursor-expired",
+                                "message": "the snapshot changed; restart pagination from the first page",
+                                "retryable": true,
+                                "details": {}
+                            })),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(test_client_envelope(json!({"items": []}))),
+                        )
+                    }
+                }
+            }),
+        );
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let value: Value = Client::unix(&socket).get("/v1/client/test").await.unwrap();
+        assert_eq!(value, json!({"items": []}));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn an_explicit_page_cursor_is_never_treated_as_a_first_page() {
+        assert!(!request_has_page_cursor("/v1/client/work"));
+        assert!(!request_has_page_cursor("/v1/client/work?limit=50"));
+        assert!(request_has_page_cursor(
+            "/v1/client/work?limit=50&cursor=page%2Fnext"
+        ));
     }
 
     async fn assert_request_transports(client: Client) {

@@ -493,7 +493,9 @@ async fn response_envelope(
             "request_id": request_id,
             "code": client_error_code(raw.get("code").and_then(Value::as_str)),
             "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
-            "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE),
+            "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
+                || (status == StatusCode::GONE
+                    && raw.get("code").and_then(Value::as_str) == Some("page-cursor-expired")),
             "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
         })
     } else if status.is_success() {
