@@ -1226,7 +1226,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
-        Command::Service { command } => run_service(command),
+        Command::Service { command } => run_service(command, cli.json),
         Command::Subject { command } => run_subject(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
         Command::Diagnostic(args) => run_harness_diagnostic(&client, args, cli.json).await,
@@ -3210,12 +3210,32 @@ async fn run_replication(
     }
 }
 
-fn run_service(command: ServiceCommand) -> Result<()> {
+fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
     match command {
         ServiceCommand::Install { config } => {
             st3::service::install(Config::load(config.as_deref())?)
         }
-        ServiceCommand::Status => st3::service::status(),
+        ServiceCommand::Status => {
+            let report = st3::service::status()?;
+            if json_output {
+                print_value(&report, true)
+            } else {
+                println!("SERVICES  {}", report.manager);
+                for service in report.services {
+                    println!(
+                        "{}  {}  {}",
+                        service.name,
+                        if service.installed {
+                            "installed"
+                        } else {
+                            "not-installed"
+                        },
+                        service.state
+                    );
+                }
+                Ok(())
+            }
+        }
         ServiceCommand::Permissions { open } => st3::service::permissions(open),
         ServiceCommand::Restart { config } => {
             st3::service::restart(Config::load(config.as_deref())?)

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
+use serde::Serialize;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use anyhow::bail;
@@ -19,6 +20,20 @@ const REPLICATION_SERVICE_NAME: &str = "st3-replication.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 const REPLICATION_SERVICE_LABEL: &str = "com.compoundingtech.st3.replication";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceStatusReport {
+    pub manager: &'static str,
+    pub services: Vec<ServiceStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceStatus {
+    pub name: String,
+    pub installed: bool,
+    pub running: bool,
+    pub state: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct ServiceSpec {
@@ -172,7 +187,7 @@ fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
     }
 }
 
-pub fn status() -> Result<()> {
+pub fn status() -> Result<ServiceStatusReport> {
     status_native_service()
 }
 
@@ -370,7 +385,7 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn status_native_service() -> Result<()> {
+fn status_native_service() -> Result<ServiceStatusReport> {
     status_systemd_user()
 }
 
@@ -511,21 +526,55 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn status_native_service() -> Result<()> {
-    run_command(
-        "launchctl",
-        &["print", &format!("{}/{SERVICE_LABEL}", launch_domain())],
-    )?;
-    if replication_launch_agent_path()?.exists() {
-        run_command(
-            "launchctl",
-            &[
-                "print",
-                &format!("{}/{REPLICATION_SERVICE_LABEL}", launch_domain()),
-            ],
-        )?;
+fn status_native_service() -> Result<ServiceStatusReport> {
+    Ok(ServiceStatusReport {
+        manager: "launchd-user",
+        services: vec![
+            launchd_service_status(SERVICE_LABEL, &launch_agent_path()?)?,
+            launchd_service_status(REPLICATION_SERVICE_LABEL, &replication_launch_agent_path()?)?,
+        ],
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_status(label: &str, plist: &Path) -> Result<ServiceStatus> {
+    if !plist.exists() {
+        return Ok(ServiceStatus {
+            name: label.into(),
+            installed: false,
+            running: false,
+            state: "not-installed".into(),
+        });
     }
-    Ok(())
+    let target = format!("{}/{label}", launch_domain());
+    let output = Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .with_context(|| format!("run launchctl print {target}"))?;
+    if !output.status.success() {
+        return Ok(ServiceStatus {
+            name: label.into(),
+            installed: true,
+            running: false,
+            state: "not-loaded".into(),
+        });
+    }
+    let state = parse_launchd_state(&String::from_utf8_lossy(&output.stdout));
+    Ok(ServiceStatus {
+        name: label.into(),
+        installed: true,
+        running: state == "running",
+        state,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_state(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("state = "))
+        .map(str::to_owned)
+        .unwrap_or_else(|| "loaded".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -698,18 +747,56 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn status_systemd_user() -> Result<()> {
-    run_command(
-        "systemctl",
-        &["--user", "status", SERVICE_NAME, "--no-pager"],
-    )?;
-    if replication_systemd_user_unit_path()?.exists() {
-        run_command(
-            "systemctl",
-            &["--user", "status", REPLICATION_SERVICE_NAME, "--no-pager"],
-        )?;
-    }
-    Ok(())
+fn status_systemd_user() -> Result<ServiceStatusReport> {
+    Ok(ServiceStatusReport {
+        manager: "systemd-user",
+        services: vec![
+            systemd_service_status(SERVICE_NAME)?,
+            systemd_service_status(REPLICATION_SERVICE_NAME)?,
+        ],
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_status(name: &str) -> Result<ServiceStatus> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            name,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--no-pager",
+        ])
+        .output()
+        .with_context(|| format!("run systemctl --user show {name}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        output.status.success() || !stdout.trim().is_empty(),
+        "systemctl failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or("unknown")
+    };
+    let load = value("LoadState");
+    let active = value("ActiveState");
+    let sub = value("SubState");
+    Ok(ServiceStatus {
+        name: name.into(),
+        installed: load != "not-found",
+        running: active == "active",
+        state: if load == "not-found" {
+            "not-installed".into()
+        } else {
+            format!("{active}/{sub}")
+        },
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -742,7 +829,7 @@ fn install_native_service(_spec: &ServiceSpec) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn status_native_service() -> Result<()> {
+fn status_native_service() -> Result<ServiceStatusReport> {
     unsupported()
 }
 
@@ -1098,6 +1185,15 @@ mod tests {
         assert!(guidance.contains("Full Disk Access"));
         assert!(guidance.contains("Developer Tools"));
         assert!(guidance.contains("cannot grant"));
+    }
+
+    #[test]
+    fn launchd_state_is_reduced_to_one_stable_value() {
+        assert_eq!(
+            parse_launchd_state("service = {\n\tstate = running\n}\n"),
+            "running"
+        );
+        assert_eq!(parse_launchd_state("service = {}\n"), "loaded");
     }
 
     #[test]
