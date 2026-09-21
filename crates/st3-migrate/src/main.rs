@@ -475,7 +475,7 @@ fn legacy_resource_warnings(source: &str, input: &Path) -> Result<Vec<String>> {
                 if let Some(path) = uri.strip_prefix("file://") {
                     let owner = next_identity.unwrap_or("agent").replace('/', "-");
                     warnings.push(format!(
-                        "{}: import legacy resource `{name}` as a document after review: st3 doc put {} --as {}",
+                        "{}: import legacy resource `{name}` as a document after review: st3 documents put {} --as {}",
                         input.display(),
                         shell(path),
                         shell(&format!("doc/migration/{owner}/{name}")),
@@ -650,7 +650,7 @@ fn rewrite_catalog_text(source: &str) -> String {
             }
             line.replace("`st2` CLI", "`st3` CLI")
                 .replace("The host (`st2 up`)", "The host (`st3 up`)")
-                .replace("st2 message", "st3 message")
+                .replace("st2 message", "st3 conversations")
                 .replace("st2 status", "st3 status")
                 .replace("st2 agents", "st3 agents")
                 .replace("st2 context", "st3 context")
@@ -1195,8 +1195,9 @@ fn write_mechanical_gate(
     host: &str,
     timeout_ms: u64,
 ) {
-    let command =
-        format!("st3 message export \"${{ST_WORKSPACE}}/.st3-messages\" >/dev/null && {command}");
+    let command = format!(
+        "st3 conversations export \"${{ST_WORKSPACE}}/.st3-messages\" >/dev/null && {command}"
+    );
     write_raw_mechanical_gate(output, name, &command, host, timeout_ms);
 }
 
@@ -1276,7 +1277,7 @@ fn infer_agent_model(agent: &st2::eval_spec::SpecAgent) -> Option<String> {
 
 fn rewrite_bus_command(value: &str) -> String {
     value
-        .replace("st2 message", "st3 message")
+        .replace("st2 message", "st3 conversations")
         .replace("st2 channel message", "st3 graph message notification")
         .replace("st2 bus", "st3 graph message API")
         .replace("hermetic st2 eval", "hermetic st3 eval")
@@ -1327,7 +1328,7 @@ fn stage_document(
         source: source.display().to_string(),
         staged: staged.display().to_string(),
         put_command: format!(
-            "st3 doc put {} --as {}",
+            "st3 documents put {} --as {}",
             shell(&staged.display().to_string()),
             shell(name)
         ),
@@ -1411,7 +1412,7 @@ fn rewrite_eval_asset(source: &str) -> String {
             if line.contains("--catalog") {
                 line.to_owned()
             } else {
-                line.replace("st2 message", "st3 message")
+                line.replace("st2 message", "st3 conversations")
                     .replace("st2 status", "st3 status")
                     .replace("st2 agents", "st3 agents")
                     .replace("st2 bus", "st3 graph message API")
@@ -1617,7 +1618,7 @@ agent "worker" {
         )
         .unwrap();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("st3 doc put '/tmp/proof file.txt'"));
+        assert!(warnings[0].contains("st3 documents put '/tmp/proof file.txt'"));
         assert!(warnings[0].contains("'doc/migration/host-a.worker/proof'"));
     }
 
@@ -1656,7 +1657,7 @@ agent "worker" {
                 .any(|warning| warning
                     .as_str()
                     .unwrap()
-                    .contains("st3 doc put '/tmp/proof.txt'"))
+                    .contains("st3 documents put '/tmp/proof.txt'"))
         );
     }
 
@@ -1903,7 +1904,7 @@ agent "worker" {
 
         assert_eq!(
             fs::read_to_string(output.path().join("sup/CLAUDE.md")).unwrap(),
-            "Use st3 message.\n"
+            "Use st3 conversations.\n"
         );
         assert_eq!(
             fs::read_to_string(output.path().join("judges/grade.sh")).unwrap(),
@@ -1918,7 +1919,7 @@ agent "worker" {
             "In a hermetic st2 eval, use st2 message and wait for an st2 channel message.",
         );
         assert!(translated.starts_with(
-            "In a hermetic st3 eval, use st3 message and end the turn and stay idle."
+            "In a hermetic st3 eval, use st3 conversations and end the turn and stay idle."
         ));
         assert!(translated.contains("Do not run a blocking wait, trace, poll, or sleep command."));
         assert!(!translated.contains("st2"));

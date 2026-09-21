@@ -8,8 +8,8 @@ worker="agent/$ST_MISSION_RUN/lmc.worker"
 messages_to() {
   local recipient=$1
   jq -s 'add | unique_by(.subject)' \
-    <(st3 message ls "$recipient" --json) \
-    <(st3 message ls "$recipient" --archive --json)
+    <(st3 conversations ls "$recipient" --json) \
+    <(st3 conversations ls "$recipient" --archive --json)
 }
 
 worker_messages="$(messages_to "$worker")"

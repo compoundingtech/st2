@@ -39,7 +39,7 @@ test "$(subject_count "$pre_head..HEAD" 2)" -eq 0
 test "$(subject_count "$pre_head..HEAD" 3)" -eq 1
 test "$(subject_count "$pre_head..HEAD" 4)" -eq 1
 
-restart="$(st3 inspect "resource/mission-run/$ST_MISSION_RUN/restart" --json)"
+restart="$(st3 subject show "resource/mission-run/$ST_MISSION_RUN/restart" --json)"
 jq -e \
   --arg old "$old_incarnation" \
   --arg new "$new_incarnation" \

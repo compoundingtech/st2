@@ -36,4 +36,4 @@ This table records the purpose and the prompt boundary for every st3 eval.
 | `test-writing` | Keep. It proves a direct coding mission with held-out gates. |
 | `weird-git-setup` | Keep. It proves work in a nonstandard repository layout. |
 
-Eval personas can contain domain facts and fixture ownership. They cannot duplicate st3 message, claim, or boot procedures.
+Eval personas can contain domain facts and fixture ownership. They cannot duplicate st3 conversations, claim, or boot procedures.

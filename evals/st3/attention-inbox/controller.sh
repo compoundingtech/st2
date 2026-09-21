@@ -33,7 +33,7 @@ cleanup() {
       --reason "the attention inbox eval finished" >/dev/null 2>&1 || true
   fi
   if [[ -n "$message_subject" ]]; then
-    st3 message archive "$message_subject" --as "$REVIEWER" >/dev/null 2>&1 || true
+    st3 conversations archive "$message_subject" --as "$REVIEWER" >/dev/null 2>&1 || true
   fi
   if [[ -n "$human_owner" ]]; then
     st3 review reject "$human_owner" --actor "$REVIEWER" \
@@ -71,7 +71,7 @@ st3 --json mission start eval/attention-inbox/standing \
 standing_run=$(jq -er '.mission_run.subject' standing.json)
 owner_id="${standing_run#mission-run/}/owner"
 owner="agent/${owner_id}"
-st3 wait "$owner" --for running --timeout 1m >/dev/null
+st3 trace wait "$owner" --for running --timeout 1m >/dev/null
 
 st3 --json mission start eval/attention-inbox/human \
   --id "eval/attention-inbox/human/${RUN_SUFFIX}" \
@@ -87,7 +87,7 @@ st3 --json mission start eval/attention-inbox/revision \
   --as "$owner" >revision.json
 revision_run=$(jq -er '.mission_run.subject' revision.json)
 revision_step=$(jq -er '.mission_run.steps[] | select(.step == "work") | .subject' revision.json)
-st3 wait "$revision_step" --for ready --timeout 1m >/dev/null
+st3 trace wait "$revision_step" --for ready --timeout 1m >/dev/null
 st3 work claim "$revision_step" --as "$owner" >/dev/null
 st3 --json work revise "$revision_run" revision.kdl \
   --as "$owner" \
@@ -174,7 +174,7 @@ st3 launch cancel "$planning_session" --as "$REVIEWER" \
   --reason "the model-free planning item is complete" >/dev/null
 planning_session=""
 
-st3 message read "$message_subject" --as "$REVIEWER" >/dev/null
+st3 conversations read "$message_subject" --as "$REVIEWER" >/dev/null
 st3 attention resolve "$fault_subject" --outcome resolved --as "$REVIEWER" \
   --reason "the explicit fault lifecycle is proved" >/dev/null
 fault_subject=""
@@ -182,7 +182,7 @@ fault_subject=""
 await_kind_count 0 empty-attention.json
 st3 review ls --as "$REVIEWER" --json \
   | jq -e 'length == 0' >/dev/null
-st3 message archive "$message_subject" --as "$REVIEWER" >/dev/null
+st3 conversations archive "$message_subject" --as "$REVIEWER" >/dev/null
 message_subject=""
 
 cancel_run "$standing_run"

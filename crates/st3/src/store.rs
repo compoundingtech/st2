@@ -3493,7 +3493,7 @@ impl Store {
         for reference in &intent.document_refs {
             let Some((name, hash)) = reference.rsplit_once('@') else {
                 blockers.push(format!(
-                    "document `{reference}` has no selected binding; run `st3 doc put` first"
+                    "document `{reference}` has no selected binding; run `st3 documents put` first"
                 ));
                 continue;
             };
@@ -3508,7 +3508,7 @@ impl Store {
                 .is_some();
             if !exists {
                 blockers.push(format!(
-                    "missing document `{reference}`; run `st3 doc put` first"
+                    "missing document `{reference}`; run `st3 documents put` first"
                 ));
                 continue;
             }
@@ -11382,10 +11382,10 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 "approve",
                 &[
                     "st3",
-                    "review",
+                    "attention",
                     "approve",
                     &review.owner,
-                    "--actor",
+                    "--as",
                     &review.reviewer,
                 ],
             ),
@@ -11393,10 +11393,10 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 "reject",
                 &[
                     "st3",
-                    "review",
+                    "attention",
                     "reject",
                     &review.owner,
-                    "--actor",
+                    "--as",
                     &review.reviewer,
                 ],
             ),
@@ -11430,7 +11430,7 @@ fn attention_item_from_planning(
                 "approve",
                 &[
                     "st3",
-                    "planning",
+                    "launch",
                     "approve",
                     &session.id,
                     &preview.hash,
@@ -11442,7 +11442,7 @@ fn attention_item_from_planning(
                 "cancel",
                 &[
                     "st3",
-                    "planning",
+                    "launch",
                     "cancel",
                     &session.id,
                     "--as",
@@ -11522,7 +11522,7 @@ fn attention_item_from_message(
             "read",
             &[
                 "st3",
-                "message",
+                "conversations",
                 "read",
                 &message.subject,
                 "--as",
@@ -22850,6 +22850,17 @@ message "human-attention" {
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].title, "Please review");
         assert!(items[0].requested_at_unix_ms > 0);
+        assert_eq!(
+            items[0].actions[0].argv,
+            [
+                "st3",
+                "conversations",
+                "read",
+                "message/human-attention",
+                "--as",
+                "person/nathan",
+            ]
+        );
         assert!(
             store
                 .claims_for("message/human-attention", Some("message.sent"))

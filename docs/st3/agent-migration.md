@@ -21,7 +21,7 @@ Write stable facts that an agent on the host needs. Do not put current work in t
 Store the bytes first:
 
 ```sh
-st3 doc put hosts/local.md --as doc/hosts/local
+st3 documents put hosts/local.md --as doc/hosts/local
 ```
 
 The command returns the exact SHA-256 reference. Put that reference in a host declaration:
@@ -86,14 +86,14 @@ The rehearsal proves these facts:
 
 ## Start one st3 run
 
-Do not start the live st3 mission while st2 still owns the same agent workspace.
+Do not start the live st3 missions while st2 still owns the same agent workspace.
 
 Stop the authorized st2 agent first. Remove only the st2-generated files that conflict with the st3 render.
 
 Use a readable run ID for the first trial:
 
 ```sh
-st3 mission start agents/example \
+st3 missions start agents/example \
   --id agents/example/pilot \
   --workspace /work/st3-runs/example \
   --as person/operator \

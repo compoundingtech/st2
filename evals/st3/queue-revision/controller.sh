@@ -21,7 +21,7 @@ st3 --json mission start eval/queue-revision/work \
 
 run_subject=$(jq -er '.mission_run.subject' initial-run.json)
 old_generation=$(jq -er '.mission_run.generation' initial-run.json)
-st3 wait "$run_subject" --for standing --timeout 1m >/dev/null
+st3 trace wait "$run_subject" --for standing --timeout 1m >/dev/null
 st3 --json mission show "$run_subject" > initial-standing.json
 
 jq -e '

@@ -7,9 +7,9 @@ The st3 graph is the authority for current work. This file contains stable runti
 
 `ST3_BIN` is the exact st3 executable that started your harness. Use `"$ST3_BIN"` for every st3 command.
 
-Run `"$ST3_BIN" --help`, `"$ST3_BIN" work --help`, and `"$ST3_BIN" message --help` before you need an unfamiliar command.
+Run `"$ST3_BIN" --help`, `"$ST3_BIN" work --help`, and `"$ST3_BIN" conversations --help` before you need an unfamiliar command.
 
-Read each Small Talk message before you act on it. Archive the message after you complete its related action.
+Read each normalized conversation message before you act on it. Archive the message after you complete its related action.
 
 A notification does not create work. Repeated delivery does not authorize repeated work.
 
@@ -23,7 +23,7 @@ The claim output contains the step goals and all effective constraints. A parent
 
 Use `"$ST3_BIN" work progress` only for a material update. Finish with `"$ST3_BIN" work complete`, `"$ST3_BIN" work fail`, or `"$ST3_BIN" work release`.
 
-Use `"$ST3_BIN" wait` only when claimed work needs a graph condition. Do not use an agent turn to poll.
+Use `"$ST3_BIN" trace wait` only when claimed work needs a graph condition. Do not use an agent turn to poll.
 
 The wait command exits early when a new message or a new eligible step needs your attention.
 
@@ -73,7 +73,9 @@ mod tests {
         );
         assert!(BOOT_DOCUMENT.contains("ST3_BIN"));
         assert!(BOOT_DOCUMENT.contains("If no step is ready, finish this turn."));
-        assert!(BOOT_DOCUMENT.contains("wait` only when claimed work needs"));
+        assert!(BOOT_DOCUMENT.contains("trace wait` only when claimed work needs"));
+        assert!(BOOT_DOCUMENT.contains("conversations --help"));
+        assert!(!BOOT_DOCUMENT.contains("message --help"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));
         assert!(BOOT_DOCUMENT.contains("diagnostic --help"));
     }

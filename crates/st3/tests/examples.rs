@@ -258,7 +258,7 @@ fn eval_personas_do_not_duplicate_runtime_work_instructions() {
         for forbidden in [
             "## Boot ritual",
             "st3 work claim",
-            "st3 message ls",
+            "st3 conversations ls",
             "st3 work progress",
         ] {
             assert!(

@@ -2635,7 +2635,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for launch {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
+        "You are the durable Codex planner for launch {id}. Use `st3 conversations ls`, read and archive the native Small Talk request, and use `st3 documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
     );
     let planner = quick_agent(
         &state,
@@ -7278,6 +7278,9 @@ version 2
             attention[0]["subject"],
             format!("planning-session/{session}")
         );
+        assert_eq!(attention[0]["actions"][0]["argv"][1], "launch");
+        assert_eq!(attention[0]["actions"][1]["argv"][1], "launch");
+        assert_eq!(attention[0]["actions"][2]["argv"][1], "launch");
 
         let (status, revised) = json_request(
             app.clone(),
@@ -9357,6 +9360,16 @@ version 2
                 .unwrap()
                 .iter()
                 .all(|item| item["kind"] == "human-gate")
+        );
+        assert!(
+            attention.as_array().unwrap().iter().all(|item| {
+                item["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|action| action["argv"][1] == "attention" && action["argv"][4] == "--as")
+            }),
+            "{attention}"
         );
 
         let (status, filtered) =

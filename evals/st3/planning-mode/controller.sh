@@ -145,12 +145,12 @@ jq -e --arg markdown "$markdown_ref" --arg kdl "$kdl_ref" '
   .candidate.markdown == $markdown
   and .candidate.kdl == $kdl
 ' "$EVAL_ROOT/approved.json" >/dev/null
-st3 doc get "$markdown_ref" --output "$EVAL_ROOT/approved-mission.md" >/dev/null
-st3 doc get "$kdl_ref" --output "$EVAL_ROOT/approved-mission.kdl" >/dev/null
+st3 documents get "$markdown_ref" --output "$EVAL_ROOT/approved-mission.md" >/dev/null
+st3 documents get "$kdl_ref" --output "$EVAL_ROOT/approved-mission.kdl" >/dev/null
 test -s "$EVAL_ROOT/approved-mission.md"
 test -s "$EVAL_ROOT/approved-mission.kdl"
 
-st3 wait "$planner" --for stopped --timeout 2m >/dev/null
+st3 trace wait "$planner" --for stopped --timeout 2m >/dev/null
 
 after_digest=$(workspace_digest)
 [[ "$before_digest" == "$after_digest" ]]

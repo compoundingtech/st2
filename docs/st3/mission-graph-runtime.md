@@ -229,7 +229,7 @@ An open mission keeps its runtimes present. This rule supports long-lived chat a
 
 A runtime `stop` can occur only inside the owner mission. Root control uses a named mission-run `cancellation` instead.
 
-The default mission permits one nonterminal run. This default also lets `st3 mission show MISSION` identify the current run.
+The default mission permits one nonterminal run. This default also lets `st3 missions show MISSION` identify the current run.
 
 Bare `concurrent-runs` permits unlimited nonterminal runs. `concurrent-runs max=N` sets a positive limit.
 
@@ -539,7 +539,7 @@ Nested child missions cannot declare inputs in this version.
 
 ```sh
 st3 publish mission.kdl --as person/operator
-st3 mission start MISSION_ID \
+st3 missions start MISSION_ID \
   --input message="Review this release." \
   --input source=resource/release-source \
   --as person/operator
@@ -1219,9 +1219,9 @@ The run keeps its initial revision and root revision. Its current revision is th
 `document` on a step always requires `doc/NAME@SHA256`.
 
 ```sh
-st3 doc put request.md --as doc/project/request
-st3 doc get doc/project/request@SHA256 --output request.md
-st3 doc list doc/project/request
+st3 documents put request.md --as doc/project/request
+st3 documents get doc/project/request@SHA256 --output request.md
+st3 documents ls doc/project/request
 ```
 
 Bare document names can appear in an intent before preview. The preview resolves them to the current exact hash. Apply validates the bytes and binds that exact version.
@@ -1236,9 +1236,9 @@ Store a summary, a redacted sample, or a hash when later work needs durable evid
 
 `st3 publish FILE --as ACTOR` repeats preview and applies the exact tokens. It never starts a mission run.
 
-`st3 mission start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
+`st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
 
-`st3 mission show MISSION_RUN` reads one exact run. `st3 mission show MISSION` works only when that mission has exactly one nonterminal run.
+`st3 missions show MISSION_RUN` reads one exact run. `st3 missions show MISSION` works only when that mission has exactly one nonterminal run.
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
 

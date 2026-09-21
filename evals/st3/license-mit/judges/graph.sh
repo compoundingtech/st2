@@ -30,7 +30,7 @@ for step in "${steps[@]}"; do
 done
 
 while read -r name kind; do
-  st3 inspect "resource/mission-run/$ST_MISSION_RUN/$name" --json \
+  st3 subject show "resource/mission-run/$ST_MISSION_RUN/$name" --json \
     | jq -e --arg kind "$kind" '.status.subjects[0].actual | (.fields // .) | .kind == $kind and .state == "published"' >/dev/null
 done <<'PRODUCTS'
 license-brief custom.st3.message-receipt

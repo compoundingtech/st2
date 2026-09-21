@@ -15,7 +15,7 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
-st3 wait "$PLANNER" --for running --timeout 1m >/dev/null
+st3 trace wait "$PLANNER" --for running --timeout 1m >/dev/null
 st3 work claim "$PRODUCE" --as "$PLANNER" >/dev/null
 st3 work publish-mission "$PRODUCE" produced.kdl --as "$PLANNER" > published.txt
 grep -Fq 'mission/eval/mission-authority/produced@' published.txt
@@ -34,8 +34,8 @@ st3 --json mission start eval/mission-authority/produced \
 produced_run=$(jq -er '.mission_run.subject' started.json)
 produced_run_id=${produced_run#mission-run/}
 readonly REVISER="agent/${produced_run_id}/reviser"
-st3 wait "$REVISER" --for running --timeout 1m >/dev/null
-st3 wait "$produced_run" --for standing --timeout 1m >/dev/null
+st3 trace wait "$REVISER" --for running --timeout 1m >/dev/null
+st3 trace wait "$produced_run" --for standing --timeout 1m >/dev/null
 
 st3 --json work revise "$produced_run" revised.kdl \
   --as "$REVISER" \
@@ -44,9 +44,9 @@ jq -e '
   .status == "applied"
   and .mission_run.initial_revision != .mission_run.revision
 ' revised.json >/dev/null
-st3 wait "$produced_run" --for standing --timeout 1m >/dev/null
+st3 trace wait "$produced_run" --for standing --timeout 1m >/dev/null
 
-if st3 mission start eval/mission-authority/produced \
+if st3 missions start eval/mission-authority/produced \
   --id "eval/mission-authority/denied/${ST_MISSION_RUN}" \
   --workspace "$PWD" \
   --as "$REVISER" > denied.out 2> denied.err; then

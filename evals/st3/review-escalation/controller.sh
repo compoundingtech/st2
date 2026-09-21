@@ -32,7 +32,7 @@ st3 --json mission start eval/review-escalation/standing \
   --workspace "$PWD" \
   --as "$REQUESTER" >standing.json
 standing_run=$(jq -er '.mission_run.subject' standing.json)
-st3 wait "$OWNER" --for running --timeout 1m >/dev/null
+st3 trace wait "$OWNER" --for running --timeout 1m >/dev/null
 
 st3 --json mission start eval/review-escalation/work \
   --id "eval/review-escalation/work/${ST_MISSION_RUN}" \
@@ -46,10 +46,10 @@ st3 claim "resource/mission-run/${work_run#mission-run/}/review" resource.observ
   --actor "$REQUESTER" \
   --field kind=human.review \
   --field target=resource/eval/review-escalation/source >/dev/null
-st3 wait "$work_run" --for running --timeout 1m >/dev/null
+st3 trace wait "$work_run" --for running --timeout 1m >/dev/null
 
 route=$(st3 --json mission show "$work_run" | jq -er '.steps[] | select(.step == "route") | .subject')
-st3 wait "$route" --for ready --timeout 1m >/dev/null
+st3 trace wait "$route" --for ready --timeout 1m >/dev/null
 st3 work claim "$route" --as "$OWNER" >/dev/null
 
 st3 --json work revise "$work_run" escalation.kdl \
@@ -63,7 +63,7 @@ st3 work claim "$route" --as "$OWNER" >/dev/null
 st3 work complete "$route" --as "$OWNER" --summary "Nathan must review this result" >/dev/null
 
 human=$(st3 --json mission show "$work_run" | jq -er '.steps[] | select(.step == "human-review") | .subject')
-st3 wait "$human" --for ready --timeout 1m >/dev/null
+st3 trace wait "$human" --for ready --timeout 1m >/dev/null
 review_list_ready=false
 for attempt in $(seq 1 100); do
   st3 review ls --as person/nathan --json >pending-reviews.json
@@ -98,7 +98,7 @@ for attempt in $(seq 1 100); do
   sleep 0.1
 done
 [[ "$review_requested" == "true" ]]
-st3 wait "$work_run" --for completed --timeout 1m >/dev/null
+st3 trace wait "$work_run" --for completed --timeout 1m >/dev/null
 st3 review ls --as person/nathan --json \
   | jq -e --arg owner "$human" 'map(select(.owner == $owner)) | length == 0' >/dev/null
 

@@ -106,7 +106,7 @@ The mission and mission-run can be in one atomic publication when the run names 
 The helper reads the current ready revision and publishes the exact run declaration:
 
 ```sh
-st3 mission start release \
+st3 missions start release \
   --id release/demo \
   --workspace /work/release \
   --input target=demo \
@@ -121,7 +121,7 @@ An optional mission `timeout="2h"` becomes one absolute deadline on each run. It
 
 ## Waiting during claimed work
 
-`st3 wait` is for a condition needed by work that the current agent has already claimed. It is not an idle-work loop.
+`st3 trace wait` is for a condition needed by work that the current agent has already claimed. It is not an idle-work loop.
 
 When `ST_AGENT` contains an `agent/...` subject, the command watches the complete event graph. It exits early when that agent receives a message or becomes eligible for another ready step. It also refuses to wait when the agent has no claimed step. The harness can then end its turn, and native delivery can start a fresh turn for new work.
 
@@ -251,7 +251,7 @@ The resource must already have an active observer. `st3 resource refresh` publis
 Planning uses an immutable request document and a declarative launch.
 
 ```sh
-st3 doc put request.md --as doc/planning/release/request
+st3 documents put request.md --as doc/planning/release/request
 st3 launch start --id release request.md \
   --workspace /work/release \
   --as person/operator
@@ -273,9 +273,9 @@ planning-session "planning/release/01990000000070008000000000000000" {
 
 The session creates a session-scoped Codex planner with a bounded runtime ID. Candidate submission is an observed result, so it is not authored in KDL. Candidate submission creates an exact preview automatically. A blocked preview stays durable for review.
 
-Human approval is also observed input. It publishes the approved mission revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new mission separately with `st3 mission start`.
+Human approval is also observed input. It publishes the approved mission revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new mission separately with `st3 missions start`.
 
-`st3 launch start --print-kdl` does not store the request. It prints the required `st3 doc put` command and the planning-session KDL.
+`st3 launch start --print-kdl` does not store the request. It prints the required `st3 documents put` command and the planning-session KDL.
 
 ### Review or resume a launch
 
@@ -429,7 +429,7 @@ The main helpers are:
 
 - `st3 codex --print-kdl` and `st3 claude --print-kdl`;
 - `st3 exec --print-kdl`;
-- `st3 message send --print-kdl` and `st3 message reply --print-kdl`;
+- `st3 conversations send --print-kdl` and `st3 conversations reply --print-kdl`;
 - `st3 resource watch`, `unwatch`, and `refresh` with `--print-kdl`;
 - `st3 runtime reset --print-kdl`;
 - `st3 launch start`, `revise`, and `cancel` with `--print-kdl`;

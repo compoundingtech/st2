@@ -23,7 +23,7 @@ for step in "${completed_steps[@]}"; do
 done
 
 subject="resource/mission-run/$ST_MISSION_RUN/skill-report"
-status="$(st3 inspect "$subject" --json)"
+status="$(st3 subject show "$subject" --json)"
 jq -e '
   .status.subjects[0].actual | (.fields // .)
     | (.kind == "custom.st3.message-receipt") and (.state == "published")' \

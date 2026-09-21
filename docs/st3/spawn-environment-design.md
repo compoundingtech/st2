@@ -214,7 +214,7 @@ Each launch receipt records these facts:
 
 Receipts never record secret values. The digest key stays in owner-only local state.
 
-`st3 inspect` should show names, sources, redacted value classes, the profile revision, and the digest.
+`st3 subject show` should show names, sources, redacted value classes, the profile revision, and the digest.
 
 `st3 doctor environment` should run disposable exec and PTY poison probes.
 

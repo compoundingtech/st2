@@ -35,7 +35,7 @@ done
 
 while read -r name kind state_name; do
   subject="resource/mission-run/$ST_MISSION_RUN/$name"
-  status="$(st3 inspect "$subject" --json)"
+  status="$(st3 subject show "$subject" --json)"
   jq -e --arg kind "$kind" --arg state "$state_name" \
     '.status.subjects[0].actual | (.fields // .)
       | (.kind == $kind) and (.state == $state)' \

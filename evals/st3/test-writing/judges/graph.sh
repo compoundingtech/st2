@@ -32,7 +32,7 @@ done
 
 while read -r name kind; do
   subject="resource/mission-run/$ST_MISSION_RUN/$name"
-  status="$(st3 inspect "$subject" --json)"
+  status="$(st3 subject show "$subject" --json)"
   jq -e --arg kind "$kind" '
     .status.subjects[0].actual | (.fields // .)
       | (.kind == $kind) and (.state == "published")' \
@@ -47,7 +47,7 @@ developer-report custom.st3.message-receipt
 final-assessment custom.st3.message-receipt
 PRODUCTS
 
-published="$(st3 inspect "resource/mission-run/$ST_MISSION_RUN/test-revision" --json \
+published="$(st3 subject show "resource/mission-run/$ST_MISSION_RUN/test-revision" --json \
   | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
 current="$(git -C "$CATALOG/worker" rev-parse HEAD)"
 test "$published" = "$current"

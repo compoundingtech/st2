@@ -60,7 +60,7 @@ st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --actor "$REQUESTER" \
   --field kind=custom.st3.eval-signal \
   --field state=done >/dev/null
-st3 wait "$stable_subject" --for completed --timeout 2m >/dev/null
+st3 trace wait "$stable_subject" --for completed --timeout 2m >/dev/null
 
 st3 --json launch start \
   --run "$run_subject" \
@@ -114,7 +114,7 @@ jq -e --arg hash "$preview_hash" '
 st3 --json mission show "$run_subject" > "$EVAL_ROOT/applied.json"
 new_generation=$(jq -er '.generation' "$EVAL_ROOT/applied.json")
 environment_subject=$(jq -er '.steps[] | select(.step == "generation-environment") | .subject' "$EVAL_ROOT/applied.json")
-st3 wait "$environment_subject" --for completed --timeout 2m >/dev/null
+st3 trace wait "$environment_subject" --for completed --timeout 2m >/dev/null
 
 st3 --json work revision generations "$run_subject" > "$EVAL_ROOT/generations.json"
 st3 --json work revision generation "$old_generation" > "$EVAL_ROOT/old-generation.json"
@@ -150,7 +150,7 @@ st3 claim "resource/generation-proof/$run_id/changed" resource.observed \
   --actor "$REQUESTER" \
   --field kind=custom.st3.eval-signal \
   --field state=done >/dev/null
-st3 wait "$run_subject" --for completed --timeout 2m >/dev/null
-st3 wait "$planner" --for stopped --timeout 2m >/dev/null
+st3 trace wait "$run_subject" --for completed --timeout 2m >/dev/null
+st3 trace wait "$planner" --for stopped --timeout 2m >/dev/null
 
 printf '%s\n' RUN-GENERATION-REVISION-GREEN > "$EVAL_ROOT/result.txt"

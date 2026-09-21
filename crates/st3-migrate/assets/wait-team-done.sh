@@ -16,7 +16,7 @@ fi
 while (( SECONDS <= deadline )); do
   report_index=0
   if (( $# > 0 )); then
-    reports=$(st3 message ls "$supervisor" --archive --json)
+    reports=$(st3 conversations ls "$supervisor" --archive --json)
     all_workers_reported=true
     for worker in "$@"; do
       worker_actor=$worker
@@ -35,12 +35,12 @@ while (( SECONDS <= deadline )); do
       report_index=0
     fi
   else
-    report_index=$(st3 message ls --archive --json | jq -r --arg subject "message/$kickoff" \
+    report_index=$(st3 conversations ls --archive --json | jq -r --arg subject "message/$kickoff" \
       '[.[] | select(.subject == $subject) | .created_index] | min // 0')
   fi
 
   if (( report_index > 0 )); then
-    if st3 message ls "$requester" --archive --json | jq -e \
+    if st3 conversations ls "$requester" --archive --json | jq -e \
       --arg actor "$supervisor_actor" --argjson report "$report_index" \
       'any(.[]; .from == $actor and .created_index >= $report)' >/dev/null; then
       exit 0

@@ -32,7 +32,7 @@ oldest_ts(){ local t min=9999999999999; for f in $1; do t="$(basename "$f" | gre
 
 refresh_projection(){
   if [ -n "${ST3_ENDPOINT:-}" ] && command -v st3 >/dev/null 2>&1; then
-    st3 message export "$SM" >/dev/null 2>&1 || true
+    st3 conversations export "$SM" >/dev/null 2>&1 || true
   fi
 }
 

@@ -58,7 +58,7 @@ jq -e '
   and .body.steps["publish-result"].dependencies[0].step == "verify-result"
 ' <<<"$published" >/dev/null
 
-st3 inspect "resource/$root/mission-result" --json \
+st3 subject show "resource/$root/mission-result" --json \
   | jq -e '.status.subjects[0].actual | (.fields // .) | .kind == "custom.st3.document-result" and .state == "published"' >/dev/null
 
 echo "PASS: st3 used the exact attempt-bound mission output after publication"

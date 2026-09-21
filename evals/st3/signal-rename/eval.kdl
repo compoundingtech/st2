@@ -384,7 +384,7 @@ version 2
         }
         step "publish-report-receipt" {
           title "The final report receipt is published"
-          goal "Let ID be the short ID printed by the final st3 message send command. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/${ST_MISSION_RUN}/sig.base --field message=message/ID. Then complete the step without --evidence."
+          goal "Let ID be the short ID printed by the final st3 conversations send command. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/${ST_MISSION_RUN}/sig.base --field message=message/ID. Then complete the step without --evidence."
           depends-on { step "send-final-report" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/final-report" {

@@ -8,8 +8,8 @@ REVIEWER_ID="agent/$ST_MISSION_RUN/prx.rev"
 messages_to() {
   local recipient=$1
   jq -s 'add | unique_by(.subject)' \
-    <(st3 message ls "$recipient" --json) \
-    <(st3 message ls "$recipient" --archive --json)
+    <(st3 conversations ls "$recipient" --json) \
+    <(st3 conversations ls "$recipient" --archive --json)
 }
 
 reviewer_report="$(messages_to "$SUP_ID" \

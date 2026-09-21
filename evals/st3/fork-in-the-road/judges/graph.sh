@@ -38,7 +38,7 @@ done
 
 while read -r name kind; do
   subject="resource/mission-run/$ST_MISSION_RUN/$name"
-  status="$(st3 inspect "$subject" --json)"
+  status="$(st3 subject show "$subject" --json)"
   jq -e --arg kind "$kind" '
     .status.subjects[0].actual | (.fields // .)
       | (.kind == $kind) and (.state == "published")' \
@@ -59,7 +59,7 @@ PRODUCTS
 
 while read -r role name; do
   subject="resource/mission-run/$ST_MISSION_RUN/$name"
-  published="$(st3 inspect "$subject" --json \
+  published="$(st3 subject show "$subject" --json \
     | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
   current="$(git -C "$CATALOG/$role" rev-parse HEAD)"
   test "$published" = "$current"
