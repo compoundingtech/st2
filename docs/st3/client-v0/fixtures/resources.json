@@ -67,6 +67,13 @@
     "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3"
   },
   {
+    "id": "machine/host-a", "kind": "machine", "revision": "mh5", "updated_at": "2026-09-20T11:09:10Z",
+    "host_id": "host/host-a", "name": "host-a", "state": "local", "fleet_id": "fleet/release",
+    "capacity": {"state":"unknown","reason":"no capacity observation"}, "occupancy": {"running_runtimes":1}, "projects": [],
+    "work": ["work/release/1/build"], "transports": [{"protocol":"unix","status":"local","last_success_at":"2026-09-20T11:09:10Z"}],
+    "runtime_ids": ["runtime/release-agent"]
+  },
+  {
     "id": "device/ios-release", "kind": "device", "revision": "dv2", "updated_at": "2026-09-20T11:09:30Z",
     "person_id": "person/nathan", "session_actor": "person/nathan/session/ios-release", "state": "active",
     "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z"

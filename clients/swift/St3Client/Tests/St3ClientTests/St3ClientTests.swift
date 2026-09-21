@@ -34,7 +34,7 @@ final class St3ClientTests: XCTestCase {
         for _ in 0..<6 { root.deleteLastPathComponent() }
         let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/resources.json"))
         let resources = try JSONDecoder().decode([Resource].self, from: data)
-        XCTAssertEqual(resources.count, 13)
+        XCTAssertEqual(resources.count, 15)
         guard case .attention(let attention) = resources[0] else { return XCTFail("attention discriminator lost") }
         XCTAssertEqual(attention.priority, "high")
         XCTAssertEqual(attention.actions, ["attention.resolve"])
@@ -58,9 +58,14 @@ final class St3ClientTests: XCTestCase {
         guard case .runtime(let runtime) = resources[9] else { return XCTFail("runtime discriminator lost") }
         XCTAssertEqual(runtime.ownerHostID, "host/host-a")
         XCTAssertEqual(runtime.incarnationID, "runtime-9:2026-09-20T11:06:30Z")
-        guard case .history(let history) = resources[11] else { return XCTFail("history discriminator lost") }
+        guard case .machine(let machine) = resources[10] else { return XCTFail("machine discriminator lost") }
+        XCTAssertEqual(machine.hostID, "host/host-a")
+        XCTAssertEqual(machine.capacity.state, "unknown")
+        XCTAssertEqual(machine.occupancy.runningRuntimes, 1)
+        XCTAssertEqual(machine.projects, [])
+        guard case .history(let history) = resources[13] else { return XCTFail("history discriminator lost") }
         XCTAssertEqual(history.storeIndex, 1842)
-        guard case .session(let session) = resources[12] else { return XCTFail("session discriminator lost") }
+        guard case .session(let session) = resources[14] else { return XCTFail("session discriminator lost") }
         XCTAssertEqual(session.timelineCursor, "timeline-cursor/release-agent/9/8")
     }
 

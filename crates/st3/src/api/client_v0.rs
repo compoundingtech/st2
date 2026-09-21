@@ -540,6 +540,197 @@ fn runtime_resources(
     Ok(values)
 }
 
+fn machine_resources(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+) -> anyhow::Result<Vec<Value>> {
+    let runtimes = runtime_resources(state, history, snapshot, session)?;
+    let mut host_runtime_ids = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut host_running_runtimes = BTreeMap::<String, usize>::new();
+    let mut runtime_owner_hosts = BTreeMap::<String, String>::new();
+    for runtime in &runtimes {
+        let Some(host_id) = runtime["owner_host_id"].as_str() else {
+            continue;
+        };
+        let Some(runtime_id) = runtime["id"].as_str() else {
+            continue;
+        };
+        host_runtime_ids
+            .entry(host_id.to_owned())
+            .or_default()
+            .insert(runtime_id.to_owned());
+        if runtime["state"].as_str() == Some("running") {
+            *host_running_runtimes.entry(host_id.to_owned()).or_default() += 1;
+        }
+        if let Some(owner_id) = runtime["owner_id"].as_str() {
+            runtime_owner_hosts.insert(owner_id.to_owned(), host_id.to_owned());
+        }
+    }
+
+    let work = super::client_work_resources(
+        &state.store,
+        None,
+        history,
+        client_snapshot_time(snapshot),
+        snapshot.store_index,
+    )?;
+    let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
+    for item in work {
+        let Some(claimant) = item["claimant"].as_str() else {
+            continue;
+        };
+        let Some(host_id) = runtime_owner_hosts.get(claimant) else {
+            continue;
+        };
+        if let Some(work_id) = item["id"].as_str() {
+            host_work
+                .entry(host_id.clone())
+                .or_default()
+                .insert(work_id.to_owned());
+        }
+    }
+
+    let local_host = client_host_id(&state.node);
+    let mut host_ids = BTreeSet::from([local_host.clone()]);
+    host_ids.extend(
+        state
+            .configured_peers
+            .iter()
+            .map(|peer| client_host_id(peer)),
+    );
+    host_ids.extend(host_runtime_ids.keys().cloned());
+    let status = if history {
+        state
+            .store
+            .status_history(None, None, Some(snapshot.store_index))?
+    } else {
+        state
+            .store
+            .status_at(None, None, Some(snapshot.store_index))?
+    };
+    let mut host_statuses = status
+        .subjects
+        .into_iter()
+        .filter(|subject| {
+            subject.kind.as_deref() == Some("host") || subject.subject.starts_with("host/")
+        })
+        .map(|subject| (subject.subject.clone(), subject))
+        .collect::<BTreeMap<_, _>>();
+    host_ids.extend(host_statuses.keys().cloned());
+
+    let mut machines = Vec::new();
+    for host_id in host_ids {
+        let name = host_id.strip_prefix("host/").unwrap_or(&host_id);
+        let (machine_state, transports, updated_at, transport_revision) = if host_id == local_host {
+            (
+                "local",
+                vec![json!({
+                    "protocol": "unix",
+                    "status": "local",
+                    "last_success_at": snapshot.created_at,
+                })],
+                snapshot.created_at.clone(),
+                "local".to_owned(),
+            )
+        } else if let Some(selected) = host_statuses.remove(&host_id) {
+            let actual = selected.actual.as_ref();
+            let fields = actual
+                .and_then(|actual| actual.get("fields"))
+                .or(actual)
+                .unwrap_or(&Value::Null);
+            let status = fields
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let conflicted = !selected.conflicts.is_empty()
+                || !matches!(selected.reachability.as_str(), "reachable" | "local");
+            let machine_state = if conflicted {
+                "indeterminate"
+            } else if status == "up" {
+                "reachable"
+            } else {
+                "unreachable"
+            };
+            let revision = selected
+                .actual_claim
+                .as_deref()
+                .unwrap_or("unobserved")
+                .to_owned();
+            let updated_at = if let Some(claim) = selected.actual_claim.as_deref() {
+                state
+                    .store
+                    .claim_by_id(claim)?
+                    .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+                    .unwrap_or_else(|| snapshot.created_at.clone())
+            } else {
+                snapshot.created_at.clone()
+            };
+            (
+                machine_state,
+                vec![json!({
+                    "protocol": fields.get("protocol").and_then(Value::as_str).unwrap_or("replication"),
+                    "status": if matches!(status, "up" | "down") { status } else { "unknown" },
+                    "last_success_at": fields.get("last_success_at").and_then(Value::as_u64).map(|value| client_timestamp(u128::from(value))),
+                })],
+                updated_at,
+                revision,
+            )
+        } else {
+            (
+                "indeterminate",
+                vec![json!({
+                    "protocol": "replication",
+                    "status": "unknown",
+                    "last_success_at": Value::Null,
+                })],
+                snapshot.created_at.clone(),
+                "unobserved".to_owned(),
+            )
+        };
+        let running_runtimes = host_running_runtimes.remove(&host_id).unwrap_or_default();
+        let runtime_ids = host_runtime_ids
+            .remove(&host_id)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let work = host_work
+            .remove(&host_id)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        machines.push(json!({
+            "id": format!("machine/{name}"),
+            "kind": "machine",
+            "revision": format!("{transport_revision}:{}", snapshot.store_index),
+            "updated_at": updated_at,
+            "host_id": host_id,
+            "name": name,
+            "state": machine_state,
+            "fleet_id": state.fleet_id,
+            "capacity": {
+                "state": "unknown",
+                "reason": "no capacity observation",
+            },
+            "occupancy": {
+                "running_runtimes": running_runtimes,
+            },
+            "projects": [],
+            "work": work,
+            "transports": transports,
+            "runtime_ids": runtime_ids,
+            "operational": {
+                "layer": "current",
+                "actionable": machine_state != "indeterminate",
+                "reasons": if machine_state == "local" { vec!["authoritative-local-host"] } else { vec!["replication-transport"] },
+            }
+        }));
+    }
+    machines.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    Ok(machines)
+}
+
 fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiError> {
     let report = doctor_report(state)?.0;
     let mut values = report
@@ -692,7 +883,7 @@ pub(super) async fn machines(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
-    let items = runtime_resources(&state, query.history, &snapshot, &session)
+    let items = machine_resources(&state, query.history, &snapshot, &session)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "machines", items, &query).map(Json)
 }
@@ -2757,7 +2948,7 @@ async fn dispatch_action(
                         .ok_or_else(|| validation("mission input values must be strings"))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let result = start_mission_run(
+            let result = start_mission_run_action(
                 State(state.clone()),
                 Json(MissionRunRequest {
                     mission: parameter_string(p, "mission_id")?,

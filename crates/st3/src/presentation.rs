@@ -4,8 +4,8 @@ use std::io::IsTerminal as _;
 
 use serde_json::Value;
 use st3::model::{
-    AttentionItemView, HumanReviewView, MissionInputKind, MissionRunView, RevisionCutover,
-    RevisionProposalView, RunGenerationView, StepRunView, SubjectStatus,
+    AttentionItemView, MissionInputKind, MissionRunView, RevisionCutover, RevisionProposalView,
+    RunGenerationView, StepRunView, SubjectStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -455,59 +455,6 @@ fn scalar_text(value: &Value) -> String {
 
 fn field_label(key: &str) -> String {
     key.replace(['_', '-'], " ").to_uppercase()
-}
-
-pub(crate) fn render_human_review_list(
-    reviewer: Option<&str>,
-    reviews: &[HumanReviewView],
-    style: OutputStyle,
-    now_unix_ms: u128,
-) -> String {
-    let mut output = String::new();
-    let title = reviewer.map_or_else(
-        || "HUMAN REVIEWS".to_owned(),
-        |reviewer| format!("HUMAN REVIEWS FOR {reviewer}"),
-    );
-    let _ = writeln!(output, "{}", style.heading(title));
-    if reviews.is_empty() {
-        let _ = writeln!(output, "{}", style.muted("No human reviews are waiting."));
-        return output;
-    }
-    let _ = writeln!(output, "{} waiting · oldest first", reviews.len());
-    for review in reviews {
-        let label = review
-            .title
-            .as_deref()
-            .or(review.step.as_deref())
-            .unwrap_or(review.mission.as_str());
-        let _ = writeln!(output);
-        let _ = writeln!(output, "  {} {label}", style.status_value("ready", "?"));
-        let _ = writeln!(output, "    {}", review.question);
-        let _ = write!(output, "    {} · {}", review.mission, review.mission_run);
-        if let Some(step) = &review.step {
-            let _ = write!(output, " · step {step}");
-        }
-        let _ = writeln!(
-            output,
-            " · requested {}",
-            relative_time(review.requested_at_unix_ms, now_unix_ms)
-        );
-        for target in &review.review_targets {
-            let _ = writeln!(output, "    review: {target}");
-        }
-        let _ = writeln!(output, "    owner: {}", review.owner);
-        let _ = writeln!(
-            output,
-            "    approve: st3 attention approve {} --as {}",
-            review.owner, review.reviewer
-        );
-        let _ = writeln!(
-            output,
-            "    reject:  st3 attention reject {} --as {}",
-            review.owner, review.reviewer
-        );
-    }
-    output
 }
 
 pub(crate) fn render_attention_list(
@@ -1255,25 +1202,6 @@ mod tests {
         }
     }
 
-    fn review(owner: &str, requested_at_unix_ms: u128) -> HumanReviewView {
-        HumanReviewView {
-            operation: "gate-operation/demo/review".into(),
-            request: "claim/review".into(),
-            owner: owner.into(),
-            mission: "mission/release".into(),
-            mission_run: "mission-run/release/one".into(),
-            generation: "run-generation/release/one".into(),
-            step: Some("publish".into()),
-            title: Some("Publish the release".into()),
-            reviewer: "person/nathan".into(),
-            question: "Is the release ready?".into(),
-            review_targets: vec!["doc/release/report@abc".into(), "resource/release".into()],
-            decisions: vec!["approved".into(), "rejected".into()],
-            attempt: 1,
-            requested_at_unix_ms,
-        }
-    }
-
     fn terminal(subject: &str, status: &str) -> SubjectStatus {
         SubjectStatus {
             subject: subject.into(),
@@ -1369,37 +1297,6 @@ mod tests {
             render_human_value(&serde_json::json!("plain"), OutputStyle::plain()),
             "plain\n"
         );
-    }
-
-    #[test]
-    fn human_review_list_shows_targets_age_and_decision_commands() {
-        let rendered = render_human_review_list(
-            Some("person/nathan"),
-            &[review("step-run/release/one/publish", 60_000)],
-            OutputStyle::plain(),
-            180_000,
-        );
-        assert!(rendered.contains("HUMAN REVIEWS FOR person/nathan"));
-        assert!(rendered.contains("1 waiting · oldest first"));
-        assert!(rendered.contains("Publish the release"));
-        assert!(rendered.contains("Is the release ready?"));
-        assert!(rendered.contains("requested 2m ago"));
-        assert!(rendered.contains("review: doc/release/report@abc"));
-        assert!(rendered.contains("review: resource/release"));
-        assert!(
-            rendered
-                .contains("st3 attention approve step-run/release/one/publish --as person/nathan")
-        );
-        assert!(
-            rendered
-                .contains("st3 attention reject step-run/release/one/publish --as person/nathan")
-        );
-    }
-
-    #[test]
-    fn human_review_list_has_a_clear_empty_state() {
-        let rendered = render_human_review_list(None, &[], OutputStyle::plain(), 180_000);
-        assert_eq!(rendered, "HUMAN REVIEWS\nNo human reviews are waiting.\n");
     }
 
     #[test]

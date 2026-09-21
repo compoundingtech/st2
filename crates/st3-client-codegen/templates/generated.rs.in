@@ -462,6 +462,42 @@ pub struct Runtime {
     pub terminal_access: Option<TerminalAccess>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MachineCapacity {
+    pub state: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MachineOccupancy {
+    pub running_runtimes: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MachineTransport {
+    pub protocol: String,
+    pub status: String,
+    pub last_success_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Machine {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub host_id: String,
+    pub name: String,
+    pub state: String,
+    pub fleet_id: Option<String>,
+    pub capacity: MachineCapacity,
+    pub occupancy: MachineOccupancy,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub work: Vec<String>,
+    #[serde(default)]
+    pub transports: Vec<MachineTransport>,
+    #[serde(default)]
+    pub runtime_ids: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Device {
     #[serde(flatten)]
     pub header: ResourceHeader,
@@ -528,6 +564,7 @@ pub enum Resource {
     Work(Work),
     Agent(Agent),
     Runtime(Runtime),
+    Machine(Machine),
     Device(Device),
     Operation(Operation),
     History(History),
@@ -547,6 +584,7 @@ impl Resource {
             Self::Work(v) => &v.header,
             Self::Agent(v) => &v.header,
             Self::Runtime(v) => &v.header,
+            Self::Machine(v) => &v.header,
             Self::Device(v) => &v.header,
             Self::Operation(v) => &v.header,
             Self::History(v) => &v.header,

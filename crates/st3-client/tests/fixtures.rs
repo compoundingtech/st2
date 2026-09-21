@@ -72,7 +72,7 @@ fn generated_models_decode_every_stream_fixture() {
 #[test]
 fn generated_resource_union_decodes_all_kinds() {
     let resources: Vec<Resource> = serde_json::from_slice(&fixture("resources.json")).unwrap();
-    assert_eq!(resources.len(), 14);
+    assert_eq!(resources.len(), 15);
     assert!(
         resources
             .iter()
@@ -102,6 +102,17 @@ fn generated_resource_union_decodes_all_kinds() {
         .unwrap();
     assert_eq!(work.blocked_reason, None);
     assert!(work.blockers.is_empty());
+    let machine = resources
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Machine(machine) => Some(machine),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(machine.host_id, "host/host-a");
+    assert_eq!(machine.capacity.state, "unknown");
+    assert_eq!(machine.occupancy.running_runtimes, 1);
+    assert!(machine.projects.is_empty());
     let device = resources
         .iter()
         .find_map(|resource| match resource {

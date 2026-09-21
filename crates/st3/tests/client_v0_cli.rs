@@ -22,22 +22,29 @@ fn test_state(root: &Path) -> AppState {
         pty_root: root.join("pty"),
         pty_binary: PathBuf::from("pty"),
         fleet_id: None,
-        configured_peers: Vec::new(),
+        configured_peers: vec!["offline-peer".into()],
     }
 }
 
 async fn run_cli(socket: &Path, args: &[&str]) -> Output {
+    run_cli_mode(socket, true, args).await
+}
+
+async fn run_cli_human(socket: &Path, args: &[&str]) -> Output {
+    run_cli_mode(socket, false, args).await
+}
+
+async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
     let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
     let socket = socket.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(binary)
-            .arg("--endpoint")
-            .arg(socket)
-            .arg("--json")
-            .args(args)
-            .output()
-            .unwrap()
+        let mut command = std::process::Command::new(binary);
+        command.arg("--endpoint").arg(socket);
+        if json {
+            command.arg("--json");
+        }
+        command.args(args).output().unwrap()
     })
     .await
     .unwrap()
@@ -75,6 +82,26 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
                     Value::String("cli-runtime:i1".into()),
                 ),
                 ("status".into(), Value::String("running".into())),
+                ("reachability".into(), Value::String("local".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "agent/cli-stopped".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/cli-stopped".into()),
+            fields: BTreeMap::from([
+                ("runtime_id".into(), Value::String("cli-stopped".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("cli-stopped:i1".into()),
+                ),
+                ("status".into(), Value::String("stopped".into())),
                 ("reachability".into(), Value::String("local".into())),
             ]),
             evidence: Vec::new(),
@@ -127,7 +154,44 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
 
     let machines = value(&run_cli(&socket, &["machines"]).await);
     assert_eq!(machines["api_version"], "st3.client.v0");
-    assert_eq!(machines["value"]["items"][0]["id"], "runtime/cli-runtime");
+    assert_eq!(machines["value"]["items"][0]["id"], "machine/client-v0-cli");
+    assert_eq!(machines["value"]["items"][0]["kind"], "machine");
+    assert_eq!(
+        machines["value"]["items"][0]["runtime_ids"][0],
+        "runtime/cli-runtime"
+    );
+    assert_eq!(
+        machines["value"]["items"][0]["capacity"]["state"],
+        "unknown"
+    );
+    assert_eq!(
+        machines["value"]["items"][0]["occupancy"]["running_runtimes"],
+        1
+    );
+    assert!(
+        machines["value"]["items"][0]["projects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(machines["value"]["items"][1]["id"], "machine/offline-peer");
+    assert_eq!(machines["value"]["items"][1]["state"], "indeterminate");
+    let machine_history = value(&run_cli(&socket, &["machines", "--all"]).await);
+    assert_eq!(
+        machine_history["value"]["items"][0]["runtime_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        machine_history["value"]["items"][0]["occupancy"]["running_runtimes"],
+        1
+    );
+
+    let activity = value(&run_cli(&socket, &["activity", "--limit", "10"]).await);
+    assert_eq!(activity["api_version"], "st3.client.v0");
+    assert_eq!(activity["value"]["kind"], "event-page");
 
     let devices = value(&run_cli(&socket, &["devices", "--as", "person/nathan"]).await);
     assert_eq!(devices["value"]["items"][0]["id"], "device/cli");
@@ -157,6 +221,25 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
     let history = value(&run_cli(&socket, &["devices", "--as", "person/nathan", "--all"]).await);
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
+
+    for (arguments, heading) in [
+        (vec!["now"], "NOW"),
+        (vec!["machines"], "MACHINES"),
+        (vec!["activity", "--limit", "10"], "ACTIVITY"),
+        (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),
+    ] {
+        let output = run_cli_human(&socket, &arguments).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = String::from_utf8(output.stdout).unwrap();
+        assert!(rendered.starts_with(heading), "{rendered}");
+        assert!(!rendered.contains("api_version"), "{rendered}");
+        assert!(!rendered.contains("request_id"), "{rendered}");
+        assert!(!rendered.contains("snapshot"), "{rendered}");
+    }
 
     server.abort();
 }

@@ -198,6 +198,7 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         "launch-approval",
         "launch-decision",
         "launch-variant",
+        "machine",
         "message",
         "mission",
         "operation",

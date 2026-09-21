@@ -471,6 +471,55 @@
         }
       ]
     },
+    "MachineCapacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reason"],
+      "properties": {
+        "state": { "enum": ["reported", "unknown"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "MachineOccupancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["running_runtimes"],
+      "properties": {
+        "running_runtimes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "MachineTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "status"],
+      "properties": {
+        "protocol": { "type": "string" },
+        "status": { "enum": ["local", "up", "down", "unknown"] },
+        "last_success_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "Machine": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        {
+          "type": "object",
+          "required": ["kind", "host_id", "name", "state", "capacity", "occupancy", "projects", "work", "transports", "runtime_ids"],
+          "properties": {
+            "kind": { "const": "machine" },
+            "host_id": { "$ref": "#/$defs/Id" },
+            "name": { "type": "string" },
+            "state": { "enum": ["local", "reachable", "unreachable", "indeterminate"] },
+            "fleet_id": { "type": ["string", "null"] },
+            "capacity": { "$ref": "#/$defs/MachineCapacity" },
+            "occupancy": { "$ref": "#/$defs/MachineOccupancy" },
+            "projects": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "work": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
+            "transports": { "type": "array", "items": { "$ref": "#/$defs/MachineTransport" } },
+            "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true }
+          }
+        }
+      ]
+    },
     "Device": {
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
@@ -547,6 +596,7 @@
         { "$ref": "#/$defs/LaunchDecision" }, { "$ref": "#/$defs/LaunchApproval" },
         { "$ref": "#/$defs/Mission" }, { "$ref": "#/$defs/Work" },
         { "$ref": "#/$defs/Agent" }, { "$ref": "#/$defs/Runtime" },
+        { "$ref": "#/$defs/Machine" },
         { "$ref": "#/$defs/Device" },
         { "$ref": "#/$defs/Operation" }, { "$ref": "#/$defs/History" },
         { "$ref": "#/$defs/Session" }
@@ -555,7 +605,7 @@
     "GoldenResourceSet": {
       "type": "array",
       "items": { "$ref": "#/$defs/Resource" },
-      "minItems": 14,
+      "minItems": 15,
       "contains": { "type": "object", "properties": { "kind": { "const": "session" } }, "required": ["kind"] }
     },
     "Page": {

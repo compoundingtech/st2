@@ -13,14 +13,12 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use st3::api::{AppState, router, serve_unix};
-use st3::archive::archive_eval;
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
-    EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
+    DoctorReport, DocumentPutRequest, DocumentVersion, EvalStatus, EventRecord, IntentInput,
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
     LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
     LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest, MessageView,
@@ -28,27 +26,26 @@ use st3::model::{
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
-    ResourceRefreshView, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
+    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
-    API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Fence as ClientFence,
-    PairingBegin, TargetParameters as ClientTargetParameters,
+    API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Envelope as ClientEnvelope,
+    EventPage as ClientEventPage, Fence as ClientFence, Page as ClientPage, PairingBegin,
+    Resource as ClientResource, TargetParameters as ClientTargetParameters,
 };
 use tokio::sync::{Notify, watch};
-use walkdir::WalkDir;
 
 mod presentation;
 
 use presentation::{
     OutputStyle, follow_snapshot, mission_run_signature, render_attention_list, render_generation,
-    render_generations, render_human_review_list, render_human_value, render_mission_run,
-    render_pty_list, render_revision_proposal, render_step_run, render_work_list,
+    render_generations, render_human_value, render_mission_run, render_pty_list,
+    render_revision_proposal, render_step_run, render_work_list,
 };
 
 #[derive(Parser)]
@@ -206,30 +203,6 @@ struct UpArgs {
     shared_secret_file: Option<PathBuf>,
     #[arg(long, value_parser = parse_peer)]
     peer: Vec<PeerConfig>,
-}
-
-#[derive(Args)]
-struct QuickArgs {
-    #[arg(long)]
-    name: Option<String>,
-    #[arg(long, default_value = ".")]
-    worktree: PathBuf,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long)]
-    effort: Option<String>,
-    /// Print the generated mission KDL without publishing it.
-    #[arg(long)]
-    print_kdl: bool,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
-}
-
-#[derive(Args)]
-struct FileArgs {
-    file: Option<PathBuf>,
-    #[arg(long, visible_alias = "at")]
-    at_index: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -434,66 +407,6 @@ struct PlanningCancelArgs {
     print_kdl: bool,
 }
 
-#[derive(Args)]
-struct PublishArgs {
-    file: Option<PathBuf>,
-    #[arg(long, visible_alias = "at")]
-    at_index: Option<u64>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: String,
-}
-
-#[derive(Args)]
-struct ImportArgs {
-    directory: PathBuf,
-}
-
-#[derive(Args)]
-struct SessionImportArgs {
-    #[arg(value_parser = ["codex", "claude", "pi", "omp"])]
-    driver: String,
-    /// Provider-native session ID to adopt without copying or rewriting its transcript.
-    session: String,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: String,
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
-}
-
-#[derive(Args)]
-struct ExecArgs {
-    #[arg(long)]
-    name: Option<String>,
-    #[arg(long, default_value = "local")]
-    host: String,
-    #[arg(long)]
-    cwd: Option<PathBuf>,
-    #[arg(long = "env", value_parser = parse_env)]
-    environment: Vec<(String, String)>,
-    #[arg(long)]
-    detach: bool,
-    #[arg(long)]
-    cancel_on_interrupt: bool,
-    /// Print the generated mission KDL without publishing or running it.
-    #[arg(long)]
-    print_kdl: bool,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
-    #[arg(last = true, required = true)]
-    argv: Vec<String>,
-}
-
-#[derive(Args)]
-struct LogsArgs {
-    subject: String,
-    #[arg(short = 'f', long)]
-    follow: bool,
-    #[arg(long)]
-    all: bool,
-    #[arg(long)]
-    previous: bool,
-}
-
 #[derive(Subcommand)]
 enum PtyCommand {
     Ls,
@@ -696,26 +609,6 @@ enum ReplicationCommand {
 }
 
 #[derive(Subcommand)]
-enum ClaudeChannelCommand {
-    /// Install or update the user plugin and its machine approval policy.
-    Install {
-        #[arg(long)]
-        no_policy: bool,
-    },
-    /// Verify the embedded files, registration, plugin, and machine policy.
-    Status,
-    /// Remove the plugin, marketplace, embedded files, and machine policy.
-    Uninstall {
-        #[arg(long)]
-        keep_policy: bool,
-    },
-    #[command(hide = true)]
-    InstallPolicy,
-    #[command(hide = true)]
-    UninstallPolicy,
-}
-
-#[derive(Subcommand)]
 enum DocCommand {
     Put {
         file: PathBuf,
@@ -730,39 +623,6 @@ enum DocCommand {
     List {
         name: Option<String>,
     },
-}
-
-#[derive(Args)]
-struct EvalArgs {
-    eval: PathBuf,
-    #[arg(long = "input", value_parser = parse_input)]
-    inputs: Vec<(String, String)>,
-    /// Show one live graph screen with semantic state transitions.
-    #[arg(long)]
-    graph: bool,
-    /// Print the resolved eval mission KDL without publishing or running it.
-    #[arg(long)]
-    print_kdl: bool,
-}
-
-#[derive(Args)]
-struct GraphArgs {
-    mission_run: String,
-}
-
-#[derive(Args)]
-struct StatusArgs {
-    #[arg(env = "ST_AGENT")]
-    subject: Option<String>,
-    #[arg(long)]
-    owner_run: Option<String>,
-    #[arg(long, visible_alias = "at")]
-    at_index: Option<u64>,
-    /// Include stopped, superseded, terminal-owner, and other historical records.
-    #[arg(long)]
-    all: bool,
-    #[arg(long, value_parser = ["available", "busy", "dnd", "offline"])]
-    set: Option<String>,
 }
 
 #[derive(Args)]
@@ -787,129 +647,6 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum RuntimeCommand {
-    /// List agent, exec, and PTY runtimes.
-    Ls,
-    /// Clear one runtime restart window with exact desired-state fencing.
-    Reset {
-        subject: String,
-        #[arg(long)]
-        reason: String,
-        /// Print the reset KDL without publishing it.
-        #[arg(long)]
-        print_kdl: bool,
-        #[arg(long = "as", env = "ST_AGENT")]
-        actor: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum ContextCommand {
-    Read(ContextReadArgs),
-    Write(ContextIdentityArgs),
-    Append(ContextAppendArgs),
-}
-
-#[derive(Args)]
-struct ContextIdentityArgs {
-    #[arg(env = "ST_AGENT")]
-    identity: Option<String>,
-}
-
-#[derive(Args)]
-struct ContextReadArgs {
-    #[arg(env = "ST_AGENT")]
-    identity: Option<String>,
-    #[arg(long)]
-    decisions: bool,
-    #[arg(long)]
-    full: bool,
-}
-
-#[derive(Args)]
-struct ContextAppendArgs {
-    #[arg(env = "ST_AGENT")]
-    identity: Option<String>,
-    #[arg(long)]
-    decision: String,
-    #[arg(long)]
-    why: String,
-}
-
-#[derive(Subcommand)]
-enum ResourceCommand {
-    Add(ResourceAddArgs),
-    Ls(ResourceIdentityArgs),
-    Read(ResourceReadArgs),
-    Remove(ResourceReadArgs),
-    /// Send a message when selected external resource facts change.
-    Watch(ResourceWatchArgs),
-    /// Stop one resource subscription.
-    Unwatch(ResourceUnwatchArgs),
-    /// Publish one named resource refresh request.
-    Refresh {
-        resource: String,
-        #[arg(long, default_value = "30s")]
-        timeout: String,
-        /// Print the refresh KDL without publishing it.
-        #[arg(long)]
-        print_kdl: bool,
-        #[arg(long = "as", env = "ST_AGENT")]
-        actor: Option<String>,
-    },
-}
-
-#[derive(Args)]
-struct ResourceIdentityArgs {
-    #[arg(env = "ST_AGENT")]
-    identity: Option<String>,
-}
-
-#[derive(Args)]
-struct ResourceAddArgs {
-    url: String,
-    #[arg(long)]
-    title: Option<String>,
-    #[arg(long = "tag", value_delimiter = ',')]
-    tags: Vec<String>,
-    #[arg(long)]
-    relation: Option<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    identity: Option<String>,
-}
-
-#[derive(Args)]
-struct ResourceReadArgs {
-    #[arg(num_args = 1..=2)]
-    values: Vec<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    identity: Option<String>,
-}
-
-#[derive(Args)]
-struct ResourceWatchArgs {
-    provider: String,
-    locator: String,
-    #[arg(long = "on", required = true)]
-    fields: Vec<String>,
-    #[arg(long = "to", alias = "as", env = "ST_AGENT")]
-    target: Option<String>,
-    /// Print the generated watch mission KDL without publishing it.
-    #[arg(long)]
-    print_kdl: bool,
-}
-
-#[derive(Args)]
-struct ResourceUnwatchArgs {
-    subscription: String,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
-    /// Print the cancellation KDL without publishing it.
-    #[arg(long)]
-    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -958,17 +695,6 @@ enum SchemaCommand {
     Show { kind: String },
     /// Export the complete registry.
     Export,
-}
-
-#[derive(Subcommand)]
-enum ReviewCommand {
-    /// List pending human gates.
-    Ls {
-        #[arg(long = "as")]
-        actor: Option<String>,
-    },
-    Approve(ReviewArgs),
-    Reject(ReviewArgs),
 }
 
 #[derive(Subcommand)]
@@ -1213,18 +939,6 @@ struct ReviewArgs {
 }
 
 #[derive(Args)]
-struct GateResultArgs {
-    #[arg(value_parser = ["pass", "fail"])]
-    verdict: String,
-    #[arg(long)]
-    reason: String,
-    #[arg(long)]
-    evidence: Vec<String>,
-    #[arg(long, env = "ST_GATE_CAPABILITY")]
-    operation_capability: String,
-}
-
-#[derive(Args)]
 struct DriverArgs {
     #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "opencode", "exec"])]
     driver: String,
@@ -1341,7 +1055,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
         Command::Agents { command } => run_agents(&client, command, cli.json).await,
         Command::Conversations { command } => run_message(&client, command, cli.json).await,
-        Command::Activity(args) => run_activity(&client, args, cli.json).await,
+        Command::Activity(args) => run_activity(&endpoint, args, cli.json).await,
         Command::Devices(args) => run_devices(endpoint.clone(), args, cli.json).await,
         Command::Work { command } => run_work(&client, command, cli.json).await,
         Command::Terminals { command } => {
@@ -1479,20 +1193,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
     tokio::spawn(reconciler.run());
     eprintln!("st3: local API listening at {}", config.socket.display());
     serve_unix(&config.socket, router(state)).await
-}
-
-async fn run_preview(client: &Client, args: FileArgs, json_output: bool) -> Result<()> {
-    let (kdl, source_name) = read_intent(args.file.as_deref())?;
-    let response: MissionResponse = client
-        .post(
-            "/v1/intent/mission",
-            &MissionRequest {
-                intent: IntentInput { kdl, source_name },
-                at_index: args.at_index,
-            },
-        )
-        .await?;
-    print_mission(&response, json_output)
 }
 
 async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) -> Result<()> {
@@ -1874,39 +1574,6 @@ async fn run_mission_view(
     }
 }
 
-async fn publish_file(client: &Client, args: PublishArgs, json_output: bool) -> Result<()> {
-    let (kdl, source_name) = read_intent(args.file.as_deref())?;
-    let intent = IntentInput { kdl, source_name };
-    let mission: MissionResponse = client
-        .post(
-            "/v1/intent/mission",
-            &MissionRequest {
-                intent: intent.clone(),
-                at_index: args.at_index,
-            },
-        )
-        .await?;
-    anyhow::ensure!(
-        mission.blockers.is_empty(),
-        "{}",
-        mission.blockers.join("; ")
-    );
-    let resolved_intent = mission.resolved_intent.clone();
-    let idempotency_key = idempotency(&resolved_intent.kdl, &mission.subject_tokens);
-    let response: ApplyResponse = client
-        .post(
-            "/v1/intent/apply",
-            &ApplyRequest {
-                intent: resolved_intent.clone(),
-                expected_subjects: mission.subject_tokens,
-                idempotency_key,
-                actor: Some(args.actor),
-            },
-        )
-        .await?;
-    print_value(&response, json_output)
-}
-
 async fn start_mission_run(
     client: &Client,
     args: MissionRunStartArgs,
@@ -2046,230 +1713,6 @@ fn mission_run_follow_succeeded(status: &str) -> bool {
     matches!(status, "completed" | "standing")
 }
 
-async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Result<()> {
-    let kdl = combine_kdl_tree(&args.directory)?;
-    post_staged_documents(client, &args.directory, &kdl).await?;
-    run_file_from_text(
-        client,
-        kdl,
-        args.directory.display().to_string(),
-        json_output,
-    )
-    .await
-}
-
-async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| uuid::Uuid::now_v7().simple().to_string());
-    let cwd = args.cwd.unwrap_or(std::env::current_dir()?);
-    let cwd = cwd
-        .canonicalize()
-        .with_context(|| format!("resolve working directory {}", cwd.display()))?;
-    let kdl = exec_intent(&name, &args.host, &cwd, &args.environment, &args.argv);
-    if args.print_kdl {
-        print!("{kdl}");
-        return Ok(());
-    }
-    let actor = args.actor.context("st3 exec needs --as or ST_AGENT")?;
-    let parsed = st3::parse_intent(&kdl, &args.host)?;
-    let mission_id = format!("exec/{name}");
-    let revision = parsed.missions[&mission_id].revision.clone();
-    publish_text(
-        client,
-        kdl,
-        format!("st3 exec {name} mission"),
-        actor.clone(),
-    )
-    .await?;
-    let run_id = format!("{mission_id}/{}", uuid::Uuid::now_v7().simple());
-    let run_kdl = mission_run_intent(
-        &run_id,
-        &mission_id,
-        &revision,
-        &cwd,
-        &normalize_requester_subject(&actor),
-        &BTreeMap::new(),
-        "run",
-    );
-    let applied = publish_text(
-        client,
-        run_kdl,
-        format!("st3 exec {name} run"),
-        actor.clone(),
-    )
-    .await?;
-    let run: MissionRunView = client
-        .get(&format!(
-            "/v1/mission-runs/{}",
-            urlencoding::encode(&format!("mission-run/{run_id}"))
-        ))
-        .await?;
-    let subject = format!("exec/{}/{name}", run.id);
-    if args.detach {
-        if json_output {
-            return print_value(
-                &json!({
-                "subject": subject,
-                "store_index": applied.store_index,
-                "detached": true,
-                }),
-                true,
-            );
-        }
-        println!("{subject}");
-        return Ok(());
-    }
-    #[cfg(unix)]
-    let interrupt = {
-        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        async move {
-            signal.recv().await;
-            Ok::<(), std::io::Error>(())
-        }
-    };
-    #[cfg(not(unix))]
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
-    if !json_output {
-        let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "{}", subject)?;
-        stderr.flush()?;
-    }
-    tokio::select! {
-        result = wait_for_actual(client, &subject, applied.store_index) => result?,
-        signal = &mut interrupt => {
-            signal?;
-            if args.cancel_on_interrupt {
-                publish_text(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}"), actor.clone()).await?;
-            }
-            return Err(CommandExit(130).into());
-        }
-    }
-    let follow = follow_logs(client, &subject, false, true, true, !json_output);
-    let final_chunk = tokio::select! {
-        result = follow => result?,
-        signal = &mut interrupt => {
-            signal?;
-            if args.cancel_on_interrupt {
-                publish_text(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}"), actor).await?;
-            }
-            return Err(CommandExit(130).into());
-        }
-    };
-    let final_chunk = wait_for_exec_exit_status(client, &subject, final_chunk).await?;
-    if json_output {
-        print_value(&final_chunk, true)?;
-    }
-    if let Some(signal) = final_chunk.exit_signal {
-        return Err(CommandExit((128_i32.saturating_add(signal)).clamp(1, 255) as u8).into());
-    }
-    if let Some(code) = final_chunk.exit_code
-        && code != 0
-    {
-        return Err(CommandExit(code.clamp(1, 255) as u8).into());
-    }
-    Ok(())
-}
-
-async fn wait_for_exec_exit_status(
-    client: &Client,
-    subject: &str,
-    mut chunk: SessionLogChunk,
-) -> Result<SessionLogChunk> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while chunk.exit_code.is_none() && chunk.exit_signal.is_none() {
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "the exec exited before its status became available"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        chunk = client
-            .get(&format!(
-                "/v1/sessions/logs/{}?after={}&limit=1&previous=false&wait=false",
-                urlencoding::encode(subject),
-                u64::MAX
-            ))
-            .await?;
-    }
-    Ok(chunk)
-}
-
-fn exec_intent(
-    name: &str,
-    host: &str,
-    cwd: &Path,
-    environment: &[(String, String)],
-    argv: &[String],
-) -> String {
-    let mut task = KdlNode::new("exec");
-    task.entries_mut().push(KdlEntry::new(name));
-    let mut body = KdlDocument::new();
-    body.nodes_mut().push(kdl_node("host", [host]));
-    let cwd = cwd.to_string_lossy().into_owned();
-    body.nodes_mut().push(kdl_node("workspace", [cwd.as_str()]));
-    body.nodes_mut().push(kdl_node("cwd", [cwd.as_str()]));
-    body.nodes_mut()
-        .push(kdl_node("argv", argv.iter().map(String::as_str)));
-    if !environment.is_empty() {
-        let mut environment_node = KdlNode::new("env");
-        let mut environment_body = KdlDocument::new();
-        for (name, value) in environment {
-            environment_body
-                .nodes_mut()
-                .push(kdl_node(name, [value.as_str()]));
-        }
-        environment_node.set_children(environment_body);
-        body.nodes_mut().push(environment_node);
-    }
-    body.nodes_mut().push(kdl_node("restart", ["never"]));
-    task.set_children(body);
-
-    let mut step = KdlNode::new("step");
-    step.entries_mut().push(KdlEntry::new("execute"));
-    let mut step_body = KdlDocument::new();
-    step_body.nodes_mut().push(KdlNode::new("agentless"));
-    step_body.nodes_mut().push(task);
-    let mut gate = KdlNode::new("gate");
-    gate.entries_mut().push(KdlEntry::new("the command exits"));
-    let mut gate_body = KdlDocument::new();
-    let subject = format!("exec/${{ST_MISSION_RUN}}/{name}");
-    gate_body.nodes_mut().push(kdl_node(
-        "field",
-        ["status", subject.as_str(), "is", "exited"],
-    ));
-    gate.set_children(gate_body);
-    step_body.nodes_mut().push(gate);
-    step.set_children(step_body);
-    let mut completion = KdlNode::new("completion");
-    let mut completion_body = KdlDocument::new();
-    completion_body
-        .nodes_mut()
-        .push(kdl_node("when", ["all-steps-exhausted"]));
-    completion.set_children(completion_body);
-    let mut mission = KdlNode::new("mission");
-    mission
-        .entries_mut()
-        .push(KdlEntry::new(format!("exec/{name}")));
-    mission
-        .entries_mut()
-        .push(KdlEntry::new_prop("state", "ready"));
-    let mut mission_body = KdlDocument::new();
-    mission_body
-        .nodes_mut()
-        .push(kdl_node("goal", ["Run the command to completion."]));
-    mission_body.nodes_mut().push(step);
-    mission_body.nodes_mut().push(completion);
-    mission.set_children(mission_body);
-    publication_document(mission)
-}
-
-fn cancel_run_intent(subject: &str) -> String {
-    format!(
-        "version 2\nmission-run {subject:?} {{ cancellation \"command-interrupted\" {{ reason \"the command was interrupted\" }} }}\n"
-    )
-}
-
 fn mission_run_intent(
     run_id: &str,
     mission_id: &str,
@@ -2326,10 +1769,6 @@ fn publication_document(node: KdlNode) -> String {
     document.to_string()
 }
 
-fn publication_actor() -> Result<String> {
-    std::env::var("ST_AGENT").context("publication needs --as or ST_AGENT")
-}
-
 async fn publish_text(
     client: &Client,
     kdl: String,
@@ -2366,110 +1805,6 @@ async fn publish_text(
             },
         )
         .await
-}
-
-async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Result<()> {
-    loop {
-        let status = status_for(client, subject).await?;
-        if status
-            .subjects
-            .first()
-            .and_then(|item| item.actual.as_ref())
-            .is_some_and(|actual| {
-                let fields = actual.get("fields").unwrap_or(actual);
-                fields.get("runtime_id").and_then(Value::as_str).is_some()
-                    && fields
-                        .get("incarnation_id")
-                        .and_then(Value::as_str)
-                        .is_some()
-                    && fields.get("terminal").and_then(Value::as_bool).is_some()
-            })
-        {
-            return Ok(());
-        }
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
-                urlencoding::encode(subject)
-            ))
-            .await?;
-        for event in events {
-            cursor = cursor.max(event.store_index);
-            if event.kind == "runtime.action.failed" {
-                anyhow::bail!("{} failed: {}", subject, event.body);
-            }
-        }
-    }
-}
-
-async fn run_logs(client: &Client, args: LogsArgs, json_output: bool) -> Result<()> {
-    let chunk = follow_logs(
-        client,
-        &args.subject,
-        args.previous,
-        args.all,
-        args.follow,
-        !json_output,
-    )
-    .await?;
-    if json_output {
-        print_value(&chunk, true)?;
-    }
-    Ok(())
-}
-
-async fn follow_logs(
-    client: &Client,
-    subject: &str,
-    previous: bool,
-    all: bool,
-    follow: bool,
-    emit: bool,
-) -> Result<SessionLogChunk> {
-    let subject = normalize_member_subject(subject, "exec");
-    let probe: SessionLogChunk = client
-        .get(&format!(
-            "/v1/sessions/logs/{}?after={}&limit=1&previous={previous}",
-            urlencoding::encode(&subject),
-            u64::MAX
-        ))
-        .await?;
-    let mut offset = if all {
-        0
-    } else {
-        probe.next_offset.saturating_sub(64 * 1024)
-    };
-    let generation = probe.generation_id.clone();
-    loop {
-        let chunk: SessionLogChunk = client
-            .get(&format!(
-                "/v1/sessions/logs/{}?after={offset}&limit={}&previous={previous}&wait=false",
-                urlencoding::encode(&subject),
-                64 * 1024
-            ))
-            .await?;
-        anyhow::ensure!(
-            chunk.generation_id == generation,
-            "the exec generation changed while the log was open"
-        );
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&chunk.data_base64)
-            .context("the API returned invalid base64 log data")?;
-        if emit && !bytes.is_empty() {
-            std::io::stdout().write_all(&bytes)?;
-            std::io::stdout().flush()?;
-        }
-        offset = chunk.next_offset;
-        if chunk.eof {
-            return Ok(chunk);
-        }
-        if !follow && offset >= probe.next_offset {
-            return Ok(chunk);
-        }
-        if bytes.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
 }
 
 async fn run_pty(
@@ -2724,44 +2059,36 @@ async fn run_now(endpoint: &Endpoint, args: NowArgs, json_output: bool) -> Resul
     } else {
         client.now_list(None, None, args.all).await?
     };
-    print_value(&response, json_output)
+    print_product_page("NOW", &response, json_output)
 }
 
 async fn run_machines(endpoint: &Endpoint, args: MachinesArgs, json_output: bool) -> Result<()> {
     let response = generated_client(endpoint, None)?
         .machines_list(None, None, args.all)
         .await?;
-    print_value(&response, json_output)
+    print_product_page("MACHINES", &response, json_output)
 }
 
-async fn run_activity(client: &Client, args: ActivityArgs, json_output: bool) -> Result<()> {
+async fn run_activity(endpoint: &Endpoint, args: ActivityArgs, json_output: bool) -> Result<()> {
     anyhow::ensure!(
         args.limit > 0 && args.limit <= 500,
         "the activity limit must be 1 through 500"
     );
+    let client = generated_client(endpoint, None)?;
     let mut cursor = args.after;
     loop {
-        let mut query = vec![format!("limit={}", args.limit)];
-        if let Some(after) = cursor.as_deref() {
-            query.push(format!("after={}", urlencoding::encode(after)));
-        }
-        let response: Value = client
-            .get(&format!("/v1/client/events?{}", query.join("&")))
+        let response = client
+            .events(
+                cursor.as_deref(),
+                Some(args.limit),
+                args.follow.then_some(30_000),
+            )
             .await?;
-        if json_output {
-            println!("{}", serde_json::to_string(&response)?);
-        } else {
-            print_value(&response, false)?;
-        }
-        cursor = response
-            .pointer("/value/resume_cursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(cursor);
+        cursor = Some(response.value.resume_cursor.clone());
+        print_activity_page(&response, json_output)?;
         if !args.follow {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -2771,7 +2098,7 @@ async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -
     match args.command.unwrap_or(DevicesCommand::Ls) {
         DevicesCommand::Ls => {
             let response = client.devices_list(None, None, args.all).await?;
-            print_value(&response, json_output)
+            print_product_page("DEVICES", &response, json_output)
         }
         DevicesCommand::Pair { device_name } => {
             let response = client
@@ -2781,7 +2108,7 @@ async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -
                     person_id: person,
                 })
                 .await?;
-            print_value(&response, json_output)
+            print_client_value(&response, json_output)
         }
         DevicesCommand::Revoke { device, reason } => {
             let capabilities = client.capabilities().await?;
@@ -2801,9 +2128,140 @@ async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -
                     },
                 )
                 .await?;
-            print_value(&response, json_output)
+            print_client_value(&response, json_output)
         }
     }
+}
+
+fn print_client_value<T: serde::Serialize>(
+    response: &ClientEnvelope<T>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        print_value(response, true)
+    } else {
+        print_value(&response.value, false)
+    }
+}
+
+fn print_product_page(
+    title: &str,
+    response: &ClientEnvelope<ClientPage>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        return print_value(response, true);
+    }
+    print!("{}", render_product_page(title, &response.value));
+    Ok(())
+}
+
+fn render_product_page(title: &str, page: &ClientPage) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "{title}  {}", page.items.len());
+    if page.items.is_empty() {
+        let _ = writeln!(output, "No current items.");
+        return output;
+    }
+    for item in &page.items {
+        match item {
+            ClientResource::Attention(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  attention  {}  {}  {}",
+                    item.header.id, item.priority, item.state, item.title
+                );
+            }
+            ClientResource::Work(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  work  {}  {}  attempt {}",
+                    item.header.id, item.state, item.path, item.attempt
+                );
+            }
+            ClientResource::Operation(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  operation  {}  {}  {}",
+                    item.header.id, item.severity, item.state, item.summary
+                );
+            }
+            ClientResource::Machine(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  runtimes {}  work {}  transports {}",
+                    item.header.id,
+                    item.state,
+                    item.runtime_ids.len(),
+                    item.work.len(),
+                    item.transports.len()
+                );
+            }
+            ClientResource::Device(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {}  scopes {}",
+                    item.header.id,
+                    item.state,
+                    item.session_actor,
+                    item.scopes.len()
+                );
+            }
+            item => {
+                let _ = writeln!(output, "{}  resource", item.header().id);
+            }
+        }
+    }
+    if page.page.has_more {
+        let _ = writeln!(
+            output,
+            "More items are available; resume with the returned cursor."
+        );
+    }
+    output
+}
+
+fn print_activity_page(
+    response: &ClientEnvelope<ClientEventPage>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        return print_value(response, true);
+    }
+    print!("{}", render_activity_page(&response.value));
+    Ok(())
+}
+
+fn render_activity_page(page: &ClientEventPage) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "ACTIVITY  {}", page.items.len());
+    if page.items.is_empty() {
+        let _ = writeln!(output, "No changes after {}.", page.resume_cursor);
+    }
+    for item in &page.items {
+        let resources = if item.resource_ids.is_empty() {
+            "-".to_owned()
+        } else {
+            item.resource_ids.join(",")
+        };
+        let _ = writeln!(
+            output,
+            "{}  {:?}  {}  {}",
+            item.next_cursor, item.event_type, resources, item.timestamp
+        );
+    }
+    if page.has_more {
+        let _ = writeln!(
+            output,
+            "More changes are available after {}.",
+            page.resume_cursor
+        );
+    }
+    output
 }
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
@@ -2822,31 +2280,6 @@ async fn run_trace_command(
         TraceCommand::Show(args) => run_trace(client, args, json_output).await,
         TraceCommand::Wait(args) => run_wait(client, args, json_output).await,
     }
-}
-
-async fn run_session_import(
-    client: &Client,
-    args: SessionImportArgs,
-    json_output: bool,
-) -> Result<()> {
-    let workspace = args.workspace.canonicalize().with_context(|| {
-        format!(
-            "resolve imported session workspace {}",
-            args.workspace.display()
-        )
-    })?;
-    let response: Value = client
-        .post(
-            "/v1/sessions/import",
-            &json!({
-                "driver": args.driver,
-                "session_id": args.session,
-                "actor": normalize_agent_subject(&args.actor),
-                "workspace": workspace,
-            }),
-        )
-        .await?;
-    print_value(&response, json_output)
 }
 
 async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> Result<Value> {
@@ -3289,20 +2722,6 @@ fn confirm_service_reset(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
-    match command {
-        ClaudeChannelCommand::Install { no_policy } => {
-            st2::claude_channel::install(no_policy).map(|_| ())
-        }
-        ClaudeChannelCommand::Status => st2::claude_channel::status(),
-        ClaudeChannelCommand::Uninstall { keep_policy } => {
-            st2::claude_channel::uninstall(keep_policy)
-        }
-        ClaudeChannelCommand::InstallPolicy => st2::claude_channel::install_policy().map(|_| ()),
-        ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_policy(),
-    }
-}
-
 async fn status_for(client: &Client, subject: &str) -> Result<StatusResponse> {
     client
         .get(&format!(
@@ -3331,66 +2750,6 @@ fn normalize_member_subject(subject: &str, namespace: &str) -> String {
     } else {
         format!("{namespace}/{subject}")
     }
-}
-
-async fn post_staged_documents(client: &Client, root: &Path, kdl: &str) -> Result<()> {
-    let intent = st3::parse_intent(kdl, "local")?;
-    for reference in intent.document_refs {
-        let (name, hash) = reference
-            .rsplit_once('@')
-            .with_context(|| format!("staged document reference `{reference}` has no hash"))?;
-        let versions: Vec<DocumentVersion> = client
-            .get(&format!("/v1/documents?name={}", urlencoding::encode(name)))
-            .await?;
-        if versions.iter().any(|version| version.hash == hash) {
-            continue;
-        }
-        let path = root.join(".st3-documents").join(hash);
-        let metadata = fs::symlink_metadata(&path).with_context(|| {
-            format!(
-                "document `{reference}` is absent from the API and {} is not staged",
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink() && metadata.is_file(),
-            "staged document {} must be a regular file",
-            path.display()
-        );
-        let bytes = fs::read(&path)?;
-        let actual_hash = hex::encode(Sha256::digest(&bytes));
-        anyhow::ensure!(
-            actual_hash == hash,
-            "staged document {} has hash {actual_hash}, not {hash}",
-            path.display()
-        );
-        let expected_document = versions
-            .iter()
-            .find(|version| version.latest)
-            .map(|version| version.binding_claim_id.clone());
-        let _: DocumentVersion = client
-            .post(
-                "/v1/documents",
-                &DocumentPutRequest {
-                    name: name.into(),
-                    bytes,
-                    expected_document,
-                    idempotency_key: format!("document:{name}:{hash}"),
-                },
-            )
-            .await?;
-    }
-    Ok(())
-}
-
-async fn run_file_from_text(
-    client: &Client,
-    kdl: String,
-    source_name: String,
-    json_output: bool,
-) -> Result<()> {
-    let response = publish_text(client, kdl, source_name, publication_actor()?).await?;
-    print_value(&response, json_output)
 }
 
 async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Result<()> {
@@ -3478,65 +2837,6 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
         }
     }
-}
-
-async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Result<()> {
-    if let Some(presence) = args.set {
-        let identity = args
-            .subject
-            .as_deref()
-            .context("status --set needs an identity or ST_AGENT")?;
-        let subject = normalize_agent_subject(identity);
-        let response: ClaimRecord = client
-            .post(
-                "/v1/claims",
-                &ClaimInput {
-                    subject,
-                    kind: "agent.presence".into(),
-                    actor: Some(normalize_agent_subject(identity)),
-                    fields: BTreeMap::from([
-                        ("presence".into(), Value::String(presence)),
-                        ("reachability".into(), Value::String("reachable".into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                },
-            )
-            .await?;
-        return print_value(&response, json_output);
-    }
-    let mut query = Vec::new();
-    if let Some(subject) = args.subject {
-        query.push(format!("subject={}", urlencoding::encode(&subject)));
-    }
-    if let Some(owner_run) = args.owner_run {
-        query.push(format!("owner_run={}", urlencoding::encode(&owner_run)));
-    }
-    if let Some(at_index) = args.at_index {
-        query.push(format!("at_index={at_index}"));
-    }
-    if args.all {
-        query.push("history=true".into());
-    }
-    let path = if query.is_empty() {
-        "/v1/status".to_owned()
-    } else {
-        format!("/v1/status?{}", query.join("&"))
-    };
-    let response: StatusResponse = client.get(&path).await?;
-    let terminal = response.subjects.iter().any(|subject| {
-        subject.reachability == "unreachable"
-            || subject.actual.as_ref().is_some_and(|actual| {
-                matches!(
-                    actual.get("verdict").and_then(Value::as_str),
-                    Some("fail" | "void")
-                )
-            })
-    });
-    print_value(&response, json_output)?;
-    anyhow::ensure!(!terminal, "terminal status selected");
-    Ok(())
 }
 
 async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) -> Result<()> {
@@ -3671,175 +2971,6 @@ fn desired_child_string<'a>(desired: &'a Value, child_name: &str) -> Option<&'a 
         .as_str()
 }
 
-async fn run_runtime(client: &Client, command: RuntimeCommand, json_output: bool) -> Result<()> {
-    match command {
-        RuntimeCommand::Ls => {
-            let response: StatusResponse = client.get("/v1/status").await?;
-            let runtimes = response
-                .subjects
-                .into_iter()
-                .filter(|subject| matches!(subject.kind.as_deref(), Some("agent" | "exec" | "pty")))
-                .collect::<Vec<_>>();
-            if json_output {
-                return print_value(&runtimes, true);
-            }
-            for runtime in runtimes {
-                let status = runtime
-                    .actual
-                    .as_ref()
-                    .and_then(|actual| actual.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let parked = runtime.reachability == "unreachable";
-                println!(
-                    "{}\t{}\t{}{}",
-                    runtime.subject,
-                    status,
-                    runtime.reachability,
-                    if parked { "\tparked" } else { "" }
-                );
-            }
-            Ok(())
-        }
-        RuntimeCommand::Reset {
-            subject,
-            reason,
-            print_kdl,
-            actor,
-        } => {
-            anyhow::ensure!(
-                subject.starts_with("agent/")
-                    || subject.starts_with("exec/")
-                    || subject.starts_with("pty/"),
-                "runtime reset needs a full agent, exec, or PTY subject"
-            );
-            let status: StatusResponse = client
-                .get(&format!(
-                    "/v1/status?subject={}",
-                    urlencoding::encode(&subject)
-                ))
-                .await?;
-            let runtime = status
-                .subjects
-                .into_iter()
-                .find(|candidate| candidate.subject == subject)
-                .with_context(|| format!("runtime `{subject}` does not exist"))?;
-            let run_subject = runtime
-                .owner_run
-                .context("the runtime has no owning mission run")?;
-            let run: MissionRunView = client
-                .get(&format!(
-                    "/v1/mission-runs/{}",
-                    urlencoding::encode(&run_subject)
-                ))
-                .await?;
-            let operation = format!("reset-{}", uuid::Uuid::now_v7().simple());
-            let response_kdl =
-                runtime_reset_intent(&run.subject, &operation, &subject, &run.generation, &reason);
-            if print_kdl {
-                print!("{response_kdl}");
-                return Ok(());
-            }
-            let actor = actor.context("runtime reset needs --as or ST_AGENT")?;
-            let response = publish_text(
-                client,
-                response_kdl,
-                format!("st3 runtime reset {subject}"),
-                actor,
-            )
-            .await?;
-            print_value(&response, json_output)
-        }
-    }
-}
-
-fn runtime_reset_intent(
-    run: &str,
-    operation: &str,
-    runtime: &str,
-    generation: &str,
-    reason: &str,
-) -> String {
-    format!(
-        "version 2\nmission-run {run:?} {{\n  reset {operation:?} {{\n    runtime {runtime:?}\n    from {generation:?}\n    reason {reason:?}\n  }}\n}}\n"
-    )
-}
-
-async fn run_context(client: &Client, command: ContextCommand, json_output: bool) -> Result<()> {
-    match command {
-        ContextCommand::Read(args) => {
-            let identity = required_identity(args.identity)?;
-            let prefix = format!("doc/context/{identity}/");
-            let versions: Vec<DocumentVersion> = client.get("/v1/documents").await?;
-            let mut selected = versions
-                .into_iter()
-                .filter(|version| version.latest && version.name.starts_with(&prefix))
-                .filter(|version| {
-                    if args.decisions && !args.full {
-                        version.name.starts_with(&format!("{prefix}decisions/"))
-                    } else if !args.full {
-                        version.name == format!("{prefix}now")
-                    } else {
-                        true
-                    }
-                })
-                .collect::<Vec<_>>();
-            selected.sort_by(|left, right| left.name.cmp(&right.name));
-            if json_output {
-                let mut values = Vec::new();
-                for version in selected {
-                    values.push(json!({
-                        "reference": format!("{}@{}", version.name, version.hash),
-                        "content": String::from_utf8(document_bytes(client, &version.name, &version.hash).await?)?,
-                    }));
-                }
-                return print_value(&values, true);
-            }
-            for (index, version) in selected.iter().enumerate() {
-                if index != 0 {
-                    println!();
-                }
-                std::io::Write::write_all(
-                    &mut std::io::stdout(),
-                    &document_bytes(client, &version.name, &version.hash).await?,
-                )?;
-            }
-            Ok(())
-        }
-        ContextCommand::Write(args) => {
-            let identity = required_identity(args.identity)?;
-            let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
-            std::str::from_utf8(&bytes).context("context must be UTF-8 text")?;
-            let name = format!("doc/context/{identity}/now");
-            let version = put_document_bytes(client, name, bytes).await?;
-            if json_output {
-                print_value(&version, true)
-            } else {
-                println!("{}@{}", version.name, version.hash);
-                Ok(())
-            }
-        }
-        ContextCommand::Append(args) => {
-            let identity = required_identity(args.identity)?;
-            let content = format!("# Decision\n\n{}\n\n# Why\n\n{}\n", args.decision, args.why);
-            let hash = hex::encode(Sha256::digest(content.as_bytes()));
-            let name = format!(
-                "doc/context/{identity}/decisions/{:020}-{}",
-                now_ms(),
-                &hash[..12]
-            );
-            let version = put_document_bytes(client, name, content.into_bytes()).await?;
-            if json_output {
-                print_value(&version, true)
-            } else {
-                println!("{}@{}", version.name, version.hash);
-                Ok(())
-            }
-        }
-    }
-}
-
 async fn put_document_bytes(
     client: &Client,
     name: String,
@@ -3869,487 +3000,6 @@ async fn put_document_bytes(
         .await
 }
 
-async fn run_resource(client: &Client, command: ResourceCommand, json_output: bool) -> Result<()> {
-    match command {
-        ResourceCommand::Add(args) => {
-            let owner = required_identity(args.identity)?;
-            let hash = hex::encode(Sha256::digest(args.url.as_bytes()));
-            let subject = format!("resource/{}", &hash[..20]);
-            let fields = BTreeMap::from([
-                (
-                    "kind".into(),
-                    Value::String("custom.st3.external-reference".into()),
-                ),
-                ("status".into(), Value::String("active".into())),
-                ("url".into(), Value::String(args.url)),
-                (
-                    "owner".into(),
-                    Value::String(normalize_agent_subject(&owner)),
-                ),
-                (
-                    "title".into(),
-                    args.title.map(Value::String).unwrap_or(Value::Null),
-                ),
-                (
-                    "relation".into(),
-                    args.relation.map(Value::String).unwrap_or(Value::Null),
-                ),
-                (
-                    "tags".into(),
-                    Value::Array(args.tags.into_iter().map(Value::String).collect()),
-                ),
-            ]);
-            let record: ClaimRecord = client
-                .post(
-                    "/v1/claims",
-                    &ClaimInput {
-                        subject: subject.clone(),
-                        kind: "resource.observed".into(),
-                        actor: Some(normalize_agent_subject(&owner)),
-                        fields,
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(format!("resource-add:{owner}:{hash}")),
-                    },
-                )
-                .await?;
-            if json_output {
-                print_value(&record, true)
-            } else {
-                println!("{}", subject.trim_start_matches("resource/"));
-                Ok(())
-            }
-        }
-        ResourceCommand::Ls(args) => {
-            let owner = args
-                .identity
-                .map(|identity| normalize_agent_subject(&identity));
-            let response: StatusResponse = client.get("/v1/status").await?;
-            let resources = response
-                .subjects
-                .into_iter()
-                .filter(|subject| subject.subject.starts_with("resource/"))
-                .filter(|subject| {
-                    owner.as_deref().is_none_or(|owner| {
-                        subject
-                            .actual
-                            .as_ref()
-                            .and_then(|actual| actual.get("owner"))
-                            .and_then(Value::as_str)
-                            == Some(owner)
-                    })
-                })
-                .collect::<Vec<_>>();
-            if json_output {
-                return print_value(&resources, true);
-            }
-            for resource in resources {
-                let actual = resource.actual.unwrap_or(Value::Null);
-                println!(
-                    "{}\t{}\t{}",
-                    resource.subject.trim_start_matches("resource/"),
-                    actual
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    actual.get("url").and_then(Value::as_str).unwrap_or("")
-                );
-            }
-            Ok(())
-        }
-        ResourceCommand::Read(args) => {
-            let (reference, _) = positional_identity_and_reference(args.values, args.identity)?;
-            let subject = normalize_resource_subject(&reference);
-            let response: StatusResponse = client
-                .get(&format!(
-                    "/v1/status?subject={}",
-                    urlencoding::encode(&subject)
-                ))
-                .await?;
-            let resource = response
-                .subjects
-                .into_iter()
-                .next()
-                .context("resource does not exist")?;
-            print_value(&resource, json_output)
-        }
-        ResourceCommand::Remove(args) => {
-            let (reference, identity) =
-                positional_identity_and_reference(args.values, args.identity)?;
-            let identity = required_identity(identity)?;
-            let subject = normalize_resource_subject(&reference);
-            let record: ClaimRecord = client
-                .post(
-                    "/v1/claims",
-                    &ClaimInput {
-                        subject: subject.clone(),
-                        kind: "resource.observed".into(),
-                        actor: Some(normalize_agent_subject(&identity)),
-                        fields: BTreeMap::from([(
-                            "status".into(),
-                            Value::String("removed".into()),
-                        )]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(format!("resource-remove:{identity}:{subject}")),
-                    },
-                )
-                .await?;
-            print_value(&record, json_output)
-        }
-        ResourceCommand::Watch(args) => {
-            let target = args
-                .target
-                .context("a resource watch needs --to or ST_AGENT")?;
-            let target = normalize_message_subject(&target);
-            let (kdl, mission_id, resource) =
-                resource_watch_intent(&args.provider, &args.locator, &args.fields, &target)?;
-            if args.print_kdl {
-                print!("{kdl}");
-                return Ok(());
-            }
-            let parsed = st3::parse_intent(&kdl, "local")?;
-            let revision = parsed.missions[&mission_id].revision.clone();
-            let published = publish_text(
-                client,
-                kdl,
-                format!("st3 resource watch {resource}"),
-                target.clone(),
-            )
-            .await?;
-            let mut active: Vec<MissionRunView> = client
-                .get(&format!(
-                    "/v1/mission-runs?mission={}",
-                    urlencoding::encode(&mission_id)
-                ))
-                .await?;
-            anyhow::ensure!(
-                active.len() <= 1,
-                "resource watch mission `mission/{mission_id}` has more than one active run"
-            );
-            let run = if let Some(run) = active.pop() {
-                anyhow::ensure!(
-                    run.revision == revision,
-                    "the resource watch mission has an unexpected active revision"
-                );
-                run
-            } else {
-                let workspace = std::env::current_dir()?.canonicalize()?;
-                let run_kdl = mission_run_intent(
-                    &mission_id,
-                    &mission_id,
-                    &revision,
-                    &workspace,
-                    &target,
-                    &BTreeMap::new(),
-                    "run",
-                );
-                let applied = publish_text(
-                    client,
-                    run_kdl,
-                    format!("st3 resource watch {resource} run"),
-                    target.clone(),
-                )
-                .await?;
-                let _ = published.store_index.max(applied.store_index);
-                client
-                    .get::<MissionRunView>(&format!(
-                        "/v1/mission-runs/{}",
-                        urlencoding::encode(&format!("mission-run/{mission_id}"))
-                    ))
-                    .await?
-            };
-            let response = ResourceWatchView {
-                resource,
-                observer: format!("observer/{}/watch", run.id),
-                subscription: format!("subscription/{}/watch", run.id),
-            };
-            if json_output {
-                print_value(&response, true)
-            } else {
-                println!(
-                    "{}\t{}\t{}",
-                    response.resource, response.observer, response.subscription
-                );
-                Ok(())
-            }
-        }
-        ResourceCommand::Unwatch(args) => {
-            let actor = args
-                .actor
-                .context("a resource unwatch needs --as or ST_AGENT")?;
-            let subscription = args
-                .subscription
-                .strip_prefix("subscription/")
-                .unwrap_or(&args.subscription);
-            let subject = format!("subscription/{subscription}");
-            let status: StatusResponse = client
-                .get(&format!(
-                    "/v1/status?subject={}",
-                    urlencoding::encode(&subject)
-                ))
-                .await?;
-            let run = status
-                .subjects
-                .into_iter()
-                .find(|item| item.subject == subject)
-                .and_then(|item| item.owner_run)
-                .context("the subscription has no owning mission run")?;
-            let operation = format!("unwatch-{}", uuid::Uuid::now_v7().simple());
-            let kdl = cancellation_intent(&run, &operation, "the resource watch stopped");
-            if args.print_kdl {
-                print!("{kdl}");
-                return Ok(());
-            }
-            let response = publish_text(
-                client,
-                kdl,
-                format!("st3 resource unwatch {subscription}"),
-                actor,
-            )
-            .await?;
-            print_value(&response, json_output)
-        }
-        ResourceCommand::Refresh {
-            resource,
-            timeout,
-            print_kdl,
-            actor,
-        } => {
-            let timeout = parse_timeout(&timeout)?;
-            let timeout_ms =
-                u64::try_from(timeout.as_millis()).context("the refresh timeout is too large")?;
-            let resource = normalize_resource_subject(&resource);
-            anyhow::ensure!(
-                timeout_ms > 0 && timeout_ms <= 3_600_000,
-                "a resource refresh timeout must be between 1 ms and 1 hour"
-            );
-            let operation = format!("refresh-{}", uuid::Uuid::now_v7().simple());
-            let kdl = resource_refresh_intent(&resource, &operation, timeout_ms);
-            if print_kdl {
-                print!("{kdl}");
-                return Ok(());
-            }
-            let actor = actor.context("a resource refresh needs --as or ST_AGENT")?;
-            let response = publish_text(
-                client,
-                kdl,
-                format!("st3 resource refresh {resource}"),
-                actor,
-            )
-            .await?;
-            let completed = follow_resource_refresh(client, &resource, &response, timeout).await?;
-            print_value(&completed, json_output)
-        }
-    }
-}
-
-async fn follow_resource_refresh(
-    client: &Client,
-    resource: &str,
-    publication: &ApplyResponse,
-    timeout: Duration,
-) -> Result<ResourceRefreshView> {
-    let mut attempts = BTreeMap::new();
-    for claim_id in &publication.claim_ids {
-        let claim: ClaimRecord = client
-            .get(&format!(
-                "/v1/claims/by-id/{}",
-                urlencoding::encode(claim_id)
-            ))
-            .await?;
-        if claim.kind != "observer.refresh-requested" {
-            continue;
-        }
-        if let Some(attempt) = claim
-            .body
-            .pointer("/fields/attempt")
-            .and_then(Value::as_str)
-        {
-            attempts.insert(claim.subject, attempt.to_owned());
-        }
-    }
-    anyhow::ensure!(
-        !attempts.is_empty(),
-        "the refresh publication did not identify an observer attempt"
-    );
-    let wait = async {
-        let mut cursor = publication.store_index;
-        let mut completed = BTreeSet::new();
-        let mut changed = false;
-        let mut completed_at_index = cursor;
-        while completed.len() != attempts.len() {
-            let events: Vec<EventRecord> = client
-                .get(&format!(
-                    "/v1/events?after={cursor}&wait=true&timeout_ms=30000"
-                ))
-                .await?;
-            for event in events {
-                cursor = cursor.max(event.store_index);
-                let Some(expected) = attempts.get(&event.subject) else {
-                    continue;
-                };
-                if event
-                    .body
-                    .pointer("/fields/attempt")
-                    .and_then(Value::as_str)
-                    != Some(expected.as_str())
-                {
-                    continue;
-                }
-                if event.kind == "observer.observed" {
-                    changed |= event
-                        .body
-                        .pointer("/fields/changed")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    completed_at_index = completed_at_index.max(event.store_index);
-                    completed.insert(event.subject);
-                } else if event.kind == "observer.state"
-                    && event.body.pointer("/fields/state").and_then(Value::as_str)
-                        == Some("unreachable")
-                {
-                    let reason = event
-                        .body
-                        .pointer("/fields/reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("the observer failed");
-                    anyhow::bail!(
-                        "observer `{}` could not refresh `{resource}`: {reason}",
-                        event.subject
-                    );
-                }
-            }
-        }
-        Ok(ResourceRefreshView {
-            resource: resource.to_owned(),
-            observers: attempts.keys().cloned().collect(),
-            changed,
-            completed_at_index,
-        })
-    };
-    tokio::time::timeout(timeout, wait)
-        .await
-        .with_context(|| format!("resource `{resource}` did not finish its refresh in time"))?
-}
-
-fn normalize_resource_subject(reference: &str) -> String {
-    if reference.starts_with("resource/") {
-        reference.to_owned()
-    } else {
-        format!("resource/{reference}")
-    }
-}
-
-fn resource_watch_intent(
-    provider: &str,
-    locator: &str,
-    fields: &[String],
-    target: &str,
-) -> Result<(String, String, String)> {
-    anyhow::ensure!(
-        !fields.is_empty(),
-        "a resource watch needs at least one field"
-    );
-    let (resource_name, resource_kind) = match provider {
-        "github.pull-request" => {
-            for field in fields {
-                anyhow::ensure!(
-                    matches!(field.as_str(), "head" | "state" | "review" | "checks"),
-                    "GitHub pull request provider does not support field `{field}`"
-                );
-            }
-            let (repository, number) = locator
-                .rsplit_once('#')
-                .context("a GitHub pull request locator needs OWNER/REPO#NUMBER")?;
-            let (owner, repository) = repository
-                .split_once('/')
-                .context("a GitHub pull request locator needs OWNER/REPO#NUMBER")?;
-            number
-                .parse::<u64>()
-                .context("a GitHub pull request number must be an integer")?;
-            (
-                format!("github/{owner}/{repository}/pull/{number}"),
-                "vcs.pull-request",
-            )
-        }
-        "github.repository" => {
-            for field in fields {
-                anyhow::ensure!(
-                    matches!(field.as_str(), "pull_requests" | "issues"),
-                    "GitHub repository provider does not support field `{field}`"
-                );
-            }
-            let (owner, repository) = locator
-                .split_once('/')
-                .context("a GitHub repository locator needs OWNER/REPO")?;
-            anyhow::ensure!(
-                !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
-                "a GitHub repository locator needs OWNER/REPO"
-            );
-            (format!("github/{owner}/{repository}"), "vcs.repository")
-        }
-        "local.file" => {
-            anyhow::ensure!(
-                Path::new(locator).is_absolute(),
-                "a local file locator must be an absolute path"
-            );
-            for field in fields {
-                anyhow::ensure!(
-                    matches!(
-                        field.as_str(),
-                        "status" | "path" | "content_hash" | "size" | "mode" | "reason"
-                    ),
-                    "local file provider does not support field `{field}`"
-                );
-            }
-            let hash = hex::encode(Sha256::digest(locator.as_bytes()));
-            (
-                format!("local-file/local/{}", &hash[..24]),
-                "filesystem.file",
-            )
-        }
-        _ => anyhow::bail!("resource provider `{provider}` is not registered"),
-    };
-    let fields = fields.iter().cloned().collect::<BTreeSet<_>>();
-    let stable = serde_json::to_vec(&json!({
-        "provider": provider,
-        "locator": locator,
-        "fields": fields,
-        "target": target,
-        "delivery": "message",
-    }))?;
-    let hash = hex::encode(Sha256::digest(stable));
-    let mission_id = format!("resource-watch/{resource_name}/{}", &hash[..16]);
-    let observer_fields = fields
-        .iter()
-        .map(|field| format!("      field {field:?}\n"))
-        .collect::<String>();
-    let subscription_fields = fields
-        .iter()
-        .map(|field| format!("      on {field:?}\n"))
-        .collect::<String>();
-    let kdl = format!(
-        "version 2\nresource {resource_name:?} {{\n  kind {resource_kind:?}\n}}\nmission {mission_id:?} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {:?}\n    provider {provider:?}\n    locator {locator:?}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {target:?}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
-        format!("resource/{resource_name}")
-    );
-    Ok((kdl, mission_id, format!("resource/{resource_name}")))
-}
-
-fn resource_refresh_intent(resource: &str, operation: &str, timeout_ms: u64) -> String {
-    let resource = resource.strip_prefix("resource/").unwrap_or(resource);
-    format!(
-        "version 2\nresource {resource:?} {{\n  refresh {operation:?} {{\n    timeout {:?}\n  }}\n}}\n",
-        format!("{timeout_ms}ms")
-    )
-}
-
-fn cancellation_intent(run: &str, operation: &str, reason: &str) -> String {
-    format!(
-        "version 2\nmission-run {run:?} {{\n  cancellation {operation:?} {{\n    reason {reason:?}\n  }}\n}}\n"
-    )
-}
-
 fn normalize_message_subject(value: &str) -> String {
     let mission_run = std::env::var("ST_MISSION_RUN")
         .ok()
@@ -4369,20 +3019,6 @@ fn normalize_message_subject_in_run(value: &str, mission_run: Option<&str>) -> S
     }
 }
 
-fn positional_identity_and_reference(
-    values: Vec<String>,
-    explicit_identity: Option<String>,
-) -> Result<(String, Option<String>)> {
-    match values.as_slice() {
-        [reference] => Ok((reference.clone(), explicit_identity)),
-        [identity, reference] => Ok((
-            reference.clone(),
-            explicit_identity.or_else(|| Some(identity.clone())),
-        )),
-        _ => anyhow::bail!("the command needs one reference and at most one identity"),
-    }
-}
-
 async fn document_bytes(client: &Client, name: &str, hash: &str) -> Result<Vec<u8>> {
     let value: Value = client
         .get(&format!(
@@ -4397,10 +3033,6 @@ async fn document_bytes(client: &Client, name: &str, hash: &str) -> Result<Vec<u
             .context("document response lacks bytes")?,
     )
     .map_err(Into::into)
-}
-
-fn required_identity(identity: Option<String>) -> Result<String> {
-    identity.context("the command needs an identity or ST_AGENT")
 }
 
 fn normalize_agent_subject(identity: &str) -> String {
@@ -4525,37 +3157,18 @@ async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) 
     print_value(&selected, json_output)
 }
 
-async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) -> Result<()> {
-    let (decision, args) = match command {
-        ReviewCommand::Ls { actor } => {
-            let path = actor.as_deref().map_or_else(
-                || "/v1/reviews".to_owned(),
-                |actor| format!("/v1/reviews?reviewer={}", urlencoding::encode(actor)),
-            );
-            let reviews: Vec<HumanReviewView> = client.get(&path).await?;
-            if json_output {
-                return print_value(&reviews, true);
-            }
-            print!(
-                "{}",
-                render_human_review_list(
-                    actor.as_deref(),
-                    &reviews,
-                    OutputStyle::stdout(),
-                    now_ms(),
-                )
-            );
-            return Ok(());
-        }
-        ReviewCommand::Approve(args) => ("approved", args),
-        ReviewCommand::Reject(args) => ("rejected", args),
-    };
+async fn run_review_decision(
+    client: &Client,
+    decision: &str,
+    args: ReviewArgs,
+    json_output: bool,
+) -> Result<()> {
     let path = format!("/v1/reviews/{}", args.target);
     let response: ClaimRecord = client
         .post(
             &path,
             &ReviewRequest {
-                decision: decision.into(),
+                decision: decision.to_owned(),
                 reason: args.reason,
                 actor: args.actor,
                 expected_subject: None,
@@ -4647,10 +3260,10 @@ async fn run_attention(
             }
         }
         AttentionCommand::Approve(args) => {
-            run_review(client, ReviewCommand::Approve(args), json_output).await
+            run_review_decision(client, "approved", args, json_output).await
         }
         AttentionCommand::Reject(args) => {
-            run_review(client, ReviewCommand::Reject(args), json_output).await
+            run_review_decision(client, "rejected", args, json_output).await
         }
     }
 }
@@ -5416,138 +4029,6 @@ fn thread_root<'a>(message: &'a MessageView, all: &'a [MessageView]) -> &'a Mess
     current
 }
 
-async fn run_gate_result(client: &Client, args: GateResultArgs, json_output: bool) -> Result<()> {
-    let idempotency_key = gate_result_idempotency_key(
-        &args.operation_capability,
-        &args.verdict,
-        &args.reason,
-        &args.evidence,
-    );
-    let response: ClaimRecord = client
-        .post(
-            "/v1/gate-results",
-            &GateResultRequest {
-                idempotency_key,
-                operation_capability: args.operation_capability,
-                verdict: args.verdict,
-                reason: args.reason,
-                evidence: args.evidence,
-            },
-        )
-        .await?;
-    print_value(&response, json_output)
-}
-
-fn gate_result_idempotency_key(
-    operation_capability: &str,
-    verdict: &str,
-    reason: &str,
-    evidence: &[String],
-) -> String {
-    let request_bytes = serde_json::to_vec(&(operation_capability, verdict, reason, evidence))
-        .expect("a gate result request is JSON serializable");
-    format!("gate-result:{}", hex::encode(Sha256::digest(request_bytes)))
-}
-
-async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<()> {
-    anyhow::ensure!(
-        !(args.graph && json_output),
-        "--graph and --json cannot be used together"
-    );
-    anyhow::ensure!(
-        !args.graph || std::io::stdout().is_terminal(),
-        "--graph needs an interactive terminal"
-    );
-    if args.print_kdl {
-        anyhow::ensure!(
-            !args.graph,
-            "--print-kdl and --graph cannot be used together"
-        );
-        let root = args
-            .eval
-            .canonicalize()
-            .with_context(|| format!("resolve eval directory {}", args.eval.display()))?;
-        let source = fs::read_to_string(root.join("eval.kdl"))?;
-        let source = source.replace("${EVAL_ROOT}", &root.to_string_lossy());
-        st3::parse_intent(&source, "local")?;
-        print!("{source}");
-        return Ok(());
-    }
-    let bundle = archive_eval(&args.eval)?;
-    let bundle_hash = hex::encode(Sha256::digest(&bundle));
-    let name = args
-        .eval
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("the eval name is not UTF-8")?
-        .to_owned();
-    let started: EvalStartResponse = client
-        .post(
-            "/v1/evals",
-            &EvalStartRequest {
-                name,
-                bundle_hash,
-                bundle,
-                inputs: unique_pairs(args.inputs, "input")?,
-            },
-        )
-        .await?;
-    if json_output {
-        print_value(&started, true)?;
-    } else {
-        println!("started {}", started.mission_run);
-    }
-    let cursor = started.event_cursor;
-    let subject = started.mission_run;
-    let run: MissionRunView = client
-        .get(&format!(
-            "/v1/mission-runs/{}",
-            urlencoding::encode(&subject)
-        ))
-        .await?;
-    if args.graph {
-        follow_eval_graph(client, &run.subject).await
-    } else {
-        follow_mission_run(client, run, cursor, json_output).await
-    }
-}
-
-async fn run_graph(client: &Client, args: GraphArgs, json_output: bool) -> Result<()> {
-    anyhow::ensure!(!json_output, "graph and --json cannot be used together");
-    anyhow::ensure!(
-        std::io::stdout().is_terminal(),
-        "graph needs an interactive terminal"
-    );
-    let eval: EvalStatus = client
-        .get(&format!(
-            "/v1/evals/{}",
-            urlencoding::encode(&args.mission_run)
-        ))
-        .await?;
-    follow_eval_graph(client, &eval.mission_run).await
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GraphNodeState {
-    label: String,
-    state: String,
-    assignee: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GraphTransition {
-    elapsed: Duration,
-    label: String,
-    from: String,
-    to: String,
-    assignee: Option<String>,
-}
-
-struct EvalGraphSnapshot {
-    eval: EvalStatus,
-    runs: Vec<MissionRunView>,
-}
-
 struct TerminalScreen;
 
 impl TerminalScreen {
@@ -5563,625 +4044,6 @@ impl Drop for TerminalScreen {
         print!("\x1b[?25h");
         let _ = std::io::stdout().flush();
     }
-}
-
-async fn follow_eval_graph(client: &Client, root: &str) -> Result<()> {
-    let _screen = TerminalScreen::open()?;
-    let started_at = Instant::now();
-    let mut previous = BTreeMap::new();
-    let mut transitions = Vec::new();
-    let mut prior_signature = String::new();
-    loop {
-        let snapshot = load_eval_graph(client, root).await?;
-        let current = graph_node_states(&snapshot);
-        if !previous.is_empty() {
-            record_graph_transitions(&previous, &current, started_at.elapsed(), &mut transitions);
-        }
-        let signature = format!(
-            "{current:?}|{}|{:?}",
-            snapshot.eval.cleanup, snapshot.eval.verdict
-        );
-        if signature != prior_signature {
-            let frame = render_eval_graph(&snapshot, &transitions, started_at.elapsed());
-            print!("\x1b[2J\x1b[H{frame}");
-            std::io::stdout().flush()?;
-            prior_signature = signature;
-        }
-        previous = current;
-        match snapshot.eval.lifecycle.as_str() {
-            "completed" => return Ok(()),
-            "failed" | "cancelled" => {
-                anyhow::bail!(
-                    "eval {} is {}",
-                    snapshot.eval.mission_run,
-                    snapshot.eval.lifecycle
-                )
-            }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-async fn load_eval_graph(client: &Client, root: &str) -> Result<EvalGraphSnapshot> {
-    let eval: EvalStatus = client
-        .get(&format!("/v1/evals/{}", urlencoding::encode(root)))
-        .await?;
-    let runs: Vec<MissionRunView> = client
-        .get(&format!(
-            "/v1/mission-runs?root={}",
-            urlencoding::encode(root)
-        ))
-        .await?;
-    anyhow::ensure!(!runs.is_empty(), "the eval graph has no mission runs");
-    Ok(EvalGraphSnapshot { eval, runs })
-}
-
-fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNodeState> {
-    let mut states = BTreeMap::new();
-    states.insert(
-        snapshot.eval.mission_run.clone(),
-        GraphNodeState {
-            label: "eval".into(),
-            state: format!("{} / {}", snapshot.eval.lifecycle, snapshot.eval.phase),
-            assignee: None,
-        },
-    );
-    for run in &snapshot.runs {
-        states.insert(
-            run.subject.clone(),
-            GraphNodeState {
-                label: run
-                    .mission
-                    .strip_prefix("mission/")
-                    .unwrap_or(&run.mission)
-                    .to_owned(),
-                state: format!("{} / {}", run.status, run.phase),
-                assignee: None,
-            },
-        );
-        for step in &run.steps {
-            let attempt = if step.attempt > 1 {
-                format!(" (attempt {})", step.attempt)
-            } else {
-                String::new()
-            };
-            states.insert(
-                step.subject.clone(),
-                GraphNodeState {
-                    label: step.title.clone().unwrap_or_else(|| step.step.clone()),
-                    state: format!("{}{attempt}", step.status),
-                    assignee: work_actor(step).map(short_actor).map(str::to_owned),
-                },
-            );
-        }
-    }
-    states
-}
-
-fn record_graph_transitions(
-    previous: &BTreeMap<String, GraphNodeState>,
-    current: &BTreeMap<String, GraphNodeState>,
-    elapsed: Duration,
-    transitions: &mut Vec<GraphTransition>,
-) {
-    for (subject, state) in current {
-        let Some(prior) = previous.get(subject) else {
-            transitions.push(GraphTransition {
-                elapsed,
-                label: state.label.clone(),
-                from: "created".into(),
-                to: state.state.clone(),
-                assignee: state.assignee.clone(),
-            });
-            continue;
-        };
-        if prior.state != state.state {
-            transitions.push(GraphTransition {
-                elapsed,
-                label: state.label.clone(),
-                from: prior.state.clone(),
-                to: state.state.clone(),
-                assignee: state.assignee.clone(),
-            });
-        }
-    }
-    for (subject, state) in previous {
-        if !current.contains_key(subject) {
-            transitions.push(GraphTransition {
-                elapsed,
-                label: state.label.clone(),
-                from: state.state.clone(),
-                to: "removed".into(),
-                assignee: state.assignee.clone(),
-            });
-        }
-    }
-    if transitions.len() > 12 {
-        transitions.drain(..transitions.len() - 12);
-    }
-}
-
-fn render_eval_graph(
-    snapshot: &EvalGraphSnapshot,
-    transitions: &[GraphTransition],
-    elapsed: Duration,
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::new();
-    let name = snapshot
-        .eval
-        .mission_run
-        .strip_prefix("mission-run/")
-        .unwrap_or(&snapshot.eval.mission_run);
-    let steps = snapshot
-        .runs
-        .iter()
-        .flat_map(|run| run.steps.iter())
-        .collect::<Vec<_>>();
-    let completed = steps
-        .iter()
-        .filter(|step| step.status == "completed")
-        .count();
-    let ready = steps.iter().filter(|step| step.status == "ready").count();
-    let active = steps
-        .iter()
-        .filter(|step| matches!(step.status.as_str(), "claimed" | "working" | "verifying"))
-        .count();
-    let blocked = steps.iter().filter(|step| step.status == "blocked").count();
-    let verdict = snapshot.eval.verdict.as_deref().unwrap_or("pending");
-    let _ = writeln!(output, "ST3 EVAL GRAPH  {name}");
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "STATE      {} · {}",
-        snapshot.eval.lifecycle, snapshot.eval.phase
-    );
-    let _ = writeln!(output, "VERDICT    {verdict}");
-    let _ = writeln!(output, "CLEANUP    {}", snapshot.eval.cleanup);
-    let _ = writeln!(
-        output,
-        "PROGRESS   {completed}/{} completed · {ready} ready · {active} active · {blocked} blocked",
-        steps.len()
-    );
-    let _ = writeln!(output, "ELAPSED    {}", format_elapsed(elapsed));
-    let _ = writeln!(output);
-    let _ = writeln!(output, "WORK GRAPH");
-
-    let children = snapshot
-        .runs
-        .iter()
-        .filter_map(|run| run.parent_step_run.as_deref().map(|parent| (parent, run)))
-        .collect::<BTreeMap<_, _>>();
-    if let Some(root) = snapshot
-        .runs
-        .iter()
-        .find(|run| run.subject == snapshot.eval.mission_run)
-    {
-        render_mission_steps(&mut output, root, &children, "  ");
-    } else {
-        let _ = writeln!(output, "  ! the root mission run is not available");
-    }
-
-    let _ = writeln!(output);
-    let _ = writeln!(output, "TRANSITIONS");
-    if transitions.is_empty() {
-        let _ = writeln!(output, "  Waiting for a state change.");
-    } else {
-        for transition in transitions {
-            let actor = transition
-                .assignee
-                .as_deref()
-                .map(|actor| format!(" · {actor}"))
-                .unwrap_or_default();
-            let _ = writeln!(
-                output,
-                "  {}  {}: {} → {}{}",
-                format_elapsed(transition.elapsed),
-                transition.label,
-                transition.from,
-                transition.to,
-                actor
-            );
-        }
-    }
-    output
-}
-
-fn render_mission_steps(
-    output: &mut String,
-    run: &MissionRunView,
-    children: &BTreeMap<&str, &MissionRunView>,
-    indent: &str,
-) {
-    use std::fmt::Write as _;
-
-    let base_depth = run
-        .steps
-        .iter()
-        .map(|step| step.step.matches('/').count())
-        .min()
-        .unwrap_or_default();
-    for step in run
-        .steps
-        .iter()
-        .filter(|step| step.step.matches('/').count() == base_depth)
-    {
-        render_graph_step(output, step, indent);
-        let nested_prefix = format!("{}/", step.step);
-        let nested = run
-            .steps
-            .iter()
-            .filter(|candidate| candidate.step.starts_with(&nested_prefix))
-            .collect::<Vec<_>>();
-        if !nested.is_empty() {
-            let nested_completed = nested
-                .iter()
-                .filter(|candidate| candidate.status == "completed")
-                .count();
-            let _ = writeln!(
-                output,
-                "{indent}  ↳ nested work · {nested_completed}/{} completed",
-                nested.len()
-            );
-            if is_active_graph_state(&step.status) || step.status == "failed" {
-                for nested_step in nested {
-                    let relative_depth = nested_step
-                        .step
-                        .matches('/')
-                        .count()
-                        .saturating_sub(base_depth);
-                    render_graph_step(
-                        output,
-                        nested_step,
-                        &format!("{indent}{}", "  ".repeat(relative_depth + 1)),
-                    );
-                }
-            }
-        }
-        let Some(child) = children.get(step.subject.as_str()) else {
-            continue;
-        };
-        let child_completed = child
-            .steps
-            .iter()
-            .filter(|nested| nested.status == "completed")
-            .count();
-        let child_summary = format!(
-            "{indent}  ↳ {} · {} · {child_completed}/{} completed",
-            child
-                .mission
-                .strip_prefix("mission/")
-                .unwrap_or(&child.mission),
-            child.status,
-            child.steps.len()
-        );
-        let _ = writeln!(output, "{child_summary}");
-        if !matches!(child.status.as_str(), "completed" | "cancelled") {
-            render_mission_steps(output, child, children, &format!("{indent}    "));
-        }
-    }
-}
-
-fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str) {
-    use std::fmt::Write as _;
-
-    let actor = work_actor(step)
-        .map(short_actor)
-        .map(|actor| format!(" · {actor}"))
-        .unwrap_or_default();
-    let title = step.title.as_deref().unwrap_or(&step.step);
-    let attempt = if step.attempt > 1 {
-        format!(" · attempt {}", step.attempt)
-    } else {
-        String::new()
-    };
-    let queue = step
-        .queue
-        .as_deref()
-        .zip(step.queue_position)
-        .map(|(queue, position)| format!(" · queue {queue} #{position}"))
-        .unwrap_or_default();
-    let _ = writeln!(
-        output,
-        "{indent}{} {:<10} {} — {}{}{}{}",
-        graph_state_mark(&step.status),
-        step.status,
-        step.step.rsplit('/').next().unwrap_or(&step.step),
-        title,
-        actor,
-        attempt,
-        queue
-    );
-    if let Some(reason) = &step.blocked_reason {
-        let _ = writeln!(output, "{indent}  reason: {reason}");
-    }
-    for blocker in &step.blockers {
-        let _ = writeln!(output, "{indent}  blocker: {blocker}");
-    }
-}
-
-fn graph_state_mark(status: &str) -> &'static str {
-    match status {
-        "completed" => "✓",
-        "working" | "verifying" => "▶",
-        "claimed" => "◉",
-        "ready" => "●",
-        "blocked" => "!",
-        "failed" => "✗",
-        "cancelled" => "×",
-        _ => "·",
-    }
-}
-
-fn is_active_graph_state(status: &str) -> bool {
-    matches!(
-        status,
-        "ready" | "claimed" | "working" | "verifying" | "blocked"
-    )
-}
-
-fn short_actor(actor: &str) -> &str {
-    actor.strip_prefix("agent/").unwrap_or(actor)
-}
-
-fn work_actor(step: &StepRunView) -> Option<&str> {
-    step.claimant
-        .as_deref()
-        .or(step.assigned_to.as_deref())
-        .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
-}
-
-fn format_elapsed(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
-}
-
-async fn run_quick(
-    client: &Client,
-    endpoint: Endpoint,
-    config: &Config,
-    args: QuickArgs,
-    driver: &str,
-    json_output: bool,
-) -> Result<()> {
-    let health: Value = client.get("/v1/health").await?;
-    let node = health
-        .get("node")
-        .and_then(Value::as_str)
-        .context("health lacks node")?;
-    let name = args.name.unwrap_or_else(generated_name);
-    let bus_id = if name.contains('.') {
-        name
-    } else {
-        format!("{node}.{name}")
-    };
-    let worktree = fs::canonicalize(&args.worktree)
-        .with_context(|| format!("resolve worktree {}", args.worktree.display()))?;
-    let mission_id = format!("standing/{bus_id}");
-    let kdl = quick_agent_intent(
-        &mission_id,
-        &bus_id,
-        &worktree,
-        driver,
-        args.model.as_deref(),
-        args.effort.as_deref(),
-    );
-    if args.print_kdl {
-        print!("{kdl}");
-        return Ok(());
-    }
-    let actor = args.actor.context("a quick agent needs --as or ST_AGENT")?;
-    let parsed = st3::parse_intent(&kdl, node)?;
-    let mission = parsed.missions[&mission_id].clone();
-    let mission_publication = publish_text(
-        client,
-        kdl,
-        format!("st3 {driver} {bus_id} mission"),
-        actor.clone(),
-    )
-    .await?;
-    let mut active: Vec<MissionRunView> = client
-        .get(&format!(
-            "/v1/mission-runs?mission={}",
-            urlencoding::encode(&mission_id)
-        ))
-        .await?;
-    anyhow::ensure!(
-        active.len() <= 1,
-        "standing mission `mission/{mission_id}` has more than one active run"
-    );
-    let mut cursor = mission_publication.store_index;
-    let run = if let Some(current) = active.pop() {
-        if current.revision != mission.revision {
-            let revision_id = format!("quick-{}", uuid::Uuid::now_v7().simple());
-            let revision_kdl = mission_revision_intent(
-                &current.subject,
-                &revision_id,
-                &mission_id,
-                &mission.revision,
-                &current.generation,
-                "the quick agent declaration changed",
-            );
-            let applied = publish_text(
-                client,
-                revision_kdl,
-                format!("st3 {driver} {bus_id} revision"),
-                actor.clone(),
-            )
-            .await?;
-            cursor = cursor.max(applied.store_index);
-            client
-                .get::<MissionRunView>(&format!(
-                    "/v1/mission-runs/{}",
-                    urlencoding::encode(&current.subject)
-                ))
-                .await?
-        } else {
-            current
-        }
-    } else {
-        let run_id = mission_id.clone();
-        let run_kdl = mission_run_intent(
-            &run_id,
-            &mission_id,
-            &mission.revision,
-            &worktree,
-            &normalize_requester_subject(&actor),
-            &BTreeMap::new(),
-            "run",
-        );
-        let applied = publish_text(
-            client,
-            run_kdl,
-            format!("st3 {driver} {bus_id} run"),
-            actor.clone(),
-        )
-        .await?;
-        cursor = cursor.max(applied.store_index);
-        client
-            .get::<MissionRunView>(&format!(
-                "/v1/mission-runs/{}",
-                urlencoding::encode(&format!("mission-run/{run_id}"))
-            ))
-            .await?
-    };
-    let subject = format!("agent/{}/{bus_id}", run.id);
-    let status: StatusResponse = client
-        .get(&format!(
-            "/v1/status?subject={}",
-            urlencoding::encode(&subject)
-        ))
-        .await?;
-    let ready = status.subjects.first().is_some_and(|subject| {
-        subject
-            .harness
-            .as_ref()
-            .is_some_and(st3::model::CurrentHarnessView::is_ready)
-    });
-    let incarnation_id = status.subjects.first().and_then(|subject| {
-        subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual))
-            .and_then(|actual| actual.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
-    let created = QuickAgentResponse {
-        subject,
-        mission: format!("mission/{mission_id}"),
-        mission_run: run.subject,
-        generation: run.generation,
-        runtime_id: format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', ".")),
-        event_cursor: cursor,
-        incarnation_id,
-        ready,
-    };
-    if json_output {
-        print_value(&created, true)?;
-    } else {
-        println!("waiting for {}", created.subject);
-    }
-    let mut cursor = created.event_cursor;
-    if created.incarnation_id.is_none() {
-        loop {
-            let events: Vec<EventRecord> = client
-                .get(&format!(
-                    "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
-                    urlencoding::encode(&created.subject)
-                ))
-                .await?;
-            let mut runtime_available = false;
-            for event in events {
-                cursor = cursor.max(event.store_index);
-                if event.kind == "runtime.observed"
-                    && event.body.pointer("/fields/status").and_then(Value::as_str)
-                        == Some("running")
-                    && event
-                        .body
-                        .pointer("/fields/incarnation_id")
-                        .and_then(Value::as_str)
-                        .is_some()
-                {
-                    runtime_available = true;
-                }
-                if matches!(
-                    event.kind.as_str(),
-                    "harness.diagnostic" | "daemon.diagnostic" | "runtime.action.failed"
-                ) {
-                    anyhow::bail!("{} became unreachable: {}", created.subject, event.body);
-                }
-            }
-            if runtime_available {
-                break;
-            }
-        }
-    }
-    let _ = endpoint;
-    let _ = config;
-    attach_terminal(client, &created.subject, false).await
-}
-
-fn quick_agent_intent(
-    mission_id: &str,
-    agent_id: &str,
-    worktree: &Path,
-    driver: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> String {
-    let mut harness_body = KdlDocument::new();
-    if let Some(model) = model {
-        harness_body.nodes_mut().push(kdl_node("model", [model]));
-    }
-    if let Some(effort) = effort {
-        harness_body.nodes_mut().push(kdl_node("effort", [effort]));
-    }
-    if driver == "claude" {
-        let mut development = KdlNode::new("dev-channels");
-        development.entries_mut().push(KdlEntry::new(true));
-        harness_body.nodes_mut().push(development);
-    }
-    let mut harness = KdlNode::new("harness");
-    harness.entries_mut().push(KdlEntry::new(driver));
-    harness.set_children(harness_body);
-
-    let mut agent = KdlNode::new("agent");
-    agent.entries_mut().push(KdlEntry::new(agent_id));
-    let mut agent_body = KdlDocument::new();
-    agent_body
-        .nodes_mut()
-        .push(kdl_node("identity", [agent_id]));
-    agent_body
-        .nodes_mut()
-        .push(kdl_node("workspace", [worktree.to_string_lossy().as_ref()]));
-    if driver == "claude" {
-        let mut environment = KdlNode::new("env");
-        let mut environment_body = KdlDocument::new();
-        environment_body
-            .nodes_mut()
-            .push(kdl_node("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK", ["1"]));
-        environment.set_children(environment_body);
-        agent_body.nodes_mut().push(environment);
-    }
-    agent_body.nodes_mut().push(harness);
-    agent.set_children(agent_body);
-
-    let mut mission = KdlNode::new("mission");
-    mission.entries_mut().push(KdlEntry::new(mission_id));
-    mission
-        .entries_mut()
-        .push(KdlEntry::new_prop("state", "ready"));
-    let mut mission_body = KdlDocument::new();
-    mission_body.nodes_mut().push(kdl_node(
-        "goal",
-        ["Keep the agent ready for work and conversation."],
-    ));
-    mission_body.nodes_mut().push(agent);
-    mission.set_children(mission_body);
-    publication_document(mission)
 }
 
 fn mission_revision_intent(
@@ -6266,7 +4128,7 @@ fn normalize_planning_requester(actor: &str) -> Result<String> {
     };
     anyhow::ensure!(
         actor.starts_with("person/"),
-        "a launch requester must be a person subject"
+        "a planning requester must be a person subject"
     );
     Ok(actor)
 }
@@ -7699,98 +5561,6 @@ fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
     }
 }
 
-fn combine_kdl_tree(root: &Path) -> Result<String> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "import root {} is not a directory",
-        root.display()
-    );
-    let mut files = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "import refuses symbolic link {}",
-            entry.path().display()
-        );
-        if metadata.is_file()
-            && entry.path().extension().and_then(|value| value.to_str()) == Some("kdl")
-        {
-            files.push(entry.path().to_path_buf());
-        } else if !metadata.is_dir() && !metadata.is_file() {
-            anyhow::bail!("import refuses special file {}", entry.path().display());
-        }
-    }
-    files.sort();
-    anyhow::ensure!(!files.is_empty(), "import root contains no .kdl files");
-    let mut children = KdlDocument::new();
-    for file in files {
-        let source = fs::read_to_string(&file)?;
-        let document: KdlDocument = source
-            .parse()
-            .with_context(|| format!("parse {}", file.display()))?;
-        st2::kdl_version::ensure_st3_version(&document)
-            .with_context(|| format!("check KDL version in {}", file.display()))?;
-        let declarations = document
-            .nodes()
-            .iter()
-            .filter(|node| node.name().value() != "version")
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            !declarations.is_empty(),
-            "{} contains no declarations",
-            file.display()
-        );
-        anyhow::ensure!(
-            declarations
-                .iter()
-                .all(|node| node.name().value() != "subgraph"),
-            "{} uses the removed subgraph wrapper",
-            file.display()
-        );
-        children
-            .nodes_mut()
-            .extend(declarations.into_iter().cloned());
-    }
-    let mut document = KdlDocument::new();
-    let mut version = KdlNode::new("version");
-    version.entries_mut().push(KdlEntry::new(2));
-    document.nodes_mut().push(version);
-    document
-        .nodes_mut()
-        .extend(children.nodes().iter().cloned());
-    document.autoformat();
-    Ok(document.to_string())
-}
-
-fn print_mission(response: &MissionResponse, json_output: bool) -> Result<()> {
-    if json_output {
-        return print_value(response, true);
-    }
-    for warning in &response.warnings {
-        eprintln!("warning: {warning}");
-    }
-    let normalized = response.normalized.to_string();
-    if response.resolved_intent.kdl != normalized {
-        println!("Resolved intent:\n{}", response.resolved_intent.kdl.trim());
-    }
-    for blocker in &response.blockers {
-        eprintln!("blocked: {blocker}");
-    }
-    if response.changes.is_empty() {
-        println!("No desired-state changes.");
-    } else {
-        for change in &response.changes {
-            println!("{} {}", change.change, change.subject);
-        }
-    }
-    for action in &response.predicted_actions {
-        println!("  {} {}", action.action, action.subject);
-    }
-    Ok(())
-}
-
 fn print_value(value: &impl serde::Serialize, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -7806,14 +5576,6 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
     hash.update(kdl.as_bytes());
     hash.update(serde_json::to_vec(tokens).expect("tokens serialize"));
     hex::encode(hash.finalize())
-}
-
-fn generated_name() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("session-{}-{millis}", std::process::id())
 }
 
 fn now_ms() -> u128 {
@@ -7842,24 +5604,6 @@ fn parse_peer(value: &str) -> Result<PeerConfig, String> {
         name: name.into(),
         url: url.into(),
     })
-}
-
-fn parse_env(value: &str) -> Result<(String, String), String> {
-    let (name, value) = value
-        .split_once('=')
-        .ok_or_else(|| "an environment value must use NAME=VALUE".to_owned())?;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err("an environment name is invalid".into());
-    }
-    Ok((name.into(), value.into()))
 }
 
 fn parse_input(value: &str) -> Result<(String, String), String> {
@@ -7994,6 +5738,68 @@ mod tests {
     }
 
     #[test]
+    fn removed_legacy_handlers_are_absent_from_cli_and_server_sources() {
+        let cli_source = include_str!("main.rs");
+        for handler in [
+            "run_preview",
+            "run_import",
+            "run_exec",
+            "run_logs",
+            "run_status",
+            "run_runtime",
+            "run_context",
+            "run_resource",
+            "run_review",
+            "run_gate_result",
+            "run_eval",
+            "run_graph",
+            "run_quick",
+        ] {
+            assert!(
+                !cli_source.contains(&format!("fn {handler}(")),
+                "legacy CLI handler {handler} remains compiled"
+            );
+        }
+        for command_type in [
+            "QuickArgs",
+            "PublishArgs",
+            "ImportArgs",
+            "ExecArgs",
+            "LogsArgs",
+            "StatusArgs",
+            "RuntimeCommand",
+            "ContextCommand",
+            "ResourceCommand",
+            "ReviewCommand",
+            "GateResultArgs",
+            "EvalArgs",
+            "GraphArgs",
+        ] {
+            assert!(
+                !cli_source.contains(&format!("struct {command_type}"))
+                    && !cli_source.contains(&format!("enum {command_type}")),
+                "legacy CLI type {command_type} remains compiled"
+            );
+        }
+
+        let server_source = include_str!("api.rs");
+        for handler in [
+            "watch_resource",
+            "unwatch_resource",
+            "refresh_resource",
+            "reset_runtime",
+            "quick_claude",
+            "quick_codex",
+            "start_mission_run",
+        ] {
+            assert!(
+                !server_source.contains(&format!("fn {handler}(")),
+                "legacy server handler {handler} remains compiled"
+            );
+        }
+    }
+
+    #[test]
     fn pty_attach_accepts_a_graph_subject() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -8052,18 +5858,6 @@ mod tests {
             panic!("the PTY attach command did not parse");
         };
         assert!(args.force);
-    }
-
-    #[test]
-    fn a_gate_result_uses_a_bounded_content_key() {
-        let reason = "evidence ".repeat(100);
-        let first = gate_result_idempotency_key("capability", "pass", &reason, &[]);
-        let retry = gate_result_idempotency_key("capability", "pass", &reason, &[]);
-        let changed = gate_result_idempotency_key("capability", "fail", &reason, &[]);
-
-        assert_eq!(first, retry);
-        assert_ne!(first, changed);
-        assert!(first.len() <= 512);
     }
 
     #[test]
@@ -8173,40 +5967,6 @@ mod tests {
             Command::Launch {
                 command: LaunchCommand::Show(_)
             }
-        ));
-    }
-
-    #[test]
-    fn exec_cli_builds_a_normal_st3_member() {
-        let source = exec_intent(
-            "cli-test",
-            "local",
-            Path::new("/work/tree"),
-            &[("MODE".into(), "test".into())],
-            &["printf".into(), "%s".into(), "hello".into()],
-        );
-        assert!(source.starts_with("version 2\n"));
-        let intent = st3::parse_intent(&source, "node").unwrap();
-        let mission = &intent.missions["exec/cli-test"];
-        assert!(matches!(
-            mission.completion,
-            Some(st3::model::CompletionSpec::AllStepsExhausted)
-        ));
-        let execution = mission.steps["execute"]
-            .declarations_kdl
-            .as_deref()
-            .unwrap();
-        assert!(execution.contains("exec cli-test"), "{execution}");
-        assert!(execution.contains("host local"));
-        assert!(execution.contains("workspace \"/work/tree\""));
-        assert!(execution.contains("cwd \"/work/tree\""));
-        assert!(execution.contains("argv printf %s hello"));
-        assert!(execution.contains("MODE test"));
-        assert!(execution.contains("restart never"));
-        assert!(matches!(
-            &mission.steps["execute"].gates[0],
-            st3::model::GateSpec::Field { subject, .. }
-                if subject == "exec/${ST_MISSION_RUN}/cli-test"
         ));
     }
 
@@ -8378,28 +6138,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_helpers_print_current_direct_kdl() {
-        let quick = quick_agent_intent(
-            "standing/example.worker",
-            "example.worker",
-            Path::new("/work/example"),
-            "codex",
-            None,
-            None,
-        );
-        let quick = st3::parse_intent(&quick, "node").unwrap();
-        assert!(quick.missions.contains_key("standing/example.worker"));
-
-        let quick_claude = quick_agent_intent(
-            "standing/example.claude",
-            "example.claude",
-            Path::new("/work/example"),
-            "claude",
-            None,
-            None,
-        );
-        assert!(quick_claude.contains("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK \"1\""));
-
+    fn canonical_intent_helpers_print_current_direct_kdl() {
         let message = message_mission_intent(
             "message/test",
             "test",
@@ -8412,31 +6151,6 @@ mod tests {
         );
         let message = st3::parse_intent(&message, "node").unwrap();
         assert!(message.missions.contains_key("message/test"));
-
-        let (watch, mission, resource) = resource_watch_intent(
-            "github.pull-request",
-            "example/project#1",
-            &["state".into()],
-            "person/operator",
-        )
-        .unwrap();
-        let watch = st3::parse_intent(&watch, "node").unwrap();
-        assert!(watch.missions.contains_key(&mission));
-        assert!(watch.subjects.contains_key(&resource));
-
-        let refresh = resource_refresh_intent("resource/example", "after-change", 30_000);
-        let refresh = st3::parse_intent(&refresh, "node").unwrap();
-        assert_eq!(refresh.resource_refreshes.len(), 1);
-
-        let reset = runtime_reset_intent(
-            "mission-run/example",
-            "retry",
-            "agent/worker",
-            "run-generation/01990000000070008000000000000000",
-            "retry the worker",
-        );
-        let reset = st3::parse_intent(&reset, "node").unwrap();
-        assert_eq!(reset.mission_runs["mission-run/example"].resets.len(), 1);
 
         let planning = planning_session_intent(
             "planning/example/01990000000070008000000000000000",
@@ -8823,188 +6537,6 @@ mod tests {
         assert!(mission_run_follow_succeeded("standing"));
         assert!(!mission_run_follow_succeeded("running"));
         assert!(!mission_run_follow_succeeded("failed"));
-    }
-
-    #[test]
-    fn eval_graph_renders_nested_state_and_semantic_transitions() {
-        let root_subject = "mission-run/root";
-        let parent_step = graph_step(
-            "step-run/root/rename",
-            root_subject,
-            "rename",
-            "working",
-            Some("agent/base"),
-        );
-        let root = graph_run(
-            root_subject,
-            root_subject,
-            None,
-            vec![
-                parent_step,
-                graph_step(
-                    "step-run/root/rename/work/inspect",
-                    root_subject,
-                    "rename/work/inspect",
-                    "completed",
-                    Some("agent/base"),
-                ),
-                graph_step(
-                    "step-run/root/rename/work/change",
-                    root_subject,
-                    "rename/work/change",
-                    "ready",
-                    Some("agent/base"),
-                ),
-            ],
-        );
-        let snapshot = EvalGraphSnapshot {
-            eval: EvalStatus {
-                mission_run: root_subject.into(),
-                lifecycle: "running".into(),
-                phase: "normal".into(),
-                active_steps: vec!["rename".into()],
-                verdict: None,
-                cleanup: "pending".into(),
-                store_index: 9,
-            },
-            runs: vec![root],
-        };
-        let transitions = vec![GraphTransition {
-            elapsed: Duration::from_secs(7),
-            label: "Change the package".into(),
-            from: "pending".into(),
-            to: "ready".into(),
-            assignee: Some("base".into()),
-        }];
-
-        let rendered = render_eval_graph(&snapshot, &transitions, Duration::from_secs(9));
-
-        assert!(rendered.contains("ST3 EVAL GRAPH  root"));
-        assert!(rendered.contains("STATE      running · normal"));
-        assert!(rendered.contains("1/3 completed · 1 ready · 1 active"));
-        assert!(rendered.contains("rename — Change the package · base"));
-        assert!(rendered.contains("↳ nested work · 1/2 completed"));
-        assert!(rendered.contains("inspect — Inspect the package · base"));
-        assert!(rendered.contains("00:07  Change the package: pending → ready · base"));
-    }
-
-    #[test]
-    fn eval_graph_records_only_changed_node_state() {
-        let previous = BTreeMap::from([(
-            "step-run/root/build".into(),
-            GraphNodeState {
-                label: "Build".into(),
-                state: "ready".into(),
-                assignee: Some("worker".into()),
-            },
-        )]);
-        let current = BTreeMap::from([(
-            "step-run/root/build".into(),
-            GraphNodeState {
-                label: "Build".into(),
-                state: "working".into(),
-                assignee: Some("worker".into()),
-            },
-        )]);
-        let mut transitions = Vec::new();
-
-        record_graph_transitions(
-            &previous,
-            &current,
-            Duration::from_secs(3),
-            &mut transitions,
-        );
-
-        assert_eq!(
-            transitions,
-            [GraphTransition {
-                elapsed: Duration::from_secs(3),
-                label: "Build".into(),
-                from: "ready".into(),
-                to: "working".into(),
-                assignee: Some("worker".into()),
-            }]
-        );
-    }
-
-    fn graph_run(
-        subject: &str,
-        root: &str,
-        parent_step_run: Option<&str>,
-        steps: Vec<StepRunView>,
-    ) -> MissionRunView {
-        MissionRunView {
-            subject: subject.into(),
-            id: subject
-                .strip_prefix("mission-run/")
-                .unwrap_or(subject)
-                .into(),
-            mission: "mission/work".into(),
-            generation: "run-generation/current".into(),
-            initial_revision: "initial-revision".into(),
-            revision: "revision".into(),
-            root_revision: "root-revision".into(),
-            root_mission_run: root.into(),
-            parent_step_run: parent_step_run.map(str::to_owned),
-            workspace: "/tmp/eval".into(),
-            requester: "person/eval-requester".into(),
-            inputs: BTreeMap::new(),
-            mode: "eval".into(),
-            timeout_ms: Some(1_200_000),
-            deadline_at_unix_ms: Some(1_200_001),
-            status: "running".into(),
-            phase: "normal".into(),
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-            steps,
-            loops: Vec::new(),
-        }
-    }
-
-    fn graph_step(
-        subject: &str,
-        run: &str,
-        step: &str,
-        status: &str,
-        assignee: Option<&str>,
-    ) -> StepRunView {
-        StepRunView {
-            subject: subject.into(),
-            run: run.into(),
-            generation: "run-generation/current".into(),
-            step: step.into(),
-            queue: None,
-            queue_position: None,
-            definition_hash: "definition".into(),
-            status: status.into(),
-            attempt: 1,
-            assigned_to: assignee.map(str::to_owned),
-            available_to: Vec::new(),
-            agentless: assignee.is_none(),
-            title: Some(match step.rsplit('/').next().unwrap_or(step) {
-                "rename" | "change" => "Change the package".into(),
-                "inspect" => "Inspect the package".into(),
-                _ => step.into(),
-            }),
-            goals: Vec::new(),
-            constraints: Vec::new(),
-            under: Vec::new(),
-            worker_reported: false,
-            claimant: None,
-            claim_incarnation: None,
-            claim_expires_at_unix_ms: None,
-            execution_started_at_unix_ms: None,
-            execution_elapsed_ms: 0,
-            timeout_ms: None,
-            ready_age_ms: None,
-            wake: None,
-            readiness_epoch: 1,
-            blocked_reason: None,
-            blockers: Vec::new(),
-            not_before_unix_ms: None,
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-        }
     }
 
     #[test]
