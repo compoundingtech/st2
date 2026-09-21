@@ -6,12 +6,90 @@ pub use contract::*;
 pub use generated::*;
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{
+    WebSocketStream, connect_async,
+    tungstenite::{Message as WsMessage, client::IntoClientRequest as _},
+};
+
+const HARD_MAX_RESPONSE_BYTES: usize = 1_048_576;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(35);
+const STREAM_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Resolve the local daemon socket in the same order as the `st3` CLI.
+///
+/// An explicit endpoint (including `ST3_ENDPOINT`, when the caller exposes it through clap) wins,
+/// followed by the normal st3 config file and then the XDG runtime/state defaults.
+pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, ClientError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+
+    let config_path = xdg_path("XDG_CONFIG_HOME", ".config")?
+        .join("st3")
+        .join("config.toml");
+    match std::fs::read_to_string(&config_path) {
+        Ok(document) => {
+            if let Some(socket) = configured_socket(&document)? {
+                return Ok(socket);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ClientError::Transport(format!(
+                "read st3 config {}: {error}",
+                config_path.display()
+            )));
+        }
+    }
+
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(runtime).join("st3.sock"));
+    }
+    Ok(xdg_path("XDG_STATE_HOME", ".local/state")?
+        .join("st3")
+        .join("run")
+        .join("st3.sock"))
+}
+
+fn configured_socket(document: &str) -> Result<Option<PathBuf>, ClientError> {
+    let config: toml::Value = toml::from_str(document)
+        .map_err(|error| ClientError::Protocol(format!("parse st3 config: {error}")))?;
+    match config.get("socket") {
+        None => Ok(None),
+        Some(toml::Value::String(socket)) if socket.is_empty() => Ok(None),
+        Some(toml::Value::String(socket)) => Ok(Some(PathBuf::from(socket))),
+        Some(_) => Err(ClientError::Protocol(
+            "parse st3 config: `socket` must be a path string".into(),
+        )),
+    }
+}
+
+fn xdg_path(variable: &str, home_suffix: &str) -> Result<PathBuf, ClientError> {
+    if let Some(value) = std::env::var_os(variable) {
+        return Ok(PathBuf::from(value));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(home_suffix))
+        .ok_or_else(|| {
+            ClientError::Transport(format!(
+                "cannot discover the st3 socket because neither {variable} nor HOME is set"
+            ))
+        })
+}
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
@@ -24,12 +102,19 @@ pub struct Client {
     endpoint: Endpoint,
     credential: Option<String>,
     http: reqwest::Client,
+    max_response_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalStreamBatch {
+    pub screen: Envelope<TerminalScreen>,
+    pub frames: Option<Envelope<TerminalFramePage>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("st3 client API error {0:?}: {1}")]
-    Api(ErrorCode, String, ErrorEnvelope),
+    Api(ErrorCode, String, Box<ErrorEnvelope>),
     #[error("st3 client transport error: {0}")]
     Transport(String),
     #[error("st3 client protocol error: {0}")]
@@ -42,6 +127,7 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             http: reqwest::Client::new(),
+            max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
         }
     }
 
@@ -50,11 +136,21 @@ impl Client {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: Some(credential.into()),
             http: reqwest::Client::new(),
+            max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
         }
     }
 
     pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {
-        self.get("/v1/client/capabilities").await
+        let envelope: Envelope<Capabilities> = self.get("/v1/client/capabilities").await?;
+        self.max_response_bytes.store(
+            envelope
+                .value
+                .limits
+                .max_response_bytes
+                .clamp(1, HARD_MAX_RESPONSE_BYTES),
+            Ordering::Relaxed,
+        );
+        Ok(envelope)
     }
     pub async fn list(
         &self,
@@ -92,14 +188,83 @@ impl Client {
         };
         self.get(&format!("/v1/client/{collection}/{id}")).await
     }
+    pub async fn launch_variants(
+        &self,
+        launch_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.launch_children(launch_id, "variants", cursor, limit)
+            .await
+    }
+    pub async fn launch_decisions(
+        &self,
+        launch_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.launch_children(launch_id, "decisions", cursor, limit)
+            .await
+    }
+    pub async fn launch_approvals(
+        &self,
+        launch_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.launch_children(launch_id, "approvals", cursor, limit)
+            .await
+    }
+    async fn launch_children(
+        &self,
+        launch_id: &str,
+        child: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let mut query = Vec::new();
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        self.get(&format!(
+            "/v1/client/launches/{}/{child}{suffix}",
+            launch_id.trim_start_matches("launch/")
+        ))
+        .await
+    }
     pub async fn timeline(
         &self,
         session_id: &str,
         limit: Option<usize>,
     ) -> Result<Envelope<TimelinePage>, ClientError> {
-        let suffix = limit
-            .map(|limit| format!("?limit={limit}"))
-            .unwrap_or_default();
+        self.timeline_page(session_id, None, limit).await
+    }
+    pub async fn timeline_page(
+        &self,
+        session_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<TimelinePage>, ClientError> {
+        let mut query = Vec::new();
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
         self.get(&format!(
             "/v1/client/sessions/{session_id}/timeline{suffix}"
         ))
@@ -169,7 +334,8 @@ impl Client {
         terminal_id: &str,
         after: Option<u64>,
         incarnation: Option<&str>,
-    ) -> Result<Envelope<TerminalFramePage>, ClientError> {
+        wait_ms: Option<u64>,
+    ) -> Result<TerminalStreamBatch, ClientError> {
         let mut query = Vec::new();
         if let Some(after) = after {
             query.push(format!("after={after}"));
@@ -182,11 +348,66 @@ impl Client {
         } else {
             format!("?{}", query.join("&"))
         };
-        self.get(&format!(
+        let path = format!(
             "/v1/client/terminals/{}/stream{suffix}",
             terminal_id.trim_start_matches("terminal/")
-        ))
-        .await
+        );
+        let wait = Duration::from_millis(wait_ms.unwrap_or_default().min(30_000));
+        match &self.endpoint {
+            Endpoint::Unix(socket) => {
+                let stream = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio::net::UnixStream::connect(socket),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("terminal stream connect deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                let request = websocket_request(&format!("ws://localhost{path}"), None)?;
+                let (websocket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio_tungstenite::client_async(request, stream),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("terminal WebSocket handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_terminal_subprotocol(&response)?;
+                read_terminal_stream(websocket, self.response_limit(), wait).await
+            }
+            Endpoint::FabricLoopback(base) => {
+                let websocket_base = if let Some(base) = base.strip_prefix("https://") {
+                    format!("wss://{base}")
+                } else if let Some(base) = base.strip_prefix("http://") {
+                    format!("ws://{base}")
+                } else {
+                    return Err(ClientError::Protocol(
+                        "Fabric loopback endpoint must use http or https".into(),
+                    ));
+                };
+                let request = websocket_request(
+                    &format!("{websocket_base}{path}"),
+                    self.credential.as_deref(),
+                )?;
+                let (websocket, response) =
+                    tokio::time::timeout(STREAM_HANDSHAKE_DEADLINE, connect_async(request))
+                        .await
+                        .map_err(|_| {
+                            ClientError::Transport(
+                                "terminal WebSocket handshake deadline exceeded".into(),
+                            )
+                        })?
+                        .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_terminal_subprotocol(&response)?;
+                read_terminal_stream(websocket, self.response_limit(), wait).await
+            }
+        }
+    }
+
+    fn response_limit(&self) -> usize {
+        self.max_response_bytes.load(Ordering::Relaxed)
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
@@ -207,40 +428,58 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<T, ClientError> {
-        let (status, bytes) = match &self.endpoint {
-            Endpoint::Unix(socket) => {
-                unix_request(socket, method, path, body, self.credential.as_deref()).await?
-            }
-            Endpoint::FabricLoopback(base) => {
-                let mut request = self.http.request(method, format!("{base}{path}"));
-                if let Some(credential) = &self.credential {
-                    request = request.bearer_auth(credential);
-                }
-                if let Some(body) = body {
-                    request = request
-                        .header("content-type", "application/json")
-                        .body(body);
-                }
-                let response = request
-                    .send()
+        let limit = self.response_limit();
+        let request = async {
+            match &self.endpoint {
+                Endpoint::Unix(socket) => {
+                    unix_request(
+                        socket,
+                        method,
+                        path,
+                        body,
+                        self.credential.as_deref(),
+                        limit,
+                    )
                     .await
-                    .map_err(|error| ClientError::Transport(error.to_string()))?;
-                let status = response.status().as_u16();
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| ClientError::Transport(error.to_string()))?
-                    .to_vec();
-                (status, bytes)
+                }
+                Endpoint::FabricLoopback(base) => {
+                    let mut request = self.http.request(method, format!("{base}{path}"));
+                    if let Some(credential) = &self.credential {
+                        request = request.bearer_auth(credential);
+                    }
+                    if let Some(body) = body {
+                        request = request
+                            .header("content-type", "application/json")
+                            .body(body);
+                    }
+                    let mut response = request
+                        .send()
+                        .await
+                        .map_err(|error| ClientError::Transport(error.to_string()))?;
+                    reject_large_content_length(response.content_length(), limit)?;
+                    let status = response.status().as_u16();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|error| ClientError::Transport(error.to_string()))?
+                    {
+                        append_bounded(&mut bytes, &chunk, limit)?;
+                    }
+                    Ok((status, bytes))
+                }
             }
         };
+        let (status, bytes) = tokio::time::timeout(REQUEST_DEADLINE, request)
+            .await
+            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))??;
         if !(200..300).contains(&status) {
             let error: ErrorEnvelope = serde_json::from_slice(&bytes)
                 .map_err(|decode| ClientError::Protocol(format!("HTTP {status}: {decode}")))?;
             return Err(ClientError::Api(
                 error.code.clone(),
                 error.message.clone(),
-                error,
+                Box::new(error),
             ));
         }
         serde_json::from_slice(&bytes).map_err(|error| ClientError::Protocol(error.to_string()))
@@ -253,6 +492,7 @@ async fn unix_request(
     path: &str,
     body: Option<Vec<u8>>,
     credential: Option<&str>,
+    limit: usize,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -281,15 +521,163 @@ async fn unix_request(
         )
         .await
         .map_err(|error| ClientError::Transport(error.to_string()))?;
+    reject_large_content_length(
+        response
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok()),
+        limit,
+    )?;
     let status = response.status().as_u16();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|error| ClientError::Transport(error.to_string()))?
-        .to_bytes()
-        .to_vec();
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| ClientError::Transport(error.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            append_bounded(&mut bytes, &data, limit)?;
+        }
+    }
     Ok((status, bytes))
+}
+
+fn reject_large_content_length(length: Option<u64>, limit: usize) -> Result<(), ClientError> {
+    if length.is_some_and(|length| length > limit as u64) {
+        return Err(ClientError::Protocol(format!(
+            "client-v0 response exceeds the negotiated {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn append_bounded(bytes: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), ClientError> {
+    if bytes.len().saturating_add(chunk.len()) > limit {
+        return Err(ClientError::Protocol(format!(
+            "client-v0 response exceeds the negotiated {limit}-byte limit"
+        )));
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn websocket_request(url: &str, credential: Option<&str>) -> Result<Request<()>, ClientError> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
+    request.headers_mut().insert(
+        hyper::header::SEC_WEBSOCKET_PROTOCOL,
+        hyper::header::HeaderValue::from_static(TERMINAL_SUBPROTOCOL),
+    );
+    if let Some(credential) = credential {
+        request.headers_mut().insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_str(&format!("Bearer {credential}"))
+                .map_err(|error| ClientError::Protocol(error.to_string()))?,
+        );
+    }
+    Ok(request)
+}
+
+fn validate_terminal_subprotocol(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Result<(), ClientError> {
+    let selected = response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok());
+    if selected != Some(TERMINAL_SUBPROTOCOL) {
+        return Err(ClientError::Protocol(format!(
+            "terminal WebSocket selected {selected:?}, expected {TERMINAL_SUBPROTOCOL}"
+        )));
+    }
+    Ok(())
+}
+
+async fn read_terminal_stream<S>(
+    mut websocket: WebSocketStream<S>,
+    limit: usize,
+    wait: Duration,
+) -> Result<TerminalStreamBatch, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let first = tokio::time::timeout(
+        STREAM_HANDSHAKE_DEADLINE,
+        next_websocket_payload(&mut websocket, limit),
+    )
+    .await
+    .map_err(|_| ClientError::Transport("terminal atomic-screen deadline exceeded".into()))??
+    .ok_or_else(|| {
+        ClientError::Protocol("terminal WebSocket closed before its atomic screen".into())
+    })?;
+    let first_value: serde_json::Value =
+        serde_json::from_slice(&first).map_err(|error| ClientError::Protocol(error.to_string()))?;
+    if first_value
+        .pointer("/value/kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("terminal-screen")
+    {
+        return Err(ClientError::Protocol(
+            "the first terminal WebSocket message is not an atomic screen".into(),
+        ));
+    }
+    let screen = serde_json::from_value(first_value)
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
+
+    let frames = if wait.is_zero() {
+        None
+    } else {
+        match tokio::time::timeout(wait, next_websocket_payload(&mut websocket, limit)).await {
+            Err(_) | Ok(Ok(None)) => None,
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(Some(bytes))) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
+                if value
+                    .pointer("/value/kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("terminal-frame-page")
+                {
+                    return Err(ClientError::Protocol(
+                        "terminal WebSocket message is not a frame page".into(),
+                    ));
+                }
+                Some(
+                    serde_json::from_value(value)
+                        .map_err(|error| ClientError::Protocol(error.to_string()))?,
+                )
+            }
+        }
+    };
+    let _ = websocket.close(None).await;
+    Ok(TerminalStreamBatch { screen, frames })
+}
+
+async fn next_websocket_payload<S>(
+    websocket: &mut WebSocketStream<S>,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let Some(message) = websocket.next().await else {
+            return Ok(None);
+        };
+        let message = message.map_err(|error| ClientError::Transport(error.to_string()))?;
+        let bytes = match message {
+            WsMessage::Text(text) => text.as_bytes().to_vec(),
+            WsMessage::Binary(bytes) => bytes.to_vec(),
+            WsMessage::Close(_) => return Ok(None),
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
+        };
+        if bytes.len() > limit {
+            return Err(ClientError::Protocol(format!(
+                "terminal WebSocket message exceeds the negotiated {limit}-byte limit"
+            )));
+        }
+        return Ok(Some(bytes));
+    }
 }
 
 fn percent_encode(value: &str) -> String {
@@ -303,4 +691,186 @@ fn percent_encode(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::SinkExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const EMPTY_PAGE: &str = r#"{
+        "api_version":"st3.client.v0",
+        "request_id":"request/test",
+        "snapshot":{
+            "id":"snapshot/test/1/a",
+            "host_id":"host/test",
+            "store_index":1,
+            "projection_version":"client-projection.v0",
+            "created_at":"2026-09-21T00:00:00Z"
+        },
+        "value":{
+            "kind":"resource-page",
+            "collection":"launch-children",
+            "items":[],
+            "page":{"limit":25,"has_more":false}
+        }
+    }"#;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_socket_uses_only_the_typed_config_path() {
+        assert_eq!(
+            configured_socket("node = 'local'\nsocket = '/tmp/st3.sock'\n").unwrap(),
+            Some(PathBuf::from("/tmp/st3.sock"))
+        );
+        assert_eq!(configured_socket("node = 'local'\n").unwrap(), None);
+        assert!(configured_socket("socket = 7\n").is_err());
+    }
+
+    #[test]
+    fn explicit_discovery_endpoint_has_absolute_precedence() {
+        let explicit = PathBuf::from("/tmp/explicit-st3.sock");
+        assert_eq!(
+            discover_unix_endpoint(Some(explicit.clone())).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn bounded_response_accumulation_rejects_declared_and_streamed_overflow() {
+        assert!(reject_large_content_length(Some(9), 8).is_err());
+        assert!(reject_large_content_length(Some(8), 8).is_ok());
+
+        let mut body = b"1234".to_vec();
+        append_bounded(&mut body, b"5678", 8).unwrap();
+        assert_eq!(body, b"12345678");
+        assert!(append_bounded(&mut body, b"9", 8).is_err());
+        assert_eq!(body, b"12345678");
+    }
+
+    #[test]
+    fn launch_child_methods_use_the_contract_routes_and_pagination_query() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("st3.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut request_lines = Vec::new();
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0, "request ended before its headers");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    request_lines.push(request.lines().next().unwrap().to_owned());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        EMPTY_PAGE.len(),
+                        EMPTY_PAGE
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                request_lines
+            });
+
+            let client = Client::unix(&socket);
+            client
+                .launch_variants("launch/release", Some("next page"), Some(25))
+                .await
+                .unwrap();
+            client
+                .launch_decisions("launch/release", None, None)
+                .await
+                .unwrap();
+            client
+                .launch_approvals("launch/release", None, Some(10))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                server.await.unwrap(),
+                [
+                    "GET /v1/client/launches/release/variants?cursor=next%20page&limit=25 HTTP/1.1",
+                    "GET /v1/client/launches/release/decisions HTTP/1.1",
+                    "GET /v1/client/launches/release/approvals?limit=10 HTTP/1.1",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn unix_terminal_stream_negotiates_protocol_and_forwards_resume_fence() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("st3.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        assert_eq!(
+                            request.uri().path_and_query().unwrap().as_str(),
+                            "/v1/client/terminals/release-shell/stream?after=40&incarnation=pty-4%3A2026-09-20T11%3A10%3A00Z"
+                        );
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+                                .unwrap(),
+                            TERMINAL_SUBPROTOCOL
+                        );
+                        response.headers_mut().insert(
+                            hyper::header::SEC_WEBSOCKET_PROTOCOL,
+                            hyper::header::HeaderValue::from_static(TERMINAL_SUBPROTOCOL),
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                websocket
+                    .send(WsMessage::Text(
+                        include_str!("../../../docs/st3/client-v0/fixtures/terminal-screen.json")
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                websocket
+                    .send(WsMessage::Text(
+                        include_str!("../../../docs/st3/client-v0/fixtures/terminal-frames.json")
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                websocket.close(None).await.unwrap();
+            });
+
+            let batch = Client::unix(&socket)
+                .terminal_frames(
+                    "terminal/release-shell",
+                    Some(40),
+                    Some("pty-4:2026-09-20T11:10:00Z"),
+                    Some(1_000),
+                )
+                .await
+                .unwrap();
+            assert_eq!(batch.screen.value.next_sequence, 41);
+            assert_eq!(batch.frames.unwrap().value.resume_sequence, 43);
+            server.await.unwrap();
+        });
+    }
 }

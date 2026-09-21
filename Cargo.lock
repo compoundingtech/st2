@@ -3034,6 +3034,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3044,6 +3045,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite 0.27.0",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
