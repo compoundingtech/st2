@@ -11187,7 +11187,7 @@ fn current_harness_at(
         if current.is_none()
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {
-            current = Some((state.to_owned(), claim, observed_at_unix_ms));
+            current = Some((state.to_owned(), claim, observed_at_unix_ms, store_index));
         }
         for name in [
             "driver",
@@ -11205,7 +11205,43 @@ fn current_harness_at(
             }
         }
     }
-    let Some((state, claim, observed_at_unix_ms)) = current else {
+    let work_activity = connection
+        .query_row(
+            "SELECT id, store_index, accepted_at_unix_ms FROM claims
+             WHERE actor=?1 AND store_index>?2 AND store_index<=?3
+               AND kind IN ('work.claimed','work.renewed','work.progress')
+               AND json_extract(body, '$.fields.claim_incarnation')=?4
+             ORDER BY store_index DESC LIMIT 1",
+            params![subject, runtime_index, at_index, incarnation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((claim, store_index, observed_at_unix_ms)) = work_activity
+        && current
+            .as_ref()
+            .is_none_or(|(_, _, _, harness_index)| store_index > *harness_index)
+    {
+        return Ok(Some(crate::model::CurrentHarnessView {
+            state: "working".into(),
+            driver: optional.remove("driver").flatten(),
+            incarnation_id: incarnation_id.to_owned(),
+            transport: optional.remove("transport").flatten(),
+            reason: None,
+            blocked_on: None,
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim,
+            observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
+        }));
+    }
+    let Some((state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
     Ok(Some(crate::model::CurrentHarnessView {
@@ -24300,6 +24336,86 @@ message "human-attention" {
         let actual = store.latest_actual_value(subject).unwrap().unwrap();
         assert!(actual.get("deadline_unix_ms").is_none());
         assert!(actual.get("reason").is_none());
+    }
+
+    #[test]
+    fn current_incarnation_work_activity_recovers_a_stale_harness_projection() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                    ("incarnation_id".into(), Value::String("current".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("activity-runtime".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("indeterminate".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("current".into())),
+                    ("reason".into(), Value::String("stale".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("activity-stale".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .current_harness(subject)
+                .unwrap()
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("stale")
+        );
+
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                "node",
+                "step-run/activity/work",
+                "work.claimed",
+                Some(subject),
+                &json!({"fields": {
+                    "status": "claimed",
+                    "attempt": 1,
+                    "readiness_epoch": 1,
+                    "claimant": subject,
+                    "claim_incarnation": "current",
+                    "claim_expires_at_unix_ms": now_ms().saturating_add(60_000),
+                    "worker_reported": false,
+                    "summary": null,
+                    "reason": null
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let recovered = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(recovered.state, "working");
+        assert!(recovered.is_ready());
+        assert_eq!(recovered.reason, None);
+        assert_eq!(recovered.driver.as_deref(), Some("codex"));
     }
 
     #[test]
