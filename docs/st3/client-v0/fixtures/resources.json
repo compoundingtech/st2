@@ -54,7 +54,8 @@
     "id": "work/release/1/build", "kind": "work", "revision": "w4", "updated_at": "2026-09-20T11:07:00Z",
     "mission_run_id": "mission-run/release/1", "generation_id": "run-generation/release/1/g1", "definition_id": "def-build",
     "path": "build", "state": "claimed", "attempt": 1, "readiness_epoch": 3, "claimant": "agent/release",
-    "claim_incarnation": "runtime-9:2026-09-20T11:06:30Z", "goals": ["Build artifacts"], "constraints": ["Use the pinned toolchain"]
+    "claim_incarnation": "runtime-9:2026-09-20T11:06:30Z", "blocked_reason": null, "blockers": [],
+    "goals": ["Build artifacts"], "constraints": ["Use the pinned toolchain"]
   },
   {
     "id": "agent/release", "kind": "agent", "revision": "ag3", "updated_at": "2026-09-20T11:08:00Z",

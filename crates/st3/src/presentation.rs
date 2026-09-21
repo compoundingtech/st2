@@ -612,6 +612,9 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "REASON     {reason}");
     }
+    for blocker in &step.blockers {
+        let _ = writeln!(output, "BLOCKER    {blocker}");
+    }
     if let Some(ready_age_ms) = step.ready_age_ms {
         let _ = writeln!(output, "READY AGE  {ready_age_ms}ms");
     }
@@ -1208,6 +1211,7 @@ mod tests {
             wake: None,
             readiness_epoch: 1,
             blocked_reason: None,
+            blockers: Vec::new(),
             not_before_unix_ms: None,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 2_000,

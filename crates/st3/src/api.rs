@@ -838,6 +838,8 @@ fn client_work_resources(
                 "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
                 "constraints": work.constraints,
+                "blocked_reason": work.blocked_reason,
+                "blockers": work.blockers,
                 "usage": usage,
                 "operational": operational
             }))

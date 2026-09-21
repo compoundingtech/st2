@@ -413,6 +413,9 @@ pub struct Work {
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
     #[serde(default)]
     pub goals: Vec<String>,
     #[serde(default)]

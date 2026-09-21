@@ -6,7 +6,8 @@
 //! ownership. A later retry uses the same adjacent-observation requirement.
 //!
 //! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
-//! never pastes the same notice again while that transport attempt remains owned.
+//! never pastes the same notice again while that transport attempt remains owned. An archive
+//! receipt cancels ownership before Return and prevents startup re-adoption.
 //! PTY or Return success is not delivery: a harness adapter must positively classify the expected
 //! notice text in its submitted-prompt or queued-message pattern while the live composer is empty.
 //! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
@@ -28,7 +29,9 @@ mod harness;
 use crate::message::{self, Message};
 use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
-use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, chain_bus_ids, resolve_spec};
+#[cfg(test)]
+use crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT;
+use crate::supervisor_chain::{chain_bus_ids, resolve_spec};
 
 use composer::{ComposerState, classify_composer, classify_located_composer, classify_receipt};
 use harness::ReceiptState;
@@ -250,6 +253,9 @@ pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
 pub enum PokeOutcome {
     Delivered,
     Staged,
+    /// The underlying message was archived after staging but before Return. The exact payload is
+    /// no longer actionable and must never be submitted or re-adopted.
+    Cancelled,
     /// A maintained adapter positively proved that the exact staged notice is absent. Queue state
     /// decides whether an archive receipt makes that proof sufficient to relinquish ownership.
     NotRetained,
@@ -323,12 +329,55 @@ pub struct FlushReport {
     pub deferred: Option<DeferralReason>,
 }
 
+#[derive(Debug)]
+struct DeliveryArchived;
+
+impl std::fmt::Display for DeliveryArchived {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the notice was archived before submission")
+    }
+}
+
+impl std::error::Error for DeliveryArchived {}
+
+fn run_submit_fence(
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Option<PokeOutcome>> {
+    match before_submit() {
+        Ok(()) => Ok(None),
+        Err(error) if error.downcast_ref::<DeliveryArchived>().is_some() => {
+            Ok(Some(PokeOutcome::Cancelled))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
 /// real `pty`.
 pub trait Poker {
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
+    fn poke_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.poke(text)
+    }
     fn retry_staged(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
         Ok(PokeOutcome::Deferred(DeferralReason::NoInputPerformed))
+    }
+    fn retry_staged_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.retry_staged(text)
     }
     fn adopt_staged(&self, _candidates: &[String]) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -406,6 +455,17 @@ impl Poker for PtyPoker {
         self.poke_with(text, &mut || Ok(()))
     }
 
+    fn poke_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.poke_with(text, before_submit)
+    }
+
     fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
         retry_staged_with_window(
             text,
@@ -413,6 +473,24 @@ impl Poker for PtyPoker {
             &mut || self.run(pty_submit_args(&self.session), "send"),
             &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
             &mut || Ok(()),
+            COMPOSER_OBSERVATION_WINDOW,
+        )
+    }
+
+    fn retry_staged_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        retry_staged_with_window(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
+            before_submit,
             COMPOSER_OBSERVATION_WINDOW,
         )
     }
@@ -502,7 +580,9 @@ fn transport_and_observe_with_window(
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     observation_window: Duration,
 ) -> anyhow::Result<PokeOutcome> {
-    before_submit()?;
+    if let Some(outcome) = run_submit_fence(before_submit)? {
+        return Ok(outcome);
+    }
     // Preserve the accepted transport-first transaction. Once it starts, any command or
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
@@ -603,9 +683,15 @@ fn submit_retained_after_final_observation(
             return Ok(PokeOutcome::Staged);
         }
     }
-    if let Err(error) = before_submit() {
-        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
-        return Ok(PokeOutcome::Staged);
+    match run_submit_fence(before_submit) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "st2 ding: pre-submit receipt failed; retaining staged ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
     }
     if let Err(error) = submit() {
         tracing::warn!(
@@ -726,9 +812,15 @@ fn submit_after_final_observation(
             return Ok(PokeOutcome::Staged);
         }
     }
-    if let Err(error) = before_submit() {
-        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
-        return Ok(PokeOutcome::Staged);
+    match run_submit_fence(before_submit) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "st2 ding: pre-submit receipt failed; retaining staged ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
     }
     if let Err(error) = submit() {
         tracing::warn!(
@@ -847,9 +939,29 @@ enum PendingNotice {
         in_inbox: bool,
         staged_text: Option<String>,
     },
-    /// Exact composer text adopted on sidecar startup. The ordinary recovery notice remains behind
-    /// it so any other unread backlog is still coalesced after this owned payload resolves.
-    Adopted { staged_text: Option<String> },
+}
+
+#[derive(Clone)]
+enum NoticeFence {
+    Recovery(HashSet<String>),
+    Message(String),
+}
+
+impl NoticeFence {
+    fn check(&self, inbox_dir: &Path) -> anyhow::Result<()> {
+        let current = message::list_inbox(inbox_dir)?;
+        let actionable = match self {
+            Self::Recovery(startup) => current
+                .iter()
+                .any(|message| startup.contains(&message.filename)),
+            Self::Message(filename) => current.iter().any(|message| message.filename == *filename),
+        };
+        if actionable {
+            Ok(())
+        } else {
+            Err(DeliveryArchived.into())
+        }
+    }
 }
 
 impl PendingNotice {
@@ -866,46 +978,41 @@ impl PendingNotice {
                 context.recipient,
                 message,
             ),
-            Self::Adopted {
-                staged_text: Some(text),
-            } => text.clone(),
-            Self::Adopted { staged_text: None } => String::new(),
         }
     }
 
     fn staged_text(&self) -> Option<&str> {
         match self {
-            Self::Recovery { staged_text, .. }
-            | Self::Message { staged_text, .. }
-            | Self::Adopted { staged_text } => staged_text.as_deref(),
+            Self::Recovery { staged_text, .. } | Self::Message { staged_text, .. } => {
+                staged_text.as_deref()
+            }
         }
     }
 
     fn set_staged_text(&mut self, value: Option<String>) {
         match self {
-            Self::Recovery { staged_text, .. }
-            | Self::Message { staged_text, .. }
-            | Self::Adopted { staged_text } => *staged_text = value,
+            Self::Recovery { staged_text, .. } | Self::Message { staged_text, .. } => {
+                *staged_text = value
+            }
         }
     }
 
     fn in_inbox(&self) -> bool {
         match self {
             Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => *in_inbox,
-            Self::Adopted { .. } => false,
         }
     }
 
     fn is_archived(&self) -> bool {
         match self {
             Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => !*in_inbox,
-            Self::Adopted { .. } => false,
         }
     }
 
-    fn adopted(text: String) -> Self {
-        Self::Adopted {
-            staged_text: Some(text),
+    fn fence(&self) -> NoticeFence {
+        match self {
+            Self::Recovery { startup, .. } => NoticeFence::Recovery(startup.clone()),
+            Self::Message { message, .. } => NoticeFence::Message(message.filename.clone()),
         }
     }
 
@@ -972,6 +1079,25 @@ pub struct DingContext<'a> {
     pub recipient: &'a str,
 }
 
+fn active_startup_candidates(
+    context: DingContext<'_>,
+    inbox_dir: &Path,
+) -> Vec<(String, Option<Message>)> {
+    let messages = message::list_inbox(inbox_dir).unwrap_or_default();
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let resolver = RelationshipResolver::read(context.catalog_root);
+    std::iter::once((RECOVERY_POKE.to_string(), None))
+        .chain(messages.into_iter().map(|message| {
+            (
+                poke_text_with_resolver(&resolver, context.this_host, context.recipient, &message),
+                Some(message),
+            )
+        }))
+        .collect()
+}
+
 impl Default for DingConfig {
     fn default() -> Self {
         Self {
@@ -1005,14 +1131,7 @@ pub fn run_ding(
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
-    let mut startup_candidates = (!backlog.is_empty()).then(|| {
-        let resolver = RelationshipResolver::read(context.catalog_root);
-        std::iter::once(RECOVERY_POKE.to_string())
-            .chain(backlog.iter().map(|message| {
-                poke_text_with_resolver(&resolver, context.this_host, context.recipient, message)
-            }))
-            .collect::<Vec<_>>()
-    });
+    let mut startup_adoption_pending = !backlog.is_empty();
     let mut pending = VecDeque::new();
     if !backlog.is_empty() {
         pending.push_back(PendingNotice::Recovery {
@@ -1069,30 +1188,55 @@ pub fn run_ding(
             let delivery_due =
                 next_delivery_attempt.is_none_or(|deadline| Instant::now() >= deadline);
             if delivery_due && !delivery_suppressed(status_path) {
-                if let Some(candidates) = startup_candidates.as_ref() {
-                    match poker.adopt_staged(candidates) {
-                        Ok(Some(text)) => {
-                            if text == RECOVERY_POKE {
-                                if let Some(recovery) = pending
-                                    .iter_mut()
-                                    .find(|notice| matches!(notice, PendingNotice::Recovery { .. }))
+                if startup_adoption_pending {
+                    let candidates = active_startup_candidates(context, inbox_dir);
+                    let texts = candidates
+                        .iter()
+                        .map(|(text, _)| text.clone())
+                        .collect::<Vec<_>>();
+                    if texts.is_empty() {
+                        startup_adoption_pending = false;
+                    } else {
+                        match poker.adopt_staged(&texts) {
+                            Ok(Some(text)) => {
+                                if text == RECOVERY_POKE {
+                                    if let Some(recovery) = pending.iter_mut().find(|notice| {
+                                        matches!(notice, PendingNotice::Recovery { .. })
+                                    }) {
+                                        recovery.set_staged_text(Some(text));
+                                    }
+                                } else if let Some((_, Some(message))) = candidates
+                                    .into_iter()
+                                    .find(|(candidate, _)| *candidate == text)
                                 {
-                                    recovery.set_staged_text(Some(text));
+                                    let filename = message.filename.clone();
+                                    for notice in &mut pending {
+                                        if let PendingNotice::Recovery {
+                                            startup, in_inbox, ..
+                                        } = notice
+                                        {
+                                            startup.remove(&filename);
+                                            *in_inbox = !startup.is_empty();
+                                        }
+                                    }
+                                    let mut adopted = PendingNotice::message(message);
+                                    adopted.set_staged_text(Some(text));
+                                    pending.push_front(adopted);
                                 }
-                            } else {
-                                pending.push_front(PendingNotice::adopted(text));
+                                startup_adoption_pending = false;
                             }
-                            startup_candidates = None;
-                        }
-                        Ok(None) => startup_candidates = None,
-                        Err(error) => {
-                            tracing::warn!(
-                                "st2 ding: startup staged-notice adoption failed: {error}"
-                            )
+                            Ok(None) => startup_adoption_pending = false,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "st2 ding: startup staged-notice adoption failed: {error}"
+                                )
+                            }
                         }
                     }
                 }
-                let report = flush_pending(context, status_path, &mut pending, poker);
+                prune_archived_pending(inbox_dir, &mut pending);
+                let report =
+                    flush_pending_inbox(context, status_path, &mut pending, poker, Some(inbox_dir));
                 if deferrals.observe(report.deferred)
                     && let Some(reason) = report.deferred
                 {
@@ -1101,7 +1245,7 @@ pub fn run_ding(
                         context.recipient
                     );
                 }
-                next_delivery_attempt = (startup_candidates.is_some() || !pending.is_empty())
+                next_delivery_attempt = (startup_adoption_pending || !pending.is_empty())
                     .then(|| Instant::now() + DELIVERY_RETRY_BACKOFF);
             }
         } else if !watch.seen_alive && !logged_waiting {
@@ -1145,23 +1289,33 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingNotice
             } => {
                 *in_inbox = filenames.contains(message.filename.as_str());
             }
-            PendingNotice::Adopted { .. } => {}
         }
     }
-    // A paste that already started stays owned across an archive race. It is never pasted again;
-    // the inspect-only retry either submits the exact safe payload or proves ownership disappeared.
-    pending.retain(|notice| notice.staged_text().is_some() || notice.in_inbox());
+    // Archive/read/close is a hard no-new-delivery fence. A staged payload may remain visible in
+    // the composer, but this sidecar relinquishes it and never sends Return or re-adopts it.
+    pending.retain(PendingNotice::in_inbox);
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
     status_path.is_some_and(|path| status::read_state(path) == status::State::Dnd)
 }
 
+#[cfg(test)]
 fn flush_pending(
     context: DingContext<'_>,
     status_path: Option<&Path>,
     pending: &mut VecDeque<PendingNotice>,
     poker: &dyn Poker,
+) -> FlushReport {
+    flush_pending_inbox(context, status_path, pending, poker, None)
+}
+
+fn flush_pending_inbox(
+    context: DingContext<'_>,
+    status_path: Option<&Path>,
+    pending: &mut VecDeque<PendingNotice>,
+    poker: &dyn Poker,
+    inbox_dir: Option<&Path>,
 ) -> FlushReport {
     let mut report = FlushReport::default();
     if delivery_suppressed(status_path) {
@@ -1171,16 +1325,24 @@ fn flush_pending(
     let mut resolver = None;
 
     while let Some(notice) = pending.front_mut() {
+        let fence = notice.fence();
         let staged = notice.staged_text().map(str::to_string);
         let was_staged = staged.is_some();
         let text = staged.unwrap_or_else(|| notice.text(context, &mut resolver));
+        let mut before_submit = || {
+            if let Some(inbox_dir) = inbox_dir {
+                fence.check(inbox_dir)
+            } else {
+                Ok(())
+            }
+        };
         let outcome = if was_staged {
-            poker.retry_staged(&text)
+            poker.retry_staged_guarded(&text, &mut before_submit)
         } else {
-            poker.poke(&text)
+            poker.poke_guarded(&text, &mut before_submit)
         };
         match outcome {
-            Ok(PokeOutcome::Delivered) => {
+            Ok(PokeOutcome::Delivered | PokeOutcome::Cancelled) => {
                 pending.pop_front();
             }
             Ok(PokeOutcome::Staged) => {

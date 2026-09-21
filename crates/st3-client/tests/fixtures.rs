@@ -89,6 +89,15 @@ fn generated_resource_union_decodes_all_kinds() {
     );
     assert_eq!(visualization.diffs[0].changes.len(), 1);
     assert_eq!(visualization.swimlanes[0].nodes, ["step/build"]);
+    let work = resources
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Work(work) => Some(work),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(work.blocked_reason, None);
+    assert!(work.blockers.is_empty());
 }
 
 #[test]

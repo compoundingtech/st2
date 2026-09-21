@@ -4210,6 +4210,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         wake: None,
                         readiness_epoch: 0,
                         blocked_reason: None,
+                        blockers: Vec::new(),
                         not_before_unix_ms: None,
                         created_at_unix_ms: run.created_at_unix_ms,
                         updated_at_unix_ms: run.updated_at_unix_ms,
@@ -12171,6 +12172,143 @@ mission "work-alert" state="ready" {
     }
 
     #[test]
+    fn unresolved_external_attention_suppresses_ready_work_wakes_until_resolved() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "ios-owner" { workspace "/tmp"; command "true" }
+mission "ios-proof-blocked" state="ready" {
+  goal "Run the simulator proof."
+  step "automated-proof" { assigned-to "agent/node.ios-owner" }
+}
+"#;
+        apply_source(&store, source, "ios-proof-blocked-mission");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "ios-proof-blocked".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "ios-proof-blocked-run".into(),
+            })
+            .unwrap();
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.ios-owner")
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("ios-owner-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime,
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let subject = run.steps[0].subject.clone();
+        let work = |key: &str, reason: Option<&str>| crate::model::WorkRequest {
+            actor: Some("agent/node.ios-owner".into()),
+            incarnation: Some("ios-owner-one".into()),
+            summary: None,
+            reason: reason.map(str::to_owned),
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&subject, "claim", &work("ios-proof-claim", None))
+            .unwrap();
+        let attention = store
+            .request_attention(
+                "attention/ios-proof-xcode",
+                &crate::model::AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reason: "CoreSimulator cannot start until the privileged repair runs.".into(),
+                    severity: "error".into(),
+                    targets: vec!["host/silber".into(), subject.clone()],
+                    actor: "agent/node.ios-owner".into(),
+                    idempotency_key: "ios-proof-xcode-attention".into(),
+                },
+            )
+            .unwrap();
+        store
+            .work_action(
+                &subject,
+                "release",
+                &work(
+                    "ios-proof-release",
+                    Some(
+                        "A privileged Xcode repair is required; an idle lease would be misleading.",
+                    ),
+                ),
+            )
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("ios-owner-one".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("ios-owner-ready".into()),
+            })
+            .unwrap();
+
+        for _ in 0..2 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        assert!(
+            store
+                .messages(Some("agent/node.ios-owner"), true)
+                .unwrap()
+                .is_empty(),
+            "a blocked step must not emit a ready-work wake"
+        );
+
+        store
+            .resolve_attention(
+                &attention.subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "resolved".into(),
+                    reason: Some("Xcode simulator components are healthy.".into()),
+                    actor: "person/nathan".into(),
+                    idempotency_key: "ios-proof-xcode-resolved".into(),
+                },
+            )
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "ready");
+        assert_eq!(
+            store
+                .messages(Some("agent/node.ios-owner"), true)
+                .unwrap()
+                .len(),
+            1,
+            "resolving the external blocker must reopen one readiness wake"
+        );
+    }
+
+    #[test]
     fn inherited_nested_work_keeps_one_parent_alert() {
         let step = |subject: &str, path: &str, assignee: &str| crate::model::StepRunView {
             subject: subject.into(),
@@ -12200,6 +12338,7 @@ mission "work-alert" state="ready" {
             wake: None,
             readiness_epoch: 1,
             blocked_reason: None,
+            blockers: Vec::new(),
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

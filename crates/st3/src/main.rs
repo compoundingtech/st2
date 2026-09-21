@@ -5686,6 +5686,9 @@ fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str) {
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "{indent}  reason: {reason}");
     }
+    for blocker in &step.blockers {
+        let _ = writeln!(output, "{indent}  blocker: {blocker}");
+    }
 }
 
 fn graph_state_mark(status: &str) -> &'static str {
@@ -8732,6 +8735,7 @@ mod tests {
             wake: None,
             readiness_epoch: 1,
             blocked_reason: None,
+            blockers: Vec::new(),
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

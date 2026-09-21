@@ -416,6 +416,8 @@
             "readiness_epoch": { "type": "integer", "minimum": 0 },
             "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "claim_incarnation": { "type": ["string", "null"] },
+            "blocked_reason": { "type": ["string", "null"] },
+            "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "goals": { "type": "array", "items": { "type": "string" } },
             "constraints": { "type": "array", "items": { "type": "string" } }
             ,"usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }

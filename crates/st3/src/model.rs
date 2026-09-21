@@ -1716,6 +1716,8 @@ pub struct StepRunView {
     pub wake: Option<WorkWakeView>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,

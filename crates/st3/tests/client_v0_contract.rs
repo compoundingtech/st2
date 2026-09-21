@@ -1179,6 +1179,127 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
 }
 
 #[tokio::test]
+async fn client_work_projection_exposes_external_blocker_and_reopens_after_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"
+version 2
+mission "ios-proof" state="ready" {
+  goal "Run the physical simulator proof."
+  step "automated-proof" { assigned-to "agent/ios-owner" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "client-blocker-mission")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "ios-proof".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/nathan".into()),
+            mode: Some("run".into()),
+            inputs: std::collections::BTreeMap::new(),
+            idempotency_key: "client-blocker-run".into(),
+        })
+        .unwrap();
+    let subject = run.steps[0].subject.clone();
+    state.store.set_step_state(&subject, "ready", None).unwrap();
+    let request = |key: &str, reason: Option<&str>| st3::model::WorkRequest {
+        actor: Some("agent/client-v0-baseline.ios-owner".into()),
+        incarnation: Some("ios-owner-one".into()),
+        summary: None,
+        reason: reason.map(str::to_owned),
+        evidence: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    state
+        .store
+        .work_action(&subject, "claim", &request("client-blocker-claim", None))
+        .unwrap();
+    let attention = state
+        .store
+        .request_attention(
+            "attention/client-silber-xcode",
+            &st3::model::AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: "Silber needs its Xcode simulator components updated".into(),
+                reason: "CoreSimulator is unavailable.".into(),
+                severity: "error".into(),
+                targets: vec!["host/silber".into(), subject.clone()],
+                actor: "agent/client-v0-baseline.ios-owner".into(),
+                idempotency_key: "client-silber-xcode".into(),
+            },
+        )
+        .unwrap();
+    let reason = "Silber requires a privileged Xcode first-launch repair.";
+    state
+        .store
+        .work_action(
+            &subject,
+            "release",
+            &request("client-blocker-release", Some(reason)),
+        )
+        .unwrap();
+
+    let app = st3::api::router(state.clone());
+    let (status, response) = client_json(app.clone(), "/v1/client/work").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let item = response["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == subject)
+        .unwrap();
+    assert_eq!(item["state"], "blocked");
+    assert_eq!(item["blocked_reason"], reason);
+    assert_eq!(item["blockers"], serde_json::json!([attention.subject]));
+    assert_eq!(item["operational"]["actionable"], false);
+    assert!(
+        item["operational"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("external-blocker".into()))
+    );
+
+    state
+        .store
+        .resolve_attention(
+            "attention/client-silber-xcode",
+            &st3::model::AttentionResolveRequest {
+                outcome: "resolved".into(),
+                reason: Some("The simulator runtime is available.".into()),
+                actor: "person/nathan".into(),
+                idempotency_key: "client-silber-resolved".into(),
+            },
+        )
+        .unwrap();
+    let (_, response) = client_json(app, "/v1/client/work").await;
+    let item = response["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == subject)
+        .unwrap();
+    assert_eq!(item["state"], "ready");
+    assert_eq!(item["blocked_reason"], Value::Null);
+    assert_eq!(item["blockers"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn stopped_agents_are_annotated_history_not_default_membership() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

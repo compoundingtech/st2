@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::{archive_dir, archive_msg, inbox_dir, send_to_inbox};
+use std::cell::RefCell;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -1388,6 +1389,108 @@ fn startup_adopts_only_an_exact_recovery_or_backlog_composer() {
 }
 
 #[test]
+fn archive_between_startup_seed_and_adoption_removes_every_stale_candidate() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("stale"), None, &[], "body").unwrap();
+    let context = DingContext {
+        catalog_root: agent.path(),
+        this_host: "h",
+        recipient: "h.recipient",
+    };
+    let seeded = active_startup_candidates(context, &inbox);
+    let stale_text = seeded
+        .iter()
+        .find_map(|(text, message)| message.as_ref().map(|_| text.clone()))
+        .unwrap();
+    assert!(
+        exact_staged_candidate(&staged_codex_screen(&stale_text), &[stale_text.clone()]).is_some()
+    );
+
+    archive_msg(&inbox, &archive, &filename).unwrap();
+    let candidates = active_startup_candidates(context, &inbox);
+    assert!(candidates.is_empty());
+    assert!(
+        exact_staged_candidate(
+            &staged_codex_screen(&stale_text),
+            &candidates
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        )
+        .is_none(),
+        "an archive after startup seeding is a hard no-adopt fence"
+    );
+}
+
+#[test]
+fn archive_between_paste_and_submit_cancels_return() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("race"), None, &[], "body").unwrap();
+    let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
+    let text = render_without_catalog(&message);
+    let fence = PendingNotice::message(message).fence();
+    let screens = RefCell::new(VecDeque::from([
+        idle_codex_screen(),
+        staged_codex_screen(&text),
+        staged_codex_screen(&text),
+    ]));
+    let submits = RefCell::new(0);
+    let outcome = observed_poke_with_window(
+        &text,
+        &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+        &mut || Ok(()),
+        &mut || {
+            *submits.borrow_mut() += 1;
+            Ok(())
+        },
+        &mut || {},
+        &mut || {
+            archive_msg(&inbox, &archive, &filename)?;
+            fence.check(&inbox)
+        },
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(outcome, PokeOutcome::Cancelled);
+    assert_eq!(*submits.borrow(), 0, "Return was never sent");
+}
+
+#[test]
+fn archived_notice_is_not_readopted_after_sidecar_restart_or_replay() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("restart"), None, &[], "body").unwrap();
+    let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
+    let stable_text = render_without_catalog(&message);
+    archive_msg(&inbox, &archive, &filename).unwrap();
+    std::fs::copy(archive.join(&filename), inbox.join(&filename)).unwrap();
+
+    let context = DingContext {
+        catalog_root: agent.path(),
+        this_host: "h",
+        recipient: "h.recipient",
+    };
+    let candidates = active_startup_candidates(context, &inbox);
+    assert!(candidates.is_empty());
+    assert!(new_arrivals(&inbox, &mut HashSet::new()).is_empty());
+    assert!(
+        exact_staged_candidate(
+            &staged_codex_screen(&stable_text),
+            &candidates
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn paste_then_two_exact_observations_precede_return() {
     use std::cell::RefCell;
 
@@ -1916,7 +2019,7 @@ fn new_arrivals_is_fifo_and_archive_receipts_prevent_reding() {
 }
 
 #[test]
-fn staged_ownership_survives_archive_and_never_repastes() {
+fn archive_cancels_staged_ownership_without_submit_or_repaste() {
     let agent = tempfile::tempdir().unwrap();
     let inbox = inbox_dir(agent.path());
     let archive = archive_dir(agent.path());
@@ -1928,10 +2031,7 @@ fn staged_ownership_survives_archive_and_never_repastes() {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
         poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([
-            PokeOutcome::Staged,
-            PokeOutcome::Delivered,
-        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
 
     flush_without_catalog(None, &mut pending, &poker);
@@ -1940,21 +2040,10 @@ fn staged_ownership_survives_archive_and_never_repastes() {
 
     archive_msg(&inbox, &archive, &filename).unwrap();
     prune_archived_pending(&inbox, &mut pending);
-    assert_eq!(
-        pending.len(),
-        1,
-        "an already-started paste remains inspection-owned across archive"
-    );
-
+    assert!(pending.is_empty(), "archive is a hard no-submit fence");
     flush_without_catalog(None, &mut pending, &poker);
-    assert_eq!(pending.len(), 1);
-    flush_without_catalog(None, &mut pending, &poker);
-    assert!(pending.is_empty());
     assert_eq!(poker.pokes.lock().unwrap().as_slice(), [expected.as_str()]);
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [expected.as_str(), expected.as_str()]
-    );
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 // -----------------------------------------------------------------------------------------
@@ -2013,9 +2102,7 @@ fn flush_in(root: &Path, pending: &mut VecDeque<PendingNotice>, poker: &dyn Poke
 }
 
 /// The race: the producer supersedes event N *while DING owns N's staged payload*. The
-/// existing ownership rules must carry it — N is pasted exactly once and never again, the
-/// archived-and-not-retained head releases FIFO, and N+1 still delivers. Nothing about
-/// `flush_pending` or `prune_archived_pending` changes to make this true.
+/// archive receipt hard-cancels N before Return, N is never pasted again, and N+1 still delivers.
 #[test]
 fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_delivers() {
     let (catalog, inbox) = event_catalog();
@@ -2047,7 +2134,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
             // the successor, once ownership of the superseded head is released
             PokeOutcome::Delivered,
         ])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     // DING stages the failure notice and owns it.
     let stage_only = OwnershipPoker {
@@ -2073,8 +2160,8 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
     prune_archived_pending(&inbox, &mut pending);
     assert_eq!(
         pending.len(),
-        2,
-        "the staged-but-archived head keeps ownership; the successor queues behind it"
+        1,
+        "the archived head is cancelled and the successor remains actionable"
     );
 
     flush_in(root, &mut pending, &poker);
@@ -2095,11 +2182,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
         1,
         "and the only fresh paste after supersede is the successor"
     );
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the superseded head was released by inspection only, never re-pasted"
-    );
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 /// The pessimistic half of the same race: the adapter still sees the superseded notice in the
@@ -2107,7 +2190,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
 /// pasted on top of a live payload. Supersede therefore cannot leak a second paste into a
 /// composer that is still holding the first.
 #[test]
-fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repasting() {
+fn a_superseded_staged_event_is_cancelled_even_if_pixels_remain() {
     let (catalog, inbox) = event_catalog();
     let root = catalog.path();
 
@@ -2129,8 +2212,11 @@ fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repastin
     let poker = OwnershipPoker {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
-        poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        poke_outcomes: Mutex::new(VecDeque::from([
+            PokeOutcome::Staged,
+            PokeOutcome::Delivered,
+        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     flush_in(root, &mut pending, &poker);
 
@@ -2143,17 +2229,15 @@ fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repastin
     prune_archived_pending(&inbox, &mut pending);
     flush_in(root, &mut pending, &poker);
 
-    assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
-    assert_eq!(
-        poker.pokes.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the successor is never pasted on top of a retained payload"
+    assert!(
+        pending.is_empty(),
+        "the actionable successor drains normally"
     );
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the retained superseded notice is retried by inspection only"
-    );
+    let pokes = poker.pokes.lock().unwrap();
+    assert_eq!(pokes.len(), 2);
+    assert_eq!(pokes[0], failure_text);
+    assert!(pokes[1].contains("CI success on PR #42"));
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 /// Platforms that cannot hardlink through the open-file descriptor path (macOS fdescfs
@@ -2197,8 +2281,11 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
     let poker = OwnershipPoker {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
-        poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        poke_outcomes: Mutex::new(VecDeque::from([
+            PokeOutcome::Staged,
+            PokeOutcome::Delivered,
+        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     flush_in(root, &mut pending, &poker);
 
@@ -2211,12 +2298,14 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
     prune_archived_pending(&inbox, &mut pending);
     flush_in(root, &mut pending, &poker);
 
-    assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
-    assert_eq!(
-        poker.pokes.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the successor is never pasted on top of a retained payload"
+    assert!(
+        pending.is_empty(),
+        "the archive fence releases the successor"
     );
+    let pokes = poker.pokes.lock().unwrap();
+    assert_eq!(pokes.len(), 2);
+    assert_eq!(pokes[0], failure_text);
+    assert!(pokes[1].contains("CI success on PR #42"));
     assert!(!inbox.join(&failure_filename).exists(), "head was archived");
     let receipt =
         std::fs::read(archive.join(&failure_filename)).expect("byte-copy archive receipt exists");
@@ -2258,7 +2347,7 @@ fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
             PokeOutcome::Staged,
             PokeOutcome::Delivered,
         ])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
 
     flush_without_catalog(None, &mut pending, &poker);
@@ -2271,7 +2360,7 @@ fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
         poker.pokes.lock().unwrap().as_slice(),
         [first_text.as_str(), second_text.as_str()]
     );
-    assert_eq!(poker.retries.lock().unwrap().as_slice(), [first_text]);
+    assert!(poker.retries.lock().unwrap().is_empty());
     assert!(!inbox.join(first).exists());
     assert!(inbox.join(second).exists());
 }
@@ -2334,7 +2423,7 @@ fn pending_delivery_ignores_busy_but_respects_fresh_dnd_archive_and_retry() {
             .iter()
             .filter_map(|notice| match notice {
                 PendingNotice::Message { message, .. } => Some(message.filename.as_str()),
-                PendingNotice::Recovery { .. } | PendingNotice::Adopted { .. } => None,
+                PendingNotice::Recovery { .. } => None,
             })
             .collect::<Vec<_>>(),
         [second.as_str()]

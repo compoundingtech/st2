@@ -2721,7 +2721,7 @@ impl Store {
             let visible_to_actor = actor.as_ref().is_none_or(|actor| {
                 view.assigned_to.as_deref() == Some(actor.as_str())
                     || view.claimant.as_deref() == Some(actor.as_str())
-                    || (view.status == "ready"
+                    || (matches!(view.status.as_str(), "ready" | "blocked")
                         && view.available_to.iter().any(|candidate| candidate == actor))
             });
             if visible_to_actor
@@ -2831,6 +2831,9 @@ impl Store {
         {
             reasons.push("expired-lease".into());
         }
+        if work.status == "blocked" && !work.blockers.is_empty() {
+            reasons.push("external-blocker".into());
+        }
         if matches!(work.status.as_str(), "completed" | "failed" | "cancelled")
             && reasons.is_empty()
         {
@@ -2852,6 +2855,16 @@ impl Store {
             owner_generation: Some(work.generation.clone()),
             runtime_incarnation: work.claim_incarnation.clone(),
         })
+    }
+
+    pub fn active_step_blockers_at(
+        &self,
+        subject: &str,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        active_step_blockers_tx(&connection, &normalize_step_run(subject), snapshot_unix_ms)
+            .map_err(Into::into)
     }
 
     pub fn step_run(&self, subject: &str) -> Result<Option<StepRunView>> {
@@ -2967,6 +2980,17 @@ impl Store {
             return Err(St3Error::new(
                 "run-generation-draining",
                 "the current generation is draining for a revision cutover",
+            ));
+        }
+        if action == "claim"
+            && current.blocked_reason.is_some()
+            && !active_step_blockers_tx(&transaction, &subject, now)
+                .map_err(internal)?
+                .is_empty()
+        {
+            return Err(St3Error::new(
+                "work-not-ready",
+                format!("step run `{subject}` has an unresolved external blocker"),
             ));
         }
         let eligible = current.assigned_to.as_deref() == Some(actor.as_str())
@@ -14495,6 +14519,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         wake: None,
         readiness_epoch: row.get(19)?,
         blocked_reason: row.get(15)?,
+        blockers: Vec::new(),
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
@@ -14865,7 +14890,47 @@ fn apply_effective_step_state(
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
     }
+    if view.status == "ready" && view.blocked_reason.is_some() {
+        view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
+        if view.blockers.is_empty() {
+            view.blocked_reason = None;
+        } else {
+            view.status = "blocked".into();
+            view.claimant = None;
+            view.claim_incarnation = None;
+            view.claim_expires_at_unix_ms = None;
+        }
+    }
     Ok(())
+}
+
+fn active_step_blockers_tx(
+    connection: &Connection,
+    subject: &str,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<Vec<String>> {
+    let snapshot = snapshot_unix_ms.to_string();
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT request.subject
+         FROM claims request, json_each(json_extract(request.body, '$.fields.targets')) target
+         WHERE request.kind='attention.requested'
+           AND target.value=?1
+           AND (length(request.accepted_at_unix_ms)<length(?2)
+                OR (length(request.accepted_at_unix_ms)=length(?2)
+                    AND request.accepted_at_unix_ms<=?2))
+           AND NOT EXISTS (
+             SELECT 1 FROM claims resolution
+             WHERE resolution.subject=request.subject
+               AND resolution.kind='attention.resolved'
+               AND (length(resolution.accepted_at_unix_ms)<length(?2)
+                    OR (length(resolution.accepted_at_unix_ms)=length(?2)
+                        AND resolution.accepted_at_unix_ms<=?2))
+           )
+         ORDER BY request.store_index, request.subject",
+    )?;
+    statement
+        .query_map(params![subject, snapshot], |row| row.get::<_, String>(0))?
+        .collect()
 }
 
 fn planning_session_view_tx(
@@ -19491,6 +19556,130 @@ version 2
         let replayed = target.step_run(subject).unwrap().unwrap();
         assert_eq!(replayed.attempt, 2);
         assert_eq!(replayed.execution_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn released_work_with_open_external_attention_is_blocked_until_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("external-blocker.sqlite3");
+        let store = Store::open(&path, "source").unwrap();
+        let source = r#"
+version 2
+
+mission "external-blocker" state="ready" {
+  goal "Wait truthfully for the external host repair."
+  step "automated-proof" { assigned-to "agent/ios-owner" }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "source").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "external-blocker-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "external-blocker".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "external-blocker-run".into(),
+            })
+            .unwrap();
+        let subject = run.steps[0].subject.clone();
+        store.set_step_state(&subject, "ready", None).unwrap();
+        let request = |key: &str, reason: Option<&str>| WorkRequest {
+            actor: Some("agent/source.ios-owner".into()),
+            incarnation: Some("ios-owner-one".into()),
+            summary: None,
+            reason: reason.map(str::to_owned),
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&subject, "claim", &request("blocker-claim", None))
+            .unwrap();
+        let attention = store
+            .request_attention(
+                "attention/silber-xcode",
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reason: "CoreSimulator must be repaired before automated proof can run.".into(),
+                    severity: "error".into(),
+                    targets: vec!["host/silber".into(), subject.clone()],
+                    actor: "agent/source.ios-owner".into(),
+                    idempotency_key: "silber-xcode-attention".into(),
+                },
+            )
+            .unwrap();
+        let reason = "Silber has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
+        store
+            .work_action(
+                &subject,
+                "release",
+                &request("blocker-release", Some(reason)),
+            )
+            .unwrap();
+
+        let blocked = store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.blocked_reason.as_deref(), Some(reason));
+        assert_eq!(blocked.blockers, [attention.subject.clone()]);
+        let listed = store.work(Some("agent/source.ios-owner"), false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "blocked");
+        let annotation = store.work_annotation(&blocked).unwrap();
+        assert!(!annotation.actionable);
+        assert!(annotation.reasons.contains(&"external-blocker".into()));
+        assert_eq!(
+            store
+                .work_action(&subject, "claim", &request("blocked-reclaim", None),)
+                .unwrap_err()
+                .code,
+            "work-not-ready"
+        );
+        drop(store);
+
+        let store = Store::open(&path, "source").unwrap();
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        let replica = Store::open_memory("replica").unwrap();
+        let exchange = exchange_from(&store, &ReplicationInventory::default());
+        assert_eq!(
+            receive_and_project(&replica, "source", &exchange).invalid,
+            0
+        );
+        let replicated = replica.step_run(&subject).unwrap().unwrap();
+        assert_eq!(replicated.status, "blocked");
+        assert_eq!(replicated.blockers, [attention.subject.clone()]);
+
+        store
+            .resolve_attention(
+                &attention.subject,
+                &AttentionResolveRequest {
+                    outcome: "resolved".into(),
+                    reason: Some("Xcode first-launch setup now succeeds.".into()),
+                    actor: "person/nathan".into(),
+                    idempotency_key: "resolve-silber-xcode".into(),
+                },
+            )
+            .unwrap();
+        let reopened = store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(reopened.status, "ready");
+        assert_eq!(reopened.blocked_reason, None);
+        assert!(reopened.blockers.is_empty());
+        store
+            .work_action(&subject, "claim", &request("unblocked-reclaim", None))
+            .unwrap();
     }
 
     #[test]

@@ -51,6 +51,8 @@ final class St3ClientTests: XCTestCase {
         guard case .work(let work) = resources[7] else { return XCTFail("work discriminator lost") }
         XCTAssertEqual(work.readinessEpoch, 3)
         XCTAssertEqual(work.goals, ["Build artifacts"])
+        XCTAssertNil(work.blockedReason)
+        XCTAssertEqual(work.blockers, [])
         guard case .agent(let agent) = resources[8] else { return XCTFail("agent discriminator lost") }
         XCTAssertEqual(agent.runtimeIDs, ["runtime/release-agent"])
         guard case .runtime(let runtime) = resources[9] else { return XCTFail("runtime discriminator lost") }
