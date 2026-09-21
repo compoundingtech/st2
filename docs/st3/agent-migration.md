@@ -61,6 +61,16 @@ The harness prompt is optional. st3 generates `.st3/boot.md` and appends the req
 
 Put current work in mission steps. Do not put it in the boot file, host document, or harness prompt.
 
+Publish exact authored mission KDL without creating a planner session:
+
+```sh
+st3 missions publish missions/example.kdl --as person/operator
+```
+
+An agent may use the same command only when its current desired declaration already grants
+`mission-authority { publish "agents/example" }` (or a matching namespace pattern). Publication
+does not start a run; use `st3 missions start` separately.
+
 ## Review before start
 
 Create and review a launch before any cutover:

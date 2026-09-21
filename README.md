@@ -87,6 +87,15 @@ st3 missions start release \
 The mission run pins the exact revision, workspace, requester, and inputs. Missions permit one
 nonterminal run by default unless their declaration opts into concurrent runs.
 
+Exact hand-authored mission KDL does not need a planner session:
+
+```sh
+st3 missions publish missions/release.kdl --as person/operator
+```
+
+An agent can publish through the same command when its already-running declaration grants matching
+`mission-authority publish`. Publishing and starting remain separate, explicit actions.
+
 ## Do mission work
 
 Every native harness receives a generated `.st3/boot.md`. It lists the exact graph-owned work and

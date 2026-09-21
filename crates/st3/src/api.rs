@@ -3035,19 +3035,7 @@ async fn submit_planning_variant(
         ))
     })?;
     let (intent, _) = mission_source(&state, kdl, None)?;
-    if !intent.subjects.is_empty()
-        || intent.missions.len() != 1
-        || !intent.missions.contains_key(&session.mission)
-    {
-        return Err(ApiError::bad(St3Error::new(
-            "wrong-launch-mission",
-            format!(
-                "a candidate must contain only ready mission `{}` and no immediate desired state",
-                session.mission
-            ),
-        )));
-    }
-    let mission = &intent.missions[&session.mission];
+    let mission = launch_candidate_mission(&intent, &session.mission).map_err(ApiError::bad)?;
     if mission.state != crate::model::MissionState::Ready {
         return Err(ApiError::bad(St3Error::new(
             "launch-mission-not-ready",
@@ -3123,6 +3111,31 @@ async fn submit_planning_variant(
     )?;
     signal_changed(&state);
     preview_planning_variant(state, id, variant).await
+}
+
+fn launch_candidate_mission<'a>(
+    intent: &'a crate::model::NormalizedIntent,
+    expected: &str,
+) -> Result<&'a crate::model::MissionSpec, St3Error> {
+    let Some(mission) = intent.missions.get(expected) else {
+        return Err(St3Error::new(
+            "wrong-launch-mission",
+            format!(
+                "a candidate must contain ready mission `{expected}` and no immediate desired state"
+            ),
+        ));
+    };
+    let published_closure = crate::mission::mission_closure_ids(mission);
+    let published = intent.missions.keys().cloned().collect::<BTreeSet<_>>();
+    if !intent.subjects.is_empty() || published != published_closure {
+        return Err(St3Error::new(
+            "wrong-launch-mission",
+            format!(
+                "a candidate must contain ready mission `{expected}`, its implicit mission graphs, and no immediate desired state"
+            ),
+        ));
+    }
+    Ok(mission)
 }
 
 async fn preview_planning_candidate(
@@ -4271,11 +4284,10 @@ async fn apply(
         ))
     })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
-    if normalized_agent_actor(actor).is_some() && !intent.missions.is_empty() {
-        return Err(ApiError::bad(St3Error::new(
-            "agent-mission-publication-route",
-            "an agent must publish a mission through `st3 work publish-mission` or `st3 work revise`",
-        )));
+    if normalized_agent_actor(actor).is_some() {
+        for mission in crate::mission::top_level_mission_ids(&intent.missions) {
+            require_agent_mission_authority(&state, actor, "publish", &mission)?;
+        }
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
@@ -7383,6 +7395,41 @@ mission "invalid-message" state="ready" {
         ));
     }
 
+    #[test]
+    fn launch_candidates_accept_standing_agents_and_implicit_loop_missions() {
+        let source = r#"
+version 2
+mission "planned/work" state="ready" {
+  goal "Keep a worker available and improve the result."
+  agent "worker" {
+    workspace "."
+    command "true"
+    restart "always"
+  }
+  loop "improve" {
+    max-rounds 2
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        assert_eq!(intent.missions.len(), 2);
+        assert!(intent.subjects.is_empty());
+        assert!(launch_candidate_mission(&intent, "planned/work").is_ok());
+
+        let extra = parse_intent(
+            r#"
+version 2
+mission "planned/work" state="ready" { goal "Do the requested work." }
+mission "unrequested/work" state="ready" { goal "Do unrelated work." }
+"#,
+            "node",
+        )
+        .unwrap();
+        let error = launch_candidate_mission(&extra, "planned/work").unwrap_err();
+        assert_eq!(error.code, "wrong-launch-mission");
+    }
+
     #[tokio::test]
     async fn planning_requires_an_exact_preview_and_publishes_without_a_run() {
         let root = tempfile::tempdir().unwrap();
@@ -9145,6 +9192,30 @@ mission "authority-target" state="ready" {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["code"], "mission-authority-denied");
 
+        let authorized_publication = r#"version 2
+mission "authority-target" state="ready" {
+  concurrent-runs
+  goal "Accept an exact authored revision from the authorized publisher."
+  loop "verify" {
+    max-rounds 2
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                authorized_publication,
+                &publisher,
+                "authority-publish-allowed",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
         let self_grant = r#"version 2
 mission "authority-self-grant" state="ready" {
   goal "Reject this generic agent publication."
@@ -9171,7 +9242,7 @@ mission "authority-self-grant" state="ready" {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["code"], "agent-mission-publication-route");
+        assert_eq!(body["code"], "mission-authority-denied");
     }
 
     #[tokio::test]

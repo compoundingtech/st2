@@ -268,6 +268,8 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
+    /// Publish exact authored mission KDL after preview and authority checks.
+    Publish(MissionPublishArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
@@ -279,6 +281,18 @@ struct MissionShowArgs {
     mission_or_run: String,
     #[arg(long)]
     follow: bool,
+}
+
+#[derive(Args)]
+struct MissionPublishArgs {
+    /// KDL file to publish; use `-` to read standard input.
+    file: PathBuf,
+    /// Preview against this exact store index.
+    #[arg(long, visible_alias = "at")]
+    at_index: Option<u64>,
+    /// Complete person or agent subject authoring the publication.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -1773,11 +1787,48 @@ async fn run_mission_view(
             );
             Ok(())
         }
+        MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
         }
     }
+}
+
+async fn publish_mission_file(
+    client: &Client,
+    args: MissionPublishArgs,
+    json_output: bool,
+) -> Result<()> {
+    let (kdl, source_name) = read_intent(Some(&args.file))?;
+    let intent = IntentInput { kdl, source_name };
+    let mission: MissionResponse = client
+        .post(
+            "/v1/intent/mission",
+            &MissionRequest {
+                intent: intent.clone(),
+                at_index: args.at_index,
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        mission.blockers.is_empty(),
+        "{}",
+        mission.blockers.join("; ")
+    );
+    let resolved = mission.resolved_intent;
+    let response: ApplyResponse = client
+        .post(
+            "/v1/intent/apply",
+            &ApplyRequest {
+                idempotency_key: idempotency(&resolved.kdl, &mission.subject_tokens),
+                intent: resolved,
+                expected_subjects: mission.subject_tokens,
+                actor: Some(args.actor),
+            },
+        )
+        .await?;
+    print_value(&response, json_output)
 }
 
 async fn cancel_mission_run(
@@ -5031,6 +5082,22 @@ fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
     Ok(actor.to_owned())
 }
 
+fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
+    let valid = actor
+        .strip_prefix("person/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+        || actor
+            .strip_prefix("agent/")
+            .is_some_and(|name| !name.is_empty() && !name.ends_with('/'));
+    if !valid {
+        return Err(
+            "publication authority must be an explicit `person/NAME` or `agent/PATH` subject"
+                .into(),
+        );
+    }
+    Ok(actor.to_owned())
+}
+
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
     if args.driver == "pi-channel" {
         let identity = args
@@ -7222,6 +7289,38 @@ mod tests {
         assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
         assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+    }
+
+    #[test]
+    fn mission_publish_requires_an_explicit_person_or_agent_actor() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "publish",
+            "missions/typecase.kdl",
+            "--as",
+            "agent/fleet/cos/standing/cos",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Publish(args),
+        } = cli.command
+        else {
+            panic!("the mission publish command did not parse");
+        };
+        assert_eq!(args.file, PathBuf::from("missions/typecase.kdl"));
+        assert_eq!(args.actor, "agent/fleet/cos/standing/cos");
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "publish",
+                "missions/typecase.kdl",
+                "--as",
+                "cos",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

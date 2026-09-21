@@ -98,6 +98,52 @@ fn collect_embedded_missions(mission: &MissionSpec, output: &mut Vec<MissionSpec
     }
 }
 
+pub(crate) fn mission_closure_ids(mission: &MissionSpec) -> BTreeSet<String> {
+    fn collect(mission: &MissionSpec, include_self: bool, output: &mut BTreeSet<String>) {
+        if include_self {
+            output.insert(mission.id.clone());
+        }
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
+            if let Some(loop_spec) = &step.loop_spec {
+                collect(&loop_spec.round, true, output);
+                if let Some(branch) = &loop_spec.on_keep {
+                    collect(branch, true, output);
+                }
+                if let Some(branch) = &loop_spec.on_discard {
+                    collect(branch, true, output);
+                }
+            }
+            if let Some(nested) = &step.nested_mission {
+                // A nested step graph lives inside its parent's immutable mission
+                // revision. Only loop rounds are additionally published as named
+                // mission revisions.
+                collect(nested, false, output);
+            }
+        }
+    }
+
+    let mut output = BTreeSet::new();
+    collect(mission, true, &mut output);
+    output
+}
+
+pub(crate) fn top_level_mission_ids(missions: &BTreeMap<String, MissionSpec>) -> BTreeSet<String> {
+    let mut embedded = BTreeSet::new();
+    for mission in missions.values() {
+        for id in mission_closure_ids(mission) {
+            if id != mission.id {
+                embedded.insert(id);
+            }
+        }
+    }
+    missions
+        .keys()
+        .filter(|id| !embedded.contains(*id))
+        .cloned()
+        .collect()
+}
+
 pub fn find_step<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a StepSpec> {
     for id in &mission.display_order {
         let step = &mission.steps[id];

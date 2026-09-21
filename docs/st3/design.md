@@ -35,9 +35,10 @@ public subject and claim vocabulary.
 Every document starts with `version 2`. Declarations follow that node directly. There is no wrapper
 that represents a database transaction.
 
-`st3 preview` parses, resolves documents, validates references, and shows the proposed changes.
-`st3 publish` applies the complete document in one transaction. A failed declaration rejects the
-complete publication.
+`st3 launch preview` validates and renders a planner-authored launch candidate.
+`st3 missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
+KDL. Agents must already hold matching `mission-authority { publish ... }`; a declaration cannot
+self-grant that authority. A failed declaration rejects the complete publication.
 
 Removing a prior declaration from a later file has no effect. A cancellation, stop, repair, or new
 desired declaration must state the change.
