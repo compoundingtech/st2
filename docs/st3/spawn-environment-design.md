@@ -247,7 +247,7 @@ Every absence test prints the examined environment-name count. An empty observat
 
 1. Add and prove PTY replace mode.
 2. Add `SpawnEnvironment` and the behavioral probe to `st-runtime`.
-3. Move st3 exec and PTY launches to the shared contract.
+3. Move st3 execution and terminal launches to the shared contract.
 4. Move st2 exec and PTY launches to the same contract.
 5. Add receipts, inspection, and doctor checks.
 6. Migrate host profiles and explicit declaration dependencies.

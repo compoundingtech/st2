@@ -152,6 +152,12 @@ pub struct Attention {
     pub header: ResourceHeader,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    pub attention_kind: String,
+    pub source_id: String,
+    pub person_id: String,
+    pub mission_id: Option<String>,
+    pub mission_run_id: Option<String>,
+    pub step_run_id: Option<String>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -860,6 +866,10 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
+    #[serde(rename = "review.approve")]
+    ReviewApprove,
+    #[serde(rename = "review.reject")]
+    ReviewReject,
     #[serde(rename = "message.send")]
     MessageSend,
     #[serde(rename = "message.read")]
@@ -882,8 +892,12 @@ pub enum ActionType {
     MissionRevise,
     #[serde(rename = "mission.approve-revision")]
     MissionApproveRevision,
+    #[serde(rename = "mission.cancel-revision")]
+    MissionCancelRevision,
     #[serde(rename = "mission.cancel")]
     MissionCancel,
+    #[serde(rename = "session.import")]
+    SessionImport,
     #[serde(rename = "work.claim")]
     WorkClaim,
     #[serde(rename = "work.renew")]

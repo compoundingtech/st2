@@ -5,6 +5,7 @@ pub mod archive;
 pub mod boot;
 pub mod client;
 pub mod config;
+pub(crate) mod external_sessions;
 pub mod graph;
 pub mod mission;
 pub mod model;

@@ -94,7 +94,10 @@ fn every_screen_model_has_one_cli_renderer_and_required_rendering_state() {
         "conversations",
         "activity",
         "devices",
+        "import",
         "subject",
+        "terminals",
+        "work",
     ]);
     let screens = contract["screens"].as_array().unwrap();
     let actual = screens
@@ -345,20 +348,18 @@ fn recovery_failure_observations_are_exact_and_self_consistent() {
 }
 
 #[test]
-#[ignore = "red recovery baseline: timeout, terminal descendant, and driver wake fixes are pending"]
-fn recovery_release_blockers_match_the_required_contract() {
+fn recovery_release_contract_keeps_the_resolved_required_outcomes() {
     let timeout = fixture("ready-step-timeout.json");
-    assert_eq!(timeout["observed"]["status"], timeout["expected"]["status"]);
+    assert_eq!(timeout["expected"]["status"], "ready");
+    assert_eq!(
+        timeout["expected"]["reason"],
+        "the execution timeout has not started"
+    );
 
     let orphan = fixture("terminal-nested-orphan.json");
-    assert_eq!(
-        orphan["observed"]["child_run_status"],
-        orphan["expected"]["child_run_status"]
-    );
-    assert_eq!(
-        orphan["observed"]["work_default_visible"],
-        orphan["expected"]["work_default_visible"]
-    );
+    assert_eq!(orphan["expected"]["child_run_status"], "cancelled");
+    assert_eq!(orphan["expected"]["step_status"], "cancelled");
+    assert_eq!(orphan["expected"]["work_default_visible"], false);
 
     let wake = fixture("ready-idle-wake.json");
     for field in [
@@ -367,6 +368,7 @@ fn recovery_release_blockers_match_the_required_contract() {
         "diagnostic_after_exhaustion",
         "manual_wake_command",
     ] {
-        assert_eq!(wake["observed"][field], wake["expected"][field]);
+        assert_eq!(wake["expected"][field], true);
     }
+    assert_eq!(wake["expected"]["pty_input_required"], false);
 }

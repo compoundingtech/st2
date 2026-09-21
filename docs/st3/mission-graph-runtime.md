@@ -538,7 +538,7 @@ Inputs do not support defaults, lists, secrets, schemas, or automatic environmen
 Nested child missions cannot declare inputs in this version.
 
 ```sh
-st3 publish mission.kdl --as person/operator
+# After the mission has been approved through st3 launch:
 st3 missions start MISSION_ID \
   --input message="Review this release." \
   --input source=resource/release-source \
@@ -547,9 +547,6 @@ st3 missions start MISSION_ID \
 st3 claim resource/mission-inputs/source resource.observed \
   --field kind=custom.st3.document-source \
   --field state=ready
-st3 eval ./evals/st3/mission-inputs \
-  --input message="Input proof." \
-  --input source=resource/mission-inputs/source
 ```
 
 ## Baselines
@@ -708,7 +705,8 @@ A human gate requires a full `person/...` reviewer. The question and repeated re
 
 st3 creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
 
-`st3 review ls` shows all pending KDL human gates. `st3 review ls --as person/NAME` selects one reviewer.
+`st3 attention ls --as person/NAME` shows the selected person's pending KDL human gates together
+with their other current decisions and faults.
 
 The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
 
@@ -716,9 +714,10 @@ The list excludes resolved requests, old generations, changed definitions, old a
 
 ### Human attention inbox
 
-`st3 attention ls` combines every current item that needs a person. It includes human gates, launch approvals, revision approvals, unread person messages, and explicit fault requests.
-
-`st3 attention ls --as person/NAME` selects one person. `--json` returns typed records and exact action argument arrays.
+`st3 attention ls --as person/NAME` combines every current item that needs that person. It includes
+human gates, launch approvals, revision approvals, unread person messages, and explicit fault
+requests. `--json` returns typed records and exact action argument arrays. The person argument is
+required and is never inferred from ambient process state.
 
 The formatted view shows each item in oldest-first order. It includes the item kind, age, graph context, targets, and safe commands.
 
@@ -1230,11 +1229,13 @@ Do not store credentials or raw private measurements in Git or shared st3 docume
 
 Store a summary, a redacted sample, or a hash when later work needs durable evidence. Keep raw private data in a restricted external store.
 
-## Preview, publish, and start
+## Review, approve, and start
 
-`st3 preview FILE` validates KDL, resolves documents, displays changes, returns subject tokens, and performs no write.
-
-`st3 publish FILE --as ACTOR` repeats preview and applies the exact tokens. It never starts a mission run.
+The public CLI has no generic preview or publish escape hatch. `st3 launch preview SESSION` validates
+the exact planner candidate, resolves documents, displays changes, and returns the approval hash.
+`st3 launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
+`st3 launch approve-and-launch` performs the approval and idempotent start as one product workflow.
+An authorized agent uses `st3 work publish-mission`, fenced to its claimed producing step.
 
 `st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
 
@@ -1310,18 +1311,11 @@ Approval publishes the ready mission and one `planning-session.approved` claim. 
 
 Controllers should wait on `planning-session.*` events. They must not spend an agent turn to poll session status.
 
-## Public gate result
+## Gate results
 
-A running mechanical or LLM gate gets a one-use operation capability. Its runner records the terminal result with:
-
-```sh
-st3 gate-result pass \
-  --operation-capability OPERATION_CAPABILITY \
-  --reason "The checks passed." \
-  --evidence claim/EVIDENCE
-```
-
-The API endpoint is `POST /v1/gate-results`. The durable kinds are `gate.requested` and `gate.result`.
+A running mechanical or LLM gate gets a one-use operation capability. Its internal runner records
+the terminal result through `POST /v1/gate-results`; there is no public gate-result CLI escape hatch.
+The durable kinds are `gate.requested` and `gate.result`.
 
 ## Claims and evidence
 
@@ -1341,7 +1335,9 @@ Evidence is a list of claim IDs or immutable graph references that support a res
 
 ## Eval contract
 
-`st3 eval DIRECTORY` archives the explicit directory, posts staged documents, applies its version 2 intent, and starts the selected eval mission.
+Repository integration tests archive explicit fixture directories, post staged documents, apply
+version 2 intent, and start the selected eval mission. Eval orchestration is a test boundary, not a
+public CLI command.
 
 New top-level eval fixtures belong to the eval run and leave the selected graph during cleanup. An eval can reuse an identical selected declaration. It cannot replace a different selected declaration, such as production host metadata.
 

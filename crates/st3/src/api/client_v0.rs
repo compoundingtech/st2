@@ -23,6 +23,8 @@ const ALL_SCOPES: &[&str] = &[
 ];
 const ACTIONS: &[&str] = &[
     "attention.resolve",
+    "review.approve",
+    "review.reject",
     "message.send",
     "message.read",
     "message.close",
@@ -34,7 +36,9 @@ const ACTIONS: &[&str] = &[
     "mission.start",
     "mission.revise",
     "mission.approve-revision",
+    "mission.cancel-revision",
     "mission.cancel",
+    "session.import",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -55,6 +59,8 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "attention.resolve",
+    "review.approve",
+    "review.reject",
     "message.send",
     "message.read",
     "message.close",
@@ -64,7 +70,10 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "launch.approve",
     "launch.cancel",
     "mission.start",
+    "mission.approve-revision",
+    "mission.cancel-revision",
     "mission.cancel",
+    "session.import",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -1174,11 +1183,34 @@ pub(super) fn timeline_value(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
+    if let Some(external) =
+        crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
+            .map_err(ApiError::internal)?
+    {
+        let mut items =
+            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)?;
+        items.reverse();
+        let mut page = client_page(
+            state,
+            snapshot,
+            &format!("timeline/{session_id}/{}", external.revision),
+            items,
+            query,
+        )?;
+        page.items.reverse();
+        return Ok(Json(json!({
+            "kind": "timeline-page",
+            "session_id": session_id,
+            "items": page.items,
+            "page": page.page
+        })));
+    }
     let resource = client_session_resources(
         &state.store,
         true,
         &snapshot.created_at,
         snapshot.store_index,
+        state.native_session_home.as_deref(),
     )
     .map_err(ApiError::internal)?
     .into_iter()
@@ -1498,13 +1530,17 @@ pub(super) fn timeline_value(
         }
     }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
-    let page = client_page(
+    // A conversation opens at its newest bounded window. The cursor walks toward older
+    // windows, while each individual page remains chronological for straightforward rendering.
+    items.reverse();
+    let mut page = client_page(
         state,
         snapshot,
         &format!("timeline/{session_id}"),
         items,
         query,
     )?;
+    page.items.reverse();
     Ok(Json(json!({
         "kind": "timeline-page",
         "session_id": session_id,
@@ -1663,17 +1699,21 @@ pub(super) async fn events(
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    let after = decode_event_cursor(&state.node, query.after.as_deref())?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
+    let after = decode_event_cursor(&state.node, query.after.as_deref())?;
     validate_event_cursor(&state.node, query.after.is_some(), after, oldest, newest)?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.unwrap_or(0).min(30_000));
     let records = loop {
-        let records = state
-            .store
-            .events_after_bounded(after, limit.saturating_add(1))
-            .map_err(ApiError::internal)?;
+        let records = if query.after.is_some() {
+            state
+                .store
+                .events_after_bounded(after, limit.saturating_add(1))
+        } else {
+            state.store.events_tail_bounded(limit)
+        }
+        .map_err(ApiError::internal)?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
             break records;
         }
@@ -1686,7 +1726,7 @@ pub(super) async fn events(
             break Vec::new();
         }
     };
-    let has_more = records.len() > limit;
+    let has_more = query.after.is_some() && records.len() > limit;
     let records = records.into_iter().take(limit).collect::<Vec<_>>();
     let resume = records
         .last()
@@ -2632,9 +2672,11 @@ pub(super) struct ActionRequest {
 fn action_scope(action: &str) -> Option<&'static str> {
     Some(match action.split_once('.')?.0 {
         "attention" => "control.attention",
+        "review" => "control.attention",
         "message" => "control.messages",
         "launch" => "control.launches",
         "mission" => "control.missions",
+        "session" => "control.missions",
         "work" => "control.work",
         "runtime" => "control.runtimes",
         "terminal" => {
@@ -2656,6 +2698,145 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
+}
+
+async fn import_external_session_action(
+    state: &AppState,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Vec<String>, ApiError> {
+    let target = parameter_string(&request.parameters, "target_id")?;
+    let external =
+        crate::external_sessions::find_fresh(state.native_session_home.as_deref(), &target)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::not_found(format!("external session `{target}` does not exist"))
+            })?;
+    if request.fence.subject_revisions.get(&target) != Some(&external.revision) {
+        return Err(stale("the native session changed before import"));
+    }
+    if external.process.is_none() {
+        let discovery =
+            crate::external_sessions::discover_fresh(state.native_session_home.as_deref(), false)
+                .map_err(ApiError::internal)?;
+        if discovery.unresolved_processes.iter().any(|candidate| {
+            candidate.driver == external.driver
+                && candidate.process.cwd.as_ref() == external.cwd.as_ref()
+        }) {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "ambiguous-running-session".into(),
+                message: "a running harness in this workspace does not expose its exact native session ID; stop it before importing the saved session".into(),
+                details: Box::new(serde_json::Map::from_iter([(
+                    "target_id".into(),
+                    Value::String(target),
+                )])),
+            });
+        }
+    }
+
+    let import = crate::external_sessions::import_mission(&external).map_err(|error| {
+        ApiError::bad(St3Error::new("invalid-import-session", error.to_string()))
+    })?;
+    let mission_intent = parse_intent(&import.kdl, &state.node).map_err(ApiError::bad)?;
+    let mission_preview = state
+        .store
+        .mission(
+            &mission_intent,
+            IntentInput {
+                kdl: import.kdl.clone(),
+                source_name: Some(format!("session import {target}")),
+            },
+        )
+        .map_err(ApiError::bad)?;
+    if !mission_preview.blockers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-import-mission",
+            mission_preview.blockers.join("; "),
+        )));
+    }
+    state
+        .store
+        .apply_as(
+            &mission_intent,
+            &mission_preview.subject_tokens,
+            &format!("{}:mission", request.idempotency_key),
+            Some(&session.authority_actor),
+        )
+        .map_err(ApiError::bad)?;
+
+    if let Some(process) = external.process.clone() {
+        let driver = external.driver;
+        tokio::task::spawn_blocking(move || {
+            crate::external_sessions::terminate_exact_process(driver, &process)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    }
+
+    let published = state
+        .store
+        .mission_spec(&import.id, None)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("the import mission was not published"))?;
+    let operation = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
+    let run_id = format!("{}/{}/{}", import.id, &operation[..12], "run");
+    let mut run = kdl::KdlNode::new("mission-run");
+    run.entries_mut().push(kdl::KdlEntry::new(run_id.clone()));
+    let mut run_body = kdl::KdlDocument::new();
+    for (name, value) in [
+        (
+            "mission",
+            format!("mission/{}@{}", import.id, published.revision),
+        ),
+        ("workspace", import.workspace.display().to_string()),
+        ("requester", session.authority_actor.clone()),
+    ] {
+        let mut node = kdl::KdlNode::new(name);
+        node.entries_mut().push(kdl::KdlEntry::new(value));
+        run_body.nodes_mut().push(node);
+    }
+    run.set_children(run_body);
+    let mut run_document = kdl::KdlDocument::new();
+    let mut version = kdl::KdlNode::new("version");
+    version.entries_mut().push(kdl::KdlEntry::new(2));
+    run_document.nodes_mut().push(version);
+    run_document.nodes_mut().push(run);
+    run_document.autoformat();
+    let run_kdl = run_document.to_string();
+    let run_intent = parse_intent(&run_kdl, &state.node).map_err(ApiError::bad)?;
+    let run_preview = state
+        .store
+        .mission(
+            &run_intent,
+            IntentInput {
+                kdl: run_kdl,
+                source_name: Some(format!("session import run {target}")),
+            },
+        )
+        .map_err(ApiError::bad)?;
+    if !run_preview.blockers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-import-run",
+            run_preview.blockers.join("; "),
+        )));
+    }
+    state
+        .store
+        .apply_as(
+            &run_intent,
+            &run_preview.subject_tokens,
+            &format!("{}:run", request.idempotency_key),
+            Some(&session.authority_actor),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(state);
+    Ok(vec![
+        external.id,
+        format!("mission/{}", import.id),
+        format!("mission-run/{run_id}"),
+    ])
 }
 
 fn contains_identity_selector(value: &Value) -> bool {
@@ -2764,6 +2945,26 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
+        decision @ ("review.approve" | "review.reject") => {
+            let target = parameter_string(p, "target_id")?;
+            let result = post_review(
+                State(state.clone()),
+                AxumPath(target),
+                Json(ReviewRequest {
+                    decision: if decision == "review.approve" {
+                        "approved".into()
+                    } else {
+                        "rejected".into()
+                    },
+                    reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+                    actor: Some(authority_actor.clone()),
+                    expected_subject: None,
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![result.subject])
+        }
         "attention.resolve" => {
             let target = parameter_string(p, "attention_id")?;
             let attention = state
@@ -3087,6 +3288,51 @@ async fn dispatch_action(
             signal_changed(state);
             Ok(vec![current.subject])
         }
+        decision @ ("mission.approve-revision" | "mission.cancel-revision") => {
+            let target = parameter_string(p, "target_id")?;
+            let proposal = state
+                .store
+                .revision_proposal(&target)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("revision proposal `{target}` does not exist"))
+                })?;
+            if request.fence.mission_generation.as_deref()
+                != Some(proposal.source_generation.as_str())
+            {
+                return Err(stale("the revision proposal generation fence is stale"));
+            }
+            if decision == "mission.approve-revision" {
+                let result = approve_revision_proposal(
+                    State(state.clone()),
+                    AxumPath(target),
+                    Json(RevisionApprovalRequest {
+                        actor: authority_actor.clone(),
+                        preview_hash: request.fence.preview_token.clone().ok_or_else(|| {
+                            validation("revision approval requires a preview token fence")
+                        })?,
+                        idempotency_key: request.idempotency_key.clone(),
+                    }),
+                )
+                .await?
+                .0;
+                Ok(vec![result.mission_run.subject])
+            } else {
+                let result = cancel_revision_proposal(
+                    State(state.clone()),
+                    AxumPath(target),
+                    Json(RevisionCancelRequest {
+                        actor: authority_actor.clone(),
+                        reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+                        idempotency_key: request.idempotency_key.clone(),
+                    }),
+                )
+                .await?
+                .0;
+                Ok(vec![result.subject])
+            }
+        }
+        "session.import" => import_external_session_action(state, session, request).await,
         "terminal.input" => {
             let mode = match parameter_string(p, "mode")?.as_str() {
                 "line" => SessionInputMode::Line,
@@ -3441,7 +3687,76 @@ mod tests {
             pty_binary: root.join("unused-pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            native_session_home: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_saved_native_session_import_publishes_and_starts_one_resuming_mission() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let transcript = home.join(".codex/sessions/2026/09/21/import.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-09-21T08:00:00Z",
+                    "payload": {
+                        "id": "native-import-test",
+                        "cwd": workspace,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let external = crate::external_sessions::discover_fresh(Some(&home), true)
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|item| item.native_id == "native-import-test")
+            .unwrap();
+        assert!(external.process.is_none());
+
+        let mut state = test_state_named(root.path(), "import-test");
+        state.native_session_home = Some(home);
+        let session = ClientSession::local(Some("person/tester")).unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/import-test".into(),
+            action_type: "session.import".into(),
+            idempotency_key: "session-import-test-0001".into(),
+            fence: Fence {
+                snapshot_id: new_client_snapshot(&state).id,
+                subject_revisions: BTreeMap::from([(
+                    external.id.clone(),
+                    external.revision.clone(),
+                )]),
+                mission_generation: None,
+                step_definition: None,
+                attempt: None,
+                readiness_epoch: None,
+                runtime_incarnation: None,
+                terminal_sequence: None,
+                preview_token: None,
+            },
+            parameters: json!({"target_id": external.id}),
+        };
+
+        let affected = import_external_session_action(&state, &session, &request)
+            .await
+            .unwrap();
+        assert_eq!(affected.len(), 3);
+        assert!(affected[1].starts_with("mission/import/codex/"));
+        assert!(affected[2].starts_with("mission-run/import/codex/"));
+        let runs = state.store.active_mission_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].requester, "person/tester");
     }
 
     #[test]
@@ -3616,6 +3931,50 @@ mod tests {
         .0;
         assert_eq!(page["oldest_cursor"], expected);
         assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_page_without_a_cursor_returns_the_latest_bounded_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "activity-node");
+        let mut accepted = Vec::new();
+        for id in ["first", "second", "latest"] {
+            accepted.push(
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: format!("message/{id}"),
+                        kind: "message.sent".into(),
+                        actor: Some("person/nathan".into()),
+                        fields: BTreeMap::from([
+                            ("from".into(), Value::String("person/nathan".into())),
+                            ("to".into(), Value::String("agent/worker".into())),
+                            ("content".into(), Value::String(id.into())),
+                            ("status".into(), Value::String("sent".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("activity-{id}")),
+                    })
+                    .unwrap(),
+            );
+        }
+        let page = events(
+            State(state),
+            Extension(ClientSession::local(None).unwrap()),
+            Query(EventsQuery {
+                after: None,
+                limit: Some(2),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert_eq!(page["items"][0]["sequence"], accepted[1].store_index);
+        assert_eq!(page["items"][1]["sequence"], accepted[2].store_index);
+        assert_eq!(page["has_more"], false);
     }
 
     #[test]
@@ -3836,6 +4195,7 @@ mod tests {
             true,
             &snapshot.created_at,
             snapshot.store_index,
+            state.native_session_home.as_deref(),
         )
         .unwrap()[0]["id"]
             .as_str()
@@ -3859,7 +4219,8 @@ mod tests {
             )
             .unwrap()
             .0;
-            entries.extend(page["items"].as_array().unwrap().iter().cloned());
+            let page_items = page["items"].as_array().unwrap().iter().cloned();
+            entries.splice(0..0, page_items);
             cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
             if cursor.is_none() {
                 break;
@@ -3976,6 +4337,7 @@ mod tests {
             true,
             &snapshot.created_at,
             snapshot.store_index,
+            state.native_session_home.as_deref(),
         )
         .unwrap()[0]["id"]
             .as_str()

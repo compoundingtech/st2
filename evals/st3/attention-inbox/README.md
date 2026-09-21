@@ -8,4 +8,5 @@ The planning workspace contains a tracked boot-file conflict. This prevents the 
 
 The controller approves or closes each item. It then proves that the selected person's inbox is empty.
 
-Run it with `st3 eval ./evals/st3/attention-inbox`.
+Validate its graph contract with `cargo test -p st3 --test examples`; live orchestration uses the
+repository's internal eval controller, not the public CLI.

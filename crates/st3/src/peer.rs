@@ -283,6 +283,7 @@ impl PeerBackend {
                 let receipt = store
                     .receive_replication_exchange(peer, fleet_id, exchange)
                     .map_err(anyhow::Error::msg)?;
+                store.record_transport_observation(peer, "up", None, None)?;
                 let admission = store.validate_replication_backlog()?;
                 let repairs = store.apply_replication_repairs()?;
                 let projected = store.project_replication_backlog()?;
@@ -311,7 +312,10 @@ impl PeerBackend {
                 Ok(())
             }
             #[cfg(test)]
-            Self::Local(store) => store.record_peer_failure(peer, status, error),
+            Self::Local(store) => {
+                store.record_peer_failure(peer, status, error)?;
+                store.record_transport_observation(peer, status, Some(error), None)
+            }
         }
     }
 }
@@ -937,6 +941,7 @@ mod tests {
             pty_binary: std::path::PathBuf::from("pty"),
             fleet_id: Some(fleet.into()),
             configured_peers: vec!["source".into()],
+            native_session_home: None,
         });
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -985,12 +990,17 @@ mod tests {
             .record_failure("source", "down", "test outage")
             .await
             .unwrap();
-        assert!(
-            store
-                .latest_claim("host/source", Some("transport.observed"))
-                .unwrap()
-                .is_some()
-        );
+        let down = store
+            .latest_claim("host/source", Some("transport.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(down.body["fields"]["status"], "down");
+        backend.receive("source", fleet, &exchange).await.unwrap();
+        let recovered = store
+            .latest_claim("host/source", Some("transport.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.body["fields"]["status"], "up");
         server.abort();
     }
 

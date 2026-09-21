@@ -483,7 +483,6 @@ pub(crate) fn render_attention_list(
             item.kind,
             item.title
         );
-        let _ = writeln!(output, "    {}", item.detail);
         let _ = write!(output, "    {}", item.person);
         if let Some(mission) = &item.mission {
             let _ = write!(output, " · {mission}");
@@ -503,6 +502,11 @@ pub(crate) fn render_attention_list(
             let _ = writeln!(output, "    review: {target}");
         }
         let _ = writeln!(output, "    subject: {}", item.subject);
+        let _ = writeln!(
+            output,
+            "    inspect: st3 attention show {} --as {}",
+            item.subject, item.person
+        );
         for action in &item.actions {
             let command = action
                 .argv
@@ -516,7 +520,53 @@ pub(crate) fn render_attention_list(
     output
 }
 
-fn shell_argument(value: &str) -> String {
+pub(crate) fn render_attention_show(
+    item: &AttentionItemView,
+    style: OutputStyle,
+    now_unix_ms: u128,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "{}  {}", style.heading("ATTENTION"), item.title);
+    let _ = writeln!(output, "SUBJECT   {}", item.subject);
+    let _ = writeln!(output, "KIND      {}", item.kind);
+    let _ = writeln!(output, "PERSON    {}", item.person);
+    let _ = writeln!(
+        output,
+        "REQUESTED {}",
+        relative_time(item.requested_at_unix_ms, now_unix_ms)
+    );
+    if let Some(mission) = &item.mission {
+        let _ = writeln!(output, "MISSION   {mission}");
+    }
+    if let Some(run) = &item.mission_run {
+        let _ = writeln!(output, "RUN       {run}");
+    }
+    if let Some(step) = &item.step {
+        let _ = writeln!(output, "STEP      {step}");
+    }
+    let _ = writeln!(output, "\n{}\n{}", style.heading("DETAIL"), item.detail);
+    if !item.targets.is_empty() {
+        let _ = writeln!(output, "\n{}", style.heading("TARGETS"));
+        for target in &item.targets {
+            let _ = writeln!(output, "  {target}");
+        }
+    }
+    if !item.actions.is_empty() {
+        let _ = writeln!(output, "\n{}", style.heading("ACTIONS"));
+        for action in &item.actions {
+            let command = action
+                .argv
+                .iter()
+                .map(|argument| shell_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(output, "  {}: {command}", action.label);
+        }
+    }
+    output
+}
+
+pub(crate) fn shell_argument(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b':' | b'@' | b'_' | b'-')
@@ -1326,7 +1376,7 @@ mod tests {
         };
         let rendered = render_attention_list(
             Some("person/nathan"),
-            &[item],
+            std::slice::from_ref(&item),
             OutputStyle::plain(),
             180_000,
         );
@@ -1336,6 +1386,15 @@ mod tests {
         assert!(rendered.contains("requested 2m ago"));
         assert!(rendered.contains("review: doc/fabric/report@abc"));
         assert!(rendered.contains("--reason 'It is fixed'"));
+        assert!(!rendered.contains("The queue did not recover."));
+        assert!(
+            rendered.contains("inspect: st3 attention show attention/fabric --as person/nathan")
+        );
+
+        let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);
+        assert!(shown.contains("ATTENTION  Fabric needs review"));
+        assert!(shown.contains("The queue did not recover."));
+        assert!(shown.contains("TARGETS\n  doc/fabric/report@abc"));
     }
 
     #[test]

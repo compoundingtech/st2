@@ -2,22 +2,20 @@
 
 Status: current authoring and publication contract.
 
-## One publication rule
+## One intent rule
 
 Every KDL document starts with `version 2`. All declarations follow that line directly.
 
-`st3 publish` is an atomic upsert. The daemon first parses, resolves document references, validates, and checks the current subject heads. It then applies every change in one transaction. One failure rejects the full publication.
+Every purpose-specific route that applies KDL is an atomic upsert. The daemon first parses, resolves document references, validates, and checks the current subject heads. It then applies every change in one transaction. One failure rejects the full operation.
 
 Omission has no effect. Removing a declaration from a later file does not stop or delete its existing graph state. Retirement, cancellation, and refresh are explicit declarations.
 
 The removed wrapper keyword is an error. There is no compatibility form.
 
-```sh
-st3 preview release.kdl
-st3 publish release.kdl --as person/operator
-```
-
-The JSON publication receipt contains the resolved KDL, subject changes, accepted operations, claim IDs, and final store index.
+There is no generic public `publish` or `preview` command. A person uses `st3 launch` to create,
+review, and approve a mission. An authorized agent uses `st3 work publish-mission` from the exact
+claimed producing step. This keeps intent, authority, and provenance on one typed path instead of a
+raw mutation escape hatch.
 
 ## Definitions do not start work
 
@@ -212,7 +210,7 @@ Publishing requires `publish` authority, a claimed producing step, and an exact 
 
 Starting requires separate `start` authority. Revising requires separate `revise` authority and structural authority in the current generation.
 
-Generic `st3 publish` rejects mission definitions from an agent. A candidate definition cannot grant authority to the same agent.
+There is no generic mission publication command. A candidate definition cannot grant authority to the same agent.
 
 Persons and internal system actions are unchanged. The identity check assumes a trusted local runtime because `--as` can name another actor.
 
@@ -244,7 +242,9 @@ resource "release-pr" {
 }
 ```
 
-The resource must already have an active observer. `st3 resource refresh` publishes this form and waits for the exact observer attempts. An unchanged observation is a successful refresh.
+The resource must already have an active observer. Refresh is a declarative mission operation; the
+current public CLI does not expose a standalone resource-refresh shortcut. An unchanged observation
+is a successful refresh.
 
 ## Planning a new mission
 
@@ -336,19 +336,20 @@ gate "the operator approves deployment" type="human" {
 The mission pauses at the gate. A later review command records the decision against the exact gate request. Editing and republishing the mission does not forge a decision.
 
 ```sh
-st3 review ls --as person/operator
-st3 review approve step-run/RELEASE_GENERATION/deploy \
-  --actor person/operator \
+st3 attention ls --as person/operator
+st3 attention approve step-run/RELEASE_GENERATION/deploy \
+  --as person/operator \
   --reason "the exact release result is accepted"
 ```
 
-`st3 review ls` lists every pending KDL human gate. The optional `--as` value selects one reviewer.
+`st3 attention ls --as person/operator` lists the current person-owned inbox, including pending KDL
+human gates. Human authority is required and never inferred from an environment variable.
 
 The decision target is the mission run or step run that owns the gate. The command binds the decision to the exact current request.
 
 ## Human attention
 
-`st3 attention ls` is the complete human inbox. It includes these current items:
+`st3 attention ls --as person/NAME` is the complete inbox for one explicit person. It includes these current items:
 
 - pending human gates;
 - launch previews that have no blockers;
@@ -362,8 +363,6 @@ st3 attention ls --as person/operator --json
 ```
 
 The formatted view shows each item with its age, graph context, targets, and exact action commands. The JSON view returns the same items as structured data. The list uses oldest-first order across all item kinds.
-
-`st3 review ls` remains the narrow view for KDL human gates. Use `st3 attention ls` when a person wants all current work that needs a decision or reading.
 
 A message leaves attention when the person reads it. Reading a sent message records delivery before the read. The person does not need to archive it. A blocked launch preview does not enter attention.
 
@@ -425,18 +424,15 @@ planning-session "planning/release/01990000000070008000000000000000" {
 
 Intent helpers support `--print-kdl`. Print-only mode performs no publication and no document upload.
 
-The main helpers are:
+The current helpers are:
 
-- `st3 codex --print-kdl` and `st3 claude --print-kdl`;
-- `st3 exec --print-kdl`;
 - `st3 conversations send --print-kdl` and `st3 conversations reply --print-kdl`;
-- `st3 resource watch`, `unwatch`, and `refresh` with `--print-kdl`;
-- `st3 runtime reset --print-kdl`;
 - `st3 launch start`, `revise`, and `cancel` with `--print-kdl`;
-- `st3 work revise --print-kdl`;
-- `st3 eval --print-kdl`.
+- `st3 missions start --print-kdl`;
+- `st3 work revise --print-kdl`.
 
-The eval helper prints the resolved eval mission. Eval bundle upload remains a packaging boundary because it transfers the complete fixture workspace before it publishes and starts the eval mission.
+Repository eval fixtures are exercised by the Rust integration tests; they are not a public CLI
+surface.
 
 ## Publication failure boundaries
 

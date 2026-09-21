@@ -7,6 +7,17 @@ This is the immutable-evidence handoff for failed run
 It records what can be reused, what remains unfinished, and three deterministic red baselines. It
 does not reinterpret the failed run as successful and does not change runtime behavior.
 
+Resolution update, 2026-09-21: the three recovery blockers below are retained as historical
+incident evidence, but they are no longer pending release baselines. Claimed-interval timeout and
+nested-terminal cleanup landed in `948a161`; durable native-driver wake, retry, acknowledgement,
+diagnostics, and manual wake landed in `85cea78`. Their executable regressions are
+`only_claimed_execution_consumes_a_step_timeout_and_failure_selects_cleanup`,
+`terminal_roots_reap_nested_orphans_idempotently_across_restart_and_replication`,
+`work_wakes_retry_with_a_bound_and_stop_after_acknowledgement`, and
+`manual_work_wake_is_idempotent_and_uses_the_durable_driver_inbox`. The operational-state contract
+suite now treats the fixture `observed` fields strictly as immutable before-fix evidence and has no
+ignored red release test.
+
 ## Audit scope and result
 
 The failed run used mission revision
@@ -240,9 +251,9 @@ cargo test -p st3 --test client_v0_contract stopped_agents_are_annotated_history
 # 1 passed
 ```
 
-The recovery fixtures are intentionally small JSON inputs. Their self-consistency test must pass;
-`recovery_release_blockers_match_the_required_contract` must remain ignored and red until the
-behavioral successor steps make the observed and required states equal.
+The recovery fixtures are intentionally small JSON inputs. Their self-consistency test preserves
+the historical observation, while the green executable regressions named in the resolution update
+prove the required runtime behavior.
 
 ## Cancellation and handoff invariants
 

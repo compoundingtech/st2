@@ -6,9 +6,9 @@ The graph stores checkout discovery, failure reproduction, repair, verification,
 
 The held-out gates require a feature commit and reject changes to `main` or its sibling worktree.
 
-Start the st3 daemon. Then run `st3 eval ./evals/st3/weird-git-setup --graph` from an interactive terminal.
-
-Use `st3 graph RUN --follow` to inspect the live eval graph in another terminal.
+Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+the repository's internal eval controller, not the public CLI. During a development run, inspect the
+exact run with `st3 missions show MISSION_RUN --follow`.
 
 The `receipts/` directory contains the 2026-08-30 live graph proof.
 

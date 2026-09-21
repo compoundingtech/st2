@@ -9,5 +9,5 @@ The graph stores both message receipts.
 
 The held-out gates check isolation, review content, the verdict, the security finding, and graph products.
 
-Start the daemon with `st3 up`.
-Run the eval with `st3 eval ./evals/st3/poisoned-pr`.
+Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+the repository's internal eval controller, not the public CLI.

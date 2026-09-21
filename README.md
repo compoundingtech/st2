@@ -1,43 +1,22 @@
 # Small Talk
 
-Small Talk runs declarative networks of coding agents.
+Small Talk (`st3`) coordinates durable agent work across machines without losing operational truth.
+Missions hold goals, constraints, ordered or parallel work, agents, terminals, gates, documents,
+queues, nested missions, schedules, and cleanup. The graph remains authoritative across harness,
+daemon, and machine restarts.
 
-You publish KDL missions. The st3 runtime stores their claims, starts their members, offers ready
-steps to eligible agents, and records the result. A daemon restart does not terminate mission-owned
-PTY or exec processes. The restarted daemon adopts the exact surviving incarnation.
+The normal product entry points answer three questions:
 
-The `st` command is the normal product command. During migration, `st3` remains the exact daemon
-name and both command names run the same installed binary.
-
-## The model
-
-A mission is a durable graph declaration. A mission can contain:
-
-- goals and constraints;
-- ordered or parallel steps;
-- standing agents and temporary agents;
-- exec processes and terminal processes;
-- mechanical gates and human gates;
-- immutable documents and observed resources;
-- nested missions, queues, schedules, and cleanup work.
-
-Publishing is an atomic upsert. Removing text from a later KDL file does not cancel the earlier
-declaration. Publish an explicit cancellation or replacement when the graph must change.
-
-Agents claim eligible work. The reconciler does not choose work for an agent. It starts declared
-runtimes, delivers graph changes, enforces leases, evaluates gates, and cleans up owned runtimes.
-
-An agent status keeps runtime facts in `actual` and current harness facts in `harness`. A harness
-observation applies only to the current runtime incarnation. A stale ready claim cannot make a new
-runtime ready.
+- `st3 now`: what is happening and what needs action?
+- `st3 attention ls --as person/NAME`: what needs this person's decision?
+- `st3 launch start ... --as person/NAME`: what work should the network launch next?
 
 ## Install
 
-The Nix package installs `st`, `st3`, and `st3-migrate`:
+The Nix package installs `st3`, the shorter `st` symlink, and `st3-migrate`:
 
 ```sh
 nix profile install .#st3
-st --help
 st3 --help
 ```
 
@@ -48,84 +27,70 @@ cargo build -p st3 -p st3-migrate --locked
 target/debug/st3 --help
 ```
 
-The runtime needs `pty` on `PATH`. A native agent also needs its selected harness, such as Codex,
+The runtime needs `pty` on `PATH`. Native agents also need their selected harness, such as Codex,
 Claude, pi, OMP, or OpenCode.
 
-## Start the daemon
-
-The default local configuration needs no file:
+## Start and check this machine
 
 ```sh
-st service install
-st service status
-st doctor
+st3 service install
+st3 service status
+st3 doctor --strict
+st3 now
 ```
 
-The default state directory is `${XDG_STATE_HOME:-$HOME/.local/state}/st3`. The default Unix socket
-is below `${XDG_RUNTIME_DIR}` when that variable is set. Otherwise, it is below the state directory.
+The default state directory is `${XDG_STATE_HOME:-$HOME/.local/state}/st3`. The local API uses a
+Unix socket below `${XDG_RUNTIME_DIR}` when available and otherwise below the state directory.
 
-Fleet replication is optional. A fleet configuration uses authenticated loopback endpoints. Fabric
-or another loopback port exposer carries those endpoints between machines.
+The service manager and mission runtimes are separate. Restarting the daemon does not stop a live
+agent, terminal, or exec process; reconciliation adopts the exact surviving incarnation. Linux uses
+systemd user scopes and macOS uses independent process sessions. On macOS, run
+`st3 service permissions` for the one-time Full Disk Access and Developer Tools instructions.
 
-See [fleet replication](docs/st3/replication.md) for the peer configuration and repair commands.
+Finite client requests have bounded timeouts and actionable failures. Terminal attachment and an
+explicit follow remain open after connecting. Fleet replication is optional; Fabric, Tailscale, or
+another authenticated transport can expose the paired client and replication endpoints between
+machines. See [fleet replication](docs/st3/replication.md).
 
-The service installer keeps the control processes separate from mission runtimes. Linux starts each
-runtime in its own systemd user scope. macOS starts each runtime in its own process session. A main
-daemon restart does not stop an existing runtime. The replication worker also has its own service.
+## Launch work
 
-The macOS main service uses the interactive launchd class because it starts interactive agent
-sessions. The replication worker stays in the background class. The Linux services use the normal
-user priority. They do not lower the priority of the runtime scopes.
-
-The service files contain the absolute st3 path. They do not contain a captured or guessed `PATH`.
-Before each new PTY or exec starts, st3 runs the account's default shell as an interactive login
-shell in a short-lived real terminal. This matches startup files that require a TTY. st3 captures the
-shell's current exported environment. The mission environment then overrides those values. A
-`${PATH}` value expands against the fresh shell path. st3 starts the declared command directly after
-this probe, so a shell wrapper does not change its arguments, signals, or exit status. The probe has
-a ten-second timeout. A broken shell startup cannot stop reconciliation forever.
-
-On macOS, run `st service permissions` for the one-time Full Disk Access and Developer Tools steps.
-Use `st service permissions --open` to open the matching System Settings pages. macOS does not let a
-launchd property list grant these permissions.
-
-Finite client commands have bounded waits. A connection gets three seconds. An ordinary request gets
-15 seconds in total. A replication import or export gets 120 seconds. A 30-second event wait gets 35
-seconds. A terminal WebSocket handshake gets ten seconds. An attached terminal and an explicit
-follow remain open after their connection succeeds. A timeout names the endpoint and phase, exits
-nonzero, and tells the operator to retry.
-
-## Publish and run a mission
-
-Start with an example or a KDL file from your private network repository:
+`launch` turns a natural-language request into a durable planning conversation and an exact mission
+preview. Human authority is always explicit as a complete `person/...` subject.
 
 ```sh
-st preview mission.kdl
-st publish mission.kdl --as person/operator
-st mission start fleet/example --as person/operator --follow
-```
+st3 launch start --id release request.md \
+  --workspace /work/release \
+  --as person/operator
 
-The preview validates the complete declaration without changing the graph. The publication applies
-all declarations in one transaction. The run pins the exact mission revision and its exact inputs.
-
-Use an explicit run ID when an external system needs a stable name:
-
-```sh
-st mission start fleet/example \
-  --id release-candidate-42 \
-  --input request="Prepare release 42" \
+st3 launch show launch/release/SESSION
+st3 launch preview launch/release/SESSION --variant default
+st3 launch approve-and-launch launch/release/SESSION PREVIEW_HASH \
+  --workspace /work/release \
   --as person/operator
 ```
 
-The default mission permits one nonterminal run. Add `concurrent-runs` when independent runs can
-overlap.
+The planner can ask typed, revisioned questions. Answers may be boolean, single-choice,
+multiple-choice, ranked-choice, or free text, and every answer may include an explanation. Use
+`launch revise` to add feedback, `launch compare` to compare variants, and `launch cancel` to end an
+unwanted conversation.
+
+An approved mission can also be started separately:
+
+```sh
+st3 missions start release \
+  --id release-candidate-42 \
+  --input request="Prepare release 42" \
+  --as person/operator \
+  --follow
+```
+
+The mission run pins the exact revision, workspace, requester, and inputs. Missions permit one
+nonterminal run by default unless their declaration opts into concurrent runs.
 
 ## Do mission work
 
-Every native harness receives a generated `.st3/boot.md`. The runtime also appends one short prompt
-that tells the harness to read that file and claim its current work.
-
-An agent uses the exact binary from `ST3_BIN`:
+Every native harness receives a generated `.st3/boot.md`. It lists the exact graph-owned work and
+teaches the harness the small worker protocol:
 
 ```sh
 "$ST3_BIN" work ls
@@ -134,92 +99,109 @@ An agent uses the exact binary from `ST3_BIN`:
 "$ST3_BIN" work complete step-run/RUN/STEP --summary "The change is ready."
 ```
 
-Use `work release` when another eligible agent should take the step. Use `work fail` when the work
-cannot meet its goal. Use `st wait` only when claimed work needs a graph condition.
+Use `work release` when another eligible agent should take the step and `work fail` when its goal
+cannot be met. An agent may publish a generated nested mission only from claimed work with declared
+`mission-authority` and a matching `produces-mission` contract. Use `queue {}` in mission KDL when
+source order is intentional; do not encode ordering only in prompts.
 
-See the [mission runtime](docs/st3/mission-graph-runtime.md) for the complete KDL language.
+The versioned examples in [`examples/st3`](examples/st3/README.md) demonstrate queues, nested
+missions, review/remediation, recurring work, observations, revisions, and bounded loops.
 
-## Messages and human attention
+## Understand the network
 
-Small Talk messages are durable graph records:
+These are the normal operational views:
 
 ```sh
-st message send agent/fleet/example/standing/worker \
+st3 now
+st3 machines
+st3 missions ls
+st3 missions show MISSION_OR_RUN
+st3 agents ls
+st3 agents tree
+st3 work ls
+st3 terminals ls
+st3 activity
+```
+
+Current state is the default. Historical, stopped, and terminal records appear only behind the
+command's explicit `--all` option. Bounded lists print the exact continuation command when another
+page exists.
+
+Use `st3 subject show SUBJECT` for one typed card, `st3 subject history SUBJECT` for its immutable
+history, and `st3 schema subjects` to inspect the authoritative model. `st3 doctor` diagnoses local
+health; `st3 repair dry-run` produces an exact bounded repair plan before any mutation.
+
+## Attention and conversations
+
+The human inbox contains only current gates, approvals, unread person messages, and explicit fault
+requests for the selected person:
+
+```sh
+st3 attention ls --as person/operator
+st3 attention show ATTENTION --as person/operator
+```
+
+Rendered items include exact approve, reject, read, resolve, or dismiss commands. No human action
+inherits `ST_AGENT`, `ST_PERSON`, local configuration, or a parent terminal.
+
+Conversations are normalized durable records:
+
+```sh
+st3 conversations send agent/fleet/example/worker \
   --from person/operator \
   --subject "Check the new request" \
   --body "A new mission step is ready."
 
-st message ls --as agent/fleet/example/standing/worker
-st message read MESSAGE --as agent/fleet/example/standing/worker
-st message archive MESSAGE --as agent/fleet/example/standing/worker
+st3 conversations ls agent/fleet/example/worker
+st3 conversations read MESSAGE --as agent/fleet/example/worker
+st3 conversations thread MESSAGE
 ```
 
-Human gates, launch approvals, revision approvals, unread person messages, and explicit faults
-appear in one inbox:
+`conversations sessions` and `conversations timeline` expose normalized Codex, Claude, and OMP
+session history, including tool activity and available usage data.
+
+## Import an existing harness session
+
+`import` discovers native Codex, Claude, and OMP sessions without claiming they are already managed:
 
 ```sh
-st attention ls --as person/operator
-st attention ls --as person/operator --json
+st3 import ls
+st3 import ls --all
+st3 import show SESSION
+st3 import run SESSION --as person/operator
 ```
 
-The JSON form contains typed items and exact action arguments for a TUI or native application.
+Saved legacy sessions are readable through the normalized conversation view. Import revalidates the
+exact process fingerprint, stops only that process, publishes a durable resume mission, and starts
+the same native session under st3 ownership. Ambiguous or changed processes are refused.
 
-## Launch and revision
-
-A launch stores its request, planner, candidate missions, feedback, and approval in the
-claims database:
+## Terminals
 
 ```sh
-st launch start request.md --id release --as person/operator
-st launch show launch/release/SESSION
-st launch preview launch/release/SESSION --variant default
-st launch revise launch/release/SESSION feedback.md --as person/operator
-st launch approve launch/release/SESSION PREVIEW_TOKEN --as person/operator
+st3 terminals ls
+st3 terminals peek PTY
+st3 terminals attach PTY
+st3 terminals send PTY "status"
 ```
 
-A running mission can move to a new revision through a successor generation. Compatible completed
-work remains complete. Changed work and its dependants become ready again.
+`terminals attach` uses the same binary terminal transport as the runtime. Ctrl+\\ detaches without
+stopping the session. The client restores terminal modes and sanitizes terminal state on normal
+exit, remote EOF, and errors. Nested attachment is refused unless `--force` is intentional.
 
-See the [KDL lifecycle guide](docs/st3/kdl-lifecycle.md) for authoring, publication, revision, review,
-resource refresh, and cancellation workflows.
+## Stable client data
 
-## Inspect and repair
-
-These commands provide the normal operational views:
+Human output is readable by default. Add global `--json` for the stable client-v0 envelope used by
+the future TUI and native applications:
 
 ```sh
-st status
-st agents
-st mission show fleet/example
-st work ls --all
-st doctor --strict
-st replication status
-st schema list
+st3 --json now
+st3 --json machines
+st3 --json conversations sessions
 ```
 
-Invalid replicated records remain visible and cannot halt replication. An explicit repair names the
-bad record and publishes its replacement. See [data authority](docs/st3/data-authority.md) and
-[fleet replication](docs/st3/replication.md) for the guarantees.
-
-## CLI output and terminals
-
-Structured commands print a readable view by default. Add the global `--json` option when a program
-needs the stable data shape:
-
-```sh
-st pty ls
-st --json pty ls
-st --json status
-```
-
-Commands that return document bytes, logs, terminal screens, or completion scripts keep their raw
-payload output.
-
-`st pty attach SUBJECT` uses the same Rust terminal client as `pty attach`. Type normally in the
-attached session. Press Ctrl+\ once to detach without stopping the session. The client restores
-terminal modes before it exits. It forwards terminal resize and Kitty key sequences without a text
-translation layer. A nested attachment is refused by default. Use `--force` only when the nested
-attachment is intentional.
+The client contract includes snapshots, fences, pagination, typed resources, structured diffs,
+capabilities, events, pairing, and normalized session timelines. Raw document bytes, terminal
+screens, streaming traces, and completion scripts retain their purpose-specific output.
 
 ## Documentation
 
@@ -228,13 +210,8 @@ attachment is intentional.
 - [Mission graph runtime](docs/st3/mission-graph-runtime.md)
 - [KDL lifecycle](docs/st3/kdl-lifecycle.md)
 - [Schema registry](docs/st3/schema.md)
-- [Agent migration](docs/st3/agent-migration.md)
 - [Examples](examples/st3/README.md)
 - [Product roadmap](docs/st3/roadmap.md)
 
-## st2
-
-st2 remains available during the fleet migration. Its catalog, file bus, CLI, and service continue
-to use their existing contracts.
-
-Read the [st2 legacy guide](README.st2.md) before changing or operating st2.
+The st2 implementation remains in this repository for migration testing. It is not part of the st3
+CLI contract.

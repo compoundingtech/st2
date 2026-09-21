@@ -130,6 +130,11 @@ represented by an event tombstone; an ID is never reused.
 health, resource observers, and diagnostics. `history` is a typed audit projection. It does not
 expose raw claims, replication envelopes, or repair internals.
 
+Every attention resource carries its concrete `person_id`, original `source_id`, semantic
+`attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
+client can therefore render a mixed inbox, navigate to the source, and act without recovering
+identity or graph context from prose.
+
 ## Harness-neutral session timeline
 
 The timeline schema deliberately contains no Claude, Codex, Pi, OMP, or transcript-file types. A
@@ -199,10 +204,11 @@ The v0 action discriminators are:
 
 | Family | Actions | Required fences |
 |---|---|---|
-| Attention | `attention.resolve` | attention revision |
+| Attention | `attention.resolve`, `review.approve`, `review.reject` | attention or review revision |
 | Messages | `message.send`, `message.read`, `message.close` | reply/message revision when present |
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
-| Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel` | mission revision and current generation where applicable |
+| Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
+| Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
 | Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation and desired revision |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |

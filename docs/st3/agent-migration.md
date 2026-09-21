@@ -34,7 +34,8 @@ host "local" {
 }
 ```
 
-Preview and publish the host declaration. Publication fails when the exact document is absent.
+Include the host declaration in the mission candidate. Approval fails when the exact document is
+absent.
 
 ## Prepare a standing mission
 
@@ -62,16 +63,18 @@ Put current work in mission steps. Do not put it in the boot file, host document
 
 ## Review before start
 
-Run these commands before any cutover:
+Create and review a launch before any cutover:
 
 ```sh
-st3 preview hosts/local.kdl
-st3 preview missions/example.kdl
-st3 publish hosts/local.kdl --as person/operator
-st3 publish missions/example.kdl --as person/operator
+st3 launch start --id agents/example migration-request.md \
+  --workspace /work/example \
+  --as person/operator
+st3 launch show launch/agents/example/SESSION
+st3 launch preview launch/agents/example/SESSION
 ```
 
-Publication does not start the mission. Inspect the subject diff and document hashes before the next action.
+Inspect the candidate KDL, subject diff, and document hashes. Approve the exact preview separately;
+approval does not start the mission.
 
 ## Rehearse in isolation
 

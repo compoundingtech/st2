@@ -39,6 +39,7 @@ fn state(root: &Path, name: &str) -> AppState {
         pty_binary,
         fleet_id: None,
         configured_peers: Vec::new(),
+        native_session_home: None,
     }
 }
 

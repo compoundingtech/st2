@@ -129,6 +129,8 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
     let actions = operations["actions"].as_object().unwrap();
     for required in [
         "attention.resolve",
+        "review.approve",
+        "review.reject",
         "message.send",
         "message.read",
         "message.close",
@@ -140,6 +142,7 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "mission.start",
         "mission.revise",
         "mission.approve-revision",
+        "mission.cancel-revision",
         "mission.cancel",
         "work.claim",
         "work.renew",
@@ -208,6 +211,20 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         "work",
     ]);
     assert_eq!(kinds, expected);
+
+    let attention = resources
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["kind"] == "attention")
+        .unwrap();
+    assert_eq!(attention["person_id"], "person/nathan");
+    assert_eq!(attention["source_id"], "launch/release");
+    assert_eq!(attention["attention_kind"], "launch-approval");
+    assert_eq!(
+        attention["actions"],
+        serde_json::json!(["launch.approve", "launch.cancel"])
+    );
 }
 
 #[test]
@@ -329,6 +346,7 @@ fn test_state(root: &Path) -> AppState {
         pty_binary: PathBuf::from("pty"),
         fleet_id: None,
         configured_peers: Vec::new(),
+        native_session_home: None,
     }
 }
 
@@ -864,6 +882,8 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .unwrap()
     };
     assert_eq!(capability_state("attention.resolve"), "granted");
+    assert_eq!(capability_state("review.approve"), "granted");
+    assert_eq!(capability_state("mission.cancel-revision"), "ungranted");
     assert_eq!(capability_state("launch.create"), "granted");
     assert_eq!(capability_state("message.send"), "ungranted");
 
@@ -879,6 +899,10 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .unwrap()
     };
     let nathan = item("attention/nathan-paired");
+    assert_eq!(nathan["attention_kind"], "fault");
+    assert_eq!(nathan["source_id"], "attention/nathan-paired");
+    assert_eq!(nathan["person_id"], "person/nathan");
+    assert_eq!(nathan["actions"], serde_json::json!(["attention.resolve"]));
     let resolve = serde_json::json!({
         "api_version": "st3.client.v0", "id": "action/paired-attention-nathan",
         "type": "attention.resolve", "idempotency_key": "paired-attention-nathan-0001",

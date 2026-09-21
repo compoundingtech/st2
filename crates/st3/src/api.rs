@@ -31,12 +31,12 @@ use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
     ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck, DoctorReport,
-    DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus,
-    EventRecord, GateResultRequest, HumanReviewView, LaunchApproveAndStartRequest,
-    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
-    LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
+    EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
+    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
+    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
+    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest, PlanningCancelRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
@@ -64,6 +64,7 @@ pub struct AppState {
     pub pty_binary: std::path::PathBuf,
     pub fleet_id: Option<String>,
     pub configured_peers: Vec<String>,
+    pub native_session_home: Option<std::path::PathBuf>,
 }
 
 const CLIENT_API_VERSION: &str = "st3.client.v0";
@@ -121,6 +122,7 @@ struct ClientPageCursor {
     person: Option<String>,
     actor: Option<String>,
     owner_run: Option<String>,
+    items_digest: String,
     expires_at_unix_ms: u128,
 }
 
@@ -662,6 +664,9 @@ fn client_page(
     items: Vec<Value>,
     query: &ClientListQuery,
 ) -> Result<ClientResourcePage, ApiError> {
+    let items_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&items).map_err(ApiError::internal)?,
+    ));
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
@@ -673,6 +678,7 @@ fn client_page(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.items_digest != items_digest
             || query
                 .limit
                 .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
@@ -708,6 +714,7 @@ fn client_page(
             person: query.person.clone(),
             actor: query.actor.clone(),
             owner_run: query.owner_run.clone(),
+            items_digest,
             expires_at_unix_ms,
         })?)
     } else {
@@ -987,11 +994,12 @@ fn client_session_resources(
     history: bool,
     at: &str,
     snapshot_index: u64,
+    native_session_home: Option<&Path>,
 ) -> anyhow::Result<Vec<Value>> {
     let status = if history {
-        store.status_history(None, None, None)?
+        store.status_history(None, None, Some(snapshot_index))?
     } else {
-        store.status(None)?
+        store.status_at(None, None, Some(snapshot_index))?
     };
     let mut sessions = Vec::new();
     for subject in status
@@ -1031,9 +1039,39 @@ fn client_session_resources(
             "stopped" | "exited" | "absent" => "completed",
             _ => "waiting",
         };
+        let claims = store
+            .claims_page(
+                Some(&subject.subject),
+                None,
+                0,
+                snapshot_index.checked_add(1),
+                false,
+                10_000,
+            )?
+            .claims;
+        let incarnation_claims = claims.iter().filter(|claim| {
+            let claim_fields = claim.body.get("fields").unwrap_or(&claim.body);
+            let same_incarnation = incarnation.is_some_and(|expected| {
+                claim_fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
+            });
+            let same_runtime = runtime.is_some_and(|expected| {
+                claim_fields.get("runtime_id").and_then(Value::as_str) == Some(expected)
+            });
+            same_incarnation || (incarnation.is_none() && same_runtime)
+        });
+        let accepted_times = incarnation_claims
+            .map(|claim| claim.accepted_at_unix_ms)
+            .collect::<Vec<_>>();
         let started = fields
             .and_then(|fields| fields.get("started_at_unix_ms"))
             .and_then(|value| value.as_u64().map(u128::from))
+            .map(client_timestamp)
+            .or_else(|| accepted_times.iter().min().copied().map(client_timestamp))
+            .unwrap_or_else(|| at.to_owned());
+        let updated = accepted_times
+            .iter()
+            .max()
+            .copied()
             .map(client_timestamp)
             .unwrap_or_else(|| at.to_owned());
         let usage = store.usage_summary_at(&subject.subject, incarnation, Some(snapshot_index))?;
@@ -1041,15 +1079,96 @@ fn client_session_resources(
             "id": format!("session/{}", &digest[..24]),
             "kind": "session",
             "revision": identity,
-            "updated_at": at,
+            "updated_at": updated.clone(),
             "owner_id": subject.subject,
             "state": state,
             "started_at": started,
-            "ended_at": if state == "completed" || state == "failed" || state == "cancelled" { Some(at) } else { None },
+            "ended_at": if state == "completed" || state == "failed" || state == "cancelled" { Some(updated) } else { None },
             "timeline_cursor": format!("timeline-cursor/{}/0", &digest[..24]),
             "runtime_incarnation": incarnation,
             "usage": usage,
             "operational": subject.projection
+        }));
+    }
+    let managed_native_sessions = store
+        .claims_for_kind_at(
+            "harness.session-file",
+            snapshot_index.checked_add(1),
+            true,
+            10_000,
+        )?
+        .claims
+        .into_iter()
+        .filter_map(|claim| {
+            claim
+                .body
+                .get("fields")
+                .unwrap_or(&claim.body)
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut external = crate::external_sessions::discover(native_session_home, history)?;
+    external
+        .sessions
+        .retain(|session| !managed_native_sessions.contains(&session.native_id));
+    for session in external.sessions {
+        let running = session.process.is_some();
+        let process = session.process.as_ref().map(|process| {
+            json!({
+                "pid": process.pid,
+                "started_at": crate::external_sessions::timestamp(process.started_at_unix_ms),
+                "fingerprint": process.fingerprint,
+                "exact_session": process.exact_session
+            })
+        });
+        sessions.push(json!({
+            "id": session.id,
+            "kind": "session",
+            "revision": session.revision,
+            "updated_at": crate::external_sessions::timestamp(session.updated_at_unix_ms),
+            "owner_id": format!("external-session/{}/{}", session.driver.as_str(), session.native_id),
+            "state": if running { "running" } else { "completed" },
+            "started_at": crate::external_sessions::timestamp(session.started_at_unix_ms),
+            "ended_at": if running { None } else { Some(crate::external_sessions::timestamp(session.updated_at_unix_ms)) },
+            "timeline_cursor": format!("timeline-cursor/{}/latest", session.id.trim_start_matches("session/")),
+            "usage": null,
+            "managed": false,
+            "driver": session.driver.as_str(),
+            "native_session_id": session.native_id,
+            "workspace": session.cwd.map(|path| path.display().to_string()),
+            "title": session.title,
+            "importable": true,
+            "import_reason": null,
+            "process": process
+        }));
+    }
+    for unresolved in external.unresolved_processes {
+        sessions.push(json!({
+            "id": unresolved.id,
+            "kind": "session",
+            "revision": unresolved.revision,
+            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+            "state": "running",
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "ended_at": null,
+            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+            "usage": null,
+            "managed": false,
+            "driver": unresolved.driver.as_str(),
+            "native_session_id": null,
+            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+            "title": null,
+            "importable": false,
+            "import_reason": "the running harness does not expose an exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+            "process": {
+                "pid": unresolved.process.pid,
+                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+                "fingerprint": unresolved.process.fingerprint,
+                "exact_session": false
+            }
         }));
     }
     sessions.sort_by(|left, right| {
@@ -1061,12 +1180,32 @@ fn client_session_resources(
     Ok(sessions)
 }
 
+fn snapshot_time_ms(timestamp: &str) -> u128 {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|value| value.timestamp_millis().max(0) as u128)
+        .unwrap_or_default()
+}
+
 fn attention_resource_id(subject: &str) -> String {
     if subject.starts_with("attention/") {
         subject.to_owned()
     } else {
         let digest = hex::encode(Sha256::digest(subject.as_bytes()));
         format!("attention/{}", &digest[..24])
+    }
+}
+
+fn client_attention_actions(kind: &str) -> Vec<&'static str> {
+    match kind {
+        "human-gate" => vec!["review.approve", "review.reject"],
+        "launch-approval" => vec!["launch.approve", "launch.cancel"],
+        "revision-approval" => {
+            vec!["mission.approve-revision", "mission.cancel-revision"]
+        }
+        "unread-message" => vec!["message.read"],
+        "fault" => vec!["attention.resolve"],
+        _ => Vec::new(),
     }
 }
 
@@ -1088,23 +1227,36 @@ fn client_attention_resources(
             .last()
             .map(|claim| claim.id.clone())
             .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
-        resources.insert(
-            id.clone(),
-            json!({
-                "id": id,
-                "kind": "attention",
-                "revision": revision,
-                "updated_at": client_timestamp(item.requested_at_unix_ms),
-                "title": item.title,
-                "detail": item.detail,
-                "priority": if item.kind == "fault" { "high" } else { "normal" },
-                "state": "open",
-                "requested_at": client_timestamp(item.requested_at_unix_ms),
-                "targets": item.targets,
-                "actions": if item.kind == "fault" { vec!["attention.resolve"] } else { Vec::<&str>::new() },
-                "operational": { "layer": "current", "actionable": true, "reasons": [] }
-            }),
-        );
+        let mut resource = json!({
+            "id": id,
+            "kind": "attention",
+            "attention_kind": item.kind,
+            "source_id": item.subject,
+            "person_id": item.person,
+            "revision": revision,
+            "updated_at": client_timestamp(item.requested_at_unix_ms),
+            "title": item.title,
+            "detail": item.detail,
+            "priority": if item.kind == "fault" { "high" } else { "normal" },
+            "state": "open",
+            "requested_at": client_timestamp(item.requested_at_unix_ms),
+            "targets": item.targets,
+            "actions": client_attention_actions(&item.kind),
+            "operational": { "layer": "current", "actionable": true, "reasons": [] }
+        });
+        let object = resource
+            .as_object_mut()
+            .expect("an attention resource is an object");
+        if let Some(mission) = &item.mission {
+            object.insert("mission_id".into(), Value::String(mission.clone()));
+        }
+        if let Some(run) = &item.mission_run {
+            object.insert("mission_run_id".into(), Value::String(run.clone()));
+        }
+        if let Some(step) = &item.step {
+            object.insert("step_run_id".into(), Value::String(step.clone()));
+        }
+        resources.insert(id, resource);
     }
     if history {
         for request in store.attention_requests(person, true)? {
@@ -1121,6 +1273,9 @@ fn client_attention_resources(
                 json!({
                     "id": id,
                     "kind": "attention",
+                    "attention_kind": "fault",
+                    "source_id": request.subject,
+                    "person_id": request.reviewer,
                     "revision": request.request,
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
@@ -1129,7 +1284,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { vec!["attention.resolve"] } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
                 }),
             );
@@ -1752,6 +1907,7 @@ async fn client_sessions(
         query.history,
         &snapshot.created_at,
         snapshot.store_index,
+        state.native_session_home.as_deref(),
     )
     .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "sessions", items, &query).map(Json)
@@ -1770,9 +1926,10 @@ async fn client_sessions_detail(
     client_detail(
         client_session_resources(
             &state.store,
-            query.history,
+            true,
             &snapshot.created_at,
             snapshot.store_index,
+            state.native_session_home.as_deref(),
         )
         .map_err(ApiError::internal)?,
         "session",
@@ -2489,11 +2646,17 @@ async fn replication_receive(
 ) -> Result<Json<ReplicationReceiveResponse>, ApiError> {
     let store = state.store.clone();
     let response = blocking_action(move || {
+        let before_index = store
+            .index()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
         let receipt = store.receive_replication_exchange(
             &request.peer,
             &request.fleet_id,
             &request.exchange,
         )?;
+        store
+            .record_transport_observation(&request.peer, "up", None, None)
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
         let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received)
         {
             let admission = store
@@ -2509,10 +2672,11 @@ async fn replication_receive(
         } else {
             (Default::default(), 0, true)
         };
-        let changed = projected && (admission.changed || repairs != 0);
         let store_index = store
             .index()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let changed =
+            store_index != before_index || (projected && (admission.changed || repairs != 0));
         Ok(ReplicationReceiveResponse {
             receipt,
             changed,
@@ -2538,11 +2702,22 @@ async fn replication_peer_failure(
     Json(request): Json<ReplicationPeerFailureRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || {
+    let changed = blocking_store(move || {
+        let before_index = store.index()?;
         store.record_peer_failure(&request.peer, &request.status, &request.error)?;
-        Ok(Json(json!({ "recorded": true })))
+        store.record_transport_observation(
+            &request.peer,
+            &request.status,
+            Some(&request.error),
+            None,
+        )?;
+        Ok(store.index()? != before_index)
     })
-    .await
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(json!({ "recorded": true, "changed": changed })))
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -4087,16 +4262,30 @@ async fn put_document(
 #[derive(Deserialize)]
 struct DocumentQuery {
     name: Option<String>,
+    #[serde(default)]
+    history: bool,
+    limit: Option<usize>,
 }
 
 async fn list_documents(
     State(state): State<AppState>,
     Query(query): Query<DocumentQuery>,
-) -> Result<Json<Vec<DocumentVersion>>, ApiError> {
+) -> Result<Json<DocumentListResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let history = query.history;
     let store = state.store.clone();
-    blocking_store(move || store.list_documents(query.name.as_deref()))
-        .await
-        .map(Json)
+    let mut items = blocking_store(move || {
+        store.list_documents(query.name.as_deref(), history, limit.saturating_add(1))
+    })
+    .await?;
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    Ok(Json(DocumentListResponse {
+        items,
+        has_more,
+        limit,
+        history,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -6701,6 +6890,7 @@ mod tests {
             pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            native_session_home: None,
         }
     }
 

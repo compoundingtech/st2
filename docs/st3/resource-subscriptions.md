@@ -23,18 +23,11 @@ Each newly ready pull request becomes one `vcs.pull-request` resource. Each new 
 
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
-## Agent command
+## Authored watch operation
 
-This command creates one watch operation:
-
-```sh
-st3 resource watch github.pull-request compoundingtech/st2#403 \
-  --on head --on state --on review --on checks
-```
-
-`ST_AGENT` supplies the delivery target. A person can use `--to agent/HOST.IDENTITY`.
-
-The command returns the resource, observer, and subscription subjects. It also creates one standing watch mission run.
+A planner or authorized producing agent authors the watch as a mission graph. The public CLI does
+not expose a standalone resource-watch mutation. The delivery target is explicit in the mission;
+it is never inferred from a caller's terminal environment.
 
 The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
 
@@ -128,13 +121,9 @@ mission "observe-config" state="ready" {
 
 The mission run owns the observer. Mission cancellation stops the observer.
 
-Use this command to request an immediate observation and wait for that exact attempt:
-
-```sh
-st3 resource refresh resource/workspace/config --timeout 30s
-```
-
-The command returns `changed=false` when the provider confirms the same facts. That success adds no resource claim.
+An internal declarative refresh operation requests an immediate observation and waits for that exact
+attempt. It returns `changed=false` when the provider confirms the same facts. That success adds no
+resource claim.
 
 The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
 
@@ -236,7 +225,8 @@ The subscription becomes active when its delivery target appears.
 
 ## Lifecycle
 
-`st3 resource unwatch SUBSCRIPTION` cancels its watch mission run. It does not remove the resource or other watch runs.
+Cancelling the watch mission run stops that subscription. It does not remove the resource or other
+watch runs.
 
 Cleanup stops the owned observer and subscription before the watch run becomes cancelled.
 

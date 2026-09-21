@@ -18,19 +18,19 @@ use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    DoctorReport, DocumentPutRequest, DocumentVersion, EvalStatus, EventRecord, IntentInput,
-    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
-    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
-    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubjectStatus, WorkRequest,
-    WorkWakeRequest,
+    DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStatus,
+    EventRecord, IntentInput, LaunchApproveAndStartRequest, LaunchApproveAndStartView,
+    LaunchDecisionAnswerRequest, LaunchDecisionOption, LaunchDecisionRequest,
+    LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest, MessageLifecycleRequest,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRevisionRequest, MissionRunView, MissionState,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
+    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningSessionView, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
+    SubjectStatus, WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -38,16 +38,18 @@ use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Envelope as ClientEnvelope,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
-    TargetParameters as ClientTargetParameters,
+    TargetParameters as ClientTargetParameters, TimelineBody as ClientTimelineBody,
+    TimelinePage as ClientTimelinePage,
 };
 use tokio::sync::{Notify, watch};
 
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, render_attention_list, render_generation,
-    render_generations, render_human_value, render_mission_run, render_pty_list,
-    render_revision_proposal, render_step_run, render_work_list,
+    OutputStyle, follow_snapshot, mission_run_signature, render_attention_list,
+    render_attention_show, render_generation, render_generations, render_human_value,
+    render_mission_run, render_pty_list, render_revision_proposal, render_step_run,
+    render_work_list, shell_argument,
 };
 
 #[derive(Parser)]
@@ -55,7 +57,7 @@ use presentation::{
     name = "st3",
     bin_name = "st3",
     version,
-    about = "Claims-graph agent reconciler"
+    about = "Coordinate durable agent work across machines without losing operational truth"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -87,7 +89,7 @@ enum Command {
     /// Show and manage work that needs a person.
     Attention {
         #[command(subcommand)]
-        command: Option<AttentionCommand>,
+        command: AttentionCommand,
     },
     /// Assess fleet machines, health, and capacity.
     Machines(MachinesArgs),
@@ -156,6 +158,11 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Discover native harness sessions and move one under durable st3 ownership.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
     #[command(hide = true)]
@@ -212,11 +219,26 @@ struct UpArgs {
 
 #[derive(Subcommand)]
 enum LaunchCommand {
+    /// List current launch conversations; use --all for finished history.
+    Ls {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Turn a natural-language request into a durable planning conversation.
     Start(PlanningStartArgs),
+    /// Review one launch's request, decisions, candidate, and current status.
     Show(PlanningSessionArgs),
+    /// Validate and render the exact candidate that could be approved.
     Preview(PlanningPreviewArgs),
+    /// Record an agent-authored candidate revision for a launch.
     Submit(PlanningSubmitArgs),
+    /// Add requester feedback and ask the planner for a new candidate.
     Revise(PlanningReviseArgs),
+    /// Approve the exact previewed candidate without starting it.
     Approve(PlanningApproveArgs),
     /// Atomically request approval, then idempotently start the published mission revision.
     ApproveAndLaunch(LaunchApproveAndStartArgs),
@@ -226,8 +248,11 @@ enum LaunchCommand {
     Question(LaunchQuestionArgs),
     /// Record the immutable answer to a launch question.
     Answer(LaunchAnswerArgs),
+    /// Stop a launch conversation without publishing its candidate.
     Cancel(PlanningCancelArgs),
+    /// Compare two candidate variants field by field.
     Compare(PlanningCompareArgs),
+    /// Select the candidate variant the requester should review.
     Propose(PlanningProposeArgs),
 }
 
@@ -237,7 +262,12 @@ enum MissionViewCommand {
     Ls {
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
+    /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
@@ -278,7 +308,7 @@ struct MissionCancelArgs {
     #[arg(long)]
     reason: String,
     /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", env = "ST_PERSON")]
+    #[arg(long = "as", value_parser = parse_person_subject)]
     actor: String,
 }
 
@@ -291,8 +321,8 @@ struct PlanningStartArgs {
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    #[arg(long = "as")]
-    requester: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    requester: String,
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
@@ -348,8 +378,8 @@ struct PlanningProposeArgs {
 struct PlanningReviseArgs {
     session: String,
     feedback: PathBuf,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
     /// Print the feedback KDL without storing the feedback or publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -359,8 +389,8 @@ struct PlanningReviseArgs {
 struct PlanningApproveArgs {
     session: String,
     preview_hash: String,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -371,8 +401,8 @@ struct LaunchApproveAndStartArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -382,8 +412,8 @@ struct LaunchRunArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -410,15 +440,15 @@ struct LaunchAnswerArgs {
     explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCancelArgs {
     session: String,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
     #[arg(long)]
     reason: Option<String>,
     /// Print the cancellation KDL without publishing it.
@@ -433,11 +463,14 @@ enum PtyCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Attach this terminal interactively to one running terminal member.
     Attach(PtyAttachArgs),
+    /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
+    /// Send explicit text or a named key to one running terminal.
     Send(PtySendArgs),
+    /// Deliver one supported Unix signal to a terminal member.
     Signal(PtySignalArgs),
-    Ui,
 }
 
 #[derive(Args)]
@@ -504,6 +537,10 @@ struct NowArgs {
     /// Include explicitly historical rows in addition to the actionable default.
     #[arg(long)]
     all: bool,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -511,6 +548,10 @@ struct MachinesArgs {
     /// Include historical and discovered hosts beyond the current configured fleet.
     #[arg(long)]
     all: bool,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -540,11 +581,15 @@ enum DevicesCommand {
 #[derive(Args)]
 struct DevicesArgs {
     /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", env = "ST_PERSON")]
+    #[arg(long = "as", value_parser = parse_person_subject)]
     person: String,
     /// Include expired and revoked device history.
     #[arg(long)]
     all: bool,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
     #[command(subcommand)]
     command: Option<DevicesCommand>,
 }
@@ -581,10 +626,12 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum ServiceCommand {
+    /// Install and start the st3 user services for this machine.
     Install {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Show whether the daemon and replication services are installed and running.
     Status,
     /// Explain the one-time macOS permissions for service-owned work.
     Permissions {
@@ -592,15 +639,17 @@ enum ServiceCommand {
         #[arg(long)]
         open: bool,
     },
+    /// Restart st3 after configuration or binary changes.
     Restart {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Stop every st3 runtime, erase all st3 state, and restart an empty daemon.
+    /// Irreversibly erase local st3 state and restart an empty daemon.
     Reset {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stop and remove st3 user services while preserving state files.
     Uninstall,
 }
 
@@ -633,18 +682,47 @@ enum ReplicationCommand {
 
 #[derive(Subcommand)]
 enum DocCommand {
+    /// Store a regular file as one immutable named document version.
     Put {
         file: PathBuf,
         #[arg(long = "as")]
         name: String,
     },
+    /// Read exact document bytes by immutable name-and-hash reference.
     Get {
         reference: String,
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    List {
+    /// List selected document bindings; use --all for immutable version history.
+    Ls {
         name: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// List running native sessions; use --all for resumable saved history.
+    Ls {
+        #[arg(long)]
+        all: bool,
+        /// Resume the next bounded page returned by an earlier list.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show the exact native identity, workspace, process fence, and importability.
+    Show { session: String },
+    /// Stop an exactly identified running harness and resume it in a durable st3 mission.
+    Run {
+        session: String,
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        person: String,
     },
 }
 
@@ -726,8 +804,14 @@ enum SchemaCommand {
 enum AttentionCommand {
     /// List all current human attention items.
     Ls {
-        #[arg(long = "as")]
-        actor: Option<String>,
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        actor: String,
+    },
+    /// Explain one attention item and show the exact available actions.
+    Show {
+        subject: String,
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        actor: String,
     },
     /// Request attention after an explicit fault.
     Request(AttentionRequestArgs),
@@ -741,7 +825,7 @@ enum AttentionCommand {
 
 #[derive(Args)]
 struct AttentionRequestArgs {
-    #[arg(long = "for")]
+    #[arg(long = "for", value_parser = parse_person_subject)]
     reviewer: String,
     #[arg(long)]
     title: String,
@@ -764,32 +848,40 @@ struct AttentionResolveArgs {
     outcome: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// List work this agent can act on now; use --all for terminal history.
     Ls {
         #[arg(long = "as", env = "ST_AGENT")]
         actor: Option<String>,
         #[arg(long)]
         all: bool,
     },
-    Show {
-        subject: String,
-    },
+    /// Explain one work item, its owner, readiness, lease, and evidence.
+    Show { subject: String },
+    /// Acquire one ready work item with the current harness incarnation.
     Claim(WorkActionArgs),
+    /// Extend the live lease for work this incarnation still owns.
     Renew(WorkActionArgs),
+    /// Record a material progress update without changing ownership.
     Progress(WorkActionArgs),
+    /// Finish claimed work and attach its durable evidence.
     Complete(WorkActionArgs),
+    /// Fail claimed work with an actionable reason and evidence.
     Fail(WorkActionArgs),
+    /// Give claimed work back so another eligible agent can take it.
     Release(WorkActionArgs),
     /// Wake one ready assignee through its supported harness driver.
     Wake(WorkWakeArgs),
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
+    /// Propose a fenced revision to the mission that owns this work.
     Revise(WorkReviseArgs),
+    /// Inspect or decide one mission revision proposal and its generations.
     Revision {
         #[command(subcommand)]
         command: WorkRevisionCommand,
@@ -807,21 +899,20 @@ struct WorkWakeArgs {
 
 #[derive(Subcommand)]
 enum WorkRevisionCommand {
-    Show {
-        run: String,
-    },
-    Generations {
-        run: String,
-    },
-    Generation {
-        generation: String,
-    },
+    /// Show the current revision proposal for one mission run.
+    Show { run: String },
+    /// List every immutable generation created for one mission run.
+    Generations { run: String },
+    /// Explain one exact generation and its work state.
+    Generation { generation: String },
+    /// Approve an exact proposal preview and permit its cutover.
     Approve {
         proposal: String,
         preview_hash: String,
         #[arg(long = "as", env = "ST_AGENT")]
         actor: Option<String>,
     },
+    /// Cancel a pending revision proposal without changing the live generation.
     Cancel {
         proposal: String,
         #[arg(long = "as", env = "ST_AGENT")]
@@ -871,16 +962,38 @@ struct WorkPublishMissionArgs {
 
 #[derive(Subcommand)]
 enum MessageCommand {
+    /// Send one durable normalized message to a person or agent.
     Send(MessageSendArgs),
+    /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
+    /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
+    /// Reply to one canonical message ID while preserving its thread.
     Reply(MessageReplyArgs),
+    /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
+    /// Render the bounded conversation thread around one message.
     Thread(MessageReferenceArgs),
-    /// Write a disposable mailbox tree for translated tools.
-    Export {
-        directory: PathBuf,
+    /// List normalized harness sessions available for native conversation views.
+    Sessions {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
+    /// Render one normalized session timeline, including tools and usage.
+    Timeline {
+        session: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Continue toward older entries using the preceding response's next cursor.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Write a disposable mailbox tree for translated tools.
+    Export { directory: PathBuf },
 }
 
 #[derive(Args)]
@@ -959,8 +1072,8 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -1067,27 +1180,20 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, args, cli.json).await,
-        Command::Launch { command } => run_launch(&client, command, cli.json).await,
+        Command::Launch { command } => run_launch(&client, &endpoint, command, cli.json).await,
         Command::Missions { command } => {
             run_mission_view(&client, &endpoint, command, cli.json).await
         }
-        Command::Attention { command } => {
-            run_attention(
-                &client,
-                command.unwrap_or(AttentionCommand::Ls { actor: None }),
-                cli.json,
-            )
-            .await
-        }
+        Command::Attention { command } => run_attention(&client, command, cli.json).await,
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
         Command::Agents { command } => run_agents(&client, command, cli.json).await,
-        Command::Conversations { command } => run_message(&client, command, cli.json).await,
+        Command::Conversations { command } => {
+            run_message(&client, &endpoint, command, cli.json).await
+        }
         Command::Activity(args) => run_activity(&endpoint, args, cli.json).await,
         Command::Devices(args) => run_devices(endpoint.clone(), args, cli.json).await,
         Command::Work { command } => run_work(&client, command, cli.json).await,
-        Command::Terminals { command } => {
-            run_pty(&client, endpoint, &config, command, cli.json).await
-        }
+        Command::Terminals { command } => run_pty(&client, command, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
@@ -1098,6 +1204,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace { command } => run_trace_command(&client, command, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Documents { command } => run_doc(&client, command, cli.json).await,
+        Command::Import { command } => run_import(&endpoint, command, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
                 CompletionShell::Bash => clap_complete::Shell::Bash,
@@ -1209,6 +1316,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         pty_binary: pty_binary.clone(),
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+        native_session_home: std::env::var_os("HOME").map(PathBuf::from),
     };
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
@@ -1235,9 +1343,31 @@ async fn run_up(args: UpArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) -> Result<()> {
+async fn run_launch(
+    client: &Client,
+    endpoint: &Endpoint,
+    command: LaunchCommand,
+    json_output: bool,
+) -> Result<()> {
+    if let LaunchCommand::Ls { all, cursor, limit } = &command {
+        anyhow::ensure!(
+            *limit > 0 && *limit <= 200,
+            "the launch limit must be 1 through 200"
+        );
+        let response = generated_client(endpoint, None)?
+            .launches_list(cursor.as_deref(), Some(*limit), *all)
+            .await?;
+        let history = if *all { " --all" } else { "" };
+        return print_product_page(
+            "LAUNCHES",
+            &response,
+            json_output,
+            &format!("st3 launch ls{history}"),
+        );
+    }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let response = match command {
+        LaunchCommand::Ls { .. } => unreachable!(),
         LaunchCommand::Start(args) => {
             let (request, _) = read_intent(args.request.as_deref())?;
             anyhow::ensure!(
@@ -1267,9 +1397,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
             let request_hash = hex::encode(Sha256::digest(request.as_bytes()));
             let request_name = format!("doc/planning/{session_id}/request");
             let request_reference = format!("{request_name}@{request_hash}");
-            let requester = normalize_planning_requester(
-                args.requester.as_deref().unwrap_or("person/requester"),
-            )?;
+            let requester = args.requester;
             let kdl = planning_session_intent(
                 &session_id,
                 &mission_id,
@@ -1356,8 +1484,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                 .await?
         }
         LaunchCommand::Revise(args) => {
-            let actor =
-                normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
+            let actor = args.actor;
             let feedback = fs::read(&args.feedback)
                 .with_context(|| format!("read feedback {}", args.feedback.display()))?;
             std::str::from_utf8(&feedback).context("launch feedback must be UTF-8 text")?;
@@ -1396,7 +1523,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                         urlencoding::encode(&args.session)
                     ),
                     &PlanningApprovalRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        actor: args.actor,
                         preview_hash: args.preview_hash,
                         idempotency_key: format!("planning-approve:{nonce}"),
                     },
@@ -1413,7 +1540,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                         urlencoding::encode(&args.session)
                     ),
                     &LaunchApproveAndStartRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        actor: args.actor,
                         preview_hash: args.preview_hash,
                         workspace: workspace.to_string_lossy().into_owned(),
                         inputs: args.inputs.into_iter().collect(),
@@ -1430,7 +1557,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                 .post(
                     &format!("/v1/launches/{}/start", urlencoding::encode(&args.session)),
                     &LaunchStartRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        actor: args.actor,
                         workspace: workspace.to_string_lossy().into_owned(),
                         inputs: args.inputs.into_iter().collect(),
                         idempotency_key: format!("launch-start:{nonce}"),
@@ -1466,7 +1593,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                         urlencoding::encode(&args.decision),
                     ),
                     &LaunchDecisionAnswerRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        actor: args.actor,
                         response: args.response,
                         explanation: args.explanation,
                         expected_revision: args.expected_revision,
@@ -1477,8 +1604,7 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
             return print_value(&response, json_output);
         }
         LaunchCommand::Cancel(args) => {
-            let actor =
-                normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
+            let actor = args.actor;
             let session = args
                 .session
                 .strip_prefix("planning-session/")
@@ -1566,20 +1692,21 @@ async fn run_mission_view(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        MissionViewCommand::Ls { all } => {
-            let path = if all {
-                "/v1/client/missions?history=true"
-            } else {
-                "/v1/client/missions"
-            };
-            let missions: Value = client.get(path).await?;
-            if json_output {
-                print_value(&missions, true)
-            } else {
-                let page: ClientPage = serde_json::from_value(missions)?;
-                print!("{}", render_product_page("MISSIONS", &page));
-                Ok(())
-            }
+        MissionViewCommand::Ls { all, cursor, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the mission limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, None)?
+                .missions_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            let history = if all { " --all" } else { "" };
+            print_product_page(
+                "MISSIONS",
+                &response,
+                json_output,
+                &format!("st3 missions ls{history}"),
+            )
         }
         MissionViewCommand::Show(args) => {
             let selected = args.mission_or_run;
@@ -1642,7 +1769,7 @@ async fn cancel_mission_run(
         "mission run `{subject}` is already {}",
         run.status
     );
-    let actor = normalize_member_subject(&args.actor, "person");
+    let actor = args.actor;
     let generated = generated_client(endpoint, Some(&actor))?;
     let capabilities = generated.capabilities().await?;
     let nonce = uuid::Uuid::now_v7().simple().to_string();
@@ -1898,13 +2025,7 @@ async fn publish_text(
         .await
 }
 
-async fn run_pty(
-    client: &Client,
-    endpoint: Endpoint,
-    config: &Config,
-    command: PtyCommand,
-    json_output: bool,
-) -> Result<()> {
+async fn run_pty(client: &Client, command: PtyCommand, json_output: bool) -> Result<()> {
     match command {
         PtyCommand::Ls { all } => {
             let path = if all {
@@ -1980,26 +2101,6 @@ async fn run_pty(
                 )
                 .await?;
             print_value(&response, json_output)
-        }
-        PtyCommand::Ui => {
-            anyhow::ensure!(
-                matches!(endpoint, Endpoint::Unix(_)),
-                "st3 terminals ui is available only with the local Unix endpoint"
-            );
-            let _: Value = client.get("/v1/health").await?;
-            let pty_root = config
-                .pty_root
-                .clone()
-                .unwrap_or_else(|| config.state_dir.join("pty"));
-            let status = std::process::Command::new("pty")
-                .env("PTY_ROOT", pty_root)
-                .status()
-                .context("start the PTY operator interface")?;
-            anyhow::ensure!(
-                status.success(),
-                "the PTY operator interface exited with {status}"
-            );
-            Ok(())
         }
     }
 }
@@ -2147,22 +2248,50 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
 }
 
 async fn run_now(endpoint: &Endpoint, args: NowArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(
+        args.limit > 0 && args.limit <= 200,
+        "the now limit must be 1 through 200"
+    );
     let client = generated_client(endpoint, None)?;
     let response = if let Some(owner_run) = args.owner_run.as_deref() {
         client
-            .now_list_for_owner_run(owner_run, None, None, args.all)
+            .now_list_for_owner_run(
+                owner_run,
+                args.cursor.as_deref(),
+                Some(args.limit),
+                args.all,
+            )
             .await?
     } else {
-        client.now_list(None, None, args.all).await?
+        client
+            .now_list(args.cursor.as_deref(), Some(args.limit), args.all)
+            .await?
     };
-    print_product_page("NOW", &response, json_output)
+    let mut command = "st3 now".to_owned();
+    if let Some(owner_run) = args.owner_run {
+        command.push_str(&format!(" --owner-run {owner_run}"));
+    }
+    if args.all {
+        command.push_str(" --all");
+    }
+    print_product_page("NOW", &response, json_output, &command)
 }
 
 async fn run_machines(endpoint: &Endpoint, args: MachinesArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(
+        args.limit > 0 && args.limit <= 200,
+        "the machine limit must be 1 through 200"
+    );
     let response = generated_client(endpoint, None)?
-        .machines_list(None, None, args.all)
+        .machines_list(args.cursor.as_deref(), Some(args.limit), args.all)
         .await?;
-    print_product_page("MACHINES", &response, json_output)
+    let history = if args.all { " --all" } else { "" };
+    print_product_page(
+        "MACHINES",
+        &response,
+        json_output,
+        &format!("st3 machines{history}"),
+    )
 }
 
 async fn run_activity(endpoint: &Endpoint, args: ActivityArgs, json_output: bool) -> Result<()> {
@@ -2189,12 +2318,30 @@ async fn run_activity(endpoint: &Endpoint, args: ActivityArgs, json_output: bool
 }
 
 async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -> Result<()> {
-    let person = normalize_member_subject(&args.person, "person");
+    let DevicesArgs {
+        person,
+        all,
+        cursor,
+        limit,
+        command,
+    } = args;
     let client = generated_client(&endpoint, Some(&person))?;
-    match args.command.unwrap_or(DevicesCommand::Ls) {
+    match command.unwrap_or(DevicesCommand::Ls) {
         DevicesCommand::Ls => {
-            let response = client.devices_list(None, None, args.all).await?;
-            print_product_page("DEVICES", &response, json_output)
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the device limit must be 1 through 200"
+            );
+            let response = client
+                .devices_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            let history = if all { " --all" } else { "" };
+            print_product_page(
+                "DEVICES",
+                &response,
+                json_output,
+                &format!("st3 devices --as {person}{history}"),
+            )
         }
         DevicesCommand::Pair { device_name } => {
             let response = client
@@ -2244,15 +2391,19 @@ fn print_product_page(
     title: &str,
     response: &ClientEnvelope<ClientPage>,
     json_output: bool,
+    continuation_command: &str,
 ) -> Result<()> {
     if json_output {
         return print_value(response, true);
     }
-    print!("{}", render_product_page(title, &response.value));
+    print!(
+        "{}",
+        render_product_page(title, &response.value, continuation_command)
+    );
     Ok(())
 }
 
-fn render_product_page(title: &str, page: &ClientPage) -> String {
+fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
@@ -2269,7 +2420,11 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     "{}  attention  {}  {}  {}",
                     item.header.id, item.priority, item.state, item.title
                 );
-                let _ = writeln!(output, "  action: st3 attention ls");
+                let _ = writeln!(
+                    output,
+                    "  action: st3 attention show {} --as {}",
+                    item.source_id, item.person_id
+                );
             }
             ClientResource::Work(item) => {
                 let _ = writeln!(
@@ -2294,6 +2449,20 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                 if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st3 missions show {run}");
                 }
+            }
+            ClientResource::Launch(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {} variant{} · {} decision{}",
+                    item.header.id,
+                    item.phase,
+                    item.variants.len(),
+                    if item.variants.len() == 1 { "" } else { "s" },
+                    item.decisions.len(),
+                    if item.decisions.len() == 1 { "" } else { "s" }
+                );
+                let _ = writeln!(output, "  {}", item.title);
+                let _ = writeln!(output, "  inspect: st3 launch show {}", item.header.id);
             }
             ClientResource::Operation(item) => {
                 let _ = writeln!(
@@ -2353,15 +2522,31 @@ fn render_product_page(title: &str, page: &ClientPage) -> String {
                     item.person_id, item.header.id
                 );
             }
+            ClientResource::Session(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {} · started {}",
+                    item.header.id, item.state, item.owner_id, item.started_at
+                );
+                if let Some(usage) = &item.usage {
+                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                }
+                let _ = writeln!(
+                    output,
+                    "  timeline: st3 conversations timeline {}",
+                    item.header.id
+                );
+            }
             item => {
                 let _ = writeln!(output, "{}  resource", item.header().id);
             }
         }
     }
-    if page.page.has_more {
+    if let Some(cursor) = page.page.next_cursor.as_deref() {
         let _ = writeln!(
             output,
-            "More items are available; resume with the returned cursor."
+            "More items are available: {continuation_command} --cursor {cursor} --limit {}",
+            page.page.limit
         );
     }
     output
@@ -2420,6 +2605,103 @@ fn client_event_type_label(event_type: &ClientEventType) -> &'static str {
         ClientEventType::CapabilitiesChanged => "capabilities.changed",
         ClientEventType::Unknown => "unknown",
     }
+}
+
+fn print_timeline_page(
+    response: &ClientEnvelope<ClientTimelinePage>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        return print_value(response, true);
+    }
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "CONVERSATION  {} · {} entries",
+        response.value.session_id,
+        response.value.items.len()
+    );
+    if response.value.items.is_empty() {
+        let _ = writeln!(output, "No normalized timeline entries.");
+    }
+    for entry in &response.value.items {
+        let kind = format!("{:?}", entry.body.entry_type()).to_lowercase();
+        let role = format!("{:?}", entry.role).to_lowercase();
+        let _ = writeln!(
+            output,
+            "\n#{}  {} · {} · {}",
+            entry.sequence, entry.timestamp, role, kind
+        );
+        match &entry.body {
+            ClientTimelineBody::Message(body) => {
+                let _ = write!(output, "message {}", body.message_id);
+                if let Some(reply_to) = &body.reply_to {
+                    let _ = write!(output, " · reply to {reply_to}");
+                }
+                let _ = writeln!(output);
+            }
+            ClientTimelineBody::Content(body) => {
+                if let Some(text) = &body.text {
+                    let _ = writeln!(output, "{text}");
+                } else if let Some(attachment) = &body.attachment_id {
+                    let _ = writeln!(output, "attachment {attachment} ({})", body.media_type);
+                }
+            }
+            ClientTimelineBody::ToolCall(body) => {
+                let _ = writeln!(output, "tool {} ({})", body.name, body.call_id);
+                let _ = writeln!(output, "{}", body.arguments);
+            }
+            ClientTimelineBody::ToolResult(body) => {
+                let _ = writeln!(output, "tool result {} · {:?}", body.call_id, body.status);
+                let _ = writeln!(output, "{}", body.content);
+            }
+            ClientTimelineBody::Status(body) => {
+                let _ = writeln!(output, "{:?}", body.status);
+                if let Some(detail) = &body.detail {
+                    let _ = writeln!(output, "{detail}");
+                }
+            }
+            ClientTimelineBody::Error(body) => {
+                let _ = writeln!(output, "{}: {}", body.code, body.message);
+            }
+            ClientTimelineBody::Usage(body) => {
+                let _ = writeln!(
+                    output,
+                    "{} tokens · {} · {:?}",
+                    body.total_tokens.unwrap_or_default(),
+                    body.driver,
+                    body.semantics
+                );
+            }
+            ClientTimelineBody::Redaction(body) => {
+                let _ = writeln!(
+                    output,
+                    "redacted {} bytes: {}",
+                    body.withheld_bytes, body.reason
+                );
+            }
+            ClientTimelineBody::Truncation(body) => {
+                let _ = writeln!(
+                    output,
+                    "omitted sequences {}..{}: {}",
+                    body.omitted_from_sequence, body.omitted_to_sequence, body.reason
+                );
+            }
+        }
+    }
+    if response.value.page.has_more
+        && let Some(cursor) = &response.value.page.next_cursor
+    {
+        let _ = writeln!(
+            output,
+            "\nOlder entries: st3 conversations timeline {} --cursor {}",
+            response.value.session_id,
+            shell_argument(cursor)
+        );
+    }
+    print!("{output}");
+    Ok(())
 }
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
@@ -2712,6 +2994,13 @@ async fn run_replication(
             if json_output {
                 return print_value(&records, true);
             }
+            if records.is_empty() {
+                println!(
+                    "No {} replication records.",
+                    if all { "stored" } else { "unresolved" }
+                );
+                return Ok(());
+            }
             for record in records {
                 println!(
                     "{}\t{}\t{}:{}\t{}\t{}",
@@ -2923,13 +3212,13 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             let bytes =
                 fs::read(&file).with_context(|| format!("read document {}", file.display()))?;
             let local_hash = hex::encode(Sha256::digest(&bytes));
-            let versions: Vec<DocumentVersion> = client
+            let versions: DocumentListResponse = client
                 .get(&format!(
                     "/v1/documents?name={}",
                     urlencoding::encode(&name)
                 ))
                 .await?;
-            let selected = versions.iter().find(|version| version.latest);
+            let selected = versions.items.iter().find(|version| version.latest);
             if let Some(selected) = selected.filter(|version| version.hash != local_hash) {
                 eprintln!(
                     "warning: local bytes have hash {local_hash}; the selected binding has hash {}",
@@ -2975,26 +3264,197 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
             Ok(())
         }
-        DocCommand::List { name } => {
-            let path = name.map_or_else(
-                || "/v1/documents".to_owned(),
-                |name| format!("/v1/documents?name={}", urlencoding::encode(&name)),
+        DocCommand::Ls { name, all, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the document limit must be 1 through 200"
             );
-            let response: Vec<DocumentVersion> = client.get(&path).await?;
+            let mut path = name.map_or_else(
+                || "/v1/documents?".to_owned(),
+                |name| format!("/v1/documents?name={}&", urlencoding::encode(&name)),
+            );
+            path.push_str(&format!("history={all}&limit={limit}"));
+            let response: DocumentListResponse = client.get(&path).await?;
             if json_output {
                 print_value(&response, true)
             } else {
-                for version in response {
+                if response.items.is_empty() {
+                    println!("No documents.");
+                }
+                for version in response.items {
                     let latest = if version.latest { " latest" } else { "" };
                     println!(
                         "{}@{} {} bytes{latest}",
                         version.name, version.hash, version.size
                     );
                 }
+                if response.has_more {
+                    println!(
+                        "More document versions are available; narrow the name or raise --limit."
+                    );
+                }
                 Ok(())
             }
         }
     }
+}
+
+async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bool) -> Result<()> {
+    match command {
+        ImportCommand::Ls { all, cursor, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the import limit must be 1 through 200"
+            );
+            let client = generated_client(endpoint, None)?;
+            let mut response = client
+                .sessions_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            response.value.items.retain(|item| {
+                matches!(item, ClientResource::Session(session) if session.extra.get("managed") == Some(&Value::Bool(false)))
+            });
+            if json_output {
+                return print_value(&response, true);
+            }
+            println!("NATIVE SESSIONS  {}", response.value.items.len());
+            if response.value.items.is_empty() {
+                println!("No native harness sessions found.");
+            }
+            let next_cursor = response.value.page.next_cursor.clone();
+            for resource in response.value.items {
+                if let ClientResource::Session(session) = resource {
+                    print!("{}", render_import_session(&session));
+                }
+            }
+            if let Some(cursor) = next_cursor {
+                let history = if all { " --all" } else { "" };
+                println!(
+                    "More sessions are available: st3 import ls{history} --cursor {cursor} --limit {limit}"
+                );
+            }
+            Ok(())
+        }
+        ImportCommand::Show { session } => {
+            let response = generated_client(endpoint, None)?
+                .sessions_get(&session)
+                .await?;
+            if json_output {
+                return print_value(&response, true);
+            }
+            let ClientResource::Session(session) = response.value else {
+                anyhow::bail!("`{session}` is not a session resource");
+            };
+            anyhow::ensure!(
+                session.extra.get("managed") == Some(&Value::Bool(false)),
+                "`{}` is already managed by st3",
+                session.header.id
+            );
+            print!("{}", render_import_session(&session));
+            Ok(())
+        }
+        ImportCommand::Run { session, person } => {
+            let client = generated_client(endpoint, Some(&person))?;
+            let resource = client.sessions_get(&session).await?;
+            let ClientResource::Session(native) = &resource.value else {
+                anyhow::bail!("`{session}` is not a session resource");
+            };
+            anyhow::ensure!(
+                native.extra.get("managed") == Some(&Value::Bool(false)),
+                "`{}` is already managed by st3",
+                native.header.id
+            );
+            anyhow::ensure!(
+                native.extra.get("importable") == Some(&Value::Bool(true)),
+                "{}",
+                native
+                    .extra
+                    .get("import_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the native session is not importable")
+            );
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let result = client
+                .session_import(
+                    format!("action/{nonce}"),
+                    format!("session-import:{nonce}"),
+                    ClientFence {
+                        snapshot_id: resource.snapshot.id,
+                        subject_revisions: BTreeMap::from([(
+                            native.header.id.clone(),
+                            native.header.revision.clone(),
+                        )]),
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: native.header.id.clone(),
+                        ..ClientTargetParameters::default()
+                    },
+                )
+                .await?;
+            print_client_value(&result, json_output)
+        }
+    }
+}
+
+fn render_import_session(session: &st3_client::Session) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let driver = session
+        .extra
+        .get("driver")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let native = session
+        .extra
+        .get("native_session_id")
+        .and_then(Value::as_str);
+    let workspace = session
+        .extra
+        .get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown workspace");
+    let importable = session
+        .extra
+        .get("importable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let _ = writeln!(
+        output,
+        "{}  {}  {}  {}",
+        session.header.id, driver, session.state, workspace
+    );
+    if let Some(native) = native {
+        let _ = writeln!(output, "  native session: {native}");
+    }
+    if let Some(process) = session.extra.get("process").and_then(Value::as_object) {
+        let _ = writeln!(
+            output,
+            "  process: pid {} · exact {}",
+            process
+                .get("pid")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            process
+                .get("exact_session")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+    }
+    if importable {
+        let _ = writeln!(
+            output,
+            "  import: st3 import run {} --as person/NAME",
+            session.header.id
+        );
+        let _ = writeln!(
+            output,
+            "  conversation: st3 conversations timeline {}",
+            session.header.id
+        );
+    } else if let Some(reason) = session.extra.get("import_reason").and_then(Value::as_str) {
+        let _ = writeln!(output, "  blocked: {reason}");
+    }
+    output
 }
 
 async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) -> Result<()> {
@@ -3062,6 +3522,11 @@ async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) 
     }
     if tree {
         print!("{}", render_agent_tree(&agents));
+        return Ok(());
+    }
+    println!("AGENTS  {}", agents.len());
+    if agents.is_empty() {
+        println!("No operational agents.");
         return Ok(());
     }
     for agent in agents {
@@ -3203,13 +3668,14 @@ async fn put_document_bytes(
     name: String,
     bytes: Vec<u8>,
 ) -> Result<DocumentVersion> {
-    let versions: Vec<DocumentVersion> = client
+    let versions: DocumentListResponse = client
         .get(&format!(
             "/v1/documents?name={}",
             urlencoding::encode(&name)
         ))
         .await?;
     let expected_document = versions
+        .items
         .iter()
         .find(|version| version.latest)
         .map(|version| version.binding_claim_id.clone());
@@ -3397,7 +3863,7 @@ async fn run_review_decision(
             &ReviewRequest {
                 decision: decision.to_owned(),
                 reason: args.reason,
-                actor: args.actor,
+                actor: Some(args.actor),
                 expected_subject: None,
             },
         )
@@ -3412,22 +3878,35 @@ async fn run_attention(
 ) -> Result<()> {
     match command {
         AttentionCommand::Ls { actor } => {
-            let path = actor.as_deref().map_or_else(
-                || "/v1/attention".to_owned(),
-                |actor| format!("/v1/attention?person={}", urlencoding::encode(actor)),
-            );
+            let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let items: Vec<AttentionItemView> = client.get(&path).await?;
             if json_output {
                 print_value(&items, true)
             } else {
                 print!(
                     "{}",
-                    render_attention_list(
-                        actor.as_deref(),
-                        &items,
-                        OutputStyle::stdout(),
-                        now_ms(),
-                    )
+                    render_attention_list(Some(&actor), &items, OutputStyle::stdout(), now_ms(),)
+                );
+                Ok(())
+            }
+        }
+        AttentionCommand::Show { subject, actor } => {
+            let normalized = normalize_member_subject(&subject, "attention");
+            let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
+            let item = client
+                .get::<Vec<AttentionItemView>>(&path)
+                .await?
+                .into_iter()
+                .find(|item| item.subject == normalized)
+                .with_context(|| {
+                    format!("attention item `{normalized}` is not currently actionable")
+                })?;
+            if json_output {
+                print_value(&item, true)
+            } else {
+                print!(
+                    "{}",
+                    render_attention_show(&item, OutputStyle::stdout(), now_ms())
                 );
                 Ok(())
             }
@@ -3461,9 +3940,6 @@ async fn run_attention(
             }
         }
         AttentionCommand::Resolve(args) => {
-            let actor = args
-                .actor
-                .context("an attention resolution needs --as or ST_AGENT")?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let response: AttentionRequestView = client
                 .post(
@@ -3474,7 +3950,7 @@ async fn run_attention(
                     &AttentionResolveRequest {
                         outcome: args.outcome,
                         reason: args.reason,
-                        actor,
+                        actor: args.actor,
                         idempotency_key: format!("attention-resolve:{}:{nonce}", args.subject),
                     },
                 )
@@ -3845,7 +4321,12 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
     }
 }
 
-async fn run_message(client: &Client, command: MessageCommand, json_output: bool) -> Result<()> {
+async fn run_message(
+    client: &Client,
+    endpoint: &Endpoint,
+    command: MessageCommand,
+    json_output: bool,
+) -> Result<()> {
     sync_message_projection(client).await?;
     match command {
         MessageCommand::Send(args) => {
@@ -4004,6 +4485,36 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
                 .collect::<Vec<_>>();
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
+        }
+        MessageCommand::Sessions { all, cursor, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the session limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, None)?
+                .sessions_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            let history = if all { " --all" } else { "" };
+            print_product_page(
+                "SESSIONS",
+                &response,
+                json_output,
+                &format!("st3 conversations sessions{history}"),
+            )
+        }
+        MessageCommand::Timeline {
+            session,
+            limit,
+            cursor,
+        } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the timeline limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, None)?
+                .timeline(&session, cursor.as_deref(), Some(limit))
+                .await?;
+            print_timeline_page(&response, json_output)
         }
         MessageCommand::Export { directory } => {
             let messages: Vec<MessageView> = client.get("/v1/messages?include_closed=true").await?;
@@ -4346,17 +4857,14 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
     )
 }
 
-fn normalize_planning_requester(actor: &str) -> Result<String> {
-    let actor = if actor.contains('/') {
-        actor.to_owned()
-    } else {
-        format!("person/{actor}")
-    };
-    anyhow::ensure!(
-        actor.starts_with("person/"),
-        "a planning requester must be a person subject"
-    );
-    Ok(actor)
+fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
+    let name = actor.strip_prefix("person/").ok_or_else(|| {
+        "human authority must be explicit as a complete `person/NAME` subject".to_owned()
+    })?;
+    if name.is_empty() || name.contains('/') {
+        return Err("human authority must be a complete `person/NAME` subject".into());
+    }
+    Ok(actor.to_owned())
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
@@ -5185,10 +5693,10 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
 }
 
 async fn latest_document_text(client: &Client, name: &str) -> Result<Option<String>> {
-    let versions: Vec<DocumentVersion> = client
+    let versions: DocumentListResponse = client
         .get(&format!("/v1/documents?name={}", urlencoding::encode(name)))
         .await?;
-    let Some(version) = versions.into_iter().find(|version| version.latest) else {
+    let Some(version) = versions.items.into_iter().find(|version| version.latest) else {
         return Ok(None);
     };
     Ok(Some(String::from_utf8(
@@ -5876,6 +6384,13 @@ mod tests {
     #[test]
     fn every_cli_command_has_a_valid_help_surface() {
         fn visit(command: &clap::Command, path: &[String]) {
+            if !command.is_hide_set() {
+                assert!(
+                    command.get_about().is_some(),
+                    "{} has no human job or reason",
+                    path.join(" ")
+                );
+            }
             let mut help = command.clone();
             assert!(
                 !help.render_long_help().to_string().trim().is_empty(),
@@ -5938,7 +6453,6 @@ mod tests {
             "planning",
             "mission",
             "publish",
-            "import",
             "exec",
             "logs",
             "pty",
@@ -5968,7 +6482,6 @@ mod tests {
         let cli_source = include_str!("main.rs");
         for handler in [
             "run_preview",
-            "run_import",
             "run_exec",
             "run_logs",
             "run_status",
@@ -5989,7 +6502,6 @@ mod tests {
         for command_type in [
             "QuickArgs",
             "PublishArgs",
-            "ImportArgs",
             "ExecArgs",
             "LogsArgs",
             "StatusArgs",
@@ -6055,18 +6567,19 @@ mod tests {
     #[test]
     fn product_renderers_have_exact_empty_and_mixed_now_output() {
         assert_eq!(
-            render_product_page("NOW", &fixture_product_page(&[], false)),
+            render_product_page("NOW", &fixture_product_page(&[], false), "st3 now"),
             "NOW  0\nNo current items.\n"
         );
         assert_eq!(
             render_product_page(
                 "NOW",
-                &fixture_product_page(&["attention", "work", "operation"], false)
+                &fixture_product_page(&["attention", "work", "operation"], false),
+                "st3 now"
             ),
             concat!(
                 "NOW  3\n",
                 "attention/release-review  attention  high  open  Review release\n",
-                "  action: st3 attention ls\n",
+                "  action: st3 attention show launch/release --as person/nathan\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  action: st3 work show work/release/1/build\n",
                 "operation/transport-host-b  operation  warning  degraded  Peer is retrying\n",
@@ -6098,18 +6611,22 @@ mod tests {
         );
         assert_eq!(
             contract["purposes"]["attention"]["human_example"],
-            "st3 attention ls"
+            "st3 attention ls --as person/nathan"
         );
         assert_eq!(
             contract["purposes"]["attention"]["json_example"],
-            "st3 attention ls --json"
+            "st3 attention ls --as person/nathan --json"
         );
     }
 
     #[test]
     fn machine_and_device_renderers_have_exact_operational_output() {
         assert_eq!(
-            render_product_page("MACHINES", &fixture_product_page(&["machine"], true)),
+            render_product_page(
+                "MACHINES",
+                &fixture_product_page(&["machine"], true),
+                "st3 machines"
+            ),
             concat!(
                 "MACHINES  1\n",
                 "machine/host-a  local\n",
@@ -6118,11 +6635,15 @@ mod tests {
                 "  work 1 · projects 0\n",
                 "  transport unix local · last success 2026-09-20T11:09:10Z\n",
                 "  inspect: st3 subject show host/host-a\n",
-                "More items are available; resume with the returned cursor.\n",
+                "More items are available: st3 machines --cursor cursor/next --limit 100\n",
             )
         );
         assert_eq!(
-            render_product_page("DEVICES", &fixture_product_page(&["device"], false)),
+            render_product_page(
+                "DEVICES",
+                &fixture_product_page(&["device"], false),
+                "st3 devices --as person/nathan"
+            ),
             concat!(
                 "DEVICES  1\n",
                 "device/ios-release  active  person/nathan/session/ios-release  scopes 4\n",
@@ -6528,12 +7049,63 @@ mod tests {
         ])
         .unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Approve(args)),
+            command: AttentionCommand::Approve(args),
         } = cli.command
         else {
             panic!("review approve did not parse");
         };
-        assert_eq!(args.actor.as_deref(), Some("person/reviewer"));
+        assert_eq!(args.actor, "person/reviewer");
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "attention",
+                "approve",
+                "attention/item",
+                "--as",
+                "reviewer",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["st3", "attention", "approve", "attention/item",]).is_err());
+    }
+
+    #[test]
+    fn every_human_authorized_cli_path_rejects_ambient_or_shorthand_identity() {
+        let missing = [
+            vec!["st3", "attention", "ls"],
+            vec!["st3", "attention", "show", "attention/item"],
+            vec![
+                "st3",
+                "missions",
+                "cancel",
+                "mission-run/demo",
+                "--reason",
+                "done",
+            ],
+            vec!["st3", "launch", "start", "--id", "demo"],
+            vec!["st3", "launch", "approve", "launch/demo", "hash"],
+            vec!["st3", "launch", "run", "launch/demo"],
+            vec!["st3", "launch", "cancel", "launch/demo"],
+            vec!["st3", "devices"],
+            vec!["st3", "import", "run", "session/demo"],
+        ];
+        for argv in missing {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "accepted human action without --as: {argv:?}"
+            );
+        }
+
+        for argv in [
+            vec!["st3", "attention", "ls", "--as", "nathan"],
+            vec!["st3", "devices", "--as", "nathan"],
+            vec!["st3", "import", "run", "session/demo", "--as", "nathan"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "accepted shorthand human identity: {argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -6626,12 +7198,12 @@ mod tests {
         let list =
             Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Ls { actor }),
+            command: AttentionCommand::Ls { actor },
         } = list.command
         else {
             panic!("the review list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor, "person/nathan");
 
         let approve = Cli::try_parse_from([
             "st3",
@@ -6643,7 +7215,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Approve(args)),
+            command: AttentionCommand::Approve(args),
         } = approve.command
         else {
             panic!("the review approve command did not parse");
@@ -6656,12 +7228,12 @@ mod tests {
         let list =
             Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Ls { actor }),
+            command: AttentionCommand::Ls { actor },
         } = list.command
         else {
             panic!("the attention list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor, "person/nathan");
 
         let request = Cli::try_parse_from([
             "st3",
@@ -6682,7 +7254,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Request(args)),
+            command: AttentionCommand::Request(args),
         } = request.command
         else {
             panic!("the attention request command did not parse");
@@ -6702,23 +7274,13 @@ mod tests {
         ])
         .unwrap();
         let Command::Attention {
-            command: Some(AttentionCommand::Resolve(args)),
+            command: AttentionCommand::Resolve(args),
         } = resolve.command
         else {
             panic!("the attention resolve command did not parse");
         };
         assert_eq!(args.subject, "attention/fabric");
         assert_eq!(args.outcome, "dismissed");
-    }
-
-    #[tokio::test]
-    async fn pty_ui_refuses_a_remote_endpoint_before_launch() {
-        let endpoint = Endpoint::Http("http://example.invalid".into());
-        let client = Client::new(endpoint.clone());
-        let error = run_pty(&client, endpoint, &Config::default(), PtyCommand::Ui, false)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("local Unix endpoint"));
     }
 
     #[test]
@@ -6822,6 +7384,7 @@ mod tests {
             pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            native_session_home: None,
         });
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {

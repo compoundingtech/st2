@@ -16,7 +16,7 @@
       "actions": ["attention.open", "mission.open", "work.claim", "operation.open"]
     },
     {
-      "id": "missions.list", "task": "Find active or ready missions", "model": "missions-list.v0", "cli": "st3 missions",
+      "id": "missions.list", "task": "Find active or ready missions", "model": "missions-list.v0", "cli": "st3 missions ls",
       "sections": ["summary", "missions", "progress"], "actions": ["mission.open", "mission.start", "mission.cancel"]
     },
     {
@@ -25,7 +25,7 @@
       "actions": ["mission.start", "mission.revise", "mission.cancel", "work.open"]
     },
     {
-      "id": "attention", "task": "Review and resolve person-authorized decisions", "model": "attention.v0", "cli": "st3 attention",
+      "id": "attention", "task": "Review and resolve person-authorized decisions", "model": "attention.v0", "cli": "st3 attention ls --as person/NAME",
       "sections": ["counts", "inbox", "detail"], "actions": ["attention.resolve", "review.approve", "review.reject", "message.read"]
     },
     {
@@ -39,13 +39,13 @@
       "actions": ["machine.open", "operation.open", "replication.open"]
     },
     {
-      "id": "agents", "task": "Find live agents and understand typed ownership", "model": "agents-tree.v0", "cli": "st3 agents --tree",
+      "id": "agents", "task": "Find live agents and understand typed ownership", "model": "agents-tree.v0", "cli": "st3 agents tree",
       "sections": ["counts", "fleet-tree", "agent-detail", "sessions", "work"],
       "tree": ["fleet", "mission-run", "nested-run", "agent-role"],
       "actions": ["agent.open", "conversation.open", "runtime.stop", "work.open"]
     },
     {
-      "id": "conversations", "task": "Read, follow, and send harness-neutral conversation turns", "model": "conversations.v0", "cli": "st3 conversations",
+      "id": "conversations", "task": "Read, follow, and send harness-neutral conversation turns", "model": "conversations.v0", "cli": "st3 conversations sessions",
       "sections": ["sessions", "timeline", "usage", "errors", "redactions", "truncations"],
       "actions": ["conversation.follow", "message.send", "message.reply", "message.read", "message.close"]
     },
@@ -56,6 +56,18 @@
     {
       "id": "devices", "task": "Pair, inspect, scope, and revoke remote devices", "model": "devices.v0", "cli": "st3 devices",
       "sections": ["paired", "sessions", "scopes", "revocations"], "actions": ["device.pair", "device.revoke"]
+    },
+    {
+      "id": "work", "task": "See exactly what work is ready, claimed, blocked, or historical", "model": "work.v0", "cli": "st3 work ls",
+      "sections": ["counts", "ready", "claimed", "blocked", "owner", "lease"], "actions": ["work.open", "work.claim", "work.release", "work.wake"]
+    },
+    {
+      "id": "terminals", "task": "Find and safely attach to terminal runtimes", "model": "runtime.v0", "cli": "st3 terminals ls",
+      "sections": ["terminals", "owner-host", "incarnation", "access", "screen"], "actions": ["terminal.attach", "terminal.peek", "terminal.input", "terminal.signal"]
+    },
+    {
+      "id": "import", "task": "Inspect legacy harness conversations and move one under st3 ownership", "model": "session.v0", "cli": "st3 import ls",
+      "sections": ["running-native-sessions", "saved-history", "normalized-conversation", "process-fence", "importability"], "actions": ["conversation.open", "session.import"]
     },
     {
       "id": "subject", "task": "Inspect any registered subject without exposing storage tables", "model": "subject-explorer.v0", "cli": "st3 subject show ID",

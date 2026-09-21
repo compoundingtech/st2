@@ -23,6 +23,7 @@ fn test_state(root: &Path) -> AppState {
         pty_binary: PathBuf::from("pty"),
         fleet_id: None,
         configured_peers: vec!["offline-peer".into()],
+        native_session_home: None,
     }
 }
 

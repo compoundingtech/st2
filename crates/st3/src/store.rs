@@ -4766,15 +4766,22 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn list_documents(&self, name: Option<&str>) -> Result<Vec<DocumentVersion>> {
+    pub fn list_documents(
+        &self,
+        name: Option<&str>,
+        history: bool,
+        limit: usize,
+    ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
                      ,d.binding_claim_id
                      FROM documents d JOIN blobs b ON b.hash=d.hash
-                     WHERE (?1 IS NULL OR d.name=?1) ORDER BY d.name, d.created_index DESC";
+                     WHERE (?1 IS NULL OR d.name=?1)
+                       AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
+                     ORDER BY d.name, d.created_index DESC LIMIT ?3";
         let mut statement = connection.prepare(query)?;
-        let rows = statement.query_map([name], |row| {
+        let rows = statement.query_map(params![name, history, limit], |row| {
             Ok(DocumentVersion {
                 name: row.get(0)?,
                 hash: row.get(1)?,
@@ -5398,6 +5405,26 @@ impl Store {
                     body: serde_json::from_str(&body).unwrap_or(Value::Null),
                 })
             })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn events_tail_bounded(&self, limit: usize) -> Result<Vec<EventRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT store_index, kind, subject, body FROM (
+                 SELECT store_index, kind, subject, body FROM events
+                 ORDER BY store_index DESC LIMIT ?1
+             ) ORDER BY store_index",
+        )?;
+        let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| {
+            let body = row.get::<_, String>(3)?;
+            Ok(EventRecord {
+                store_index: row.get(0)?,
+                kind: row.get(1)?,
+                subject: row.get(2)?,
+                body: serde_json::from_str(&body).unwrap_or(Value::Null),
+            })
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -7771,14 +7798,64 @@ impl Store {
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
-        connection.execute(
-            "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
-                updated_at_unix_ms=excluded.updated_at_unix_ms",
-            params![peer, status, error, now_ms().to_string()],
-        )?;
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection.execute(
+                "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
+                    updated_at_unix_ms=excluded.updated_at_unix_ms",
+                params![peer, status, error, now_ms().to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_transport_observation(
+        &self,
+        peer: &str,
+        status: &str,
+        reason: Option<&str>,
+        last_success_at: Option<u128>,
+    ) -> Result<()> {
+        let subject = format!("host/{peer}");
+        let already_current = self
+            .latest_claim(&subject, Some("transport.observed"))?
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(status);
+        if already_current {
+            return Ok(());
+        }
+        let mut fields = BTreeMap::from([
+            ("status".into(), Value::String(status.to_owned())),
+            ("protocol".into(), Value::String("http-replication".into())),
+        ]);
+        if let Some(reason) = reason {
+            fields.insert("reason".into(), Value::String(reason.to_owned()));
+        }
+        let last_success_at = last_success_at.or_else(|| (status == "up").then(now_ms));
+        if let Some(last_success_at) = last_success_at.and_then(|value| u64::try_from(value).ok()) {
+            fields.insert("last_success_at".into(), Value::from(last_success_at));
+        }
+        self.append_claim(&ClaimInput {
+            subject,
+            kind: "transport.observed".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "replication-transport:{peer}:{status}:{}",
+                now_ms()
+            )),
+        })?;
         Ok(())
     }
 
@@ -17941,6 +18018,24 @@ version 2
             )
             .expect("new");
         assert_ne!(old.hash, new.hash);
+        let selected = store
+            .list_documents(Some("doc/task"), false, 10)
+            .expect("selected documents");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash, new.hash);
+        let history = store
+            .list_documents(Some("doc/task"), true, 10)
+            .expect("document history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].hash, new.hash);
+        assert_eq!(history[1].hash, old.hash);
+        assert_eq!(
+            store
+                .list_documents(Some("doc/task"), true, 1)
+                .expect("bounded history")
+                .len(),
+            1
+        );
         let intent = parse_intent(
             &format!(
                 "version 2\n person \"worker\"; message \"task\" {{ to \"person/worker\"; content \"doc/task@{}\"; }} ",

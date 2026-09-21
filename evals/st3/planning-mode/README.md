@@ -16,4 +16,5 @@ Mechanical gates prove these boundaries:
 
 The revision path and stale-preview refusal are deterministic API tests. This paid eval uses direct approval so the model budget measures authoring, not a forced rewrite.
 
-Run it with `st3 eval ./evals/st3/planning-mode`.
+Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+the repository's internal eval controller, not the public CLI.

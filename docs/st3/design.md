@@ -93,8 +93,9 @@ split lets a ready step survive a daemon outage, a driver outage, and a failed d
 An agent notification only indicates that ready work or a message may exist. It does not authorize
 new work. The work queue and message record remain authoritative.
 
-`st3 attention ls` combines current human gates, launch approvals, revision approvals, unread
-person messages, and explicit fault requests. It is the machine source for future user interfaces.
+`st3 attention ls --as person/NAME` combines that person's current human gates, launch approvals,
+revision approvals, unread messages, and explicit fault requests. Human identity is required rather
+than inferred. The stable client-v0 attention resource is the machine source for user interfaces.
 
 ## Resources and observers
 

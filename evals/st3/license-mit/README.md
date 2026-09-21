@@ -14,6 +14,7 @@ This st3 eval runs the license MIT task with two native Claude Sonnet agents.
   declares MIT, the change is committed with a clean worktree, and a Codex gate that the confirmation
   cites real evidence (not a bare "done!").
 
-Start the daemon with `st3 up`. Run the eval with `st3 eval ./evals/st3/license-mit`.
+Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+the repository's internal eval controller, not the public CLI.
 
 The `receipts/` directory contains the attempts and the passing proof.

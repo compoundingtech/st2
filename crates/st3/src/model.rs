@@ -1088,6 +1088,14 @@ pub struct DocumentVersion {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DocumentListResponse {
+    pub items: Vec<DocumentVersion>,
+    pub has_more: bool,
+    pub limit: usize,
+    pub history: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GateResultRequest {
     pub operation_capability: String,
     pub verdict: String,

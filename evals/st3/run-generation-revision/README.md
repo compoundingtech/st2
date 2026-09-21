@@ -18,4 +18,5 @@ The gates prove these results:
 
 This eval uses one Codex planning run.
 
-Run it with `st3 eval ./evals/st3/run-generation-revision`.
+Validate its graph contract with `cargo test -p st3 --test examples`; live orchestration uses the
+repository's internal eval controller, not the public CLI.

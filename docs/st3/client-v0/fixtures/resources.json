@@ -1,8 +1,8 @@
 [
   {
-    "id": "attention/release-review", "kind": "attention", "revision": "a1", "updated_at": "2026-09-20T11:00:00Z",
+    "id": "attention/release-review", "kind": "attention", "attention_kind": "launch-approval", "source_id": "launch/release", "person_id": "person/nathan", "mission_id": "mission/release", "revision": "a1", "updated_at": "2026-09-20T11:00:00Z",
     "title": "Review release", "detail": "Choose a launch variant", "priority": "high", "state": "open",
-    "requested_at": "2026-09-20T11:00:00Z", "targets": ["launch/release"], "actions": ["attention.resolve"]
+    "requested_at": "2026-09-20T11:00:00Z", "targets": ["launch/release"], "actions": ["launch.approve", "launch.cancel"]
   },
   {
     "id": "message/release-ready", "kind": "message", "revision": "m1", "updated_at": "2026-09-20T11:01:00Z",

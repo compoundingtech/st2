@@ -46,6 +46,8 @@
     { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalFramePage", "websocket_protocol": "st3.client.terminal.v0" }
   ],
   "actions": {
+    "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
+    "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
     "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters" },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },
@@ -58,7 +60,9 @@
     "mission.start": { "capability": "control.missions", "parameters": "MissionStartParameters" },
     "mission.revise": { "capability": "control.missions", "parameters": "MissionReviseParameters" },
     "mission.approve-revision": { "capability": "control.missions", "parameters": "TargetParameters" },
+    "mission.cancel-revision": { "capability": "control.missions", "parameters": "TargetParameters" },
     "mission.cancel": { "capability": "control.missions", "parameters": "TargetParameters" },
+    "session.import": { "capability": "control.missions", "parameters": "TargetParameters" },
     "work.claim": { "capability": "control.work", "parameters": "TargetParameters" },
     "work.renew": { "capability": "control.work", "parameters": "TargetParameters" },
     "work.progress": { "capability": "control.work", "parameters": "TargetParameters" },

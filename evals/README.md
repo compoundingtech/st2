@@ -136,19 +136,15 @@ Record exact values when the runtime exposes them. Mark an unavailable value and
 
 Commit the report with the run evidence. Do not leave the only report in terminal output or temporary state.
 
-## Commands
+## Validation
 
 ```sh
 st2 eval ./evals/st2/license-mit
-st3 eval ./evals/st3/license-mit
 st2 eval ./evals/st2/network-smoke
-st3 eval ./evals/st3/network-smoke
-st3 claim resource/mission-inputs/source resource.observed \
-  --field kind=custom.st3.document-source \
-  --field state=ready
-st3 eval ./evals/st3/mission-inputs \
-  --input message="Input proof." \
-  --input source=resource/mission-inputs/source
+cargo test -p st3 --test examples
 ```
 
-Use the matching command for the selected runtime directory.
+st3 eval orchestration is exercised through repository integration controllers and is deliberately
+not a public CLI command. The Rust test validates every st3 fixture against the normative grammar
+and its structural contracts. Paid live runs must use an explicit development controller so the
+public product CLI does not acquire an unfenced raw-fixture launcher.
