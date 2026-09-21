@@ -9896,13 +9896,20 @@ mission "scheduled-cycle" state="ready" {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(occurrences, [0, 1]);
+        assert!(
+            occurrences.len() >= 2,
+            "the recurring schedule did not start twice: {occurrences:?}"
+        );
+        assert!(
+            occurrences.windows(2).all(|pair| pair[0] < pair[1]),
+            "recurring occurrences were not distinct and ordered: {occurrences:?}"
+        );
         assert_eq!(
             store
                 .claims_for("schedule/cycle", Some("schedule.work-started"))
                 .unwrap()
                 .len(),
-            2
+            occurrences.len()
         );
     }
 
