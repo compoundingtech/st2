@@ -385,22 +385,21 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn next_work_wake_deadline(&self) -> Result<Option<u128>> {
-        let work = self.store.work(None, true)?;
-        let now = now_ms();
-        Ok(work
-            .iter()
-            .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
-            .filter_map(|step| step.wake.as_ref())
-            .filter(|wake| {
-                matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
-                    && wake.acknowledged_by.is_none()
-                    && wake.failure.is_none()
+        let work = self.store.work(None, false)?;
+        let local_agents = self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| {
+                subject.kind == "agent"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
             })
-            .map(|wake| {
-                wake.last_attempt_at_unix_ms
-                    .map_or(now, |last| last.saturating_add(WORK_WAKE_RETRY_MS))
-            })
-            .min())
+            .map(|subject| subject.subject)
+            .collect::<BTreeSet<_>>();
+        Ok(work_wake_deadline(&work, &local_agents, now_ms()))
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
@@ -703,7 +702,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
         let incarnation_key = harness_incarnation_key(incarnation);
-        let messages = self.store.messages(Some(agent), true)?;
+        let messages = self.store.messages(Some(agent), false)?;
         let work = self.store.work(Some(agent), true)?;
         let harness = self.store.current_harness(agent)?;
 
@@ -1483,12 +1482,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_mission_runs(&self) -> Result<()> {
-        let runs = self.store.active_mission_runs()?;
+        let runs = self.store.active_mission_runs_for_origin(&self.host)?;
         let mut changed = false;
         for run in runs {
-            if self.store.mission_run_origin(&run.id)?.as_deref() != Some(self.host.as_str()) {
-                continue;
-            }
             if run
                 .deadline_at_unix_ms
                 .is_some_and(|deadline| deadline <= now_ms())
@@ -6566,6 +6562,31 @@ fn message_sent_at(store: &Store, message: &MessageView) -> Option<u128> {
         .into_iter()
         .next()
         .map(|claim| claim.accepted_at_unix_ms)
+}
+
+fn work_wake_deadline(
+    work: &[StepRunView],
+    local_agents: &BTreeSet<String>,
+    now: u128,
+) -> Option<u128> {
+    work.iter()
+        .filter(|step| {
+            step.assigned_to
+                .as_ref()
+                .is_some_and(|assignee| local_agents.contains(assignee))
+        })
+        .filter(|step| step.status == "ready" && should_notify_work_message(step, work))
+        .filter_map(|step| step.wake.as_ref())
+        .filter(|wake| {
+            matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
+                && wake.acknowledged_by.is_none()
+                && wake.failure.is_none()
+        })
+        .map(|wake| {
+            wake.last_attempt_at_unix_ms
+                .map_or(now, |last| last.saturating_add(WORK_WAKE_RETRY_MS))
+        })
+        .min()
 }
 
 fn should_notify_work_message(
@@ -12693,6 +12714,65 @@ mission "ios-proof-blocked" state="ready" {
         assert_eq!(
             work_wake_decision(1, Some(1_000), true, u128::MAX),
             WorkWakeDecision::Wait
+        );
+    }
+
+    #[test]
+    fn only_the_assignee_host_arms_a_work_wake_deadline() {
+        let step = StepRunView {
+            subject: "step-run/run-1/work".into(),
+            run: "mission-run/run-1".into(),
+            generation: "run-generation/run-1".into(),
+            step: "work".into(),
+            queue: None,
+            queue_position: None,
+            definition_hash: "definition".into(),
+            status: "ready".into(),
+            attempt: 1,
+            assigned_to: Some("agent/remote.worker".into()),
+            available_to: Vec::new(),
+            agentless: false,
+            title: None,
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            under: Vec::new(),
+            worker_reported: false,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            execution_started_at_unix_ms: None,
+            execution_elapsed_ms: 0,
+            timeout_ms: None,
+            ready_age_ms: Some(1),
+            wake: Some(crate::model::WorkWakeView {
+                assignee: "agent/remote.worker".into(),
+                assignee_state: "ready".into(),
+                incarnation_id: "remote-one".into(),
+                attempts: 1,
+                last_attempt_at_unix_ms: Some(1_000),
+                acknowledged_by: None,
+                failure: None,
+            }),
+            readiness_epoch: 1,
+            blocked_reason: None,
+            blockers: Vec::new(),
+            not_before_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let work = [step];
+
+        assert_eq!(
+            work_wake_deadline(&work, &BTreeSet::from(["agent/local.worker".into()]), 2_000),
+            None
+        );
+        assert_eq!(
+            work_wake_deadline(
+                &work,
+                &BTreeSet::from(["agent/remote.worker".into()]),
+                2_000
+            ),
+            Some(1_000 + WORK_WAKE_RETRY_MS)
         );
     }
 }

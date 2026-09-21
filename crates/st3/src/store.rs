@@ -2577,6 +2577,28 @@ impl Store {
             .collect()
     }
 
+    pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT mission_runs.id
+             FROM mission_runs
+             WHERE mission_runs.status IN ('running','standing','blocked')
+               AND EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE claims.subject='mission-run/' || mission_runs.id
+                   AND claims.kind='mission-run.created'
+                   AND claims.origin=?1
+               )
+             ORDER BY mission_runs.created_at_unix_ms",
+        )?;
+        let ids = statement
+            .query_map([origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
     pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -2723,9 +2745,17 @@ impl Store {
              FROM step_runs
              WHERE agentless=0
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+               AND (?1 IS NULL
+                    OR assignee=?1
+                    OR lease_owner=?1
+                    OR EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1))
+               AND (?2 OR status NOT IN ('pending','completed','failed','cancelled'))
              ORDER BY created_at_unix_ms, step_path",
         )?;
-        let rows = statement.query_map([], step_run_from_row)?;
+        let rows = statement.query_map(
+            params![actor.as_deref(), include_terminal],
+            step_run_from_row,
+        )?;
         let views = rows.collect::<Result<Vec<_>, _>>()?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
@@ -5675,12 +5705,43 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT DISTINCT subject FROM claims WHERE subject LIKE 'message/%' ORDER BY subject",
+            "SELECT DISTINCT subject
+             FROM claims
+             WHERE subject LIKE 'message/%'
+               AND (?1 OR NOT EXISTS (
+                   SELECT 1 FROM claims closed
+                   WHERE closed.subject=claims.subject AND closed.kind='message.closed'
+               ))
+               AND (?2 IS NULL OR EXISTS (
+                   SELECT 1 FROM claims sent
+                   WHERE sent.subject=claims.subject
+                     AND sent.kind='message.sent'
+                     AND CASE
+                         WHEN json_extract(sent.body, '$.fields.to')='' OR json_extract(sent.body, '$.fields.to')='requester' OR instr(json_extract(sent.body, '$.fields.to'), '/')>0
+                         THEN json_extract(sent.body, '$.fields.to')
+                         ELSE 'agent/' || json_extract(sent.body, '$.fields.to')
+                     END=?2
+               ) OR EXISTS (
+                   SELECT 1
+                   FROM desired, json_each(desired.body, '$.children') child
+                   WHERE desired.subject=claims.subject
+                     AND desired.kind='message'
+                     AND json_extract(child.value, '$.name')='to'
+                     AND CASE
+                         WHEN json_extract(child.value, '$.arguments[0]')='' OR json_extract(child.value, '$.arguments[0]')='requester' OR instr(json_extract(child.value, '$.arguments[0]'), '/')>0
+                         THEN json_extract(child.value, '$.arguments[0]')
+                         ELSE 'agent/' || json_extract(child.value, '$.arguments[0]')
+                     END=?2
+               ))
+             ORDER BY subject",
         )?;
         let subjects = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map(params![include_closed, recipient.as_deref()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut output = Vec::new();
         for subject in subjects {
@@ -5724,7 +5785,9 @@ impl Store {
                 .and_then(Value::as_str)
                 .unwrap_or("sent")
                 .to_owned();
-            if recipient.is_some_and(|recipient| recipient != to)
+            if recipient
+                .as_deref()
+                .is_some_and(|recipient| recipient != to)
                 || (!include_closed && status == "closed")
             {
                 continue;
@@ -16330,6 +16393,47 @@ mod tests {
     }
 
     #[test]
+    fn active_mission_evaluation_selects_only_the_creating_origin() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "origin-owned" state="ready" {
+  goal "Evaluate this run on exactly one origin."
+}
+"#,
+            "publish-origin-owned",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "origin-owned".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "origin-owned-run".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .active_mission_runs_for_origin("node")
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate.subject.as_str())
+                .collect::<Vec<_>>(),
+            [run.subject.as_str()]
+        );
+        assert!(
+            store
+                .active_mission_runs_for_origin("other")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn an_embedded_loop_mission_cannot_start_without_its_parent() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
@@ -19338,6 +19442,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         .unwrap();
         assert_eq!(repeated_close.id, closed.id);
         assert_eq!(store.messages(None, true).unwrap()[0].status, "closed");
+        assert!(store.messages(None, false).unwrap().is_empty());
     }
 
     #[test]
