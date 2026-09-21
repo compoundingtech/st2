@@ -16,8 +16,10 @@ The examples use local names and workspaces. Change them before production use.
 
 - [`standing-owner.kdl`](standing-owner.kdl) keeps one agent available without a special mission type.
 - [`queued-work.kdl`](queued-work.kdl) gives one agent an explicit ordered queue.
+- [`queued-nested-work.kdl`](queued-nested-work.kdl) runs nested jobs in a strict sequence; agentless container steps start automatically and are not claimed by workers.
 - [`concurrent-intake.kdl`](concurrent-intake.kdl) starts isolated runs from observed resource changes.
 - [`human-review.kdl`](human-review.kdl) stops finite work at an exact human gate.
+- [`review-remediation.kdl`](review-remediation.kdl) records an independent review as a completed report so findings do not cancel their remediation step.
 - [`recurring-stewardship.kdl`](recurring-stewardship.kdl) schedules repeated finite cycles.
 - [`nested-mission.kdl`](nested-mission.kdl) delegates a step into an inline child mission.
 - [`resource-observation.kdl`](resource-observation.kdl) gates work on a local observed resource.

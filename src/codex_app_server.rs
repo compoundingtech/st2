@@ -9,7 +9,7 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -768,7 +768,12 @@ impl CodexInboxDelivery {
         }) {
             self.rejected = None;
         }
-        self.head = unread.into_iter().next();
+        // A consumed message remains unread until the recipient's normal archive precedence
+        // settles it. It is history, not a FIFO lock: select the earliest unread message that has
+        // not already reached Codex's consumption ceiling.
+        self.head = unread
+            .into_iter()
+            .find(|message| !self.ledger.settled(&message.filename));
         self.suppressed =
             status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
         self.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
@@ -814,7 +819,7 @@ impl CodexInboxDelivery {
         // Exactly one delivery is outstanding at a time on this transport: an entry bound to some
         // other file holds the pump until archive precedence resolves it, so a message arriving
         // out of filename order can never open a second concurrent delivery.
-        if !self.ledger.entries().is_empty() && self.ledger.entry(&head.filename).is_none() {
+        if self.ledger.holds_other_than(&head.filename) {
             return Ok(None);
         }
         // An attempt this pump already owns is held until evidence settles or refuses it. Only an
@@ -894,9 +899,9 @@ impl CodexInboxDelivery {
             });
             return Ok(true);
         }
-        match &pending.method {
+        let accepted_turn_id = match &pending.method {
             CodexDeliveryMethod::Start => {
-                required_string(message, "/result/turn/id", "turn/start response")?;
+                required_string(message, "/result/turn/id", "turn/start response")?
             }
             CodexDeliveryMethod::Steer { turn_id } => {
                 let returned = required_string(message, "/result/turnId", "turn/steer response")?;
@@ -904,14 +909,14 @@ impl CodexInboxDelivery {
                     returned == turn_id,
                     "Codex turn/steer response returned a different turn"
                 );
+                returned
             }
-        }
-        // The request returned a well-formed result. That is a fact about the call, never about
-        // the model, so it grades no higher than `transportAccepted`.
-        self.ledger.record(
-            &pending.filename,
-            delivery_ledger::Evidence::TransportAccepted,
-        )?;
+        };
+        // The result proves transport acceptance and names the exact turn that accepted the
+        // delivery. Persist both facts atomically so a matching successful turn completion can
+        // settle clients (including Codex 0.146) that omit the correlated user-message receipt.
+        self.ledger
+            .accept_codex_turn(&pending.filename, accepted_turn_id)?;
         self.rejected = None;
         Ok(true)
     }
@@ -956,20 +961,66 @@ impl CodexInboxDelivery {
         Ok(true)
     }
 
+    /// Accept the exact successful terminal turn as a fallback receipt.
+    ///
+    /// Some supported Codex app-server releases persist and process a `clientUserMessageId` but do
+    /// not broadcast the corresponding `item/completed{userMessage}` on the control subscription.
+    /// A successful `turn/completed` for the turn returned by `turn/start` or `turn/steer` is the
+    /// next monotone observation: the accepted input's turn ran to its ordinary end. Binding,
+    /// incarnation, and exact turn identity prevent another thread or attempt from settling it.
+    fn accept_turn_completion_receipt(
+        &mut self,
+        message: &Value,
+        state: &CodexControlState,
+    ) -> Result<bool> {
+        if message.get("method").and_then(Value::as_str) != Some("turn/completed")
+            || message.pointer("/params/threadId").and_then(Value::as_str)
+                != Some(state.thread_id())
+            || state.runtime_incarnation != self.runtime.incarnation()
+            || codex_turn_outcome(message.pointer("/params/turn")) != CodexTurnOutcome::Accepted
+        {
+            return Ok(false);
+        }
+        let turn_id = required_string(message, "/params/turn/id", "turn/completed")?;
+        let settled = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.binding == state.thread_id()
+                    && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
+                    && entry.accepted_turn_id.as_deref() == Some(turn_id)
+                    && entry.phase < delivery_ledger::Phase::Consumed
+            })
+            .map(|entry| entry.filename.clone())
+            .collect::<Vec<_>>();
+        for filename in &settled {
+            self.ledger
+                .record(filename, delivery_ledger::Evidence::Consumed)?;
+        }
+        Ok(!settled.is_empty())
+    }
+
     /// Reconcile a pre-crash attempt against the typed history returned by `thread/resume` before
     /// the same client ID can be sent again.
     fn reconcile_resume(&mut self, message: &Value, state: &CodexControlState) -> Result<()> {
         if message.get("error").is_some() {
             return Ok(());
         }
-        let unsettled: Vec<(String, String)> = self
+        let unsettled: Vec<(String, String, Option<String>)> = self
             .ledger
             .entries()
             .iter()
             .filter(|entry| {
                 entry.binding == state.thread_id() && entry.phase < delivery_ledger::Phase::Consumed
             })
-            .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
+            .map(|entry| {
+                (
+                    entry.filename.clone(),
+                    entry.correlation.value.clone(),
+                    entry.accepted_turn_id.clone(),
+                )
+            })
             .collect();
         if unsettled.is_empty() {
             return Ok(());
@@ -980,17 +1031,23 @@ impl CodexInboxDelivery {
             .context(
                 "Codex thread/resume response has no typed turn history for delivery recovery",
             )?;
-        for (filename, client_id) in unsettled {
+        for (filename, client_id, accepted_turn_id) in unsettled {
             let accepted = turns.iter().any(|turn| {
-                turn.get("items")
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("userMessage")
-                                && item.get("clientId").and_then(Value::as_str)
-                                    == Some(client_id.as_str())
-                        })
-                    })
+                let correlated_item =
+                    turn.get("items")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("type").and_then(Value::as_str) == Some("userMessage")
+                                    && item.get("clientId").and_then(Value::as_str)
+                                        == Some(client_id.as_str())
+                            })
+                        });
+                let completed_accepted_turn = accepted_turn_id.as_deref().is_some_and(|expected| {
+                    turn.get("id").and_then(Value::as_str) == Some(expected)
+                        && turn.get("status").and_then(Value::as_str) == Some("completed")
+                });
+                correlated_item || completed_accepted_turn
             });
             if accepted {
                 self.ledger
@@ -1019,6 +1076,38 @@ fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &st
         hash.update(value);
     }
     format!("st2:{:x}", hash.finalize())
+}
+
+/// Read the exact native inbox filenames whose Codex deliveries reached consumption.
+///
+/// This is the graph bridge's receipt boundary: copying a projected message into the native inbox
+/// is not delivery to a turn. The same ledger loader and correlation derivation used by the pump
+/// validate the record before a graph lifecycle may advance. A missing ledger means no receipts.
+pub fn consumed_delivery_filenames(
+    state_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<BTreeSet<String>> {
+    let path = state_dir.join(delivery_ledger::LEDGER_FILE);
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let ledger = delivery_ledger::Ledger::open(
+        &path,
+        delivery_ledger::Harness::Codex.profile(),
+        identity,
+        runtime_id,
+        |thread, filename| stable_client_user_message_id(identity, thread, filename),
+    );
+    if let Some(reason) = ledger.quarantined() {
+        anyhow::bail!("Codex delivery receipt ledger is quarantined: {reason}");
+    }
+    Ok(ledger
+        .entries()
+        .iter()
+        .filter(|entry| entry.phase == delivery_ledger::Phase::Consumed)
+        .map(|entry| entry.filename.clone())
+        .collect())
 }
 
 fn codex_delivery_request(
@@ -2766,6 +2855,13 @@ fn pump_control(
                 }
                 None => false,
             };
+            // Unlike an item receipt, a terminal turn notification still changes the harness
+            // state below. Grade its delivery evidence without consuming the frame.
+            if let Some(delivery) = delivery.as_mut() {
+                delivery
+                    .accept_turn_completion_receipt(&message, state)
+                    .context("accepting Codex turn completion receipt")?;
+            }
             let changed = if delivery_response {
                 false
             } else if message.get("method").is_none()

@@ -3573,6 +3573,7 @@ impl Store {
             }
         }
         for mission in intent.missions.values() {
+            append_review_remediation_warnings(mission, &mut warnings);
             let mut selectors = mission.work_selector.iter().cloned().collect::<Vec<_>>();
             selectors.extend(
                 flatten_mission_step_specs(mission)
@@ -13601,6 +13602,49 @@ fn flatten_mission_step_specs(mission: &MissionSpec) -> Vec<&crate::model::StepS
     output
 }
 
+fn append_review_remediation_warnings(mission: &MissionSpec, warnings: &mut Vec<String>) {
+    fn describes(step: &crate::model::StepSpec, terms: &[&str]) -> bool {
+        let description = std::iter::once(step.id.as_str())
+            .chain(step.title.as_deref())
+            .chain(step.goals.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        terms.iter().any(|term| description.contains(term))
+    }
+
+    for id in &mission.display_order {
+        let step = &mission.steps[id];
+        let remediation = describes(step, &["fix", "remediat", "repair", "resolve finding"]);
+        if remediation {
+            for dependency in &step.dependencies {
+                let DependencySpec::Step {
+                    step: target,
+                    state,
+                } = dependency
+                else {
+                    continue;
+                };
+                let Some(predecessor) = mission.steps.get(target) else {
+                    continue;
+                };
+                if state == "completed"
+                    && describes(predecessor, &["review", "validation", "audit"])
+                    && !describes(predecessor, &["report-only"])
+                {
+                    warnings.push(format!(
+                        "remediation step `{}` depends on review step `{}` completing; if findings make the review fail, failure propagation makes remediation unreachable. Make the review report findings and complete, or use an explicit bounded review/fix loop",
+                        step.path, predecessor.path
+                    ));
+                }
+            }
+        }
+        if let Some(nested) = &step.nested_mission {
+            append_review_remediation_warnings(nested, warnings);
+        }
+    }
+}
+
 fn interpolate_selector(
     selector: &WorkSelector,
     variables: &BTreeMap<String, String>,
@@ -20839,6 +20883,40 @@ mission "work" state="ready" {
                 .warnings
                 .iter()
                 .all(|warning| !warning.contains("missing eligible agent")),
+            "{:?}",
+            planned.warnings
+        );
+    }
+
+    #[test]
+    fn preview_warns_when_negative_review_would_cancel_its_only_remediation() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+mission "review-guardrail" state="ready" {
+  goal "Review, remediate, and release."
+  step "independent-review" { goal "Fail validation when material findings exist." }
+  step "fix-and-real-daemon-proof" {
+    goal "Remediate every review finding."
+    depends-on { step "independent-review" completed }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(planned.blockers.is_empty());
+        assert!(
+            planned.warnings.iter().any(|warning| {
+                warning.contains("failure propagation makes remediation unreachable")
+                    && warning.contains("independent-review")
+            }),
             "{:?}",
             planned.warnings
         );

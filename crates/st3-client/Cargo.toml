@@ -17,4 +17,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["net", "rt"] }
 
 [dev-dependencies]
+axum = "0.8"
+st3 = { path = "../st3" }
 tempfile = "3"

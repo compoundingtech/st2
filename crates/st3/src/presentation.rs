@@ -95,9 +95,10 @@ pub(crate) fn render_mission_run(
         .iter()
         .filter(|step| step.status == "completed")
         .count();
+    let ready = steps.iter().filter(|step| step.status == "ready").count();
     let active = steps
         .iter()
-        .filter(|step| is_moving_state(&step.status))
+        .filter(|step| is_executing_state(&step.status))
         .count();
     let blocked = steps.iter().filter(|step| step.status == "blocked").count();
 
@@ -125,7 +126,7 @@ pub(crate) fn render_mission_run(
     );
     let _ = writeln!(
         output,
-        "PROGRESS  {completed}/{} completed · {active} active · {blocked} blocked",
+        "PROGRESS  {completed}/{} completed · {ready} ready · {active} active · {blocked} blocked",
         steps.len()
     );
     if let Some(deadline) = selected.deadline_at_unix_ms {
@@ -781,10 +782,15 @@ pub(crate) fn render_generation(generation: &RunGenerationView, style: OutputSty
         .iter()
         .filter(|step| step.status == "completed")
         .count();
+    let ready = generation
+        .steps
+        .iter()
+        .filter(|step| step.status == "ready")
+        .count();
     let active = generation
         .steps
         .iter()
-        .filter(|step| is_moving_state(&step.status))
+        .filter(|step| is_executing_state(&step.status))
         .count();
     let _ = writeln!(
         output,
@@ -802,7 +808,7 @@ pub(crate) fn render_generation(generation: &RunGenerationView, style: OutputSty
     }
     let _ = writeln!(
         output,
-        "PROGRESS  {completed}/{} completed · {active} active",
+        "PROGRESS  {completed}/{} completed · {ready} ready · {active} active",
         generation.steps.len()
     );
     let _ = writeln!(output);
@@ -1114,8 +1120,8 @@ fn is_active_state(status: &str) -> bool {
     )
 }
 
-fn is_moving_state(status: &str) -> bool {
-    matches!(status, "ready" | "claimed" | "working" | "verifying")
+fn is_executing_state(status: &str) -> bool {
+    matches!(status, "claimed" | "working" | "verifying")
 }
 
 fn is_terminal_state(status: &str) -> bool {
@@ -1469,7 +1475,7 @@ mod tests {
             render_mission_run(&root, &[root.clone(), child], OutputStyle::plain(), 3_000);
 
         assert!(rendered.contains("MISSION  demo"));
-        assert!(rendered.contains("PROGRESS  2/4 completed · 1 active"));
+        assert!(rendered.contains("PROGRESS  2/4 completed · 0 ready · 1 active"));
         assert!(rendered.contains("research — investigate research"));
         assert!(rendered.contains("queue issues #1"));
         assert!(rendered.contains("↳ demo · completed · 1/1 completed"));

@@ -158,6 +158,8 @@ enum Command {
     },
     /// Publish one registered typed observation.
     Claim(ClaimArgs),
+    /// Report a harness failure as this agent through the authorized diagnostic path.
+    Diagnostic(HarnessDiagnosticArgs),
     /// Inspect the authoritative subject, resource, and claim schema.
     Schema {
         #[command(subcommand)]
@@ -863,6 +865,22 @@ struct ClaimArgs {
     idempotency_key: Option<String>,
 }
 
+#[derive(Args)]
+struct HarnessDiagnosticArgs {
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long)]
+    code: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, default_value = "error", value_parser = ["warning", "error"])]
+    severity: String,
+    #[arg(long, default_value = "active")]
+    status: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum SchemaCommand {
     /// List registered subject families.
@@ -1274,6 +1292,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Context { command } => run_context(&client, command, cli.json).await,
         Command::Resource { command } => run_resource(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
+        Command::Diagnostic(args) => run_harness_diagnostic(&client, args, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Review { command } => run_review(&client, command, cli.json).await,
         Command::Attention { command } => run_attention(&client, command, cli.json).await,
@@ -4198,6 +4217,49 @@ async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Resul
     }
 }
 
+async fn run_harness_diagnostic(
+    client: &Client,
+    args: HarnessDiagnosticArgs,
+    json_output: bool,
+) -> Result<()> {
+    let actor = normalize_agent_subject(&args.actor);
+    let mut fields = BTreeMap::from([
+        ("code".into(), Value::String(args.code.clone())),
+        ("reason".into(), Value::String(args.reason.clone())),
+        ("severity".into(), Value::String(args.severity)),
+        ("status".into(), Value::String(args.status)),
+    ]);
+    if let Some(incarnation) = &args.incarnation {
+        fields.insert("incarnation_id".into(), Value::String(incarnation.clone()));
+    }
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
+        actor.as_str(),
+        args.incarnation.as_deref(),
+        args.code.as_str(),
+        args.reason.as_str(),
+    ))?));
+    let response: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: actor.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(actor),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("harness-diagnostic:{}", &digest[..32])),
+            },
+        )
+        .await?;
+    if json_output {
+        print_value(&response, true)
+    } else {
+        println!("{}", response.id);
+        Ok(())
+    }
+}
+
 async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) -> Result<()> {
     let value: Value = client.get("/v1/schema").await?;
     let selected = match command {
@@ -4400,16 +4462,17 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
             Ok(())
         }
         WorkCommand::Show { subject } => {
-            let work: Vec<StepRunView> = client.get("/v1/work?include_terminal=true").await?;
             let normalized = if subject.starts_with("step-run/") {
                 subject
             } else {
                 format!("step-run/{subject}")
             };
-            let step = work
-                .into_iter()
-                .find(|step| step.subject == normalized)
-                .with_context(|| format!("step run `{normalized}` does not exist"))?;
+            let step: StepRunView = client
+                .get(&format!(
+                    "/v1/work-items/{}",
+                    urlencoding::encode(&normalized)
+                ))
+                .await?;
             if json_output {
                 print_value(&step, true)
             } else {
@@ -5445,9 +5508,10 @@ fn render_eval_graph(
         .iter()
         .filter(|step| step.status == "completed")
         .count();
+    let ready = steps.iter().filter(|step| step.status == "ready").count();
     let active = steps
         .iter()
-        .filter(|step| is_active_graph_state(&step.status))
+        .filter(|step| matches!(step.status.as_str(), "claimed" | "working" | "verifying"))
         .count();
     let blocked = steps.iter().filter(|step| step.status == "blocked").count();
     let verdict = snapshot.eval.verdict.as_deref().unwrap_or("pending");
@@ -5462,7 +5526,7 @@ fn render_eval_graph(
     let _ = writeln!(output, "CLEANUP    {}", snapshot.eval.cleanup);
     let _ = writeln!(
         output,
-        "PROGRESS   {completed}/{} completed · {active} active · {blocked} blocked",
+        "PROGRESS   {completed}/{} completed · {ready} ready · {active} active · {blocked} blocked",
         steps.len()
     );
     let _ = writeln!(output, "ELAPSED    {}", format_elapsed(elapsed));
@@ -6200,7 +6264,15 @@ async fn run_st2_native_driver(
                         .await?;
                     }
                     if driver != "claude" {
-                        forward_projected_messages(client, subject, &inbox, &archive, "native").await?;
+                        forward_projected_messages(
+                            client,
+                            subject,
+                            &inbox,
+                            &archive,
+                            "native",
+                            None,
+                        )
+                        .await?;
                     }
                     Ok(())
                 }.await;
@@ -6663,13 +6735,15 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
         "st3.{}",
         &hex::encode(Sha256::digest(subject.as_bytes()))[..16]
     );
+    let driver_identity = identity.clone();
+    let driver_runtime_id = runtime_id.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         st2::codex_app_server::run_controlled_paths(
             &driver_root,
             &driver_state,
             &driver_agent,
-            identity,
-            runtime_id,
+            driver_identity,
+            driver_runtime_id,
             argv,
         )
     });
@@ -6708,6 +6782,11 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         &inbox,
                         &archive,
                         "app-server",
+                        Some(CodexDeliveryReceipts {
+                            state_dir: &state_dir,
+                            identity: &identity,
+                            runtime_id: &runtime_id,
+                        }),
                     )
                     .await?;
                     if let Some(observed) = st2::harness_state::read(
@@ -6842,6 +6921,7 @@ async fn forward_projected_messages(
     inbox: &Path,
     archive: &Path,
     transport: &str,
+    codex_receipts: Option<CodexDeliveryReceipts<'_>>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
     let messages: Vec<MessageView> = client
@@ -6851,12 +6931,23 @@ async fn forward_projected_messages(
         ))
         .await?;
     sync_closed_projected_messages(inbox, archive, &messages)?;
-    let present = projected_message_subjects(inbox, archive)?;
+    let mut present = projected_message_files(inbox, archive)?;
+    let consumed = codex_receipts
+        .map(|receipts| {
+            st2::codex_app_server::consumed_delivery_filenames(
+                receipts.state_dir,
+                receipts.identity,
+                receipts.runtime_id,
+            )
+        })
+        .transpose()?;
     for message in messages
         .into_iter()
         .filter(|message| message.status == "sent")
     {
-        if !present.contains(&message.subject) {
+        let filename = if let Some(filename) = present.get(&message.subject) {
+            filename.clone()
+        } else {
             let content = if message.content.starts_with("doc/") {
                 let value: Value = client
                     .get(&format!(
@@ -6876,7 +6967,7 @@ async fn forward_projected_messages(
             };
             let mut tags = message.tags.clone();
             tags.push(format!("{TAG_PREFIX}{}", message.subject));
-            st2::message::send_to_inbox(
+            let filename = st2::message::send_to_inbox(
                 inbox,
                 &message.from,
                 message.title.as_deref(),
@@ -6884,6 +6975,14 @@ async fn forward_projected_messages(
                 &tags,
                 &content,
             )?;
+            present.insert(message.subject.clone(), filename.clone());
+            filename
+        };
+        // Generic native transports retain their existing synchronous acceptance boundary. Codex
+        // advances graph delivery only after its durable ledger proves the exact inbox file was
+        // consumed by a turn; materialization alone is merely queued native delivery.
+        if !native_delivery_receipted(consumed.as_ref(), &filename) {
+            continue;
         }
         deliver_message(
             client,
@@ -6894,6 +6993,17 @@ async fn forward_projected_messages(
         .await?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CodexDeliveryReceipts<'a> {
+    state_dir: &'a Path,
+    identity: &'a str,
+    runtime_id: &'a str,
+}
+
+fn native_delivery_receipted(codex_consumed: Option<&BTreeSet<String>>, filename: &str) -> bool {
+    codex_consumed.is_none_or(|filenames| filenames.contains(filename))
 }
 
 fn sync_closed_projected_messages(
@@ -6920,13 +7030,24 @@ fn sync_closed_projected_messages(
     Ok(())
 }
 
+#[cfg(test)]
 fn projected_message_subjects(inbox: &Path, archive: &Path) -> Result<BTreeSet<String>> {
+    Ok(projected_message_files(inbox, archive)?
+        .into_keys()
+        .collect())
+}
+
+fn projected_message_files(inbox: &Path, archive: &Path) -> Result<BTreeMap<String, String>> {
     const TAG_PREFIX: &str = "st3-message:";
     Ok(st2::message::list_dir(inbox)?
         .into_iter()
         .chain(st2::message::list_dir(archive)?)
-        .flat_map(|message| message.tags)
-        .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
+        .flat_map(|message| {
+            message.tags.into_iter().filter_map(move |tag| {
+                tag.strip_prefix(TAG_PREFIX)
+                    .map(|subject| (subject.to_owned(), message.filename.clone()))
+            })
+        })
         .collect())
 }
 
@@ -7384,6 +7505,29 @@ mod tests {
         };
         assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
         assert!(!args.force);
+    }
+
+    #[test]
+    fn harness_diagnostic_requires_and_derives_the_agent_identity() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "diagnostic",
+            "--as",
+            "agent/run/worker",
+            "--code",
+            "driver-failed",
+            "--reason",
+            "the native driver exited",
+            "--incarnation",
+            "runtime:one",
+        ])
+        .unwrap();
+        let Command::Diagnostic(args) = cli.command else {
+            panic!("the harness diagnostic command did not parse");
+        };
+        assert_eq!(args.actor, "agent/run/worker");
+        assert_eq!(args.severity, "error");
+        assert_eq!(args.incarnation.as_deref(), Some("runtime:one"));
     }
 
     #[test]
@@ -8123,6 +8267,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_graph_delivery_waits_for_the_exact_consumed_native_file() {
+        let first = "1786380000000-aaa111.md";
+        let second = "1786380000001-bbb222.md";
+        let transport_accepted_only = BTreeSet::new();
+        assert!(native_delivery_receipted(None, first));
+        assert!(!native_delivery_receipted(
+            Some(&transport_accepted_only),
+            first
+        ));
+
+        let consumed = BTreeSet::from([first.to_owned()]);
+        assert!(native_delivery_receipted(Some(&consumed), first));
+        assert!(!native_delivery_receipted(Some(&consumed), second));
+    }
+
+    #[test]
     fn a_graph_archive_moves_the_native_delivery_file() {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
@@ -8218,7 +8378,7 @@ mod tests {
 
         assert!(rendered.contains("ST3 EVAL GRAPH  root"));
         assert!(rendered.contains("STATE      running · normal"));
-        assert!(rendered.contains("1/3 completed · 2 active"));
+        assert!(rendered.contains("1/3 completed · 1 ready · 1 active"));
         assert!(rendered.contains("rename — Change the package · base"));
         assert!(rendered.contains("↳ nested work · 1/2 completed"));
         assert!(rendered.contains("inspect — Inspect the package · base"));

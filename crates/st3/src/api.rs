@@ -335,6 +335,7 @@ pub fn router(state: AppState) -> Router {
             post(cancel_revision_proposal),
         )
         .route("/v1/work", get(list_work))
+        .route("/v1/work-items/{*subject}", get(get_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/wake/{*subject}", post(wake_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
@@ -5572,6 +5573,23 @@ async fn list_work(
         }
     }
     Ok(Json(work))
+}
+
+async fn get_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let subject = if subject.starts_with("step-run/") {
+        subject
+    } else {
+        format!("step-run/{subject}")
+    };
+    state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))
 }
 
 async fn wake_work(

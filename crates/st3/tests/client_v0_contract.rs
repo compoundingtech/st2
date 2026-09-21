@@ -491,6 +491,231 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
 }
 
 #[tokio::test]
+async fn core_launch_and_mission_actions_use_session_identity_and_exact_fences() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let app = st3::api::router(state);
+
+    let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let create = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/launch-create-test",
+        "type": "launch.create",
+        "idempotency_key": "launch-create-test-0001",
+        "fence": { "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": {
+            "title": "Client launch",
+            "request": "Prepare a one-step mission without changing the workspace.",
+            "target": {
+                "type": "new-mission",
+                "mission_id": "mission/client-action-demo",
+                "workspace": workspace.display().to_string()
+            }
+        }
+    });
+    let (status, created) = client_post_json(app.clone(), "/v1/client/actions", create).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let launch_id = created["value"]["affected_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session_id = launch_id.trim_start_matches("launch/");
+    let session = store.planning_session(session_id).unwrap().unwrap();
+    assert_eq!(session.requester, "person/local/session/unix");
+
+    let (status, current) =
+        client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    let stale_revision = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/launch-revise-stale",
+        "type": "launch.revise",
+        "idempotency_key": "launch-revise-stale-001",
+        "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "launch_id": launch_id, "feedback": "Add evidence." }
+    });
+    let (status, stale) = client_post_json(app.clone(), "/v1/client/actions", stale_revision).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], "stale-fence");
+
+    let candidate = br#"
+version 2
+mission "client-action-demo" state="ready" {
+  goal "Prove client action flow."
+  step "prove" { goal "Record proof." }
+}
+"#;
+    let (status, submitted) = client_post_json(
+        app.clone(),
+        &format!("/v1/launches/{session_id}/variants/default/submit"),
+        serde_json::to_value(st3::model::PlanningCandidateSubmitRequest {
+            actor: session.planner,
+            markdown: b"# Client action demo\n\nRecord proof.\n".to_vec(),
+            kdl: candidate.to_vec(),
+            idempotency_key: "launch-candidate-test-001".into(),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{submitted}");
+
+    let (_, launch) = client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
+    let launch_revision = launch["value"]["revision"].clone();
+    let preview = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/launch-preview-test",
+        "type": "launch.preview",
+        "idempotency_key": "launch-preview-test-001",
+        "fence": {
+            "snapshot_id": launch["snapshot"]["id"],
+            "subject_revisions": { (launch_id.clone()): launch_revision }
+        },
+        "parameters": {
+            "launch_id": launch_id,
+            "variant_id": format!("launch-variant/{session_id}/default")
+        }
+    });
+    let (status, previewed) = client_post_json(app.clone(), "/v1/client/actions", preview).await;
+    assert_eq!(status, StatusCode::OK, "{previewed}");
+
+    let (_, launch) = client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
+    let (_, variant) = client_json(
+        app.clone(),
+        &format!("/v1/client/launches/{session_id}/variants/default"),
+    )
+    .await;
+    let approve = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/launch-approve-test",
+        "type": "launch.approve",
+        "idempotency_key": "launch-approve-test-001",
+        "fence": {
+            "snapshot_id": variant["snapshot"]["id"],
+            "subject_revisions": { (launch_id.clone()): launch["value"]["revision"] },
+            "preview_token": variant["value"]["preview_token"]
+        },
+        "parameters": {
+            "launch_id": launch_id,
+            "variant_id": format!("launch-variant/{session_id}/default")
+        }
+    });
+    let (status, approved) = client_post_json(app.clone(), "/v1/client/actions", approve).await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert!(
+        store
+            .active_mission_runs()
+            .unwrap()
+            .iter()
+            .all(|run| { run.mission != "mission/client-action-demo" }),
+        "launch approval must publish without starting the mission"
+    );
+
+    let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let start = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/mission-start-test",
+        "type": "mission.start",
+        "idempotency_key": "mission-start-test-0001",
+        "fence": { "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": {
+            "mission_id": "mission/client-action-demo",
+            "workspace": workspace.display().to_string(),
+            "inputs": {}
+        }
+    });
+    let (status, started) = client_post_json(app.clone(), "/v1/client/actions", start).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let run_id = started["value"]["affected_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (_, mission) = client_json(app.clone(), "/v1/client/missions/client-action-demo").await;
+    let generation = mission["value"]["run_generations"][&run_id]
+        .as_str()
+        .unwrap();
+    let cancel = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "id": "action/mission-cancel-test",
+        "type": "mission.cancel",
+        "idempotency_key": "mission-cancel-test-001",
+        "fence": {
+            "snapshot_id": mission["snapshot"]["id"],
+            "subject_revisions": {},
+            "mission_generation": generation
+        },
+        "parameters": { "target_id": run_id, "reason": "test complete" }
+    });
+    let (status, cancelled) = client_post_json(app.clone(), "/v1/client/actions", cancel).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(
+        store.mission_run(&run_id).unwrap().unwrap().status,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn launch_revise_and_cancel_are_revision_fenced() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let app = st3::api::router(state);
+    let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let create = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/launch-create-cancel",
+        "type": "launch.create", "idempotency_key": "launch-create-cancel-01",
+        "fence": { "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "title": "Cancel me", "request": "Draft and revise.",
+            "target": { "type": "new-mission", "mission_id": "mission/client-cancel-demo", "workspace": root.path().display().to_string() } }
+    });
+    let (_, created) = client_post_json(app.clone(), "/v1/client/actions", create).await;
+    let launch_id = created["value"]["affected_ids"][0].as_str().unwrap();
+    let session_id = launch_id.trim_start_matches("launch/");
+    let planner = store.planning_session(session_id).unwrap().unwrap().planner;
+    let candidate = br#"
+version 2
+mission "client-cancel-demo" state="ready" {
+  goal "Exercise revision."
+  step "draft" { goal "Draft evidence." }
+}
+"#;
+    let (status, submitted) = client_post_json(
+        app.clone(),
+        &format!("/v1/launches/{session_id}/variants/default/submit"),
+        serde_json::to_value(st3::model::PlanningCandidateSubmitRequest {
+            actor: planner,
+            markdown: b"# Revision demo\n".to_vec(),
+            kdl: candidate.to_vec(),
+            idempotency_key: "launch-revise-candidate-01".into(),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{submitted}");
+    let (_, launch) = client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
+    let revise = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/launch-revise-test",
+        "type": "launch.revise", "idempotency_key": "launch-revise-test-0001",
+        "fence": { "snapshot_id": launch["snapshot"]["id"], "subject_revisions": { (launch_id): launch["value"]["revision"] } },
+        "parameters": { "launch_id": launch_id, "feedback": "Clarify the evidence." }
+    });
+    let (status, revised) = client_post_json(app.clone(), "/v1/client/actions", revise).await;
+    assert_eq!(status, StatusCode::OK, "{revised}");
+    let (_, launch) = client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
+    let cancel = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/launch-cancel-test",
+        "type": "launch.cancel", "idempotency_key": "launch-cancel-test-0001",
+        "fence": { "snapshot_id": launch["snapshot"]["id"], "subject_revisions": { (launch_id): launch["value"]["revision"] } },
+        "parameters": { "target_id": launch_id, "reason": "test complete" }
+    });
+    let (status, cancelled) = client_post_json(app, "/v1/client/actions", cancel).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+}
+
+#[tokio::test]
 async fn operational_lists_share_one_versioned_paginated_shape() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

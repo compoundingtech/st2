@@ -176,6 +176,7 @@ fn command_inventory_resolves_every_baseline_command_to_a_complete_purpose() {
         "context",
         "resource",
         "claim",
+        "diagnostic",
         "schema",
         "review",
         "attention",

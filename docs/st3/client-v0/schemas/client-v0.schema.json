@@ -161,6 +161,8 @@
               "required": ["type"],
               "properties": {
                 "type": { "enum": ["new-mission", "mission-run"] },
+                "mission_id": { "$ref": "#/$defs/Id" },
+                "workspace": { "type": "string", "minLength": 1 },
                 "mission_run_id": { "$ref": "#/$defs/Id" },
                 "generation_id": { "$ref": "#/$defs/Id" }
               },
@@ -337,13 +339,14 @@
         { "$ref": "#/$defs/ResourceHeader" },
         {
           "type": "object",
-          "required": ["kind", "title", "state", "mission_revision", "runs"],
+          "required": ["kind", "title", "state", "mission_revision", "runs", "run_generations"],
           "properties": {
             "kind": { "const": "mission" },
             "title": { "type": "string" },
             "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
-            "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+            "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } }
           }
         }
       ]
@@ -670,7 +673,24 @@
             "type": { "const": "launch.create" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["title", "request", "target"],
-              "properties": { "title": { "type": "string" }, "request": { "type": "string" }, "target": { "type": "object" } }
+              "properties": {
+                "title": { "type": "string" },
+                "request": { "type": "string" },
+                "target": {
+                  "oneOf": [
+                    {
+                      "type": "object", "additionalProperties": false,
+                      "required": ["type", "mission_id", "workspace"],
+                      "properties": { "type": { "const": "new-mission" }, "mission_id": { "$ref": "#/$defs/Id" }, "workspace": { "type": "string" } }
+                    },
+                    {
+                      "type": "object", "additionalProperties": false,
+                      "required": ["type", "mission_run_id", "generation_id"],
+                      "properties": { "type": { "const": "mission-run" }, "mission_run_id": { "$ref": "#/$defs/Id" }, "generation_id": { "$ref": "#/$defs/Id" } }
+                    }
+                  ]
+                }
+              }
             }
           }
         },
@@ -708,7 +728,7 @@
             "type": { "const": "mission.start" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["mission_id", "workspace", "inputs"],
-              "properties": { "mission_id": { "$ref": "#/$defs/Id" }, "workspace": { "type": "string" }, "inputs": { "type": "object" } }
+              "properties": { "mission_id": { "$ref": "#/$defs/Id" }, "workspace": { "type": "string" }, "inputs": { "type": "object", "additionalProperties": { "type": "string" } } }
             }
           }
         },

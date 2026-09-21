@@ -1849,6 +1849,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             ) {
                 continue;
             }
+            // An agentless step that owns a nested mission is a structural
+            // container, not claimable work. Admit it automatically so its
+            // nested steps can satisfy their parent fence. This transition is
+            // persisted on the generation-scoped step run, making repeated
+            // reconciliation and replay idempotent.
+            if view.status == "ready" && view.agentless && step.spec.nested_mission.is_some() {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "working",
+                    Some("the eligible nested mission started"),
+                )?;
+                continue;
+            }
             changed |= self.materialize_step_declarations(run, &step, view)?;
             if let Some(reason) = self.step_declaration_failure(&view.subject)? {
                 changed |= self
@@ -10889,6 +10902,212 @@ mission "queue" state="ready" {
             store.mission_run(&run.id).unwrap().unwrap().status,
             "standing"
         );
+    }
+
+    #[test]
+    fn a_strict_queue_starts_agentless_nested_containers_in_order() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+mission "queue-nested" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Run two nested jobs without overlap."
+  agent "worker" { workspace "/tmp"; command "true" }
+  queue "jobs" {
+    step "first-job" {
+      mission "first" {
+        assigned-to "agent/${ST_MISSION_RUN}/worker"
+        goal "Complete the first nested job."
+        step "work" {
+          goal "Complete first work."
+          retry { attempts 2 }
+        }
+      }
+    }
+    step "second-job" {
+      mission "second" {
+        assigned-to "agent/${ST_MISSION_RUN}/worker"
+        goal "Complete the second nested job."
+        step "work" { goal "Complete second work." }
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-queue-nested");
+        let published = store.index().unwrap();
+        apply_source(&store, source, "publish-queue-nested");
+        assert_eq!(
+            store.index().unwrap(),
+            published,
+            "duplicate publication changed the graph"
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "queue-nested".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-queue-nested".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let view = store.mission_run(&run.id).unwrap().unwrap();
+        let step = |path: &str| view.steps.iter().find(|step| step.step == path).unwrap();
+        let first = step("first-job");
+        let first_work = step("first-job/first/work");
+        let second = step("second-job");
+        let second_work = step("second-job/second/work");
+        assert_eq!(first.status, "working");
+        assert!(first.agentless);
+        assert_eq!(first_work.status, "ready");
+        assert_eq!(second.status, "pending");
+        assert_eq!(second_work.status, "pending");
+        let unavailable = store
+            .work_action(
+                &first.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(first_work.assigned_to.clone().unwrap()),
+                    incarnation: Some("current".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-structural-parent".into(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(unavailable.code, "work-not-available");
+        assert!(store.step_run(&first.subject).unwrap().is_some());
+
+        let work = |key: &str, actor: String| crate::model::WorkRequest {
+            actor: Some(actor),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let first_actor = first_work.assigned_to.clone().unwrap();
+        let first_subject = first_work.subject.clone();
+        store
+            .work_action(
+                &first_subject,
+                "claim",
+                &work("claim-first-nested", first_actor.clone()),
+            )
+            .unwrap();
+        store
+            .work_action(
+                &first_subject,
+                "fail",
+                &work("fail-first-nested", first_actor.clone()),
+            )
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let after_retry = store.mission_run(&run.id).unwrap().unwrap();
+        let retried = after_retry
+            .steps
+            .iter()
+            .find(|step| step.step == "first-job/first/work")
+            .unwrap();
+        assert_eq!(retried.status, "ready");
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(
+            after_retry
+                .steps
+                .iter()
+                .find(|step| step.step == "second-job")
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        // Reconstructing the reconciler is the daemon-restart boundary. The persisted parent
+        // admission and retry attempt resume without duplicating or advancing the queue item.
+        drop(reconciler);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        store
+            .work_action(
+                &first_subject,
+                "claim",
+                &work("claim-first-nested-retry", first_actor.clone()),
+            )
+            .unwrap();
+        store
+            .work_action(
+                &first_subject,
+                "complete",
+                &work("complete-first-nested-retry", first_actor),
+            )
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let view = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            view.steps
+                .iter()
+                .find(|step| step.step == "first-job")
+                .unwrap()
+                .status,
+            "completed"
+        );
+        let second = view
+            .steps
+            .iter()
+            .find(|step| step.step == "second-job")
+            .unwrap();
+        let second_work = view
+            .steps
+            .iter()
+            .find(|step| step.step == "second-job/second/work")
+            .unwrap();
+        assert_eq!(second.status, "working");
+        assert_eq!(second_work.status, "ready");
+        let second_actor = second_work.assigned_to.clone().unwrap();
+        let second_subject = second_work.subject.clone();
+        store
+            .work_action(
+                &second_subject,
+                "claim",
+                &work("claim-second-nested", second_actor.clone()),
+            )
+            .unwrap();
+        store
+            .work_action(
+                &second_subject,
+                "complete",
+                &work("complete-second-nested", second_actor),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let view = store.mission_run(&run.id).unwrap().unwrap();
+        assert!(view.steps.iter().all(|step| step.status == "completed"));
+        assert_eq!(view.status, "completed");
     }
 
     #[test]

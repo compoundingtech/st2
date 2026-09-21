@@ -51,7 +51,13 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "message.send",
     "message.read",
     "message.close",
+    "launch.create",
+    "launch.revise",
+    "launch.preview",
+    "launch.approve",
+    "launch.cancel",
     "mission.start",
+    "mission.cancel",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -61,6 +67,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "runtime.context-clear",
     "runtime.signal",
     "terminal.input",
+    "terminal.resize",
     "terminal.attach",
     "terminal.detach",
     "pairing.revoke",
@@ -258,6 +265,10 @@ fn mission_resources(store: &Store) -> anyhow::Result<Vec<Value>> {
                     _ => "ready",
                 }
             };
+            let run_generations = runs
+                .iter()
+                .map(|run| (run.subject.clone(), Value::String(run.generation.clone())))
+                .collect::<serde_json::Map<_, _>>();
             json!({
                 "id": mission,
                 "kind": "mission",
@@ -267,6 +278,7 @@ fn mission_resources(store: &Store) -> anyhow::Result<Vec<Value>> {
                 "state": state,
                 "mission_revision": latest.revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
+                "run_generations": run_generations,
                 "operational": { "layer": "current", "actionable": true, "reasons": [] }
             })
         })
@@ -908,6 +920,23 @@ fn validate_work_fence(state: &AppState, target: &str, fence: &Fence) -> Result<
     Ok(())
 }
 
+fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Result<(), ApiError> {
+    let launch_id = launch_session_id(target);
+    let launch = state
+        .store
+        .planning_session(launch_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("launch `{target}` does not exist")))?;
+    let resource_id = format!("launch/{}", launch.id);
+    let expected = format!("launch/{}", launch.updated_at_unix_ms);
+    if fence.subject_revisions.get(&resource_id) != Some(&expected) {
+        return Err(stale(format!(
+            "the launch revision fence for `{resource_id}` is stale"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_fence(
     state: &AppState,
     _snapshot: &ClientSnapshot,
@@ -928,12 +957,20 @@ fn validate_fence(
         ));
     }
     for (subject, revision) in &fence.subject_revisions {
-        let current = state
-            .store
-            .claims_for(subject, None)
-            .map_err(ApiError::internal)?
-            .last()
-            .map(|claim| claim.id.clone());
+        let current = if let Some(id) = subject.strip_prefix("launch/") {
+            state
+                .store
+                .planning_session(id)
+                .map_err(ApiError::internal)?
+                .map(|launch| format!("launch/{}", launch.updated_at_unix_ms))
+        } else {
+            state
+                .store
+                .claims_for(subject, None)
+                .map_err(ApiError::internal)?
+                .last()
+                .map(|claim| claim.id.clone())
+        };
         if current.as_deref() != Some(revision) {
             return Err(stale(format!(
                 "the revision fence for `{subject}` is stale"
@@ -1015,6 +1052,171 @@ async fn dispatch_action(
             .0;
             Ok(vec![result.subject])
         }
+        "launch.create" => {
+            let target = p
+                .get("target")
+                .and_then(Value::as_object)
+                .ok_or_else(|| validation("launch creation requires a typed target"))?;
+            let target_type = target
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| validation("launch target requires `type`"))?;
+            let (mission, run, workspace) = match target_type {
+                "new-mission" => (
+                    target
+                        .get("mission_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            validation("a new-mission launch target requires `mission_id`")
+                        })?
+                        .trim_start_matches("mission/")
+                        .to_owned(),
+                    None,
+                    target
+                        .get("workspace")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            validation("a new-mission launch target requires `workspace`")
+                        })?
+                        .to_owned(),
+                ),
+                "mission-run" => {
+                    let run_id = target
+                        .get("mission_run_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            validation("a mission-run launch target requires `mission_run_id`")
+                        })?;
+                    let current = state
+                        .store
+                        .mission_run(run_id)
+                        .map_err(ApiError::internal)?
+                        .ok_or_else(|| {
+                            ApiError::not_found(format!("mission run `{run_id}` does not exist"))
+                        })?;
+                    let generation = target
+                        .get("generation_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            validation("a mission-run launch target requires `generation_id`")
+                        })?;
+                    if generation != current.generation
+                        || request.fence.mission_generation.as_deref()
+                            != Some(current.generation.as_str())
+                    {
+                        return Err(stale("the launch target generation is stale"));
+                    }
+                    (
+                        current.mission.trim_start_matches("mission/").to_owned(),
+                        Some(current.subject),
+                        current.workspace,
+                    )
+                }
+                _ => return Err(validation("launch target type is invalid")),
+            };
+            let launch = start_planning_session(
+                State(state.clone()),
+                Json(PlanningSessionStartRequest {
+                    mission,
+                    run,
+                    request: parameter_string(p, "request")?.into_bytes(),
+                    workspace,
+                    requester: Some(session.actor.clone()),
+                    model: None,
+                    effort: None,
+                    idempotency_key: request.idempotency_key.clone(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![format!("launch/{}", launch.id)])
+        }
+        "launch.revise" => {
+            let launch_id = parameter_string(p, "launch_id")?;
+            validate_launch_fence(state, &launch_id, &request.fence)?;
+            let launch = revise_planning_session(
+                State(state.clone()),
+                AxumPath(launch_session_id(&launch_id).to_owned()),
+                Json(PlanningRevisionRequest {
+                    actor: session.actor.clone(),
+                    feedback: parameter_string(p, "feedback")?.into_bytes(),
+                    idempotency_key: request.idempotency_key.clone(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![format!("launch/{}", launch.id)])
+        }
+        "launch.preview" => {
+            let launch_id = parameter_string(p, "launch_id")?;
+            validate_launch_fence(state, &launch_id, &request.fence)?;
+            let variant_id = parameter_string(p, "variant_id")?;
+            let variant = variant_id.rsplit('/').next().unwrap_or(&variant_id);
+            let launch = preview_named_planning_candidate(
+                State(state.clone()),
+                AxumPath((launch_session_id(&launch_id).to_owned(), variant.to_owned())),
+            )
+            .await?
+            .0;
+            Ok(vec![
+                format!("launch/{}", launch.id),
+                format!("launch-variant/{}/{}", launch.id, variant),
+            ])
+        }
+        "launch.approve" => {
+            let launch_id = parameter_string(p, "launch_id")?;
+            validate_launch_fence(state, &launch_id, &request.fence)?;
+            let requested_variant = parameter_string(p, "variant_id")?;
+            let requested_variant = requested_variant
+                .rsplit('/')
+                .next()
+                .unwrap_or(&requested_variant);
+            let launch = state
+                .store
+                .planning_session(launch_session_id(&launch_id))
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("launch `{launch_id}` does not exist"))
+                })?;
+            if launch
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.variant.as_str())
+                != Some(requested_variant)
+            {
+                return Err(stale("the selected launch variant is stale"));
+            }
+            let launch = approve_planning_session(
+                State(state.clone()),
+                AxumPath(launch_session_id(&launch_id).to_owned()),
+                Json(PlanningApprovalRequest {
+                    actor: session.actor.clone(),
+                    preview_hash: request.fence.preview_token.clone().ok_or_else(|| {
+                        validation("launch approval requires a preview token fence")
+                    })?,
+                    idempotency_key: request.idempotency_key.clone(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![format!("launch/{}", launch.id)])
+        }
+        "launch.cancel" => {
+            let launch_id = parameter_string(p, "target_id")?;
+            validate_launch_fence(state, &launch_id, &request.fence)?;
+            let launch = cancel_planning_session(
+                State(state.clone()),
+                AxumPath(launch_session_id(&launch_id).to_owned()),
+                Json(PlanningCancelRequest {
+                    actor: session.actor.clone(),
+                    reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+                    idempotency_key: request.idempotency_key.clone(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![format!("launch/{}", launch.id)])
+        }
         action @ ("work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail"
         | "work.release") => {
             let target = parameter_string(p, "target_id")?;
@@ -1045,6 +1247,18 @@ async fn dispatch_action(
             Ok(vec![result.subject])
         }
         "mission.start" => {
+            let inputs = p
+                .get("inputs")
+                .and_then(Value::as_object)
+                .ok_or_else(|| validation("mission start requires an `inputs` object"))?
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| validation("mission input values must be strings"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
             let result = start_mission_run(
                 State(state.clone()),
                 Json(MissionRunRequest {
@@ -1053,13 +1267,37 @@ async fn dispatch_action(
                     workspace: parameter_string(p, "workspace")?,
                     requester: Some(session.actor.clone()),
                     mode: Some("run".into()),
-                    inputs: BTreeMap::new(),
+                    inputs,
                     idempotency_key: request.idempotency_key.clone(),
                 }),
             )
             .await?
             .0;
             Ok(vec![result.subject])
+        }
+        "mission.cancel" => {
+            let target = parameter_string(p, "target_id")?;
+            let current = state
+                .store
+                .mission_run(&target)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("mission run `{target}` does not exist"))
+                })?;
+            if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
+                return Err(stale("the mission generation fence is stale"));
+            }
+            state
+                .store
+                .set_mission_run_state(
+                    &current.subject,
+                    "cancelled",
+                    "terminal",
+                    p.get("reason").and_then(Value::as_str),
+                )
+                .map_err(ApiError::internal)?;
+            signal_changed(state);
+            Ok(vec![current.subject])
         }
         "terminal.input" => {
             let mode = match parameter_string(p, "mode")?.as_str() {
@@ -1084,6 +1322,47 @@ async fn dispatch_action(
             .await?
             .0;
             Ok(vec![result.subject])
+        }
+        "terminal.resize" => {
+            let target = terminal_subject(&parameter_string(p, "terminal_id")?);
+            let rows = p
+                .get("rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| *value != 0)
+                .ok_or_else(|| validation("terminal resize rows must fit a positive u16"))?;
+            let columns = p
+                .get("columns")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| *value != 0)
+                .ok_or_else(|| validation("terminal resize columns must fit a positive u16"))?;
+            let live = live_session(state, &target, request.fence.runtime_incarnation.as_deref())?;
+            if !live.terminal {
+                return Err(validation("terminal resize requires a terminal runtime"));
+            }
+            let socket = state.pty_root.join(format!("{}.sock", live.runtime_id));
+            let runtime_id = live.runtime_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let stream = std::os::unix::net::UnixStream::connect(&socket)?;
+                let mut connection = pty_core::client::SessionConnection::attach_over(
+                    stream,
+                    &runtime_id,
+                    rows,
+                    columns,
+                    Some(Duration::from_secs(2)),
+                )?;
+                connection.resize(rows, columns);
+                connection.disconnect();
+                anyhow::Ok(())
+            })
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+            Ok(vec![client_detail_id(
+                "terminal",
+                &parameter_string(p, "terminal_id")?,
+            )])
         }
         "runtime.context-clear" => {
             let target = terminal_subject(&parameter_string(p, "target_id")?);
@@ -1221,18 +1500,23 @@ pub(super) async fn action(
                 details: serde_json::Map::new(),
             });
         }
-        return Ok(Json(
-            receipt
-                .body
-                .pointer("/fields/result")
-                .cloned()
-                .ok_or_else(|| ApiError::internal("the client action receipt has no result"))?,
-        ));
+        let mut result = receipt
+            .body
+            .pointer("/fields/result")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("the client action receipt has no result"))?;
+        result["snapshot_id"] = Value::String(new_client_snapshot(&state).id);
+        return Ok(Json(result));
     }
     validate_fence(&state, &snapshot, &request.fence)?;
+    if request.action_type.starts_with("terminal.")
+        && request.fence.terminal_sequence != Some(state.store.index().map_err(ApiError::internal)?)
+    {
+        return Err(stale("the terminal sequence fence is stale"));
+    }
     let affected = dispatch_action(&state, &session, &request).await?;
     let operation_id = format!("operation/client-{}", &request_digest[..24]);
-    let result = json!({ "kind": "action-result", "action_id": request.id, "operation_id": operation_id, "status": "completed", "affected_ids": affected, "snapshot_id": new_client_snapshot(&state).id });
+    let mut result = json!({ "kind": "action-result", "action_id": request.id, "operation_id": operation_id, "status": "completed", "affected_ids": affected });
     state
         .store
         .append_claim(&ClaimInput {
@@ -1249,5 +1533,6 @@ pub(super) async fn action(
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
+    result["snapshot_id"] = Value::String(new_client_snapshot(&state).id);
     Ok(Json(result))
 }

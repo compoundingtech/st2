@@ -442,10 +442,23 @@ pub struct MessageSendParameters {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum LaunchTarget {
+    NewMission {
+        mission_id: String,
+        workspace: String,
+    },
+    MissionRun {
+        mission_run_id: String,
+        generation_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LaunchCreateParameters {
     pub title: String,
     pub request: String,
-    pub target: Value,
+    pub target: LaunchTarget,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -464,7 +477,7 @@ pub struct LaunchVariantParameters {
 pub struct MissionStartParameters {
     pub mission_id: String,
     pub workspace: String,
-    pub inputs: BTreeMap<String, Value>,
+    pub inputs: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -170,6 +170,11 @@ pub struct Entry {
     /// incarnation; history reconciliation settles attempts from earlier incarnations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation: Option<String>,
+    /// The harness turn that accepted this delivery. Codex can use the exact matching terminal
+    /// turn notification as a fallback consumption receipt when a supported app-server release
+    /// omits the correlated `item/completed{userMessage}` notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative: Option<NegativeReceipt>,
 }
@@ -347,6 +352,14 @@ impl Ledger {
             "delivery ledger entry records a phase {} cannot prove",
             self.profile.harness.as_str()
         );
+        anyhow::ensure!(
+            entry.accepted_turn_id.as_deref().is_none_or(|turn_id| {
+                self.profile.harness == Harness::Codex
+                    && entry.phase >= Phase::TransportAccepted
+                    && !turn_id.is_empty()
+            }),
+            "delivery ledger entry has an invalid accepted turn"
+        );
         Ok(())
     }
 
@@ -396,6 +409,7 @@ impl Ledger {
         {
             Some(index) => {
                 let entry = &mut self.record.entries[index];
+                let retrying_refused_attempt = entry.negative.is_some();
                 entry.binding = begin.binding;
                 entry.correlation = begin.correlation;
                 entry.incarnation = begin.incarnation;
@@ -404,6 +418,9 @@ impl Ledger {
                 // else's claim about the world.
                 entry.attestation = Attestation::Observed;
                 entry.negative = None;
+                if retrying_refused_attempt {
+                    entry.accepted_turn_id = None;
+                }
                 entry.clone()
             }
             None => {
@@ -414,6 +431,7 @@ impl Ledger {
                     phase: Phase::Attempted,
                     attestation: Attestation::Observed,
                     incarnation: begin.incarnation,
+                    accepted_turn_id: None,
                     negative: None,
                 };
                 self.record.entries.push(entry.clone());
@@ -444,6 +462,49 @@ impl Ledger {
         entry.attestation = Attestation::Observed;
         entry.negative = None;
         self.persist()?;
+        Ok(Some(phase))
+    }
+
+    /// Bind a transport-accepted Codex delivery to the exact turn returned by the app-server.
+    ///
+    /// The association is durable before a later `turn/completed` can be used as fallback
+    /// consumption evidence. Repeating the same response is idempotent; a conflicting turn is
+    /// refused unless an authoritative negative receipt already reopened the attempt through
+    /// [`Ledger::begin`].
+    pub fn accept_codex_turn(&mut self, filename: &str, turn_id: &str) -> Result<Option<Phase>> {
+        self.ensure_writable()?;
+        anyhow::ensure!(
+            self.profile.harness == Harness::Codex && !turn_id.is_empty(),
+            "only Codex can bind a non-empty accepted turn"
+        );
+        let (phase, changed) = {
+            let Some(entry) = self
+                .record
+                .entries
+                .iter_mut()
+                .find(|entry| entry.filename == filename)
+            else {
+                return Ok(None);
+            };
+            if let Some(existing) = entry.accepted_turn_id.as_deref() {
+                anyhow::ensure!(
+                    existing == turn_id,
+                    "Codex delivery is already bound to a different accepted turn"
+                );
+            }
+            let before = (entry.phase, entry.accepted_turn_id.clone());
+            entry.phase = entry.phase.max(Phase::TransportAccepted);
+            entry.accepted_turn_id = Some(turn_id.to_owned());
+            entry.attestation = Attestation::Observed;
+            entry.negative = None;
+            (
+                entry.phase,
+                before != (entry.phase, entry.accepted_turn_id.clone()),
+            )
+        };
+        if changed {
+            self.persist()?;
+        }
         Ok(Some(phase))
     }
 
@@ -490,6 +551,19 @@ impl Ledger {
             return Retention::Hold(HoldReason::UnreadReceipt);
         }
         Retention::Hold(HoldReason::AmbiguousAttempt)
+    }
+
+    /// Whether this unread file has already reached the harness's release ceiling.
+    pub fn settled(&self, filename: &str) -> bool {
+        self.entry(filename).is_some() && self.retention(filename) == Retention::Release
+    }
+
+    /// Whether another entry still owns FIFO delivery ahead of `filename`.
+    pub fn holds_other_than(&self, filename: &str) -> bool {
+        self.record.entries.iter().any(|entry| {
+            entry.filename != filename
+                && matches!(self.retention(&entry.filename), Retention::Hold(_))
+        })
     }
 
     pub fn retry(&self, filename: &str) -> RetryDecision {
@@ -570,6 +644,7 @@ pub fn asserted(
         phase,
         attestation: Attestation::Asserted,
         incarnation,
+        accepted_turn_id: None,
         negative: None,
     }
 }
@@ -820,6 +895,27 @@ mod tests {
     }
 
     #[test]
+    fn an_accepted_codex_turn_is_monotone_idempotent_and_conflict_fenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = open(tmp.path(), Harness::Codex);
+        begin(&mut ledger, "thread-main", FILE_A);
+        assert_eq!(
+            ledger.accept_codex_turn(FILE_A, "turn-one").unwrap(),
+            Some(Phase::TransportAccepted)
+        );
+        assert_eq!(
+            ledger.accept_codex_turn(FILE_A, "turn-one").unwrap(),
+            Some(Phase::TransportAccepted)
+        );
+        assert!(ledger.accept_codex_turn(FILE_A, "turn-other").is_err());
+
+        let reopened = open(tmp.path(), Harness::Codex);
+        let entry = reopened.entry(FILE_A).unwrap();
+        assert_eq!(entry.phase, Phase::TransportAccepted);
+        assert_eq!(entry.accepted_turn_id.as_deref(), Some("turn-one"));
+    }
+
+    #[test]
     fn negative_receipt_is_the_only_retry_authority() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = open(tmp.path(), Harness::Codex);
@@ -918,6 +1014,7 @@ mod tests {
                     phase: Phase::Attempted,
                     attestation: Attestation::Observed,
                     incarnation: None,
+                    accepted_turn_id: None,
                     negative: None,
                 }],
             },

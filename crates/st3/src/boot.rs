@@ -27,7 +27,7 @@ Use `"$ST3_BIN" wait` only when claimed work needs a graph condition. Do not use
 
 The wait command exits early when a new message or a new eligible step needs your attention.
 
-Publish a `harness.diagnostic` claim when the harness itself fails.
+When the harness itself fails, run `"$ST3_BIN" diagnostic --help` and report it through that dedicated authorized operation.
 
 When a person must act, run `"$ST3_BIN" attention request --help` and publish one explicit request for the responsible person.
 "#;
@@ -75,5 +75,6 @@ mod tests {
         assert!(BOOT_DOCUMENT.contains("If no step is ready, finish this turn."));
         assert!(BOOT_DOCUMENT.contains("wait` only when claimed work needs"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));
+        assert!(BOOT_DOCUMENT.contains("diagnostic --help"));
     }
 }

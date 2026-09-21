@@ -1635,7 +1635,7 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
 }
 
 #[test]
-fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
+fn a_success_response_persists_transport_and_exact_turn_without_archiving() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename = message::send_to_inbox(
@@ -1668,8 +1668,167 @@ fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
         delivery_ledger::Phase::TransportAccepted,
         "a well-formed JSON result is transport, never typed acceptance"
     );
+    assert_eq!(
+        delivery
+            .ledger
+            .entry(&filename)
+            .unwrap()
+            .accepted_turn_id
+            .as_deref(),
+        Some("turn-new")
+    );
     assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
     assert!(config.inbox.join(&filename).is_file());
+}
+
+#[test]
+fn a_consumed_unarchived_head_releases_the_next_fifo_message_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("long-running directive"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = CodexControlState::new(&delivery.runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    let first_client_id = request["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    delivery
+        .accept_response(
+            &json!({ "id": request["id"], "result": { "turn": { "id": "turn-first" } } }),
+            state.observed(),
+        )
+        .unwrap();
+    delivery
+        .accept_typed_receipt(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-first",
+                    "item": { "type": "userMessage", "clientId": first_client_id }
+                }
+            }),
+            &state,
+        )
+        .unwrap();
+    assert!(config.inbox.join(&first).is_file());
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("later message"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+    delivery.next_inbox_refresh = Instant::now();
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the consumed unarchived head must not hold the later message");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+    assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+    assert!(config.inbox.join(&first).is_file());
+    assert!(delivery.ledger.entry(&first).is_some());
+    assert_eq!(delivery.ledger.entries().len(), 2);
+}
+
+#[test]
+fn a_successful_exact_turn_completion_settles_when_codex_omits_the_item_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("Codex 0.146 sequence"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = CodexControlState::new(&delivery.runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    delivery
+        .accept_response(
+            &json!({ "id": request["id"], "result": { "turn": { "id": "turn-first" } } }),
+            state.observed(),
+        )
+        .unwrap();
+    assert!(
+        !delivery
+            .accept_turn_completion_receipt(
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-other", "status": "completed", "items": [] }
+                    }
+                }),
+                &state,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    assert!(
+        delivery
+            .accept_turn_completion_receipt(
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-first", "status": "completed", "items": [] }
+                    }
+                }),
+                &state,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("after successful turn"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+    delivery.next_inbox_refresh = Instant::now();
+    let next = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+    assert!(config.inbox.join(&first).is_file());
 }
 
 #[test]

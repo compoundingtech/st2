@@ -3032,6 +3032,7 @@ dependencies = [
 name = "st3-client"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "http-body-util",
  "hyper",
@@ -3039,6 +3040,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "st3",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
