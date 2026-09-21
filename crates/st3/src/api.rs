@@ -110,6 +110,7 @@ struct ClientListQuery {
     person: Option<String>,
     actor: Option<String>,
     owner_run: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -122,6 +123,7 @@ struct ClientPageCursor {
     person: Option<String>,
     actor: Option<String>,
     owner_run: Option<String>,
+    status: Option<String>,
     items_digest: String,
     expires_at_unix_ms: u128,
 }
@@ -253,6 +255,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
         .route("/v1/client/runtimes", get(client_v0::runtimes))
         .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
+        .route("/v1/client/terminals", get(client_v0::terminals))
         .route("/v1/client/operations", get(client_v0::operations))
         .route(
             "/v1/client/operations/{*id}",
@@ -678,6 +681,7 @@ fn client_page(
             || cursor.person != query.person
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
             || cursor.items_digest != items_digest
             || query
                 .limit
@@ -714,6 +718,7 @@ fn client_page(
             person: query.person.clone(),
             actor: query.actor.clone(),
             owner_run: query.owner_run.clone(),
+            status: query.status.clone(),
             items_digest,
             expires_at_unix_ms,
         })?)
@@ -915,12 +920,13 @@ fn aggregate_usage_for_runs(
     )
 }
 
-fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {
-    let status = if history {
-        store.status_history(None, None, None)?
-    } else {
-        store.status(None)?
-    };
+fn client_agent_resources(
+    store: &Store,
+    history: bool,
+    at: &str,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let mut agents = status
         .subjects
         .into_iter()
@@ -950,6 +956,18 @@ fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Res
                 .and_then(Value::as_str)
                 .map(|runtime| vec![format!("runtime/{runtime}")])
                 .unwrap_or_default();
+            let incarnation_id = fields
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let driver = subject
+                .harness
+                .as_ref()
+                .map(|harness| harness.driver.clone());
+            let harness_state = subject
+                .harness
+                .as_ref()
+                .map(|harness| harness.state.clone());
             let name = subject
                 .desired
                 .as_ref()
@@ -976,6 +994,14 @@ fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Res
                 "state": state,
                 "reachability": subject.reachability,
                 "runtime_ids": runtime_ids,
+                "owner_run_id": subject.owner_run,
+                "driver": driver,
+                "harness_state": harness_state,
+                "incarnation_id": incarnation_id,
+                "under": subject.under.into_iter().map(|relationship| json!({
+                    "agent_id": relationship.agent,
+                    "reason": relationship.reason
+                })).collect::<Vec<_>>(),
                 "operational": subject.projection
             });
             (name, value)
@@ -996,11 +1022,7 @@ fn client_session_resources(
     snapshot_index: u64,
     native_session_home: Option<&Path>,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = if history {
-        store.status_history(None, None, Some(snapshot_index))?
-    } else {
-        store.status_at(None, None, Some(snapshot_index))?
-    };
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let mut sessions = Vec::new();
     for subject in status
         .subjects
@@ -1878,8 +1900,16 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_agent_resources(&state.store, query.history, &snapshot.created_at)
-        .map_err(ApiError::internal)?;
+    let mut items = client_agent_resources(
+        &state.store,
+        query.history,
+        &snapshot.created_at,
+        snapshot.store_index,
+    )
+    .map_err(ApiError::internal)?;
+    if let Some(status) = query.status.as_deref() {
+        items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
+    }
     client_page(&state, &snapshot, "agents", items, &query).map(Json)
 }
 
@@ -1890,8 +1920,13 @@ async fn client_agents_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     client_detail(
-        client_agent_resources(&state.store, query.history, &snapshot.created_at)
-            .map_err(ApiError::internal)?,
+        client_agent_resources(
+            &state.store,
+            query.history,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .map_err(ApiError::internal)?,
         "agent",
         &id,
     )

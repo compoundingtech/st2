@@ -442,10 +442,24 @@
             "name": { "type": "string" },
             "state": { "enum": ["desired", "starting", "running", "waiting", "stopped", "failed"] },
             "reachability": { "enum": ["local", "remote", "unreachable", "unknown"] },
-            "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+            "runtime_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "driver": { "type": ["string", "null"] },
+            "harness_state": { "type": ["string", "null"] },
+            "incarnation_id": { "type": ["string", "null"] },
+            "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }
       ]
+    },
+    "AgentRelationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_id"],
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/Id" },
+        "reason": { "type": ["string", "null"] }
+      }
     },
     "Runtime": {
       "allOf": [
@@ -462,6 +476,7 @@
             "runtime_id": { "type": "string" },
             "incarnation_id": { "type": ["string", "null"] },
             "desired_revision": { "$ref": "#/$defs/Revision" },
+            "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "terminal_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "terminal_sequence": { "type": ["integer", "null"], "minimum": 0 },
             "terminal_access": {

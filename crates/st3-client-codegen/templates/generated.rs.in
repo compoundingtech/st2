@@ -430,6 +430,11 @@ pub struct Work {
     pub usage: Option<UsageSummary>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentRelationship {
+    pub agent_id: String,
+    pub reason: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Agent {
     #[serde(flatten)]
     pub header: ResourceHeader,
@@ -440,6 +445,16 @@ pub struct Agent {
     pub reachability: String,
     #[serde(default)]
     pub runtime_ids: Vec<String>,
+    #[serde(default)]
+    pub owner_run_id: Option<String>,
+    #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default)]
+    pub harness_state: Option<String>,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub under: Vec<AgentRelationship>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalAccess {
@@ -460,6 +475,8 @@ pub struct Runtime {
     pub runtime_id: String,
     pub incarnation_id: Option<String>,
     pub desired_revision: String,
+    #[serde(default)]
+    pub owner_run_id: Option<String>,
     #[serde(default)]
     pub terminal_id: Option<String>,
     #[serde(default)]

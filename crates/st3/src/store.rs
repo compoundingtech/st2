@@ -5228,6 +5228,80 @@ impl Store {
         self.status_at_view(selected, selected_owner_run, at_index, true)
     }
 
+    /// Reduce only subjects whose IDs begin with `prefix`.
+    ///
+    /// Product projections use this instead of reducing every subject in the graph and filtering
+    /// afterwards. The latter made small agent and host screens temporarily allocate the complete
+    /// claim graph on large stores.
+    pub fn status_for_subject_prefix_at(
+        &self,
+        prefix: &str,
+        at_index: Option<u64>,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let current = current_index(&connection)?;
+        let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
+        let pattern = format!("{prefix}*");
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT subject FROM claims
+             WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
+        )?;
+        let subjects = statement
+            .query_map(params![store_index, pattern], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        self.status_for_subject_names_at(subjects, store_index, include_history)
+    }
+
+    /// Reduce only subjects that have emitted one claim kind at the selected snapshot.
+    pub fn status_for_claim_kind_at(
+        &self,
+        kind: &str,
+        at_index: Option<u64>,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let current = current_index(&connection)?;
+        let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT subject FROM claims
+             WHERE kind=?1 AND store_index<=?2 ORDER BY subject",
+        )?;
+        let subjects = statement
+            .query_map(params![kind, store_index], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        self.status_for_subject_names_at(subjects, store_index, include_history)
+    }
+
+    fn status_for_subject_names_at(
+        &self,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
+        let mut selected_subjects = Vec::new();
+        let mut pending_actions = Vec::new();
+        for subject in subjects {
+            let status =
+                self.status_at_view(Some(&subject), None, Some(store_index), include_history)?;
+            for selected in status.subjects {
+                if include_history || selected.projection.actionable {
+                    selected_subjects.push(selected);
+                }
+            }
+            pending_actions.extend(status.pending_actions);
+        }
+        Ok(StatusResponse {
+            store_index,
+            subjects: selected_subjects,
+            pending_actions,
+        })
+    }
+
     fn status_at_view(
         &self,
         selected: Option<&str>,
@@ -17035,6 +17109,75 @@ observer "ordered/file" {
         assert_eq!(index, 0);
         assert_eq!(status.store_index, 0);
         drop(writer);
+    }
+
+    #[test]
+    fn bounded_status_reductions_select_only_relevant_subjects() {
+        let store = Store::open_memory("node").unwrap();
+        let observe = |subject: &str, runtime_id: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("runtime_id".into(), Value::String(runtime_id.into())),
+                        ("status".into(), Value::String("running".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+                .store_index
+        };
+        let first_index = observe("agent/selected", "selected");
+        observe("exec/also-runtime", "also-runtime");
+        store
+            .append_claim(&ClaimInput {
+                subject: "host/unrelated".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("protocol".into(), Value::String("test".into())),
+                    ("status".into(), Value::String("up".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+
+        let agents = store
+            .status_for_subject_prefix_at("agent/", None, true)
+            .unwrap();
+        assert_eq!(
+            agents
+                .subjects
+                .iter()
+                .map(|subject| subject.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["agent/selected"]
+        );
+
+        let runtimes = store
+            .status_for_claim_kind_at("runtime.observed", None, true)
+            .unwrap();
+        assert_eq!(
+            runtimes
+                .subjects
+                .iter()
+                .map(|subject| subject.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["agent/selected", "exec/also-runtime"]
+        );
+
+        let first_snapshot = store
+            .status_for_claim_kind_at("runtime.observed", Some(first_index), true)
+            .unwrap();
+        assert_eq!(first_snapshot.store_index, first_index);
+        assert_eq!(first_snapshot.subjects.len(), 1);
+        assert_eq!(first_snapshot.subjects[0].subject, "agent/selected");
     }
 
     #[test]

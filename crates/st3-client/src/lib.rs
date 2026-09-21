@@ -198,6 +198,17 @@ impl Client {
         limit: Option<usize>,
         history: bool,
     ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(collection, cursor, limit, history, &[])
+            .await
+    }
+    async fn list_internal_with_filters(
+        &self,
+        collection: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+        filters: &[(&str, &str)],
+    ) -> Result<Envelope<Page>, ClientError> {
         let mut query = Vec::new();
         if let Some(cursor) = cursor {
             query.push(format!("cursor={}", percent_encode(cursor)));
@@ -207,6 +218,13 @@ impl Client {
         }
         if history {
             query.push("history=true".into());
+        }
+        for (name, value) in filters {
+            query.push(format!(
+                "{}={}",
+                percent_encode(name),
+                percent_encode(value)
+            ));
         }
         let suffix = if query.is_empty() {
             String::new()
@@ -236,6 +254,26 @@ impl Client {
             query.push("history=true".into());
         }
         self.get(&format!("/v1/client/now?{}", query.join("&")))
+            .await
+    }
+    pub async fn work_list_for_actor(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters("work", cursor, limit, history, &[("actor", actor)])
+            .await
+    }
+    pub async fn agents_list_for_status(
+        &self,
+        status: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters("agents", cursor, limit, history, &[("status", status)])
             .await
     }
     async fn resource_internal(
@@ -484,6 +522,15 @@ impl Client {
     }
     pub async fn runtimes_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("runtimes", id).await
+    }
+    pub async fn terminals_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("terminals", cursor, limit, history)
+            .await
     }
     pub async fn operations_list(
         &self,

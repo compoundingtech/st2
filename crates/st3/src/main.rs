@@ -30,7 +30,7 @@ use st3::model::{
     ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
     RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
     SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
-    SubjectStatus, WorkRequest, WorkWakeRequest,
+    WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -46,10 +46,9 @@ use tokio::sync::{Notify, watch};
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, render_attention_list,
-    render_attention_show, render_generation, render_generations, render_human_value,
-    render_mission_run, render_pty_list, render_revision_proposal, render_step_run,
-    render_work_list, shell_argument,
+    OutputStyle, follow_snapshot, mission_run_signature, render_attention_show, render_generation,
+    render_generations, render_human_value, render_mission_run, render_revision_proposal,
+    render_step_run, shell_argument,
 };
 
 #[derive(Parser)]
@@ -462,6 +461,11 @@ enum PtyCommand {
     Ls {
         #[arg(long)]
         all: bool,
+        /// Resume the next bounded page returned by an earlier list.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Attach this terminal interactively to one running terminal member.
     Attach(PtyAttachArgs),
@@ -735,6 +739,11 @@ struct AgentsArgs {
     /// Include stopped, superseded, terminal-owner, and historical eval agents.
     #[arg(long)]
     all: bool,
+    /// Resume the next bounded page returned by an earlier list.
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Subcommand)]
@@ -806,6 +815,14 @@ enum AttentionCommand {
     Ls {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: String,
+        /// Include resolved and historical attention.
+        #[arg(long)]
+        all: bool,
+        /// Resume the next bounded page returned by an earlier list.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Explain one attention item and show the exact available actions.
     Show {
@@ -860,6 +877,11 @@ enum WorkCommand {
         actor: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Resume the next bounded page returned by an earlier list.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
     Show { subject: String },
@@ -1184,16 +1206,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Missions { command } => {
             run_mission_view(&client, &endpoint, command, cli.json).await
         }
-        Command::Attention { command } => run_attention(&client, command, cli.json).await,
+        Command::Attention { command } => {
+            run_attention(&client, &endpoint, command, cli.json).await
+        }
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
-        Command::Agents { command } => run_agents(&client, command, cli.json).await,
+        Command::Agents { command } => run_agents(&client, &endpoint, command, cli.json).await,
         Command::Conversations { command } => {
             run_message(&client, &endpoint, command, cli.json).await
         }
         Command::Activity(args) => run_activity(&endpoint, args, cli.json).await,
         Command::Devices(args) => run_devices(endpoint.clone(), args, cli.json).await,
-        Command::Work { command } => run_work(&client, command, cli.json).await,
-        Command::Terminals { command } => run_pty(&client, command, cli.json).await,
+        Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
+        Command::Terminals { command } => run_pty(&client, &endpoint, command, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
@@ -2025,21 +2049,28 @@ async fn publish_text(
         .await
 }
 
-async fn run_pty(client: &Client, command: PtyCommand, json_output: bool) -> Result<()> {
+async fn run_pty(
+    client: &Client,
+    endpoint: &Endpoint,
+    command: PtyCommand,
+    json_output: bool,
+) -> Result<()> {
     match command {
-        PtyCommand::Ls { all } => {
-            let path = if all {
-                "/v1/sessions?history=true"
-            } else {
-                "/v1/sessions"
-            };
-            let sessions: Vec<st3::model::SubjectStatus> = client.get(path).await?;
-            if json_output {
-                print_value(&sessions, true)
-            } else {
-                print!("{}", render_pty_list(&sessions, OutputStyle::stdout()));
-                Ok(())
-            }
+        PtyCommand::Ls { all, cursor, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the terminal limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, None)?
+                .terminals_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            let history = if all { " --all" } else { "" };
+            print_product_page(
+                "TERMINALS",
+                &response,
+                json_output,
+                &format!("st3 terminals ls{history}"),
+            )
         }
         PtyCommand::Attach(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -2471,6 +2502,30 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     item.header.id, item.severity, item.state, item.summary
                 );
                 let _ = writeln!(output, "  recovery: st3 doctor");
+            }
+            ClientResource::Agent(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {} · {}",
+                    item.header.id, item.state, item.name, item.reachability
+                );
+                if let Some(owner) = &item.owner_run_id {
+                    let _ = writeln!(output, "  owner: {owner}");
+                }
+            }
+            ClientResource::Runtime(item) => {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {} · {}",
+                    item.header.id, item.state, item.owner_id, item.owner_host_id
+                );
+                let _ = writeln!(output, "  runtime: {}", item.runtime_id);
+                if item.terminal_id.is_some() && item.state == "running" {
+                    let _ = writeln!(output, "  attach: st3 terminals attach {}", item.owner_id);
+                }
+                if let Some(owner) = &item.owner_run_id {
+                    let _ = writeln!(output, "  owner: {owner}");
+                }
             }
             ClientResource::Machine(item) => {
                 let _ = writeln!(output, "{}  {}", item.header.id, item.state);
@@ -3457,7 +3512,12 @@ fn render_import_session(session: &st3_client::Session) -> String {
     output
 }
 
-async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) -> Result<()> {
+async fn run_agents(
+    client: &Client,
+    endpoint: &Endpoint,
+    command: AgentsCommand,
+    json_output: bool,
+) -> Result<()> {
     let (args, tree) = match command {
         AgentsCommand::Ls(args) => (args, false),
         AgentsCommand::Tree(args) => (args, true),
@@ -3488,179 +3548,163 @@ async fn run_agents(client: &Client, command: AgentsCommand, json_output: bool) 
             return print_value(&agent, json_output);
         }
     };
-    let path = if args.all {
-        "/v1/status?history=true"
+    anyhow::ensure!(
+        args.limit > 0 && args.limit <= 200,
+        "the agent limit must be 1 through 200"
+    );
+    let generated = generated_client(endpoint, None)?;
+    let response = if let Some(status) = args.status.as_deref() {
+        generated
+            .agents_list_for_status(status, args.cursor.as_deref(), Some(args.limit), args.all)
+            .await?
     } else {
-        "/v1/status"
+        generated
+            .agents_list(args.cursor.as_deref(), Some(args.limit), args.all)
+            .await?
     };
-    let response: StatusResponse = client.get(path).await?;
-    let agents = response
-        .subjects
-        .into_iter()
-        .filter(|subject| subject.subject.starts_with("agent/"))
-        .filter(|subject| args.all || subject.projection.actionable)
-        .filter(|subject| {
-            args.status.as_deref().is_none_or(|selected| {
-                subject
-                    .actual
-                    .as_ref()
-                    .and_then(|actual| actual.get("presence"))
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        subject
-                            .actual
-                            .as_ref()
-                            .and_then(|actual| actual.get("status"))
-                            .and_then(Value::as_str)
-                    })
-                    == Some(selected)
-            })
-        })
-        .collect::<Vec<_>>();
     if json_output {
-        return print_value(&agents, true);
+        return print_value(&response, true);
     }
-    if tree {
-        print!("{}", render_agent_tree(&agents));
-        return Ok(());
+    let mut continuation = if tree {
+        "st3 agents tree".to_owned()
+    } else {
+        "st3 agents ls".to_owned()
+    };
+    if let Some(status) = args.status.as_deref() {
+        continuation.push_str(&format!(" --status {status}"));
     }
-    println!("AGENTS  {}", agents.len());
-    if agents.is_empty() {
-        println!("No operational agents.");
-        return Ok(());
+    if args.enrich {
+        continuation.push_str(" --enrich");
     }
-    for agent in agents {
-        let actual = agent.actual.as_ref();
-        let state = actual
-            .and_then(|value| value.get("presence"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                actual
-                    .and_then(|value| value.get("status"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("unknown");
-        let display_name = agent
-            .desired
-            .as_ref()
-            .and_then(|desired| desired_child_string(desired, "name"));
-        if args.enrich {
-            let driver = agent
-                .desired
-                .as_ref()
-                .and_then(|desired| desired_child_string(desired, "harness"))
-                .unwrap_or("-");
-            let incarnation = actual
-                .and_then(|value| value.get("incarnation_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("-");
-            let harness = agent
-                .harness
-                .as_ref()
-                .map(|harness| harness.state.as_str())
-                .unwrap_or("-");
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                agent.subject,
-                display_name.unwrap_or("-"),
-                state,
-                agent.reachability,
-                driver,
-                harness,
-                agent.owner_run.as_deref().unwrap_or("-"),
-            );
-            println!("  incarnation {incarnation}");
-        } else {
-            println!(
-                "{}\t{}\t{}",
-                agent.subject,
-                display_name.unwrap_or("-"),
-                state
-            );
-        }
-        for grouping in agent.under {
-            match grouping.reason {
-                Some(reason) => println!("  under {} ({reason})", grouping.agent),
-                None => println!("  under {}", grouping.agent),
-            }
-        }
+    if args.all {
+        continuation.push_str(" --all");
     }
+    print!(
+        "{}",
+        render_client_agents(&response.value, tree, args.enrich, &continuation)
+    );
     Ok(())
 }
 
-fn render_agent_tree(agents: &[SubjectStatus]) -> String {
+fn render_client_agents(
+    page: &ClientPage,
+    tree: bool,
+    enrich: bool,
+    continuation_command: &str,
+) -> String {
     use std::fmt::Write as _;
 
-    let mut groups = BTreeMap::<String, Vec<&SubjectStatus>>::new();
-    for agent in agents {
-        let owner = agent
-            .owner_run
-            .as_deref()
-            .unwrap_or("unowned")
-            .strip_prefix("mission-run/")
-            .unwrap_or_else(|| agent.owner_run.as_deref().unwrap_or("unowned"));
-        groups.entry(owner.to_owned()).or_default().push(agent);
-    }
+    let agents = page
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ClientResource::Agent(agent) => Some(agent),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let mut output = String::new();
-    let _ = writeln!(output, "AGENT TREE  {}", agents.len());
+    let _ = writeln!(
+        output,
+        "{}  {}",
+        if tree { "AGENT TREE" } else { "AGENTS" },
+        agents.len()
+    );
     if agents.is_empty() {
         let _ = writeln!(output, "No operational agents.");
         return output;
     }
-    let group_count = groups.len();
-    for (group_index, (owner, mut members)) in groups.into_iter().enumerate() {
-        members.sort_by(|left, right| left.subject.cmp(&right.subject));
-        let group_branch = if group_index + 1 == group_count {
-            "└─"
-        } else {
-            "├─"
-        };
-        let _ = writeln!(output, "{group_branch} {owner}");
-        let member_prefix = if group_index + 1 == group_count {
-            "   "
-        } else {
-            "│  "
-        };
-        for (member_index, agent) in members.iter().enumerate() {
-            let branch = if member_index + 1 == members.len() {
+    if !tree {
+        for agent in &agents {
+            if enrich {
+                let _ = writeln!(
+                    output,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    agent.header.id,
+                    agent.name,
+                    agent.state,
+                    agent.reachability,
+                    agent.driver.as_deref().unwrap_or("-"),
+                    agent.harness_state.as_deref().unwrap_or("-"),
+                    agent.owner_run_id.as_deref().unwrap_or("-"),
+                );
+                let _ = writeln!(
+                    output,
+                    "  incarnation {}",
+                    agent.incarnation_id.as_deref().unwrap_or("-")
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "{}\t{}\t{}",
+                    agent.header.id, agent.name, agent.state
+                );
+            }
+            for relationship in &agent.under {
+                match relationship.reason.as_deref() {
+                    Some(reason) => {
+                        let _ = writeln!(output, "  under {} ({reason})", relationship.agent_id);
+                    }
+                    None => {
+                        let _ = writeln!(output, "  under {}", relationship.agent_id);
+                    }
+                }
+            }
+        }
+    } else {
+        let mut groups = BTreeMap::<String, Vec<&st3_client::Agent>>::new();
+        for agent in agents {
+            let owner = agent
+                .owner_run_id
+                .as_deref()
+                .unwrap_or("unowned")
+                .strip_prefix("mission-run/")
+                .unwrap_or_else(|| agent.owner_run_id.as_deref().unwrap_or("unowned"));
+            groups.entry(owner.to_owned()).or_default().push(agent);
+        }
+        let group_count = groups.len();
+        for (group_index, (owner, mut members)) in groups.into_iter().enumerate() {
+            members.sort_by(|left, right| left.header.id.cmp(&right.header.id));
+            let group_branch = if group_index + 1 == group_count {
                 "└─"
             } else {
                 "├─"
             };
-            let state = agent
-                .harness
-                .as_ref()
-                .map(|harness| harness.state.as_str())
-                .or_else(|| {
-                    agent
-                        .actual
-                        .as_ref()
-                        .and_then(|actual| actual.get("status"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("unknown");
-            let name = agent.subject.rsplit('/').next().unwrap_or(&agent.subject);
-            let _ = writeln!(
-                output,
-                "{member_prefix}{branch} {name}  {state} · {}",
-                agent.reachability
-            );
-            let _ = writeln!(output, "{member_prefix}   {}", agent.subject);
+            let _ = writeln!(output, "{group_branch} {owner}");
+            let member_prefix = if group_index + 1 == group_count {
+                "   "
+            } else {
+                "│  "
+            };
+            for (member_index, agent) in members.iter().enumerate() {
+                let branch = if member_index + 1 == members.len() {
+                    "└─"
+                } else {
+                    "├─"
+                };
+                let state = agent.harness_state.as_deref().unwrap_or(&agent.state);
+                let name = agent
+                    .header
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&agent.header.id);
+                let _ = writeln!(
+                    output,
+                    "{member_prefix}{branch} {name}  {state} · {}",
+                    agent.reachability
+                );
+                let _ = writeln!(output, "{member_prefix}   {}", agent.header.id);
+            }
         }
     }
+    if let Some(cursor) = page.page.next_cursor.as_deref() {
+        let _ = writeln!(
+            output,
+            "More agents are available: {continuation_command} --cursor {cursor} --limit {}",
+            page.page.limit
+        );
+    }
     output
-}
-
-fn desired_child_string<'a>(desired: &'a Value, child_name: &str) -> Option<&'a str> {
-    desired
-        .get("children")?
-        .as_array()?
-        .iter()
-        .find(|child| child.get("name").and_then(Value::as_str) == Some(child_name))?
-        .get("arguments")?
-        .as_array()?
-        .first()?
-        .as_str()
 }
 
 async fn put_document_bytes(
@@ -3873,22 +3917,31 @@ async fn run_review_decision(
 
 async fn run_attention(
     client: &Client,
+    endpoint: &Endpoint,
     command: AttentionCommand,
     json_output: bool,
 ) -> Result<()> {
     match command {
-        AttentionCommand::Ls { actor } => {
-            let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
-            let items: Vec<AttentionItemView> = client.get(&path).await?;
-            if json_output {
-                print_value(&items, true)
-            } else {
-                print!(
-                    "{}",
-                    render_attention_list(Some(&actor), &items, OutputStyle::stdout(), now_ms(),)
-                );
-                Ok(())
-            }
+        AttentionCommand::Ls {
+            actor,
+            all,
+            cursor,
+            limit,
+        } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the attention limit must be 1 through 200"
+            );
+            let response = generated_client(endpoint, Some(&actor))?
+                .attention_list(cursor.as_deref(), Some(limit), all)
+                .await?;
+            let history = if all { " --all" } else { "" };
+            print_product_page(
+                &format!("HUMAN ATTENTION FOR {actor}"),
+                &response,
+                json_output,
+                &format!("st3 attention ls --as {actor}{history}"),
+            )
         }
         AttentionCommand::Show { subject, actor } => {
             let normalized = normalize_member_subject(&subject, "attention");
@@ -3971,27 +4024,41 @@ async fn run_attention(
     }
 }
 
-async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
+async fn run_work(
+    client: &Client,
+    endpoint: &Endpoint,
+    command: WorkCommand,
+    json_output: bool,
+) -> Result<()> {
     match command {
-        WorkCommand::Ls { actor, all } => {
-            let include_terminal = all;
-            let path = if let Some(actor) = actor.as_deref() {
-                format!(
-                    "/v1/work?actor={}&include_terminal={include_terminal}",
-                    urlencoding::encode(actor)
-                )
-            } else {
-                format!("/v1/work?include_terminal={include_terminal}")
-            };
-            let work: Vec<StepRunView> = client.get(&path).await?;
-            if json_output {
-                return print_value(&work, true);
-            }
-            print!(
-                "{}",
-                render_work_list(actor.as_deref(), &work, all, OutputStyle::stdout())
+        WorkCommand::Ls {
+            actor,
+            all,
+            cursor,
+            limit,
+        } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the work limit must be 1 through 200"
             );
-            Ok(())
+            let generated = generated_client(endpoint, None)?;
+            let response = if let Some(actor) = actor.as_deref() {
+                generated
+                    .work_list_for_actor(actor, cursor.as_deref(), Some(limit), all)
+                    .await?
+            } else {
+                generated
+                    .work_list(cursor.as_deref(), Some(limit), all)
+                    .await?
+            };
+            let mut command = "st3 work ls".to_owned();
+            if let Some(actor) = actor.as_deref() {
+                command.push_str(&format!(" --as {actor}"));
+            }
+            if all {
+                command.push_str(" --all");
+            }
+            print_product_page("WORK", &response, json_output, &command)
         }
         WorkCommand::Show { subject } => {
             let normalized = if subject.starts_with("step-run/") {
@@ -6705,7 +6772,7 @@ mod tests {
     fn terminal_history_is_explicit() {
         let cli = Cli::try_parse_from(["st3", "terminals", "ls", "--all"]).unwrap();
         let Command::Terminals {
-            command: PtyCommand::Ls { all },
+            command: PtyCommand::Ls { all, .. },
         } = cli.command
         else {
             panic!("the terminal list command did not parse");
@@ -7198,7 +7265,7 @@ mod tests {
         let list =
             Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
         let Command::Attention {
-            command: AttentionCommand::Ls { actor },
+            command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the review list command did not parse");
@@ -7228,7 +7295,7 @@ mod tests {
         let list =
             Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
         let Command::Attention {
-            command: AttentionCommand::Ls { actor },
+            command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the attention list command did not parse");

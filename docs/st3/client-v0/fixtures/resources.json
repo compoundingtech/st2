@@ -59,12 +59,14 @@
   },
   {
     "id": "agent/release", "kind": "agent", "revision": "ag3", "updated_at": "2026-09-20T11:08:00Z",
-    "name": "Release agent", "state": "running", "reachability": "local", "runtime_ids": ["runtime/release-agent"]
+    "name": "Release agent", "state": "running", "reachability": "local", "runtime_ids": ["runtime/release-agent"],
+    "owner_run_id": "mission-run/release", "driver": "codex", "harness_state": "ready",
+    "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "under": []
   },
   {
     "id": "runtime/release-agent", "kind": "runtime", "revision": "rt5", "updated_at": "2026-09-20T11:09:00Z",
     "runtime_kind": "agent", "owner_id": "agent/release", "owner_host_id": "host/host-a", "state": "running", "runtime_id": "runtime-9",
-    "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3"
+    "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3", "owner_run_id": "mission-run/release"
   },
   {
     "id": "machine/host-a", "kind": "machine", "revision": "mh5", "updated_at": "2026-09-20T11:09:10Z",

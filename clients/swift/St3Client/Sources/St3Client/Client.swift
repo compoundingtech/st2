@@ -64,6 +64,7 @@ public actor St3Client {
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
     public func runtimesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("runtimes", cursor: cursor, limit: limit, history: history) }
     public func runtimesGet(id: String) async throws -> Envelope<Resource> { try await resource("runtimes", id: id) }
+    public func terminalsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("terminals", cursor: cursor, limit: limit, history: history) }
     public func operationsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("operations", cursor: cursor, limit: limit, history: history) }
     public func operationsGet(id: String) async throws -> Envelope<Resource> { try await resource("operations", id: id) }
     public func historyList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("history", cursor: cursor, limit: limit, history: history) }

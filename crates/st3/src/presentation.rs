@@ -1,11 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
 use serde_json::Value;
+#[cfg(test)]
+use st3::model::SubjectStatus;
 use st3::model::{
     AttentionItemView, MissionInputKind, MissionRunView, RevisionCutover, RevisionProposalView,
-    RunGenerationView, StepRunView, SubjectStatus,
+    RunGenerationView, StepRunView,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +157,7 @@ pub(crate) fn render_mission_run(
     output
 }
 
+#[cfg(test)]
 pub(crate) fn render_work_list(
     actor: Option<&str>,
     work: &[StepRunView],
@@ -242,6 +247,7 @@ pub(crate) fn render_work_list(
     output
 }
 
+#[cfg(test)]
 pub(crate) fn render_pty_list(sessions: &[SubjectStatus], style: OutputStyle) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "{}", style.heading("TERMINALS"));
@@ -457,6 +463,7 @@ fn field_label(key: &str) -> String {
     key.replace(['_', '-'], " ").to_uppercase()
 }
 
+#[cfg(test)]
 pub(crate) fn render_attention_list(
     person: Option<&str>,
     items: &[AttentionItemView],
@@ -1047,6 +1054,7 @@ fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str, styl
     }
 }
 
+#[cfg(test)]
 fn render_work_list_item(output: &mut String, step: &StepRunView, style: OutputStyle) {
     let title = step.title.as_deref().unwrap_or(&step.step);
     let _ = writeln!(
@@ -1124,6 +1132,7 @@ fn is_executing_state(status: &str) -> bool {
     matches!(status, "claimed" | "working" | "verifying")
 }
 
+#[cfg(test)]
 fn is_terminal_state(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }

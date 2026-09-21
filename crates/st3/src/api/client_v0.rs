@@ -466,15 +466,11 @@ fn runtime_resources(
     // Runtime authority must come from the same status reduction used by every
     // other control path. A raw claim ordered last by this replica's ingest
     // index is not necessarily the causally current runtime observation.
-    let status = if history {
-        state
-            .store
-            .status_history(None, None, Some(snapshot.store_index))?
-    } else {
-        state
-            .store
-            .status_at(None, None, Some(snapshot.store_index))?
-    };
+    let status = state.store.status_for_claim_kind_at(
+        "runtime.observed",
+        Some(snapshot.store_index),
+        history,
+    )?;
     let mut values = Vec::new();
     for selected in status.subjects {
         let Some(actual) = selected.actual.as_ref() else {
@@ -532,6 +528,7 @@ fn runtime_resources(
             "runtime_id": runtime_id,
             "incarnation_id": incarnation_id,
             "desired_revision": actual_claim,
+            "owner_run_id": selected.owner_run,
             "terminal_id": terminal_id,
             "terminal_sequence": terminal.then_some(snapshot.store_index),
             "terminal_access": terminal.then(|| json!({
@@ -651,15 +648,10 @@ fn machine_resources(
         .collect::<BTreeSet<_>>();
     host_ids.extend(configured_hosts.iter().cloned());
     host_ids.extend(host_runtime_ids.keys().cloned());
-    let status = if history {
+    let status =
         state
             .store
-            .status_history(None, None, Some(snapshot.store_index))?
-    } else {
-        state
-            .store
-            .status_at(None, None, Some(snapshot.store_index))?
-    };
+            .status_for_subject_prefix_at("host/", Some(snapshot.store_index), history)?;
     let mut host_statuses = status
         .subjects
         .into_iter()
@@ -902,6 +894,19 @@ pub(super) async fn runtimes(
     let items = runtime_resources(&state, query.history, &snapshot, &session)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "runtimes", items, &query).map(Json)
+}
+
+pub(super) async fn terminals(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let mut items = runtime_resources(&state, query.history, &snapshot, &session)
+        .map_err(ApiError::internal)?;
+    items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
+    client_page(&state, &snapshot, "terminals", items, &query).map(Json)
 }
 
 pub(super) async fn runtime_detail(

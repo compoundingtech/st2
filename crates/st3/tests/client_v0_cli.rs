@@ -170,6 +170,23 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     assert_eq!(now["api_version"], "st3.client.v0");
     assert_eq!(now["value"]["collection"], "now");
 
+    for arguments in [
+        vec!["attention", "ls", "--as", "person/nathan"],
+        vec!["agents", "ls"],
+        vec!["agents", "tree"],
+        vec!["work", "ls"],
+        vec!["terminals", "ls"],
+    ] {
+        let page = value(&run_cli(&socket, &arguments).await);
+        assert_eq!(page["api_version"], "st3.client.v0", "{arguments:?}");
+        assert_eq!(page["value"]["kind"], "page", "{arguments:?}");
+        assert!(page["value"]["items"].is_array(), "{arguments:?}");
+    }
+
+    let first_agent = value(&run_cli(&socket, &["agents", "ls", "--all", "--limit", "1"]).await);
+    assert_eq!(first_agent["value"]["page"]["limit"], 1);
+    assert!(first_agent["value"]["page"]["next_cursor"].is_string());
+
     let machines = value(&run_cli(&socket, &["machines"]).await);
     assert_eq!(machines["api_version"], "st3.client.v0");
     assert_eq!(machines["value"]["items"][0]["id"], "machine/client-v0-cli");
@@ -301,6 +318,14 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
         (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),
+        (
+            vec!["attention", "ls", "--as", "person/nathan"],
+            "HUMAN ATTENTION",
+        ),
+        (vec!["agents", "ls"], "AGENTS"),
+        (vec!["agents", "tree"], "AGENT TREE"),
+        (vec!["work", "ls"], "WORK"),
+        (vec!["terminals", "ls"], "TERMINALS"),
     ] {
         let output = run_cli_human(&socket, &arguments).await;
         assert!(

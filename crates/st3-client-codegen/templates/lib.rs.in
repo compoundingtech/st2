@@ -198,6 +198,17 @@ impl Client {
         limit: Option<usize>,
         history: bool,
     ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(collection, cursor, limit, history, &[])
+            .await
+    }
+    async fn list_internal_with_filters(
+        &self,
+        collection: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+        filters: &[(&str, &str)],
+    ) -> Result<Envelope<Page>, ClientError> {
         let mut query = Vec::new();
         if let Some(cursor) = cursor {
             query.push(format!("cursor={}", percent_encode(cursor)));
@@ -207,6 +218,9 @@ impl Client {
         }
         if history {
             query.push("history=true".into());
+        }
+        for (name, value) in filters {
+            query.push(format!("{}={}", percent_encode(name), percent_encode(value)));
         }
         let suffix = if query.is_empty() {
             String::new()
@@ -237,6 +251,38 @@ impl Client {
         }
         self.get(&format!("/v1/client/now?{}", query.join("&")))
             .await
+    }
+    pub async fn work_list_for_actor(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(
+            "work",
+            cursor,
+            limit,
+            history,
+            &[("actor", actor)],
+        )
+        .await
+    }
+    pub async fn agents_list_for_status(
+        &self,
+        status: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(
+            "agents",
+            cursor,
+            limit,
+            history,
+            &[("status", status)],
+        )
+        .await
     }
     async fn resource_internal(
         &self,

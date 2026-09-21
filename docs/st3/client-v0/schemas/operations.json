@@ -29,6 +29,7 @@
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
     { "id": "runtimes.list", "method": "GET", "path": "/v1/client/runtimes", "response": "Page" },
     { "id": "runtimes.get", "method": "GET", "path": "/v1/client/runtimes/{id}", "response": "Resource" },
+    { "id": "terminals.list", "method": "GET", "path": "/v1/client/terminals", "response": "Page" },
     { "id": "operations.list", "method": "GET", "path": "/v1/client/operations", "response": "Page" },
     { "id": "operations.get", "method": "GET", "path": "/v1/client/operations/{id}", "response": "Resource" },
     { "id": "history.list", "method": "GET", "path": "/v1/client/history", "response": "Page" },
