@@ -3551,6 +3551,13 @@ impl Store {
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
 
+        if intent.deprecated_syntax.contains("pty") {
+            warnings.push(
+                "deprecated-kdl-node: `pty {}` is temporarily accepted; use canonical `terminal {}` before the friend-ready v0"
+                    .into(),
+            );
+        }
+
         for reference in &intent.document_refs {
             let Some((name, hash)) = reference.rsplit_once('@') else {
                 blockers.push(format!(
@@ -5173,6 +5180,15 @@ impl Store {
                     claim_ids.push(claim.id);
                 }
                 "impossible-state" => {
+                    claim_ids.extend(repair_impossible_run_tx(
+                        &transaction,
+                        &self.origin,
+                        &item.subject,
+                        &item.reason,
+                        now,
+                    )?);
+                }
+                "cancelled-final-stall" => {
                     claim_ids.extend(repair_impossible_run_tx(
                         &transaction,
                         &self.origin,
@@ -8857,7 +8873,7 @@ fn adopt_declared_mission_revision_tx(
     let actor = actor.ok_or_else(|| {
         St3Error::new(
             "missing-publication-actor",
-            "a mission-run revision needs `--as` or ST_AGENT",
+            "a mission-run revision needs an explicit actor",
         )
     })?;
     let actor = normalize_actor_for_publication(actor);
@@ -12112,6 +12128,75 @@ fn operational_repair_plan_tx(
                         .get("wake_attempts")
                         .cloned()
                         .unwrap_or_else(|| Value::from(0)),
+                ),
+            ]),
+        )?;
+    }
+
+    let mut cancelled_final = connection.prepare(
+        "SELECT id, current_generation_id, updated_at_unix_ms
+         FROM mission_runs
+         WHERE status='running' AND phase='final-cancelled'
+         ORDER BY id",
+    )?;
+    let cancelled_final = cancelled_final
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (run, generation, updated) in cancelled_final {
+        let updated = updated.parse::<u128>().unwrap_or(snapshot_unix_ms);
+        let age_ms = snapshot_unix_ms.saturating_sub(updated);
+        if age_ms < 60_000 {
+            continue;
+        }
+        let mut statement = connection.prepare(
+            "SELECT subject, status, not_before_unix_ms
+             FROM step_runs
+             WHERE generation_id=?1 AND status NOT IN ('completed','failed','cancelled')
+             ORDER BY subject",
+        )?;
+        let steps = statement
+            .query_map([&generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if steps.is_empty()
+            || steps.iter().any(|(_, status, not_before)| {
+                status != "pending"
+                    || not_before
+                        .as_deref()
+                        .and_then(|value| value.parse::<u128>().ok())
+                        .is_some_and(|deadline| deadline > snapshot_unix_ms)
+            })
+        {
+            continue;
+        }
+        let subject = format!("mission-run/{run}");
+        let mut affected = vec![subject.clone()];
+        affected.extend(steps.iter().map(|(subject, _, _)| subject.clone()));
+        push_operational_repair_item(
+            &mut items,
+            "cancelled-final-stall",
+            &subject,
+            affected,
+            "a cancelled mission has had only unscheduled pending final work for more than one minute",
+            BTreeMap::from([
+                (
+                    "generation".into(),
+                    Value::String(format!("run-generation/{generation}")),
+                ),
+                (
+                    "updated_at_unix_ms".into(),
+                    Value::String(updated.to_string()),
                 ),
             ]),
         )?;
@@ -20982,6 +21067,86 @@ version 2
         let duplicate = store.apply_operational_repair(&plan.token).unwrap();
         assert_eq!(duplicate.applied, 0);
         assert!(duplicate.already_applied);
+    }
+
+    #[test]
+    fn operational_repair_terminalizes_a_stale_cancelled_final_phase() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+mission "cancelled-final-repair" state="ready" {
+  goal "Prove stale cancellation repair."
+  step "work" { agentless }
+  finally { step "cleanup" { agentless } }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(
+                &intent,
+                &planned.subject_tokens,
+                "cancelled-final-repair-source",
+            )
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "cancelled-final-repair".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "cancelled-final-repair-run".into(),
+            })
+            .unwrap();
+        store
+            .request_mission_run_cancellation(&run.id, "the operator cancelled")
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_runs SET updated_at_unix_ms='0' WHERE id=?1",
+                [&run.id],
+            )
+            .unwrap();
+
+        let plan = store.operational_repair_plan().unwrap();
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.class == "cancelled-final-stall")
+            .expect("the stale cancelled final phase needs a bounded repair");
+        assert_eq!(item.subject, run.subject);
+        assert!(
+            item.affected_subjects
+                .iter()
+                .any(|subject| subject.ends_with("/cleanup"))
+        );
+
+        let result = store.apply_operational_repair(&plan.token).unwrap();
+        assert!(result.applied >= 1);
+        let repaired = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (repaired.status.as_str(), repaired.phase.as_str()),
+            ("cancelled", "terminal")
+        );
+        assert!(
+            repaired
+                .steps
+                .iter()
+                .all(|step| matches!(step.status.as_str(), "completed" | "failed" | "cancelled"))
+        );
+        assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
     }
 
     #[test]

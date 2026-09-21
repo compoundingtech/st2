@@ -121,6 +121,8 @@ pub struct PageInfo {
 pub struct Page {
     pub kind: String,
     pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
     pub items: Vec<Resource>,
     pub page: PageInfo,
 }

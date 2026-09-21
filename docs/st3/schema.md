@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `b89865d20209041a3e4955d99b0ee16e422585e7ffdd5cea31bc1c3365f78521`
+Digest: `bb7f7e6ec1b1cef8f85d3f2ac73b17da01910c2603b503827475ab518026c505`
 
 ## Subject families
 
@@ -69,11 +69,12 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `gate.result` | `gate-operation` | `capability-holder` | `append` | `baseline:boolean`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:string`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
-| `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `reason:string`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
+| `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `observed_since_ms:integer`, `reason:string`, `retry_after_unix_ms:integer`, `retry_attempt:integer`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
 | `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
 | `harness.timeline` | `agent` | `same-subject-actor` | `append` | `body!:object`, `driver!:string`, `entry_id!:string`, `entry_type!:string`, `final!:boolean`, `incarnation_id!:string`, `observed_at_unix_ms:integer`, `operation!:string`, `revision!:integer`, `role!:string`, `sequence:integer` |  |
 | `harness.usage` | `agent` | `same-subject-actor` | `append` | `cached_tokens:integer`, `context_used_percent:number`, `context_used_tokens:integer`, `context_window_tokens:integer`, `cost:number`, `currency:string`, `driver!:string`, `incarnation_id!:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `semantics!:string`, `total_tokens:integer` |  |
 | `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
+| `loop.round-dispatch` | `loop-run` | `system-only` | `append` | `candidate:integer`, `dispatch!:integer`, `item_id:string`, `mission_run!:subject-reference(mission-run)`, `reason!:string`, `round!:integer`, `status!:string` | `loop`, `round` |
 | `loop.round-result` | `loop-run` | `system-only` | `append` | `candidate:integer`, `feedback:subject-reference(doc)`, `item:any`, `metrics:object`, `mission_run!:subject-reference(mission-run)`, `reason:string`, `round!:integer`, `status!:string`, `token_usage:integer` | `loop`, `round` |
 | `loop.state` | `loop-run` | `system-only` | `state-transition` | `best_metrics:object`, `best_round:integer`, `feedback:subject-reference(doc)`, `items:array`, `reason:string`, `round:integer`, `status!:string`, `winner:integer` | `loop` |
 | `message.closed` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |

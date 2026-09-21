@@ -121,7 +121,7 @@ An optional mission `timeout="2h"` becomes one absolute deadline on each run. It
 
 `st3 trace wait` is for a condition needed by work that the current agent has already claimed. It is not an idle-work loop.
 
-When `ST_AGENT` contains an `agent/...` subject, the command watches the complete event graph. It exits early when that agent receives a message or becomes eligible for another ready step. It also refuses to wait when the agent has no claimed step. The harness can then end its turn, and native delivery can start a fresh turn for new work.
+When invoked with `--as "$ST_AGENT"`, the command watches the complete event graph. It exits early when that exact agent receives a message or becomes eligible for another ready step. It also refuses to wait when the agent has no claimed step. The explicit flag prevents an inherited environment variable from silently changing a nested shell's view. The harness can then end its turn, and native delivery can start a fresh turn for new work.
 
 This keeps a narrow condition wait from hiding broader graph progress. Scripts outside an agent harness retain the ordinary subject-specific wait behavior.
 

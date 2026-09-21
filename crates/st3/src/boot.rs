@@ -23,7 +23,7 @@ The claim output contains the step goals and all effective constraints. A parent
 
 Use `"$ST3_BIN" work progress` only for a material update. Finish with `"$ST3_BIN" work complete`, `"$ST3_BIN" work fail`, or `"$ST3_BIN" work release`.
 
-Use `"$ST3_BIN" trace wait` only when claimed work needs a graph condition. Do not use an agent turn to poll.
+Use `"$ST3_BIN" trace wait ... --as "$ST_AGENT"` only when claimed work needs a graph condition. Identity is always explicit; do not use an agent turn to poll.
 
 The wait command exits early when a new message or a new eligible step needs your attention.
 
@@ -73,7 +73,7 @@ mod tests {
         );
         assert!(BOOT_DOCUMENT.contains("ST3_BIN"));
         assert!(BOOT_DOCUMENT.contains("If no step is ready, finish this turn."));
-        assert!(BOOT_DOCUMENT.contains("trace wait` only when claimed work needs"));
+        assert!(BOOT_DOCUMENT.contains("trace wait ... --as \"$ST_AGENT\"` only when"));
         assert!(BOOT_DOCUMENT.contains("conversations --help"));
         assert!(!BOOT_DOCUMENT.contains("message --help"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));

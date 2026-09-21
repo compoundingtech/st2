@@ -1385,12 +1385,12 @@ fn failed_turn_without_idle_allows_next_native_delivery_and_preserves_system_err
 }
 
 #[test]
-fn captured_usage_limit_boundary_allows_next_native_delivery() {
+fn captured_usage_limit_boundary_is_retryable_capacity_and_allows_next_native_delivery() {
     // This fixture is a payload-minimized projection of all 23 inbound frames from the
     // #263 trivial capture. It preserves their order and methods while removing fields this
     // observer never reads. The second capture has the same method sequence. The recorder
     // stops at turn completion, so this test pins the boundary state only. The provider
-    // source establishes that no later idle notification follows the system error.
+    // source establishes that no later idle notification follows the capacity error.
     let frames = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -1425,21 +1425,21 @@ fn captured_usage_limit_boundary_allows_next_native_delivery() {
     assert_eq!(
         state.observed(),
         &CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
+            reason: CodexTerminalError::ProviderCapacity,
         }
     );
     let request = delivery
         .maybe_request(&state)
         .unwrap()
-        .expect("a captured terminal system error must permit the next native delivery");
+        .expect("a captured provider-capacity error must permit the next native delivery");
     assert_eq!(request["method"], "turn/start");
 }
 
 /// The credential class and the quota class arrive through the SAME frame sequence, differing
 /// only in one word of `Turn.error.codexErrorInfo`. This replays the auth-rejected shape and
 /// asserts the fork: `providerAuth` on the observed record, a native-driver diagnostic, and
-/// delivery still permitted — while the captured usage-limit fixture beside it keeps reading
-/// `systemError` with no diagnostic at all.
+/// delivery still permitted — while the captured usage-limit fixture beside it is retryable
+/// capacity rather than an authentication failure.
 #[test]
 fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_not() {
     let rejected = include_str!("../../tests/fixtures/codex_provider_auth_inbound.jsonl")
@@ -1521,7 +1521,7 @@ fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_no
         driver_diagnostic::Observed::Absent
     );
 
-    // The quota capture walks the same methods and must stay unclassified.
+    // The quota capture walks the same methods and must remain distinct from authentication.
     let quota_tmp = tempfile::tempdir().unwrap();
     let quota_config = delivery_config(quota_tmp.path());
     let quota_agent_dir = quota_config.agent_dir.clone();
@@ -1534,14 +1534,77 @@ fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_no
     assert_eq!(
         quota_state.observed(),
         &CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
+            reason: CodexTerminalError::ProviderCapacity,
         }
+    );
+    let quota_observation = quota_state.observed().harness_observation().unwrap();
+    assert_eq!(quota_observation.state, harness_state::Activity::Idle);
+    assert_eq!(
+        quota_observation.reason.as_deref(),
+        Some("providerCapacity")
     );
     assert_eq!(
         driver_diagnostic::read(&driver_diagnostic::path(&quota_agent_dir)),
         driver_diagnostic::Observed::Absent,
         "an exhausted allowance is not a rejected credential"
     );
+}
+
+#[test]
+fn selected_model_capacity_is_retryable_in_the_same_codex_session() {
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state
+        .observe(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+        }))
+        .unwrap();
+    state
+        .observe(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-main",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": "⚠ Selected model is at capacity. Please try a different model."
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderCapacity,
+        }
+    );
+    let observed = state.observed().harness_observation().unwrap();
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(observed.reason.as_deref(), Some("providerCapacity"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(
+        &config.inbox,
+        "daemon/runtime",
+        Some("capacity retry"),
+        None,
+        &[],
+        "resume",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("capacity backoff may resume the existing session");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(request["params"]["threadId"], "thread-main");
 }
 
 #[test]

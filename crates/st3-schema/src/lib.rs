@@ -953,6 +953,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["loop", "round"],
         ),
         (
+            "loop.round-dispatch",
+            &["loop-run"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("loops"),
+            true,
+            &["loop", "round"],
+        ),
+        (
             "loop.state",
             &["loop-run"],
             WritePolicy::SystemOnly,
@@ -1678,6 +1687,15 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", string()),
             ("token_usage", integer()),
         ],
+        "loop.round-dispatch" => &[
+            ("round", required_integer()),
+            ("dispatch", required_integer()),
+            ("status", required_enum(&["rescheduled"])),
+            ("mission_run", required_reference_to(&["mission-run"])),
+            ("candidate", integer()),
+            ("item_id", string()),
+            ("reason", required_string()),
+        ],
         "loop.state" => &[
             (
                 "status",
@@ -1955,6 +1973,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation_id", string()),
             ("step_run", reference_to(&["step-run"])),
             ("wake_attempts", integer()),
+            ("observed_since_ms", integer()),
+            ("retry_attempt", integer()),
+            ("retry_after_unix_ms", integer()),
         ],
         "harness.usage" => &[
             ("input_tokens", integer()),
@@ -2445,6 +2466,7 @@ mod tests {
                 "harness.timeline",
                 "harness.usage",
                 "intent.desired",
+                "loop.round-dispatch",
                 "loop.round-result",
                 "loop.state",
                 "message.closed",

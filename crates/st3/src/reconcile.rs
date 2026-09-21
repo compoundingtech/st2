@@ -26,6 +26,10 @@ const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 
+fn provider_capacity_retry_key(claim_id: &str) -> String {
+    format!("provider-capacity-retry:{claim_id}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeObservation {
     pub runtime_id: String,
@@ -378,6 +382,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok([
             self.store.next_active_mission_deadline(&self.host)?,
             self.next_work_wake_deadline()?,
+            self.next_provider_capacity_retry_deadline()?,
         ]
         .into_iter()
         .flatten()
@@ -400,6 +405,45 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|subject| subject.subject)
             .collect::<BTreeSet<_>>();
         Ok(work_wake_deadline(&work, &local_agents, now_ms()))
+    }
+
+    fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
+        let mut deadline = None;
+        for subject in self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| {
+                subject.kind == "agent"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+            })
+        {
+            for claim in self
+                .store
+                .claims_for(&subject.subject, Some("harness.diagnostic"))?
+            {
+                let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
+                    || fields.get("status").and_then(Value::as_str) != Some("waiting")
+                    || self
+                        .store
+                        .operation_claim(&provider_capacity_retry_key(&claim.id))?
+                        .is_some()
+                {
+                    continue;
+                }
+                let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
+                    continue;
+                };
+                deadline = Some(deadline.map_or(u128::from(due), |current: u128| {
+                    current.min(u128::from(due))
+                }));
+            }
+        }
+        Ok(deadline)
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
@@ -567,7 +611,125 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_schedules(&desired)?;
         self.reconcile_scheduled_work(&desired)?;
         self.reconcile_subscription_missions(&desired)?;
+        self.reconcile_provider_capacity_retries(&desired)?;
         self.evaluate_mission_runs()?;
+        Ok(())
+    }
+
+    fn reconcile_provider_capacity_retries(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let now = now_ms();
+        for subject in desired.iter().filter(|subject| {
+            subject.kind == "agent"
+                && subject
+                    .member
+                    .as_ref()
+                    .is_some_and(|member| member.host == self.host)
+        }) {
+            for claim in self
+                .store
+                .claims_for(&subject.subject, Some("harness.diagnostic"))?
+            {
+                let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                if fields.get("code").and_then(Value::as_str) != Some("provider-capacity")
+                    || fields.get("status").and_then(Value::as_str) != Some("waiting")
+                {
+                    continue;
+                }
+                let Some(due) = fields.get("retry_after_unix_ms").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if u128::from(due) > now {
+                    continue;
+                }
+                let retry_key = provider_capacity_retry_key(&claim.id);
+                if self.store.operation_claim(&retry_key)?.is_some() {
+                    continue;
+                }
+                let incarnation = fields
+                    .get("incarnation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let same_capacity_session = self
+                    .store
+                    .current_harness(&subject.subject)?
+                    .is_some_and(|harness| {
+                        harness.incarnation_id == incarnation
+                            && harness.state == "idle"
+                            && harness.reason.as_deref() == Some("providerCapacity")
+                    });
+                if !same_capacity_session {
+                    self.store.append_claim(&ClaimInput {
+                        subject: subject.subject.clone(),
+                        kind: "publication.operation".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            (
+                                "operation".into(),
+                                Value::String("provider-capacity-retry".into()),
+                            ),
+                            (
+                                "action".into(),
+                                Value::String("skip-stale-incarnation".into()),
+                            ),
+                            ("status".into(), Value::String("accepted".into())),
+                        ]),
+                        evidence: vec![claim.id],
+                        expected_subject: None,
+                        idempotency_key: Some(retry_key),
+                    })?;
+                    self.signal_changed();
+                    continue;
+                }
+                let attempt = fields
+                    .get("retry_attempt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let step = fields.get("step_run").and_then(Value::as_str);
+                let message_id = &hex::encode(sha2::Sha256::digest(retry_key.as_bytes()))[..16];
+                let message_subject = format!("message/{message_id}");
+                let work_context = step
+                    .map(|step| format!(" Continue the claimed work `{step}`."))
+                    .unwrap_or_default();
+                self.store.append_claim(&ClaimInput {
+                    subject: message_subject,
+                    kind: "message.sent".into(),
+                    actor: Some("daemon/runtime".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("daemon/runtime".into())),
+                        ("to".into(), Value::String(subject.subject.clone())),
+                        (
+                            "content".into(),
+                            Value::String(format!(
+                                "The provider-capacity backoff elapsed.{work_context} Resume in this existing session; do not create a replacement worker."
+                            )),
+                        ),
+                        (
+                            "status".into(),
+                            Value::String("sent".into()),
+                        ),
+                        (
+                            "title".into(),
+                            Value::String(format!(
+                                "Provider capacity retry {attempt}"
+                            )),
+                        ),
+                        ("in_reply_to".into(), Value::Null),
+                        (
+                            "tags".into(),
+                            Value::Array(vec![
+                                Value::String("st3-provider-capacity-retry".into()),
+                                Value::String(format!("st3-retry-attempt:{attempt}")),
+                                Value::String(format!("diagnostic-claim:{}", claim.id)),
+                            ]),
+                        ),
+                    ]),
+                    evidence: vec![claim.id],
+                    expected_subject: None,
+                    idempotency_key: Some(retry_key),
+                })?;
+                self.signal_changed();
+            }
+        }
         Ok(())
     }
 
@@ -2354,8 +2516,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("round".into(), Value::from(view.attempt)),
             ]),
         )?;
+        let first_execution = self.loop_first_execution_at(run, view)?;
         let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
-            now_ms().saturating_sub(view.created_at_unix_ms) >= timeout as u128
+            first_execution
+                .is_some_and(|started| now_ms().saturating_sub(started) >= timeout as u128)
         });
         if timed_out {
             return self.finish_exhausted_loop(
@@ -2387,7 +2551,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &variables,
             );
         }
-        let key = format!("loop-round:{}:{}", view.subject, view.attempt);
+        let dispatch = self.loop_dispatch_count(&loop_subject, view.attempt, None, None)?;
+        let base_key = format!("loop-round:{}:{}", view.subject, view.attempt);
+        let key = if dispatch == 0 {
+            base_key
+        } else {
+            format!("{base_key}:dispatch-{dispatch}")
+        };
         let expected = self.store.mission_run_subject_for_idempotency_key(&key);
         let existed = self.store.mission_run(&expected)?.is_some();
         let mut inputs: BTreeMap<String, String> = run
@@ -2435,6 +2605,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         match child.status.as_str() {
             "running" | "standing" | "blocked" => Ok(false),
             "failed" | "cancelled" => {
+                if self.loop_child_timed_out_without_claim(&child)? {
+                    return self.reschedule_unclaimed_loop_child(
+                        &loop_subject,
+                        view.attempt,
+                        dispatch,
+                        &child,
+                        None,
+                        None,
+                    );
+                }
                 let token_usage = self.mission_run_token_usage(&child)?;
                 let structural = self.loop_child_failure_is_structural(&child)?;
                 let failure_reason = if structural {
@@ -3173,12 +3353,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                     Some("the stored for-each item has no ID"),
                 );
             };
-            let key = format!("loop-item:{}:{id}", view.subject);
+            let dispatch = self.loop_dispatch_count(loop_subject, round, None, Some(id))?;
+            let base_key = format!("loop-item:{}:{id}", view.subject);
+            let key = if dispatch == 0 {
+                base_key
+            } else {
+                format!("{base_key}:dispatch-{dispatch}")
+            };
             let subject = self.store.mission_run_subject_for_idempotency_key(&key);
             if let Some(child) = self.store.mission_run(&subject)? {
                 match child.status.as_str() {
                     "running" | "standing" | "blocked" => active += 1,
                     "failed" | "cancelled" => {
+                        if self.loop_child_timed_out_without_claim(&child)? {
+                            return self.reschedule_unclaimed_loop_child(
+                                loop_subject,
+                                round,
+                                dispatch,
+                                &child,
+                                None,
+                                Some(id),
+                            );
+                        }
                         return self.store.set_step_state(
                             &view.subject,
                             "cancelled",
@@ -3334,15 +3530,32 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 continue;
             }
-            let key = format!(
+            let dispatch =
+                self.loop_dispatch_count(loop_subject, view.attempt, Some(candidate), None)?;
+            let base_key = format!(
                 "loop-candidate:{}:{}:{candidate}",
                 view.subject, view.attempt
             );
+            let key = if dispatch == 0 {
+                base_key
+            } else {
+                format!("{base_key}:dispatch-{dispatch}")
+            };
             let subject = self.store.mission_run_subject_for_idempotency_key(&key);
             if let Some(child) = self.store.mission_run(&subject)? {
                 match child.status.as_str() {
                     "running" | "standing" | "blocked" => active += 1,
                     "failed" | "cancelled" => {
+                        if self.loop_child_timed_out_without_claim(&child)? {
+                            return self.reschedule_unclaimed_loop_child(
+                                loop_subject,
+                                view.attempt,
+                                dispatch,
+                                &child,
+                                Some(candidate),
+                                None,
+                            );
+                        }
                         let structural = self.loop_child_failure_is_structural(&child)?;
                         let reason = if structural {
                             "the candidate mission had a structural failure"
@@ -3774,6 +3987,149 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(None);
         };
         self.store.mission_run(subject)
+    }
+
+    fn loop_first_execution_at(
+        &self,
+        run: &MissionRunView,
+        view: &crate::model::StepRunView,
+    ) -> Result<Option<u128>> {
+        let root = run
+            .root_mission_run
+            .strip_prefix("mission-run/")
+            .unwrap_or(&run.root_mission_run);
+        let mut started = None;
+        for child in self
+            .store
+            .mission_runs_for_root(root)?
+            .into_iter()
+            .filter(|child| child.parent_step_run.as_deref() == Some(view.subject.as_str()))
+        {
+            let has_claimable_work = child.steps.iter().any(|step| !step.agentless);
+            if !has_claimable_work {
+                started = Some(started.map_or(child.created_at_unix_ms, |current: u128| {
+                    current.min(child.created_at_unix_ms)
+                }));
+                continue;
+            }
+            for step in &child.steps {
+                for claim in self.store.claims_for(&step.subject, Some("work.claimed"))? {
+                    started = Some(started.map_or(claim.accepted_at_unix_ms, |current: u128| {
+                        current.min(claim.accepted_at_unix_ms)
+                    }));
+                }
+            }
+        }
+        Ok(started)
+    }
+
+    fn loop_child_timed_out_without_claim(&self, child: &MissionRunView) -> Result<bool> {
+        if !child.steps.iter().any(|step| !step.agentless) {
+            return Ok(false);
+        }
+        let timed_out = self
+            .store
+            .claims_for(&child.subject, Some("mission-run.state"))?
+            .iter()
+            .any(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.contains("timeout expired"))
+            });
+        if !timed_out {
+            return Ok(false);
+        }
+        for step in &child.steps {
+            if !self
+                .store
+                .claims_for(&step.subject, Some("work.claimed"))?
+                .is_empty()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn loop_dispatch_count(
+        &self,
+        loop_subject: &str,
+        round: u32,
+        candidate: Option<u32>,
+        item_id: Option<&str>,
+    ) -> Result<u32> {
+        Ok(self
+            .store
+            .claims_for(loop_subject, Some("loop.round-dispatch"))?
+            .into_iter()
+            .filter(|claim| {
+                let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                fields.get("round").and_then(Value::as_u64) == Some(u64::from(round))
+                    && fields.get("candidate").and_then(Value::as_u64) == candidate.map(u64::from)
+                    && fields.get("item_id").and_then(Value::as_str) == item_id
+            })
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/dispatch")
+                    .and_then(Value::as_u64)
+                    .and_then(|dispatch| u32::try_from(dispatch).ok())
+            })
+            .max()
+            .unwrap_or(0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reschedule_unclaimed_loop_child(
+        &self,
+        loop_subject: &str,
+        round: u32,
+        dispatch: u32,
+        child: &MissionRunView,
+        candidate: Option<u32>,
+        item_id: Option<&str>,
+    ) -> Result<bool> {
+        let next_dispatch = dispatch.saturating_add(1);
+        let reason = "the round mission timeout expired before any worker claimed its work; rescheduled without consuming max-rounds";
+        let mut fields = BTreeMap::from([
+            ("round".into(), Value::from(round)),
+            ("dispatch".into(), Value::from(next_dispatch)),
+            ("status".into(), Value::String("rescheduled".into())),
+            ("mission_run".into(), Value::String(child.subject.clone())),
+            ("reason".into(), Value::String(reason.into())),
+        ]);
+        if let Some(candidate) = candidate {
+            fields.insert("candidate".into(), Value::from(candidate));
+        }
+        if let Some(item_id) = item_id {
+            fields.insert("item_id".into(), Value::String(item_id.into()));
+        }
+        self.store.append_claim(&ClaimInput {
+            subject: loop_subject.into(),
+            kind: "loop.round-dispatch".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "loop-round-dispatch:{loop_subject}:{round}:{next_dispatch}:{}:{}",
+                candidate.map_or_else(|| "round".into(), |value| value.to_string()),
+                item_id.unwrap_or("none")
+            )),
+        })?;
+        self.record_once(
+            loop_subject,
+            "loop.state",
+            BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("round".into(), Value::from(round)),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+        )?;
+        self.signal_changed();
+        Ok(true)
     }
 
     fn loop_child_failure_is_structural(&self, child: &MissionRunView) -> Result<bool> {
@@ -10620,6 +10976,101 @@ mission "loop" state="ready" {
     }
 
     #[test]
+    fn an_unclaimed_timed_out_round_is_redispatched_without_spending_a_round() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+mission "unclaimed-loop" state="ready" {
+  goal "Do not call scheduling failure an execution failure."
+  completion { when "all-steps-exhausted" }
+  loop "improve" timeout="20ms" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { assigned-to "agent/node.worker" }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "unclaimed-loop-source");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "unclaimed-loop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "unclaimed-loop-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        let loop_subject = format!(
+            "loop-run/{}/improve",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        for _ in 0..12 {
+            reconciler.reconcile_once().unwrap();
+            if !store
+                .claims_for(&loop_subject, Some("loop.round-dispatch"))
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+        }
+
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.steps[0].attempt, 1);
+        assert!(
+            !matches!(current.status.as_str(), "failed" | "cancelled"),
+            "unexpected parent state: status={} phase={} step={} reason={:?}",
+            current.status,
+            current.phase,
+            current.steps[0].status,
+            current.steps[0].blocked_reason
+        );
+        assert!(
+            store
+                .claims_for(&loop_subject, Some("loop.round-result"))
+                .unwrap()
+                .is_empty(),
+            "a never-claimed dispatch is not a loop result"
+        );
+        let dispatches = store
+            .claims_for(&loop_subject, Some("loop.round-dispatch"))
+            .unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0]
+                .body
+                .pointer("/fields/dispatch")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            dispatches[0]
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str),
+            Some(
+                "the round mission timeout expired before any worker claimed its work; rescheduled without consuming max-rounds"
+            )
+        );
+    }
+
+    #[test]
     fn loop_stop_rules_use_durable_round_results() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
@@ -12714,6 +13165,151 @@ mission "ios-proof-blocked" state="ready" {
         assert_eq!(
             work_wake_decision(1, Some(1_000), true, u128::MAX),
             WorkWakeDecision::Wait
+        );
+    }
+
+    #[test]
+    fn a_due_provider_capacity_retry_is_durable_and_does_not_duplicate_after_restart() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+"#,
+            "capacity-worker",
+        );
+        let diagnostic = store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("waiting".into())),
+                    ("code".into(), Value::String("provider-capacity".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the selected model is temporarily at capacity".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                    ("retry_attempt".into(), Value::from(1)),
+                    ("retry_after_unix_ms".into(), Value::from(0)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("capacity-diagnostic".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("worker".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("capacity-runtime".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                    ("reason".into(), Value::String("providerCapacity".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("capacity-harness".into()),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let desired = store.desired_subjects().unwrap();
+
+        reconciler
+            .reconcile_provider_capacity_retries(&desired)
+            .unwrap();
+        let messages = store.messages(Some("agent/node.worker"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from, "daemon/runtime");
+        assert!(messages[0].content.contains("existing session"));
+        assert!(
+            messages[0]
+                .tags
+                .contains(&format!("diagnostic-claim:{}", diagnostic.id))
+        );
+
+        let restarted = Reconciler::new(
+            store.clone(),
+            runtime,
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        restarted
+            .reconcile_provider_capacity_retries(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .messages(Some("agent/node.worker"), true)
+                .unwrap()
+                .len(),
+            1,
+            "a daemon restart must not duplicate a scheduled capacity retry"
+        );
+        assert_eq!(
+            restarted.next_provider_capacity_retry_deadline().unwrap(),
+            None
+        );
+
+        let stale = store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("waiting".into())),
+                    ("code".into(), Value::String("provider-capacity".into())),
+                    ("incarnation_id".into(), Value::String("worker-old".into())),
+                    ("retry_attempt".into(), Value::from(1)),
+                    ("retry_after_unix_ms".into(), Value::from(0)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("stale-capacity-diagnostic".into()),
+            })
+            .unwrap();
+        restarted
+            .reconcile_provider_capacity_retries(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .messages(Some("agent/node.worker"), true)
+                .unwrap()
+                .len(),
+            1,
+            "a retry must never cross into a replacement harness incarnation"
+        );
+        assert!(
+            store
+                .operation_claim(&provider_capacity_retry_key(&stale.id))
+                .unwrap()
+                .is_some(),
+            "the stale retry must be durably consumed"
         );
     }
 

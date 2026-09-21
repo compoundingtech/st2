@@ -5,7 +5,7 @@ version 2
     goal "Complete mission eval/pty-send-peek."
     step "contract" timeout="1m" {
       title "PTY send and peek make a real byte round trip"
-        pty "psp" {
+        terminal "psp" {
           host "local"
           workspace "${ST_WORKSPACE}"
           command "bash -c 'echo READY; while IFS= read -r line; do echo ACK:$line; done'"

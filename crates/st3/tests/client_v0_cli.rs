@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use st3::api::AppState;
-use st3::model::ClaimInput;
+use st3::model::{ClaimInput, IntentInput, MissionRunRequest};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -46,6 +46,25 @@ async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
             command.arg("--json");
         }
         command.args(args).output().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+async fn run_cli_with_agent_env(socket: &Path, agent: &str, args: &[&str]) -> Output {
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let socket = socket.to_path_buf();
+    let agent = agent.to_owned();
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(binary)
+            .arg("--endpoint")
+            .arg(socket)
+            .arg("--json")
+            .args(args)
+            .env("ST_AGENT", agent)
+            .output()
+            .unwrap()
     })
     .await
     .unwrap()
@@ -91,6 +110,62 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
             idempotency_key: None,
         })
         .unwrap();
+    let source = r#"version 2
+mission "cli/root" state="ready" {
+  goal "Expose nested work."
+  step "child" { agentless }
+}
+mission "cli/child" state="ready" {
+  goal "Prove list and detail use the same replicated projection."
+  agent "remote" { workspace "/tmp"; command "true"; restart "never" }
+  step "nested" {
+    assigned-to "agent/${ST_MISSION_RUN}/remote"
+    goal "Remain visible through client-v0."
+  }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-nested-work-source")
+        .unwrap();
+    let root_run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "cli/root".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/nathan".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "cli-root-run".into(),
+        })
+        .unwrap();
+    let child_run = store
+        .create_child_mission_run(
+            &MissionRunRequest {
+                mission: "cli/child".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "cli-child-run".into(),
+            },
+            &root_run,
+            &root_run.steps[0].subject,
+            None,
+        )
+        .unwrap();
+    let nested_work = child_run.steps[0].subject.clone();
+    store.set_step_state(&nested_work, "ready", None).unwrap();
     state
         .store
         .append_claim(&ClaimInput {
@@ -166,9 +241,10 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     }
     assert!(socket.exists(), "client-v0 test socket did not appear");
 
-    let now = value(&run_cli(&socket, &["now"]).await);
+    let now = value(&run_cli(&socket, &["now", "--as", "person/nathan"]).await);
     assert_eq!(now["api_version"], "st3.client.v0");
     assert_eq!(now["value"]["collection"], "now");
+    assert_eq!(now["value"]["filters"]["person"], "person/nathan");
 
     for arguments in [
         vec!["attention", "ls", "--as", "person/nathan"],
@@ -181,7 +257,37 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
         assert_eq!(page["api_version"], "st3.client.v0", "{arguments:?}");
         assert_eq!(page["value"]["kind"], "page", "{arguments:?}");
         assert!(page["value"]["items"].is_array(), "{arguments:?}");
+        assert!(page["value"]["filters"].is_object(), "{arguments:?}");
     }
+
+    let work = value(&run_cli(&socket, &["work", "ls"]).await);
+    let listed = work["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == nested_work)
+        .expect("the nested remote-owned step is listed");
+    assert_eq!(listed["mission_run_id"], child_run.subject);
+    let detail = value(&run_cli(&socket, &["work", "show", &nested_work]).await);
+    assert_eq!(detail["value"]["id"], nested_work);
+    assert_eq!(detail["value"]["mission_run_id"], child_run.subject);
+    let human_detail = run_cli_human(&socket, &["work", "show", &nested_work]).await;
+    assert!(human_detail.status.success());
+    let human_detail = String::from_utf8(human_detail.stdout).unwrap();
+    assert!(human_detail.starts_with(&format!("WORK  {nested_work}")));
+    assert!(human_detail.contains("Goal: Remain visible through client-v0."));
+    let inherited = value(
+        &run_cli_with_agent_env(&socket, "agent/ambient.must-not-filter", &["work", "ls"]).await,
+    );
+    assert_eq!(inherited["value"]["filters"], serde_json::json!({}));
+    assert!(
+        inherited["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == nested_work),
+        "an inherited ST_AGENT must not silently filter a human work inventory"
+    );
 
     let first_agent = value(&run_cli(&socket, &["agents", "ls", "--all", "--limit", "1"]).await);
     assert_eq!(first_agent["value"]["page"]["limit"], 1);
@@ -314,7 +420,10 @@ async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
 
     for (arguments, heading) in [
-        (vec!["now"], "NOW"),
+        (
+            vec!["now", "--as", "person/nathan"],
+            "NOW FOR person/nathan",
+        ),
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
         (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),

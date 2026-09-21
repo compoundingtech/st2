@@ -649,6 +649,9 @@ pub struct NormalizedIntent {
     #[serde(default)]
     pub replica_repairs: Vec<ReplicaRepairDeclaration>,
     pub document_refs: BTreeSet<String>,
+    /// Public input spellings accepted only during a bounded vocabulary transition.
+    #[serde(default)]
+    pub deprecated_syntax: BTreeSet<String>,
     pub normalized: Value,
 }
 
@@ -1227,6 +1230,8 @@ pub struct ClientPageInfo {
 pub struct ClientResourcePage {
     pub kind: String,
     pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
     pub items: Vec<Value>,
     pub page: ClientPageInfo,
 }

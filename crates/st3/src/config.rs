@@ -17,6 +17,8 @@ pub struct PeerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub node: String,
+    /// The concrete person represented by trusted local product commands.
+    pub person: Option<String>,
     pub fleet_id: Option<String>,
     pub shared_secret_file: Option<PathBuf>,
     pub state_dir: PathBuf,
@@ -37,6 +39,7 @@ impl Default for Config {
         let client_gateway_socket = runtime_dir.join("st3-client.sock");
         Self {
             node: host_name(),
+            person: None,
             fleet_id: None,
             shared_secret_file: None,
             state_dir,
@@ -96,6 +99,14 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        anyhow::ensure!(
+            self.person.as_deref().is_none_or(|person| {
+                person.starts_with("person/")
+                    && person.matches('/').count() == 1
+                    && person.len() > "person/".len()
+            }),
+            "person must be one complete person/NAME subject"
+        );
         anyhow::ensure!(
             self.socket != self.client_gateway_socket,
             "the privileged local socket and paired client gateway socket must be different"

@@ -725,9 +725,24 @@ fn client_page(
     } else {
         None
     };
+    let mut filters = BTreeMap::new();
+    if query.history {
+        filters.insert("history".into(), "all".into());
+    }
+    for (name, value) in [
+        ("person", query.person.as_ref()),
+        ("actor", query.actor.as_ref()),
+        ("owner_run", query.owner_run.as_ref()),
+        ("status", query.status.as_ref()),
+    ] {
+        if let Some(value) = value {
+            filters.insert(name.into(), value.clone());
+        }
+    }
     Ok(ClientResourcePage {
         kind: "page".into(),
         collection: collection.into(),
+        filters,
         items: page_items,
         page: ClientPageInfo {
             limit,
@@ -747,7 +762,14 @@ fn client_detail_id(kind: &str, id: &str) -> String {
 }
 
 fn client_detail(items: Vec<Value>, kind: &str, id: &str) -> Result<Json<Value>, ApiError> {
-    let id = client_detail_id(kind, id);
+    let id = if items
+        .iter()
+        .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    {
+        id.to_owned()
+    } else {
+        client_detail_id(kind, id)
+    };
     items
         .into_iter()
         .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
@@ -1885,7 +1907,7 @@ async fn client_work_detail(
         client_work_resources(
             &state.store,
             query.actor.as_deref(),
-            query.history,
+            true,
             client_snapshot_time(&snapshot),
             snapshot.store_index,
         )
@@ -1979,9 +2001,11 @@ async fn client_attention(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
+    let mut effective_query = query.clone();
+    effective_query.person.clone_from(&person);
     let items = client_attention_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "attention", items, &query).map(Json)
+    client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
 }
 
 async fn client_attention_detail(
@@ -4241,7 +4265,7 @@ async fn apply(
     let actor = request.actor.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "missing-publication-actor",
-            "publication needs `--as` or ST_AGENT",
+            "publication needs an explicit actor",
         ))
     })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;

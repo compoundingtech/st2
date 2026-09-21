@@ -193,11 +193,15 @@ fn parse_intent_with_owner(
             "an intent cannot exceed 16 MiB",
         ));
     }
-    let document: KdlDocument = source
+    let mut document: KdlDocument = source
         .parse::<KdlDocument>()
         .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
     st2::kdl_version::ensure_st3_version(&document)
         .map_err(|error| St3Error::new("unsupported-kdl-version", error.to_string()))?;
+    let mut deprecated_syntax = BTreeSet::new();
+    canonicalize_terminal_declarations(&mut document, &mut deprecated_syntax);
+    let canonical_document = document.clone();
+    lower_terminal_declarations(&mut document);
     let declarations = document
         .nodes()
         .iter()
@@ -239,8 +243,10 @@ fn parse_intent_with_owner(
     if let Some(run) = owner_run {
         rewrite_owned_references(&mut context.subjects, owner_run_id(run));
     }
-    let normalized_nodes = declarations
-        .into_iter()
+    let normalized_nodes = canonical_document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() != "version")
         .map(canonical_node)
         .collect::<Result<Vec<_>, _>>()?;
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
@@ -255,8 +261,38 @@ fn parse_intent_with_owner(
         resource_refreshes: context.resource_refreshes,
         replica_repairs: context.replica_repairs,
         document_refs: context.document_refs,
+        deprecated_syntax,
         normalized,
     })
+}
+
+fn visit_nodes_mut(document: &mut KdlDocument, visit: &mut impl FnMut(&mut KdlNode)) {
+    for node in document.nodes_mut() {
+        visit(node);
+        if let Some(children) = node.children_mut() {
+            visit_nodes_mut(children, visit);
+        }
+    }
+}
+
+fn canonicalize_terminal_declarations(
+    document: &mut KdlDocument,
+    deprecated_syntax: &mut BTreeSet<String>,
+) {
+    visit_nodes_mut(document, &mut |node| {
+        if node.name().value() == "pty" {
+            deprecated_syntax.insert("pty".into());
+            node.set_name("terminal");
+        }
+    });
+}
+
+fn lower_terminal_declarations(document: &mut KdlDocument) {
+    visit_nodes_mut(document, &mut |node| {
+        if node.name().value() == "terminal" {
+            node.set_name("pty");
+        }
+    });
 }
 
 pub fn resolve_document_references(
@@ -4610,11 +4646,11 @@ version 2
             r#"
 version 2
 
-  pty "standalone" { command "sleep 1" }
+  terminal "standalone" { command "sleep 1" }
   agent "worker" {
     workspace "/work"
     command "sleep 1"
-    pty "helper" { command "sleep 1" }
+    terminal "helper" { command "sleep 1" }
   }
 
 "#,
@@ -4633,6 +4669,27 @@ version 2
         assert_eq!(agent.tags["st3.subject"], "agent/node.worker");
         assert_eq!(standalone.tags["st3.subject"], "pty/standalone");
         assert_eq!(helper.tags["st3.subject"], "pty/node.worker/helper");
+        assert!(intent.deprecated_syntax.is_empty());
+        assert_eq!(
+            intent.normalized["declarations"][0]["name"],
+            Value::String("terminal".into())
+        );
+    }
+
+    #[test]
+    fn legacy_pty_input_normalizes_to_terminal_with_a_deprecation_marker() {
+        let terminal = parse_test_intent(
+            "version 2\n terminal \"shell\" { command \"sleep 1\" }",
+            "node",
+        )
+        .unwrap();
+        let pty =
+            parse_test_intent("version 2\n pty \"shell\" { command \"sleep 1\" }", "node").unwrap();
+
+        assert_eq!(pty.source_hash, terminal.source_hash);
+        assert_eq!(pty.normalized, terminal.normalized);
+        assert!(pty.deprecated_syntax.contains("pty"));
+        assert!(terminal.deprecated_syntax.is_empty());
     }
 
     #[test]

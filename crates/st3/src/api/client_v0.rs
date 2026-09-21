@@ -933,6 +933,8 @@ pub(super) async fn now(
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
     let person = person_filter(&session, query.person.as_deref())?;
+    let mut effective_query = query.clone();
+    effective_query.person.clone_from(&person);
     let mut items =
         super::client_attention_resources(&state.store, person.as_deref(), query.history)
             .map_err(ApiError::internal)?;
@@ -964,7 +966,7 @@ pub(super) async fn now(
             .cmp(&priority(right))
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
-    client_page(&state, &snapshot, "now", items, &query).map(Json)
+    client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
 }
 
 pub(super) async fn machines(

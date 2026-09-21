@@ -1419,6 +1419,7 @@ mod tests {
         "value":{
             "kind":"resource-page",
             "collection":"launch-children",
+            "filters":{},
             "items":[],
             "page":{"limit":25,"has_more":false}
         }

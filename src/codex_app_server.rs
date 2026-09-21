@@ -250,6 +250,8 @@ pub enum CodexHoldReason {
 pub enum CodexTerminalError {
     SystemError,
     ProviderAuthRejected,
+    /// A turn was rejected before useful work because its selected model had no capacity.
+    ProviderCapacity,
 }
 
 /// The `CodexErrorInfo` word that names a rejected provider credential.
@@ -271,6 +273,8 @@ enum CodexTurnOutcome {
     Accepted,
     /// `failed` with `error.codexErrorInfo: unauthorized`.
     ProviderAuthRejected,
+    /// A typed allowance rejection or the captured transient model-capacity rejection.
+    ProviderCapacity,
     /// `interrupted`, `inProgress`, or a failure this version does not classify: no evidence
     /// either way, so a standing rejection must stand.
     Indeterminate,
@@ -290,8 +294,26 @@ fn codex_turn_outcome(turn: Option<&Value>) -> CodexTurnOutcome {
         {
             CodexTurnOutcome::ProviderAuthRejected
         }
+        Some("failed")
+            if turn
+                .pointer("/error/codexErrorInfo")
+                .and_then(Value::as_str)
+                == Some("usageLimitExceeded")
+                || turn
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_provider_capacity_message) =>
+        {
+            CodexTurnOutcome::ProviderCapacity
+        }
         _ => CodexTurnOutcome::Indeterminate,
     }
+}
+
+fn is_provider_capacity_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("selected model is at capacity")
+        || normalized.contains("model is at capacity")
 }
 
 impl CodexObservedState {
@@ -309,13 +331,16 @@ impl CodexObservedState {
         match self {
             CodexObservedState::AwaitingStatus => None,
             CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
-            // Both terminals project to `ended`, exactly as before; the reason is what names the
-            // cause. `providerAuth` is the same word OpenCode's `ProviderAuthError` already
-            // publishes, so one roster consumer classifies the credential class across harnesses.
+            // Capacity is retryable in the same session, while authentication and system errors
+            // end this harness incarnation.
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderCapacity,
+            } => Some(observation(Activity::Idle, BlockedOn::None).with_reason("providerCapacity")),
             CodexObservedState::TerminalError { reason } => Some(
                 observation(Activity::Ended, BlockedOn::None).with_reason(match reason {
                     CodexTerminalError::SystemError => "systemError",
                     CodexTerminalError::ProviderAuthRejected => "providerAuth",
+                    CodexTerminalError::ProviderCapacity => unreachable!(),
                 }),
             ),
             CodexObservedState::Active { .. } => {
@@ -719,6 +744,7 @@ impl CodexInboxDelivery {
             CodexTurnOutcome::Accepted => self
                 .diagnostics
                 .clear(driver_diagnostic::Stage::ProviderAuth),
+            CodexTurnOutcome::ProviderCapacity => {}
             CodexTurnOutcome::Indeterminate => {}
         }
     }
@@ -1393,6 +1419,12 @@ impl CodexControlState {
         if outcome == CodexTurnOutcome::ProviderAuthRejected {
             self.observed = CodexObservedState::TerminalError {
                 reason: CodexTerminalError::ProviderAuthRejected,
+            };
+            return;
+        }
+        if outcome == CodexTurnOutcome::ProviderCapacity {
+            self.observed = CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderCapacity,
             };
             return;
         }

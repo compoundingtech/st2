@@ -632,10 +632,11 @@
     "Page": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "collection", "items", "page"],
+      "required": ["kind", "collection", "filters", "items", "page"],
       "properties": {
         "kind": { "const": "page" },
         "collection": { "type": "string" },
+        "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" }
       }

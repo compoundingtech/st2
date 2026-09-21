@@ -18,8 +18,8 @@ use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStatus,
-    EventRecord, IntentInput, LaunchApproveAndStartRequest, LaunchApproveAndStartView,
+    CurrentHarnessView, DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion,
+    EvalStatus, EventRecord, IntentInput, LaunchApproveAndStartRequest, LaunchApproveAndStartView,
     LaunchDecisionAnswerRequest, LaunchDecisionOption, LaunchDecisionRequest,
     LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest, MessageLifecycleRequest,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
@@ -292,7 +292,7 @@ struct MissionRunStartArgs {
     inputs: Vec<(String, String)>,
     #[arg(long)]
     follow: bool,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     /// Print the exact mission-run KDL without publishing it.
     #[arg(long)]
@@ -352,7 +352,7 @@ struct PlanningSubmitArgs {
     markdown: PathBuf,
     #[arg(long)]
     kdl: PathBuf,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: String,
 }
 
@@ -367,7 +367,7 @@ struct PlanningCompareArgs {
 struct PlanningProposeArgs {
     session: String,
     variant: String,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
     reason: String,
@@ -424,7 +424,7 @@ struct LaunchQuestionArgs {
     /// Structured JSON option: {"id":"stable-id","label":"Label","description":"optional"}.
     #[arg(long = "option", value_parser = parse_launch_decision_option)]
     options: Vec<LaunchDecisionOption>,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: String,
 }
 
@@ -528,6 +528,9 @@ struct TraceArgs {
 #[derive(Args)]
 struct WaitArgs {
     subject: String,
+    /// Interrupt the wait for this exact agent's messages or newly ready work.
+    #[arg(long = "as")]
+    actor: Option<String>,
     #[arg(long = "for", default_value = "ready")]
     condition: String,
     #[arg(long, default_value = "10m")]
@@ -536,6 +539,9 @@ struct WaitArgs {
 
 #[derive(Args)]
 struct NowArgs {
+    /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
     #[arg(long)]
     owner_run: Option<String>,
     /// Include explicitly historical rows in addition to the actionable default.
@@ -677,7 +683,7 @@ enum ReplicationCommand {
         replacement_claim: String,
         #[arg(long)]
         reason: String,
-        #[arg(long = "as", env = "ST_AGENT")]
+        #[arg(long = "as")]
         actor: String,
         #[arg(long)]
         idempotency_key: Option<String>,
@@ -778,7 +784,7 @@ struct ClaimArgs {
 
 #[derive(Args)]
 struct HarnessDiagnosticArgs {
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: String,
     #[arg(long)]
     code: String,
@@ -852,7 +858,7 @@ struct AttentionRequestArgs {
     severity: String,
     #[arg(long = "target")]
     targets: Vec<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
     idempotency_key: Option<String>,
@@ -871,9 +877,9 @@ struct AttentionResolveArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// List work this agent can act on now; use --all for terminal history.
+    /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
-        #[arg(long = "as", env = "ST_AGENT")]
+        #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
         all: bool,
@@ -913,7 +919,7 @@ enum WorkCommand {
 #[derive(Args)]
 struct WorkWakeArgs {
     subject: String,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, default_value = "manual wake requested")]
     reason: String,
@@ -931,13 +937,13 @@ enum WorkRevisionCommand {
     Approve {
         proposal: String,
         preview_hash: String,
-        #[arg(long = "as", env = "ST_AGENT")]
+        #[arg(long = "as")]
         actor: Option<String>,
     },
     /// Cancel a pending revision proposal without changing the live generation.
     Cancel {
         proposal: String,
-        #[arg(long = "as", env = "ST_AGENT")]
+        #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
         reason: Option<String>,
@@ -947,7 +953,7 @@ enum WorkRevisionCommand {
 #[derive(Args)]
 struct WorkActionArgs {
     subject: String,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
@@ -963,7 +969,7 @@ struct WorkActionArgs {
 struct WorkReviseArgs {
     run: String,
     file: PathBuf,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
     reason: String,
@@ -976,7 +982,7 @@ struct WorkReviseArgs {
 struct WorkPublishMissionArgs {
     subject: String,
     file: PathBuf,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, env = "ST3_INCARNATION")]
     incarnation: Option<String>,
@@ -1029,7 +1035,7 @@ struct MessageSendArgs {
     in_reply_to: Option<String>,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
-    #[arg(long = "from", alias = "as", env = "ST_AGENT")]
+    #[arg(long = "from", alias = "as")]
     from: String,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
@@ -1038,7 +1044,6 @@ struct MessageSendArgs {
 
 #[derive(Args)]
 struct MessageListArgs {
-    #[arg(env = "ST_AGENT")]
     identity: Option<String>,
     #[arg(long)]
     archive: bool,
@@ -1056,7 +1061,7 @@ struct MessageReadArgs {
     raw: bool,
     #[arg(long)]
     archive: bool,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
 }
 
@@ -1067,7 +1072,7 @@ struct MessageReplyArgs {
     body: String,
     #[arg(long)]
     subject: Option<String>,
-    #[arg(long = "from", alias = "as", env = "ST_AGENT")]
+    #[arg(long = "from", alias = "as")]
     from: String,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
@@ -1078,7 +1083,7 @@ struct MessageReplyArgs {
 struct MessageArchiveArgs {
     #[arg(num_args = 1..)]
     references: Vec<String>,
-    #[arg(long = "as", env = "ST_AGENT")]
+    #[arg(long = "as")]
     actor: Option<String>,
 }
 
@@ -1201,7 +1206,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
-        Command::Now(args) => run_now(&endpoint, args, cli.json).await,
+        Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Launch { command } => run_launch(&client, &endpoint, command, cli.json).await,
         Command::Missions { command } => {
             run_mission_view(&client, &endpoint, command, cli.json).await
@@ -1665,7 +1670,7 @@ async fn run_launch(
         LaunchCommand::Propose(args) => {
             let actor = args
                 .actor
-                .context("a planning proposal needs --as or ST_AGENT")?;
+                .context("a planning proposal needs explicit --as")?;
             let response: RevisionSubmissionView = client
                 .post(
                     &format!(
@@ -2255,7 +2260,8 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
 async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<()> {
     validate_wait_condition(&args.condition)?;
     let timeout = parse_timeout(&args.timeout)?;
-    let wait = wait_for_condition(client, &args.subject, &args.condition);
+    let actor = args.actor.as_deref().map(normalize_agent_subject);
+    let wait = wait_for_condition(client, &args.subject, &args.condition, actor.as_deref());
     let value = if timeout.is_zero() {
         wait.await?
     } else {
@@ -2278,12 +2284,21 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
     ))
 }
 
-async fn run_now(endpoint: &Endpoint, args: NowArgs, json_output: bool) -> Result<()> {
+async fn run_now(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    args: NowArgs,
+    json_output: bool,
+) -> Result<()> {
     anyhow::ensure!(
         args.limit > 0 && args.limit <= 200,
         "the now limit must be 1 through 200"
     );
-    let client = generated_client(endpoint, None)?;
+    let person = args.person.as_deref().or(configured_person).context(
+        "st3 now needs `--as person/NAME` or `person = \"person/NAME\"` in the st3 config",
+    )?;
+    let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+    let client = generated_client(endpoint, Some(&person))?;
     let response = if let Some(owner_run) = args.owner_run.as_deref() {
         client
             .now_list_for_owner_run(
@@ -2298,14 +2313,19 @@ async fn run_now(endpoint: &Endpoint, args: NowArgs, json_output: bool) -> Resul
             .now_list(args.cursor.as_deref(), Some(args.limit), args.all)
             .await?
     };
-    let mut command = "st3 now".to_owned();
+    let mut command = format!("st3 now --as {person}");
     if let Some(owner_run) = args.owner_run {
         command.push_str(&format!(" --owner-run {owner_run}"));
     }
     if args.all {
         command.push_str(" --all");
     }
-    print_product_page("NOW", &response, json_output, &command)
+    print_product_page(
+        &format!("NOW FOR {person}"),
+        &response,
+        json_output,
+        &command,
+    )
 }
 
 async fn run_machines(endpoint: &Endpoint, args: MachinesArgs, json_output: bool) -> Result<()> {
@@ -2439,6 +2459,15 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
 
     let mut output = String::new();
     let _ = writeln!(output, "{title}  {}", page.items.len());
+    if !page.filters.is_empty() {
+        let filters = page
+            .filters
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let _ = writeln!(output, "FILTERS  {filters}");
+    }
     if page.items.is_empty() {
         let _ = writeln!(output, "No current items.");
         return output;
@@ -2777,21 +2806,23 @@ async fn run_trace_command(
     }
 }
 
-async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> Result<Value> {
+async fn wait_for_condition(
+    client: &Client,
+    subject: &str,
+    condition: &str,
+    actor: Option<&str>,
+) -> Result<Value> {
     let mut cursor = 0;
-    let actor = std::env::var("ST_AGENT")
-        .ok()
-        .filter(|value| value.starts_with("agent/"));
     loop {
         if let Some(value) = condition_value(client, subject, condition).await? {
             return Ok(value);
         }
-        if let Some(actor) = actor.as_deref()
+        if let Some(actor) = actor
             && let Some(reason) = agent_wait_interruption(client, actor).await?
         {
             anyhow::bail!(reason);
         }
-        let scope = actor.as_ref().map_or_else(
+        let scope = actor.map_or_else(
             || format!("&subject={}", urlencoding::encode(subject)),
             |_| String::new(),
         );
@@ -3967,7 +3998,7 @@ async fn run_attention(
         AttentionCommand::Request(args) => {
             let actor = args
                 .actor
-                .context("an attention request needs --as or ST_AGENT")?;
+                .context("an attention request needs explicit --as")?;
             let idempotency_key = args
                 .idempotency_key
                 .unwrap_or_else(|| format!("attention-request:{}", uuid::Uuid::now_v7().simple()));
@@ -4066,19 +4097,16 @@ async fn run_work(
             } else {
                 format!("step-run/{subject}")
             };
-            let step: StepRunView = client
-                .get(&format!(
-                    "/v1/work-items/{}",
-                    urlencoding::encode(&normalized)
-                ))
+            let response = generated_client(endpoint, None)?
+                .work_get(&normalized)
                 .await?;
             if json_output {
-                print_value(&step, true)
+                print_value(&response, true)
             } else {
-                print!(
-                    "{}",
-                    render_step_run(&step, OutputStyle::stdout(), current_unix_ms()?)
-                );
+                let ClientResource::Work(work) = &response.value else {
+                    anyhow::bail!("`{normalized}` is not a work resource");
+                };
+                print!("{}", render_client_work_detail(work));
                 Ok(())
             }
         }
@@ -4091,7 +4119,7 @@ async fn run_work(
         WorkCommand::Wake(args) => {
             let actor = args
                 .actor
-                .context("a manual work wake needs --as or ST_AGENT")?;
+                .context("a manual work wake needs explicit --as")?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let response: MessageView = client
                 .post(
@@ -4109,7 +4137,7 @@ async fn run_work(
         WorkCommand::Revise(args) => {
             let actor = args
                 .actor
-                .context("a mission revision needs --as or ST_AGENT")?;
+                .context("a mission revision needs explicit --as")?;
             let kdl = fs::read_to_string(&args.file)
                 .with_context(|| format!("read KDL {}", args.file.display()))?;
             let run: MissionRunView = client
@@ -4169,6 +4197,55 @@ async fn run_work(
         }
         WorkCommand::Revision { command } => run_work_revision(client, command, json_output).await,
     }
+}
+
+fn render_client_work_detail(work: &st3_client::Work) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "WORK  {}", work.header.id);
+    let _ = writeln!(
+        output,
+        "{}  {}  attempt {} · readiness {}",
+        work.state, work.path, work.attempt, work.readiness_epoch
+    );
+    let _ = writeln!(output, "Mission: {}", work.mission_run_id);
+    let _ = writeln!(output, "Generation: {}", work.generation_id);
+    let _ = writeln!(output, "Definition: {}", work.definition_id);
+    if let Some(claimant) = &work.claimant {
+        let _ = writeln!(output, "Claimant: {claimant}");
+    }
+    if let Some(incarnation) = &work.claim_incarnation {
+        let _ = writeln!(output, "Incarnation: {incarnation}");
+    }
+    if let Some(reason) = &work.blocked_reason {
+        let _ = writeln!(output, "Blocked: {reason}");
+    }
+    for blocker in &work.blockers {
+        let _ = writeln!(output, "Blocker: {blocker}");
+    }
+    for goal in &work.goals {
+        let _ = writeln!(output, "Goal: {goal}");
+    }
+    for constraint in &work.constraints {
+        let _ = writeln!(output, "Constraint: {constraint}");
+    }
+    if let Some(usage) = &work.usage {
+        let _ = writeln!(output, "Usage: {} tokens", usage.total_tokens);
+    }
+    if let Some(operational) = &work.header.operational {
+        let reasons = if operational.reasons.is_empty() {
+            "none".into()
+        } else {
+            operational.reasons.join(", ")
+        };
+        let _ = writeln!(
+            output,
+            "Operational: {} · actionable={} · reasons={reasons}",
+            operational.layer, operational.actionable
+        );
+    }
+    output
 }
 
 async fn run_work_revision(
@@ -4233,7 +4310,7 @@ async fn run_work_revision(
             preview_hash,
             actor,
         } => {
-            let actor = actor.context("a revision approval needs --as or ST_AGENT")?;
+            let actor = actor.context("a revision approval needs explicit --as")?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let response: RevisionSubmissionView = client
                 .post(
@@ -4255,7 +4332,7 @@ async fn run_work_revision(
             actor,
             reason,
         } => {
-            let actor = actor.context("a revision cancellation needs --as or ST_AGENT")?;
+            let actor = actor.context("a revision cancellation needs explicit --as")?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let response: RevisionProposalView = client
                 .post(
@@ -4282,7 +4359,7 @@ async fn publish_work_mission(
 ) -> Result<()> {
     let actor = args
         .actor
-        .context("publishing a mission output needs --as or ST_AGENT")?;
+        .context("publishing a mission output needs explicit --as")?;
     let incarnation = match args.incarnation {
         Some(incarnation) => Some(incarnation),
         None => current_agent_incarnation(client, &actor).await?,
@@ -4318,7 +4395,7 @@ async fn post_work(
     args: WorkActionArgs,
     json_output: bool,
 ) -> Result<()> {
-    let actor = args.actor.context("a work action needs --as or ST_AGENT")?;
+    let actor = args.actor.context("a work action needs explicit --as")?;
     let incarnation = match args.incarnation {
         Some(incarnation) => Some(incarnation),
         None => current_agent_incarnation(client, &actor).await?,
@@ -4452,7 +4529,7 @@ async fn run_message(
         MessageCommand::Read(args) => {
             let actor = args
                 .actor
-                .context("message read needs --as or ST_AGENT to record its lifecycle")?;
+                .context("message read needs explicit --as to record its lifecycle")?;
             let mut messages = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 let message = read_message(client, &reference).await?;
@@ -4523,7 +4600,7 @@ async fn run_message(
         MessageCommand::Archive(args) => {
             let actor = args
                 .actor
-                .context("message archive needs --as or ST_AGENT to record its lifecycle")?;
+                .context("message archive needs explicit --as to record its lifecycle")?;
             let mut claims = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 let message = read_message(client, &reference).await?;
@@ -5832,6 +5909,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     let mut last_usage_fingerprint = None;
     let mut published_timeline = BTreeSet::new();
     let mut last_control_warning = None;
+    let mut last_capacity_fingerprint = None;
     loop {
         tokio::select! {
             result = &mut task => return result?,
@@ -5895,6 +5973,21 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                             expected_subject: None,
                             idempotency_key: Some(format!("codex-activity:{subject}:{fingerprint}")),
                         }).await?;
+                        if observed.reason.as_deref() == Some("providerCapacity") {
+                            if last_capacity_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                                publish_provider_capacity_diagnostic(
+                                    client,
+                                    subject,
+                                    &incarnation,
+                                    observed.since_ms,
+                                    &fingerprint,
+                                )
+                                .await?;
+                                last_capacity_fingerprint = Some(fingerprint);
+                            }
+                        } else {
+                            last_capacity_fingerprint = None;
+                        }
                     }
                     publish_harness_usage(
                         client,
@@ -5935,6 +6028,122 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
             }
         }
     }
+}
+
+const PROVIDER_CAPACITY_MAX_RETRIES: u32 = 6;
+const PROVIDER_CAPACITY_BASE_BACKOFF_MS: u64 = 30_000;
+const PROVIDER_CAPACITY_MAX_BACKOFF_MS: u64 = 600_000;
+
+fn provider_capacity_backoff_ms(subject: &str, incarnation: &str, attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(20);
+    let base = PROVIDER_CAPACITY_BASE_BACKOFF_MS
+        .saturating_mul(1_u64 << shift)
+        .min(PROVIDER_CAPACITY_MAX_BACKOFF_MS);
+    let digest = Sha256::digest(format!("{subject}:{incarnation}:{attempt}").as_bytes());
+    let seed = u16::from_be_bytes([digest[0], digest[1]]) as u64;
+    let jitter = seed % (base.saturating_div(4).saturating_add(1));
+    base.saturating_add(jitter)
+}
+
+async fn publish_provider_capacity_diagnostic(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    observed_since_ms: Option<u64>,
+    event_fingerprint: &str,
+) -> Result<()> {
+    let claims: ClaimsPage = client
+        .get(&format!(
+            "/v1/claims?subject={}&order=desc&limit=100",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    let capacity_claims = claims.claims.iter().filter(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        claim.kind == "harness.diagnostic"
+            && fields.get("code").and_then(Value::as_str) == Some("provider-capacity")
+            && fields.get("incarnation_id").and_then(Value::as_str) == Some(incarnation)
+    });
+    if observed_since_ms.is_some_and(|observed_since_ms| {
+        capacity_claims.clone().any(|claim| {
+            claim
+                .body
+                .pointer("/fields/observed_since_ms")
+                .and_then(Value::as_u64)
+                == Some(observed_since_ms)
+        })
+    }) {
+        return Ok(());
+    }
+    let attempt = capacity_claims
+        .filter_map(|claim| {
+            claim
+                .body
+                .pointer("/fields/retry_attempt")
+                .and_then(Value::as_u64)
+                .and_then(|attempt| u32::try_from(attempt).ok())
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let retryable = attempt <= PROVIDER_CAPACITY_MAX_RETRIES;
+    let mut fields = BTreeMap::from([
+        (
+            "severity".into(),
+            Value::String(if retryable { "warning" } else { "error" }.into()),
+        ),
+        (
+            "status".into(),
+            Value::String(if retryable { "waiting" } else { "failed" }.into()),
+        ),
+        ("code".into(), Value::String("provider-capacity".into())),
+        (
+            "reason".into(),
+            Value::String(if retryable {
+                "the selected model is temporarily at capacity; st3 will retry this session".into()
+            } else {
+                "the selected model remained at capacity after the automatic retry limit".into()
+            }),
+        ),
+        ("incarnation_id".into(), Value::String(incarnation.into())),
+        ("retry_attempt".into(), Value::from(attempt)),
+    ]);
+    if let Some(observed_since_ms) = observed_since_ms {
+        fields.insert("observed_since_ms".into(), Value::from(observed_since_ms));
+    }
+    if retryable {
+        let retry_after = u64::try_from(current_unix_ms()?)
+            .unwrap_or(u64::MAX)
+            .saturating_add(provider_capacity_backoff_ms(subject, incarnation, attempt));
+        fields.insert("retry_after_unix_ms".into(), Value::from(retry_after));
+    }
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    if let Some(step) = work.into_iter().find(|step| {
+        matches!(step.status.as_str(), "claimed" | "working")
+            && step.claimant.as_deref() == Some(subject)
+            && step.claim_incarnation.as_deref() == Some(incarnation)
+    }) {
+        fields.insert("step_run".into(), Value::String(step.subject));
+    }
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "provider-capacity:{subject}:{incarnation}:{event_fingerprint}"
+                )),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 fn tolerate_driver_api_outage(
@@ -5979,13 +6188,24 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    let harness = status
+        .subjects
+        .iter()
+        .find(|candidate| candidate.subject == subject)
+        .and_then(|candidate| candidate.harness.as_ref());
     let work: Vec<StepRunView> = client
         .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
         .await?;
-    for step in work.into_iter().filter(|step| {
-        matches!(step.status.as_str(), "claimed" | "working")
-            && step.claimant.as_deref() == Some(subject)
-    }) {
+    for step in work
+        .into_iter()
+        .filter(|step| work_claim_has_active_harness(step, subject, harness))
+    {
         let _: StepRunView = client
             .post(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
@@ -6001,6 +6221,19 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
             .await?;
     }
     Ok(())
+}
+
+fn work_claim_has_active_harness(
+    step: &StepRunView,
+    subject: &str,
+    harness: Option<&CurrentHarnessView>,
+) -> bool {
+    matches!(step.status.as_str(), "claimed" | "working")
+        && step.claimant.as_deref() == Some(subject)
+        && harness.is_some_and(|harness| {
+            harness.state == "working"
+                && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
+        })
 }
 
 fn unix_minute() -> Result<u64> {
@@ -6621,6 +6854,7 @@ mod tests {
         ClientPage {
             kind: "resource-page".into(),
             collection: "fixture".into(),
+            filters: BTreeMap::new(),
             items,
             page: st3_client::PageInfo {
                 limit: 100,
@@ -6653,6 +6887,77 @@ mod tests {
                 "  recovery: st3 doctor\n",
             )
         );
+    }
+
+    #[test]
+    fn provider_capacity_backoff_is_bounded_deterministic_and_increases() {
+        let first = provider_capacity_backoff_ms("agent/node.worker", "one", 1);
+        let second = provider_capacity_backoff_ms("agent/node.worker", "one", 2);
+        assert_eq!(
+            first,
+            provider_capacity_backoff_ms("agent/node.worker", "one", 1)
+        );
+        assert!(first >= PROVIDER_CAPACITY_BASE_BACKOFF_MS);
+        assert!(second > first);
+        assert!(
+            provider_capacity_backoff_ms("agent/node.worker", "one", u32::MAX)
+                <= PROVIDER_CAPACITY_MAX_BACKOFF_MS
+                    + PROVIDER_CAPACITY_MAX_BACKOFF_MS.saturating_div(4)
+        );
+    }
+
+    #[test]
+    fn claimed_work_renews_only_while_the_exact_harness_incarnation_is_working() {
+        let step: StepRunView = serde_json::from_value(json!({
+            "subject": "step-run/run/work",
+            "run": "mission-run/run",
+            "generation": "run-generation/run",
+            "step": "work",
+            "definition_hash": "definition",
+            "status": "claimed",
+            "attempt": 1,
+            "assigned_to": "agent/node.worker",
+            "agentless": false,
+            "title": null,
+            "worker_reported": false,
+            "claimant": "agent/node.worker",
+            "claim_incarnation": "worker-one",
+            "claim_expires_at_unix_ms": 10,
+            "execution_elapsed_ms": 0,
+            "readiness_epoch": 1,
+            "blocked_reason": null,
+            "not_before_unix_ms": null,
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1
+        }))
+        .unwrap();
+        let harness: CurrentHarnessView = serde_json::from_value(json!({
+            "state": "working",
+            "incarnation_id": "worker-one",
+            "claim": "claim/harness",
+            "observed_at_unix_ms": 1
+        }))
+        .unwrap();
+        assert!(work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&harness)
+        ));
+
+        let mut idle = harness.clone();
+        idle.state = "idle".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&idle)
+        ));
+        let mut replacement = harness;
+        replacement.incarnation_id = "worker-two".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&replacement)
+        ));
     }
 
     #[test]

@@ -32,6 +32,7 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - `concurrent-runs` enables concurrent active runs. An optional `max` property bounds them.
 - A mission can declare exact text and resource inputs.
 - A mission can declare one absolute run `timeout`.
+- `terminal "NAME" { ... }` is the canonical interactive runtime declaration. The legacy spelling `pty "NAME" { ... }` is temporarily accepted with a preview warning and will be removed before the friend-ready v0.
 - An eval entry mission must declare a timeout no greater than 20 minutes.
 - A first-class `loop` runs one bounded child mission for each round.
 - A loop always declares `max-rounds`. It can also declare one total `timeout`.
@@ -872,7 +873,7 @@ The exact built-in names are reserved in authored `env` maps. st3 rejects an att
 
 An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested task receives its task subject in `ST3_SUBJECT` and its parent agent in `ST_AGENT`.
 
-An agentless `exec` or `pty` receives `ST3_SUBJECT` and no `ST_AGENT`.
+An agentless `exec` or `terminal` receives `ST3_SUBJECT` and no `ST_AGENT`.
 
 An unknown variable or a variable that is not available in the current phase is an error.
 
