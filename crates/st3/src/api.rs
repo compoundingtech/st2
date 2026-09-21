@@ -6518,6 +6518,15 @@ async fn input_session(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<SessionInputRequest>,
 ) -> Result<Json<SessionControlResponse>, ApiError> {
+    input_session_as(&state, subject, request, "requester").await
+}
+
+async fn input_session_as(
+    state: &AppState,
+    subject: String,
+    request: SessionInputRequest,
+    authority_actor: &str,
+) -> Result<Json<SessionControlResponse>, ApiError> {
     let result_key = format!(
         "session-control-result:input:{subject}:{}",
         request.idempotency_key
@@ -6529,7 +6538,7 @@ async fn input_session(
     {
         return Ok(Json(session_control_response(&subject, &result)));
     }
-    let session = live_session(&state, &subject, Some(&request.expected_incarnation))?;
+    let session = live_session(state, &subject, Some(&request.expected_incarnation))?;
     if !session.terminal {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
@@ -6562,7 +6571,7 @@ async fn input_session(
         .map_err(ApiError::internal)?
     {
         return finish_session_control(
-            &state,
+            state,
             &subject,
             "terminal.input.result",
             &result_key,
@@ -6578,7 +6587,7 @@ async fn input_session(
         .append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "terminal.input.requested".into(),
-            actor: Some("requester".into()),
+            actor: Some(authority_actor.into()),
             fields: BTreeMap::from([
                 ("mode".into(), Value::String(mode.into())),
                 (
@@ -6618,7 +6627,7 @@ async fn input_session(
         ),
     };
     finish_session_control(
-        &state,
+        state,
         &subject,
         "terminal.input.result",
         &result_key,
@@ -6856,7 +6865,7 @@ fn finish_session_control(
         .append_claim(&ClaimInput {
             subject: subject.into(),
             kind: claim_kind.into(),
-            actor: Some("requester".into()),
+            actor: request.actor.clone().or_else(|| Some("requester".into())),
             fields,
             evidence: vec![request.id.clone()],
             expected_subject: None,

@@ -24,6 +24,13 @@ public actor St3Client {
         if history { query.append(.init(name: "history", value: "true")) }
         return try await get("v1/client/\(collection)", query: query)
     }
+    public func nowList(ownerRun: String, cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {
+        var query: [URLQueryItem] = [.init(name: "owner_run", value: ownerRun)]
+        if let cursor { query.append(.init(name: "cursor", value: cursor)) }
+        if let limit { query.append(.init(name: "limit", value: String(limit))) }
+        if history { query.append(.init(name: "history", value: "true")) }
+        return try await get("v1/client/now", query: query)
+    }
     private func resource(_ collection: String, id: String) async throws -> Envelope<Resource> { let routedID = collection == "launches" ? id.replacingOccurrences(of: "launch/", with: "") : id; return try await get("v1/client/\(collection)/\(routedID)") }
     public func timeline(sessionID: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<TimelinePage> {
         var query: [URLQueryItem] = []

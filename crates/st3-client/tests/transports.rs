@@ -458,6 +458,48 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         "terminal-demo-runtime:i1"
     );
 
+    let control_fence = client.capabilities().await.unwrap();
+    let input = client
+        .terminal_input(
+            "action/person-terminal-input",
+            "person-terminal-input-0001",
+            Fence {
+                snapshot_id: control_fence.snapshot.id.clone(),
+                runtime_incarnation: Some(first_attachment.runtime_incarnation.clone()),
+                terminal_sequence: Some(control_fence.snapshot.store_index),
+                ..Fence::default()
+            },
+            TerminalInputParameters {
+                terminal_id: first_attachment.terminal_id.clone(),
+                mode: TerminalInputMode::Line,
+                value: "actor attribution proof".into(),
+            },
+        )
+        .await;
+    assert!(
+        input.is_err(),
+        "the fake PTY cannot accept input, but the durable request/result path must run"
+    );
+    let control_claims = state
+        .store
+        .claims_for("agent/terminal-demo", None)
+        .unwrap()
+        .into_iter()
+        .filter(|claim| {
+            matches!(
+                claim.kind.as_str(),
+                "terminal.input.requested" | "terminal.input.result"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(control_claims.len(), 2);
+    assert!(
+        control_claims
+            .iter()
+            .all(|claim| claim.actor.as_deref() == Some("person/nathan")),
+        "terminal control attribution must come from the authenticated session: {control_claims:?}"
+    );
+
     assert!(
         client
             .terminal_frames(

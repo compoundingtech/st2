@@ -779,7 +779,10 @@ pub(super) async fn devices(
     let person = person_filter(&session, query.person.as_deref())?
         .filter(|person| person.starts_with("person/"))
         .ok_or_else(|| forbidden("device inventory requires an explicitly authenticated person"))?;
-    let items = device_resources(&state, &snapshot, &person)?;
+    let mut items = device_resources(&state, &snapshot, &person)?;
+    if !query.history {
+        items.retain(|item| item["state"] == "active");
+    }
     client_page(&state, &snapshot, "devices", items, &query).map(Json)
 }
 
@@ -2802,17 +2805,18 @@ async fn dispatch_action(
                 _ => return Err(validation("terminal input mode is invalid")),
             };
             let target = terminal_subject(&parameter_string(p, "terminal_id")?);
-            let result = input_session(
-                State(state.clone()),
-                AxumPath(target),
-                Json(SessionInputRequest {
+            let result = input_session_as(
+                state,
+                target,
+                SessionInputRequest {
                     expected_incarnation: request.fence.runtime_incarnation.clone().ok_or_else(
                         || validation("terminal input requires a runtime incarnation fence"),
                     )?,
                     mode,
                     value: parameter_string(p, "value")?,
                     idempotency_key: request.idempotency_key.clone(),
-                }),
+                },
+                authority_actor,
             )
             .await?
             .0;

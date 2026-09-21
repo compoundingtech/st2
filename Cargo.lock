@@ -3016,6 +3016,7 @@ dependencies = [
  "sha2",
  "st-runtime",
  "st2",
+ "st3-client",
  "st3-schema",
  "tar",
  "tempfile",

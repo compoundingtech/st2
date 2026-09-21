@@ -36,6 +36,10 @@ use st3::model::{
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
+use st3_client::{
+    API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Fence as ClientFence,
+    PairingBegin, TargetParameters as ClientTargetParameters,
+};
 use tokio::sync::{Notify, watch};
 use walkdir::WalkDir;
 
@@ -602,6 +606,9 @@ struct DevicesArgs {
     /// Concrete human authority carried over the trusted local Unix boundary.
     #[arg(long = "as", env = "ST_PERSON")]
     person: String,
+    /// Include expired and revoked device history.
+    #[arg(long)]
+    all: bool,
     #[command(subcommand)]
     command: Option<DevicesCommand>,
 }
@@ -1320,7 +1327,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
-        Command::Now(args) => run_now(&client, args, cli.json).await,
+        Command::Now(args) => run_now(&endpoint, args, cli.json).await,
         Command::Launch { command } => run_launch(&client, command, cli.json).await,
         Command::Missions { command } => run_mission_view(&client, command, cli.json).await,
         Command::Attention { command } => {
@@ -1331,7 +1338,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::Machines(args) => run_machines(&client, args, cli.json).await,
+        Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
         Command::Agents { command } => run_agents(&client, command, cli.json).await,
         Command::Conversations { command } => run_message(&client, command, cli.json).await,
         Command::Activity(args) => run_activity(&client, args, cli.json).await,
@@ -2696,30 +2703,34 @@ async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<
     print_value(&value, json_output)
 }
 
-async fn run_now(client: &Client, args: NowArgs, json_output: bool) -> Result<()> {
-    let mut path = "/v1/client/now".to_owned();
-    let mut query = Vec::new();
-    if let Some(owner_run) = args.owner_run {
-        query.push(format!("owner_run={}", urlencoding::encode(&owner_run)));
-    }
-    if args.all {
-        query.push("history=true".into());
-    }
-    if !query.is_empty() {
-        path.push('?');
-        path.push_str(&query.join("&"));
-    }
-    let response: Value = client.get(&path).await?;
+fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<GeneratedClient> {
+    let Endpoint::Unix(socket) = endpoint else {
+        anyhow::bail!(
+            "client-v0 product commands require the trusted local Unix endpoint; remote clients must use a paired Fabric credential"
+        );
+    };
+    Ok(person.map_or_else(
+        || GeneratedClient::unix(socket),
+        |person| GeneratedClient::unix_as(socket, person),
+    ))
+}
+
+async fn run_now(endpoint: &Endpoint, args: NowArgs, json_output: bool) -> Result<()> {
+    let client = generated_client(endpoint, None)?;
+    let response = if let Some(owner_run) = args.owner_run.as_deref() {
+        client
+            .now_list_for_owner_run(owner_run, None, None, args.all)
+            .await?
+    } else {
+        client.now_list(None, None, args.all).await?
+    };
     print_value(&response, json_output)
 }
 
-async fn run_machines(client: &Client, args: MachinesArgs, json_output: bool) -> Result<()> {
-    let path = if args.all {
-        "/v1/client/machines?history=true"
-    } else {
-        "/v1/client/machines"
-    };
-    let response: Value = client.get(path).await?;
+async fn run_machines(endpoint: &Endpoint, args: MachinesArgs, json_output: bool) -> Result<()> {
+    let response = generated_client(endpoint, None)?
+        .machines_list(None, None, args.all)
+        .await?;
     print_value(&response, json_output)
 }
 
@@ -2756,48 +2767,38 @@ async fn run_activity(client: &Client, args: ActivityArgs, json_output: bool) ->
 
 async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -> Result<()> {
     let person = normalize_member_subject(&args.person, "person");
-    let Endpoint::Unix(socket) = endpoint else {
-        anyhow::bail!(
-            "device pairing and inventory require the trusted local Unix endpoint; remote apps use their paired bearer credential"
-        );
-    };
-    let client = Client::unix_as(socket, person.clone())?;
+    let client = generated_client(&endpoint, Some(&person))?;
     match args.command.unwrap_or(DevicesCommand::Ls) {
         DevicesCommand::Ls => {
-            let response: Value = client.get("/v1/client/devices").await?;
+            let response = client.devices_list(None, None, args.all).await?;
             print_value(&response, json_output)
         }
         DevicesCommand::Pair { device_name } => {
-            let response: Value = client
-                .post(
-                    "/v1/client/pairings",
-                    &json!({
-                        "api_version": "st3.client.v0",
-                        "device_name": device_name,
-                        "person_id": person,
-                    }),
-                )
+            let response = client
+                .pairing_begin(&PairingBegin {
+                    api_version: CLIENT_V0_API_VERSION.into(),
+                    device_name,
+                    person_id: person,
+                })
                 .await?;
             print_value(&response, json_output)
         }
         DevicesCommand::Revoke { device, reason } => {
-            let capabilities: Value = client.get("/v1/client/capabilities").await?;
-            let snapshot_id = capabilities
-                .pointer("/snapshot/id")
-                .and_then(Value::as_str)
-                .context("the client capability envelope omitted its snapshot fence")?;
+            let capabilities = client.capabilities().await?;
             let nonce = uuid::Uuid::now_v7().simple().to_string();
-            let response: Value = client
-                .post(
-                    "/v1/client/actions",
-                    &json!({
-                        "api_version": "st3.client.v0",
-                        "id": format!("action/{nonce}"),
-                        "type": "pairing.revoke",
-                        "idempotency_key": format!("pairing-revoke:{device}:{nonce}"),
-                        "fence": { "snapshot_id": snapshot_id, "subject_revisions": {} },
-                        "parameters": { "target_id": device, "reason": reason, "evidence": [] },
-                    }),
+            let response = client
+                .pairing_revoke(
+                    format!("action/{nonce}"),
+                    format!("pairing-revoke:{device}:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: device,
+                        reason,
+                        ..ClientTargetParameters::default()
+                    },
                 )
                 .await?;
             print_value(&response, json_output)

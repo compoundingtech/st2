@@ -190,6 +190,29 @@ impl Client {
         };
         self.get(&format!("/v1/client/{collection}{suffix}")).await
     }
+
+    /// Read the bounded Now projection for one exact mission run without a
+    /// stringly-typed path or collection name at the call site.
+    pub async fn now_list_for_owner_run(
+        &self,
+        owner_run: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let mut query = vec![format!("owner_run={}", percent_encode(owner_run))];
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if history {
+            query.push("history=true".into());
+        }
+        self.get(&format!("/v1/client/now?{}", query.join("&")))
+            .await
+    }
     async fn resource_internal(
         &self,
         collection: &str,

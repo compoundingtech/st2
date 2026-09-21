@@ -557,7 +557,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());
     let app = st3::api::router(state.clone());
-    let fabric = st3::api::fabric_router(state);
+    let fabric = st3::api::fabric_router(state.clone());
     let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
     let snapshot = capabilities["snapshot"]["id"].as_str().unwrap();
     let action = serde_json::json!({
@@ -600,6 +600,34 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     assert_eq!(status, StatusCode::OK, "{paired}");
     let credential = paired["value"]["credential"].as_str().unwrap();
     let device = paired["value"]["device_id"].as_str().unwrap();
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "custom/client/pairing-expired-inventory".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/nathan".into()),
+            fields: std::collections::BTreeMap::from([
+                (
+                    "credential_hash".into(),
+                    Value::String(hex::encode(Sha256::digest(b"expired inventory credential"))),
+                ),
+                (
+                    "device_id".into(),
+                    Value::String("device/expired-inventory".into()),
+                ),
+                ("person_id".into(), Value::String("person/nathan".into())),
+                (
+                    "session_actor".into(),
+                    Value::String("person/nathan/session/expired-inventory".into()),
+                ),
+                ("scopes".into(), serde_json::json!(["read.projections"])),
+                ("expires_at_unix_ms".into(), serde_json::json!(1)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
     let (status, devices) =
         client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
     assert_eq!(status, StatusCode::OK, "{devices}");
@@ -608,6 +636,24 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     assert_eq!(devices["value"]["items"][0]["state"], "active");
     assert!(!encoded_devices.contains("credential_hash"));
     assert!(!encoded_devices.contains("device_public_key"));
+    let (status, device_history) = client_json_person(
+        app.clone(),
+        "/v1/client/devices?history=true",
+        "person/nathan",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{device_history}");
+    assert_eq!(
+        device_history["value"]["items"].as_array().unwrap().len(),
+        2
+    );
+    assert!(
+        device_history["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["state"] == "expired")
+    );
     assert!(credential.len() >= 32);
     let (status, remote_capabilities) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
@@ -630,11 +676,29 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     });
     let (status, revoked) = client_post_json(app.clone(), "/v1/client/actions", revoke).await;
     assert_eq!(status, StatusCode::OK, "{revoked}");
-    let (status, devices) =
+    let (status, current_devices) =
         client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
+    assert_eq!(status, StatusCode::OK, "{current_devices}");
+    assert!(
+        current_devices["value"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let (status, devices) = client_json_person(
+        app.clone(),
+        "/v1/client/devices?history=true",
+        "person/nathan",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{devices}");
-    assert_eq!(devices["value"]["items"][0]["id"], device);
-    assert_eq!(devices["value"]["items"][0]["state"], "revoked");
+    let revoked_device = devices["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == device)
+        .unwrap();
+    assert_eq!(revoked_device["state"], "revoked");
     let encoded_devices = serde_json::to_string(&devices).unwrap();
     assert!(!encoded_devices.contains(credential));
     assert!(!encoded_devices.contains("credential_hash"));
