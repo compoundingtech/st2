@@ -3076,15 +3076,14 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
+            let reason = p
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the mission was cancelled by its requester");
             state
                 .store
-                .set_mission_run_state(
-                    &current.subject,
-                    "cancelled",
-                    "terminal",
-                    p.get("reason").and_then(Value::as_str),
-                )
-                .map_err(ApiError::internal)?;
+                .request_mission_run_cancellation(&current.subject, reason)
+                .map_err(ApiError::bad)?;
             signal_changed(state);
             Ok(vec![current.subject])
         }

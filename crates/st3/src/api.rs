@@ -2196,8 +2196,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         },
     });
     let status = state.store.status(None).map_err(ApiError::internal)?;
+    let terminal_owned = state
+        .store
+        .terminal_owned_runtime_subjects()
+        .map_err(ApiError::internal)?;
     let mut desired_runtime_ids = desired
         .iter()
+        .filter(|subject| !terminal_owned.contains(&subject.subject))
         .filter_map(|subject| {
             subject
                 .member
@@ -2206,7 +2211,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for subject in &status.subjects {
-        if subject.desired.is_none() {
+        if subject.desired.is_none() || terminal_owned.contains(&subject.subject) {
             continue;
         }
         if let Some(runtime_id) = subject

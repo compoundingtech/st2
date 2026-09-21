@@ -1232,9 +1232,24 @@ mission "client-action-demo" state="ready" {
     });
     let (status, cancelled) = client_post_json(app.clone(), "/v1/client/actions", cancel).await;
     assert_eq!(status, StatusCode::OK, "{cancelled}");
-    assert_eq!(
-        store.mission_run(&run_id).unwrap().unwrap().status,
-        "cancelled"
+    let cancelling = store.mission_run(&run_id).unwrap().unwrap();
+    assert_eq!(cancelling.status, "running");
+    assert_eq!(cancelling.phase, "cleanup-cancelled");
+    assert!(
+        cancelling
+            .steps
+            .iter()
+            .all(|step| step.status == "cancelled")
+    );
+    assert!(
+        store
+            .set_mission_run_state(
+                &run_id,
+                "cancelled",
+                "terminal",
+                Some("runtime cleanup completed"),
+            )
+            .unwrap()
     );
     let (_, current_missions) = client_json(app.clone(), "/v1/client/missions").await;
     assert!(

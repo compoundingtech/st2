@@ -404,7 +404,18 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
-        let desired = self.store.desired_subjects()?;
+        let mut desired = self.store.desired_subjects()?;
+        let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
+        for subject in &mut desired {
+            if terminal_owned.contains(&subject.subject)
+                && subject
+                    .member
+                    .as_ref()
+                    .is_some_and(|member| member.host == self.host)
+            {
+                subject.kind = "stop".into();
+            }
+        }
         let ptys = match self.runtime.snapshot_ptys() {
             Ok(snapshot) => snapshot
                 .into_iter()
@@ -11436,6 +11447,84 @@ version 2
                 && desired.kind == "stop"
                 && desired.owner_run.as_deref() == Some(run.subject.as_str())
         }));
+    }
+
+    #[test]
+    fn a_terminal_owner_stops_a_runtime_even_without_a_cleanup_declaration() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+  mission "direct-terminal" state="ready" {
+    goal "Stop runtimes after any authoritative terminal transition."
+    completion { when "all-steps-exhausted" }
+    agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+    step "finish" { agentless }
+  }
+
+"#;
+        apply_source(&store, source, "publish-direct-terminal");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "direct-terminal".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-direct-terminal".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == format!("agent/{}/worker", run.id))
+            .and_then(|desired| desired.member)
+            .unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("direct-terminal-incarnation".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+
+        assert!(
+            store
+                .set_mission_run_state(
+                    &run.id,
+                    "cancelled",
+                    "terminal",
+                    Some("cancelled by an older client"),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(
+                    |desired| desired.subject == format!("agent/{}/worker", run.id)
+                        && desired.kind == "agent"
+                )
+        );
+
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.stops.lock().unwrap().as_slice(),
+            &[member.runtime_id]
+        );
     }
 
     #[test]

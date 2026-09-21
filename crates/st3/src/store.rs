@@ -2601,6 +2601,24 @@ impl Store {
             .min())
     }
 
+    pub fn request_mission_run_cancellation(
+        &self,
+        run: &str,
+        reason: &str,
+    ) -> Result<bool, St3Error> {
+        let run = if run.starts_with("mission-run/") {
+            run.to_owned()
+        } else {
+            format!("mission-run/{run}")
+        };
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        let claim_ids =
+            cancel_mission_run_tx(&transaction, &self.origin, &run, reason, None, now_ms())?;
+        transaction.commit().map_err(internal)?;
+        Ok(!claim_ids.is_empty())
+    }
+
     pub fn terminate_mission_run_descendants(&self, run: &str, reason: &str) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
@@ -4384,7 +4402,7 @@ impl Store {
                         &self.origin,
                         &declaration.subject,
                         &cancellation.reason,
-                        &batch_id,
+                        Some(&batch_id),
                         now,
                     )
                     .map_err(internal)?;
@@ -4450,7 +4468,7 @@ impl Store {
                     &self.origin,
                     &declaration.subject,
                     &cancellation.reason,
-                    &batch_id,
+                    Some(&batch_id),
                     now,
                 )
                 .map_err(internal)?;
@@ -5445,6 +5463,41 @@ impl Store {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Runtime members whose owning run or generation can no longer keep them alive.
+    ///
+    /// This is deliberately derived from the mission tables instead of relying on a
+    /// cleanup-authored `stop` declaration. A terminal state may arrive through
+    /// replication or an older client, and runtime cleanup must still converge.
+    pub fn terminal_owned_runtime_subjects(&self) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT desired.subject
+             FROM desired
+             JOIN mission_runs owner
+               ON desired.owner_run='mission-run/' || owner.id
+             JOIN mission_runs root ON root.id=owner.root_run_id
+             LEFT JOIN run_generations generation
+               ON desired.owner_generation='run-generation/' || generation.id
+             WHERE desired.member IS NOT NULL
+               AND (
+                 owner.status IN ('completed','failed','cancelled')
+                 OR owner.phase='terminal'
+                 OR root.status IN ('completed','failed','cancelled')
+                 OR root.phase='terminal'
+                 OR (
+                   desired.owner_generation IS NOT NULL
+                   AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
+                 )
+                 OR generation.status IN ('superseded','completed','failed','cancelled')
+               )
+             ORDER BY desired.subject",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn terminal_statuses(&self) -> Result<Vec<SubjectStatus>> {
@@ -15487,7 +15540,7 @@ fn cancel_mission_run_tx(
     origin: &str,
     run_subject: &str,
     reason: &str,
-    batch_id: &str,
+    forced_batch: Option<&str>,
     now: u128,
 ) -> Result<Vec<String>, St3Error> {
     let run_id = run_subject
@@ -15531,7 +15584,7 @@ fn cancel_mission_run_tx(
             run_id,
             reason,
             None,
-            Some(batch_id),
+            forced_batch,
             now,
         )?);
         return Ok(claim_ids);
@@ -15545,7 +15598,7 @@ fn cancel_mission_run_tx(
             origin,
             &format!("mission-run/{descendant}"),
             reason,
-            batch_id,
+            forced_batch,
             now,
         )?);
     }
@@ -15610,7 +15663,7 @@ fn cancel_mission_run_tx(
                     "tags": [format!("mission-run:mission-run/{run_id}"), format!("step-run:{subject}")],
                 }}),
                 &[],
-                Some(batch_id),
+                forced_batch,
             )
             .map_err(internal)?;
         }
@@ -15632,7 +15685,7 @@ fn cancel_mission_run_tx(
             None,
             &json!({"fields": {"status": "cancelled", "reason": reason}}),
             &[],
-            Some(batch_id),
+            forced_batch,
         )
         .map_err(internal)?;
         claim_ids.push(claim.id);
@@ -15675,7 +15728,7 @@ fn cancel_mission_run_tx(
             None,
             &body,
             &[],
-            Some(batch_id),
+            forced_batch,
         )
         .map_err(internal)?;
         claim_ids.push(claim.id);
