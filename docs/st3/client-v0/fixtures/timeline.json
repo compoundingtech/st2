@@ -38,7 +38,11 @@
       {
         "id": "timeline-entry/release-agent/9/7", "sequence": 7, "revision": 1, "timestamp": "2026-09-20T11:06:41Z",
         "role": "system", "type": "usage", "final": true,
-        "body": { "input_tokens": 420, "output_tokens": 80, "cached_tokens": 100, "total_tokens": 500 }
+        "body": {
+          "semantics": "response", "driver": "codex",
+          "input_tokens": 420, "output_tokens": 80, "cached_tokens": 100, "total_tokens": 500,
+          "attribution": { "agent_id": "agent/release-agent", "mission_run_id": "mission-run/release", "generation_id": "run-generation/9", "step_id": "build" }
+        }
       },
       {
         "id": "timeline-entry/release-agent/9/8", "sequence": 8, "revision": 1, "timestamp": "2026-09-20T11:06:42Z",

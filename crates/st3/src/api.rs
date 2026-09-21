@@ -33,9 +33,10 @@ use crate::model::{
     ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck, DoctorReport,
     DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus,
     EventRecord, GateResultRequest, HumanReviewView, LaunchApproveAndStartRequest,
-    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionRequest,
-    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest,
-    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
+    LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
+    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest, PlanningCancelRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
@@ -69,7 +70,26 @@ const CLIENT_API_VERSION: &str = "st3.client.v0";
 const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
 const CLIENT_MAX_PAGE_ITEMS: usize = 200;
-const CLIENT_PAGE_TTL_MS: u128 = 15 * 60 * 1_000;
+const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
+// Page cursors are invalidated by a changed store index. A fixed far-future descriptor keeps the
+// same `(node, index, projection)` byte-identical instead of smuggling request wall-clock time into
+// an otherwise stable snapshot payload.
+const CLIENT_PAGE_EXPIRES_UNIX_MS: u128 = 253_402_300_799_000;
+
+#[derive(Clone, Copy)]
+enum ClientTransportBoundary {
+    Unix,
+    FabricLoopback,
+}
+
+impl ClientTransportBoundary {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unix => "unix",
+            Self::FabricLoopback => "fabric-loopback",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ClientSnapshot {
@@ -129,6 +149,7 @@ impl ApiError {
             | "stale-document-token"
             | "stale-incarnation"
             | "stale-launch-preview" => StatusCode::CONFLICT,
+            "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -170,6 +191,16 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    router_for_transport(state, ClientTransportBoundary::Unix)
+}
+
+/// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
+/// client request on this router requires a paired bearer credential.
+pub fn fabric_router(state: AppState) -> Router {
+    router_for_transport(state, ClientTransportBoundary::FabricLoopback)
+}
+
+fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
@@ -277,6 +308,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/launches/{id}/cancel", post(cancel_planning_session))
         .route("/v1/documents", get(list_documents).post(put_document))
         .route("/v1/documents/content", get(get_document))
+        .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
@@ -361,8 +393,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
         .route("/v1/mission-runs", post(start_mission_run));
-    app.layer(from_fn_with_state(state.clone(), response_envelope))
-        .with_state(state)
+    app.layer(from_fn_with_state(
+        (state.clone(), transport),
+        response_envelope,
+    ))
+    .with_state(state)
 }
 
 async fn schema() -> Json<Value> {
@@ -377,13 +412,17 @@ async fn schema() -> Json<Value> {
 }
 
 async fn response_envelope(
-    State(state): State<AppState>,
+    State((state, transport)): State<(AppState, ClientTransportBoundary)>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let client_request = request.uri().path().starts_with("/v1/client/");
+    let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
+        && !client_request
+        && request.uri().path() != "/v1/health")
+        .then(client_v0::fabric_boundary_forbidden);
     let client_authentication = client_request
-        .then(|| client_v0::authenticate(&state, &request))
+        .then(|| client_v0::authenticate(&state, &request, transport.as_str()))
         .transpose();
     if let Ok(Some(session)) = &client_authentication {
         request.extensions_mut().insert(session.clone());
@@ -409,9 +448,9 @@ async fn response_envelope(
     if let Some(snapshot) = &client_snapshot {
         request.extensions_mut().insert(snapshot.clone());
     }
-    let response = match client_authentication {
-        Ok(_) => next.run(request).await,
-        Err(error) => error.into_response(),
+    let response = match (fabric_boundary_error, client_authentication) {
+        (Some(error), _) | (None, Err(error)) => error.into_response(),
+        (None, Ok(_)) => next.run(request).await,
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         || !response
@@ -530,7 +569,16 @@ fn client_snapshot_time(snapshot: &ClientSnapshot) -> u128 {
 
 fn new_client_snapshot(state: &AppState) -> ClientSnapshot {
     let store_index = state.store.index().unwrap_or_default();
-    let created_at = client_timestamp(client_now_ms());
+    client_snapshot_at(state, store_index)
+}
+
+fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
+    let created_at = client_timestamp(
+        state
+            .store
+            .projection_time_at(store_index)
+            .unwrap_or_default(),
+    );
     let fingerprint = hex::encode(Sha256::digest(
         format!(
             "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
@@ -544,11 +592,15 @@ fn new_client_snapshot(state: &AppState) -> ClientSnapshot {
             state.node.replace(char::is_whitespace, "-"),
             &fingerprint[..16]
         ),
-        host_id: format!("host/{}", state.node.replace(char::is_whitespace, "-")),
+        host_id: client_host_id(&state.node),
         store_index,
         projection_version: CLIENT_PROJECTION_VERSION.into(),
         created_at,
     }
+}
+
+fn client_host_id(node: &str) -> String {
+    format!("host/{}", node.replace(char::is_whitespace, "-"))
 }
 
 fn client_error_code(code: Option<&str>) -> String {
@@ -562,7 +614,10 @@ fn client_error_code(code: Option<&str>) -> String {
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"
+        | "runtime-not-local"
+        | "runtime-authority-indeterminate"
         | "internal" => code.unwrap_or("internal").to_owned(),
+        "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
         _ => "internal".into(),
     }
 }
@@ -639,7 +694,7 @@ fn client_page(
         }
         (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
     } else {
-        (0, requested_limit, client_now_ms() + CLIENT_PAGE_TTL_MS)
+        (0, requested_limit, CLIENT_PAGE_EXPIRES_UNIX_MS)
     };
     if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
         return Err(client_page_expired(
@@ -699,6 +754,11 @@ async fn client_capabilities(
     Extension(session): Extension<client_v0::ClientSession>,
 ) -> Json<Value> {
     let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
+    let oldest = state
+        .store
+        .event_bounds()
+        .map(|(oldest, _)| oldest.saturating_sub(1))
+        .unwrap_or_default();
     let capabilities = client_v0::capabilities(&session);
     Json(json!({
         "kind": "capabilities",
@@ -708,11 +768,11 @@ async fn client_capabilities(
         "limits": {
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
-            "max_response_bytes": 1_048_576,
+            "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
             "max_wait_ms": 30_000
         },
         "event_cursor": cursor,
-        "oldest_event_cursor": format!("event-cursor/{}/0", state.node),
+        "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),
         "schemas": [
             "../client-v0/schemas/client-v0.schema.json",
             "../client-v0/schemas/operations.json"
@@ -725,6 +785,7 @@ fn client_work_resources(
     actor: Option<&str>,
     history: bool,
     snapshot_unix_ms: u128,
+    snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let mut work = if history {
         store.work_history_at_snapshot(actor, snapshot_unix_ms)?
@@ -746,6 +807,7 @@ fn client_work_resources(
             .then_with(|| left.step.cmp(&right.step))
             .then_with(|| left.subject.cmp(&right.subject))
     });
+    let desired = store.desired_subjects()?;
     work.into_iter()
         .map(|work| {
             let operational = store.work_annotation(&work)?;
@@ -754,6 +816,14 @@ fn client_work_resources(
                 "working" => "claimed",
                 other => other,
             };
+            let usage = aggregate_usage(
+                store,
+                desired
+                    .iter()
+                    .filter(|subject| subject.owner_step.as_deref() == Some(work.subject.as_str()))
+                    .map(|subject| subject.subject.as_str()),
+                Some(snapshot_index),
+            )?;
             Ok(json!({
                 "id": work.subject,
                 "kind": "work",
@@ -774,10 +844,40 @@ fn client_work_resources(
                 "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
                 "constraints": work.constraints,
+                "usage": usage,
                 "operational": operational
             }))
         })
         .collect()
+}
+
+fn aggregate_usage<'a>(
+    store: &Store,
+    subjects: impl Iterator<Item = &'a str>,
+    at_index: Option<u64>,
+) -> anyhow::Result<Option<crate::model::UsageSummary>> {
+    let mut aggregate = None::<crate::model::UsageSummary>;
+    for subject in subjects {
+        let Some(usage) = store.usage_summary_at(subject, None, at_index)? else {
+            continue;
+        };
+        let total = aggregate.get_or_insert_with(|| crate::model::UsageSummary {
+            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
+            ..crate::model::UsageSummary::default()
+        });
+        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+        total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+        total.incarnation_count = total
+            .incarnation_count
+            .saturating_add(usage.incarnation_count);
+        if let Some(cost) = usage.cost {
+            total.cost = Some(total.cost.unwrap_or_default() + cost);
+        }
+        total.currency = total.currency.clone().or(usage.currency);
+    }
+    Ok(aggregate)
 }
 
 fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {
@@ -853,7 +953,12 @@ fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Res
     Ok(agents.into_iter().map(|(_, value)| value).collect())
 }
 
-fn client_session_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {
+fn client_session_resources(
+    store: &Store,
+    history: bool,
+    at: &str,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
     let status = if history {
         store.status_history(None, None, None)?
     } else {
@@ -897,6 +1002,7 @@ fn client_session_resources(store: &Store, history: bool, at: &str) -> anyhow::R
             .and_then(|value| value.as_u64().map(u128::from))
             .map(client_timestamp)
             .unwrap_or_else(|| at.to_owned());
+        let usage = store.usage_summary_at(&subject.subject, incarnation, Some(snapshot_index))?;
         sessions.push(json!({
             "id": format!("session/{}", &digest[..24]),
             "kind": "session",
@@ -908,6 +1014,7 @@ fn client_session_resources(store: &Store, history: bool, at: &str) -> anyhow::R
             "ended_at": if state == "completed" || state == "failed" || state == "cancelled" { Some(at) } else { None },
             "timeline_cursor": format!("timeline-cursor/{}/0", &digest[..24]),
             "runtime_incarnation": incarnation,
+            "usage": usage,
             "operational": subject.projection
         }));
     }
@@ -942,12 +1049,17 @@ fn client_attention_resources(
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
+        let revision = store
+            .claims_for(&item.subject, None)?
+            .last()
+            .map(|claim| claim.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
         resources.insert(
             id.clone(),
             json!({
                 "id": id,
                 "kind": "attention",
-                "revision": item.subject,
+                "revision": revision,
                 "updated_at": client_timestamp(item.requested_at_unix_ms),
                 "title": item.title,
                 "detail": item.detail,
@@ -1098,8 +1210,10 @@ fn client_launch_decision_resources(
                 "question": fields.get("question").cloned().unwrap_or(Value::Null),
                 "state": if answer.is_some() { "answered" } else { "open" },
                 "requested_at": client_timestamp(claim.accepted_at_unix_ms),
-                "choices": fields.get("choices").cloned().unwrap_or_else(|| json!([])),
-                "answer": answer.and_then(|answer| answer.body.pointer("/fields/answer")).cloned(),
+                "decision_type": fields.get("decision_type").cloned().unwrap_or(Value::Null),
+                "options": fields.get("options").cloned().unwrap_or_else(|| json!([])),
+                "response": answer.and_then(|answer| answer.body.pointer("/fields/response")).cloned(),
+                "explanation": answer.and_then(|answer| answer.body.pointer("/fields/explanation")).cloned(),
                 "operational": { "layer": if answer.is_some() { "history" } else { "current" }, "actionable": answer.is_none(), "reasons": if answer.is_some() { vec!["answered"] } else { Vec::<&str>::new() } }
             }))
         })
@@ -1221,6 +1335,7 @@ fn launch_visualization(
     mission: &crate::model::MissionSpec,
     session: &PlanningSessionView,
     preview: &crate::model::PlanningPreviewView,
+    decisions: &[Value],
 ) -> Value {
     let nodes = mission.display_order.iter().filter_map(|id| mission.steps.get(id)).map(|step| {
         json!({
@@ -1312,7 +1427,9 @@ fn launch_visualization(
         "constraints": mission.constraints,
         "gates": mission.gates,
         "resources": mission.products,
+        "decisions": decisions,
         "revision": { "candidate": mission.revision, "target_generation": session.source_generation },
+        "diffs": [{ "changes": preview.mission.changes, "predicted_actions": preview.mission.predicted_actions }],
         "risk": { "blockers": preview.mission.blockers, "warnings": preview.mission.warnings, "gates": mission.gates },
         "live_progress": { "state": session.status, "cursor": null, "updated_at": client_timestamp(session.updated_at_unix_ms) }
     })
@@ -1338,14 +1455,19 @@ fn client_launch_variant_resources(
             (
                 normalized,
                 client_launch_diagnostics(preview),
-                launch_visualization(mission, session, preview),
+                launch_visualization(
+                    mission,
+                    session,
+                    preview,
+                    &client_launch_decision_resources(&state.store, session)?,
+                ),
                 json!({"changes": preview.mission.changes, "predicted_actions": preview.mission.predicted_actions}),
             )
         } else {
             (
                 json!({}),
                 Vec::new(),
-                json!({"version": "st3.visualization.v0", "views": [], "nodes": [], "edges": [], "groups": [], "timeline": {"entries": []}, "swimlanes": []}),
+                json!({"version": "st3.visualization.v0", "views": [], "nodes": [], "edges": [], "groups": [], "timeline": {"entries": []}, "swimlanes": [], "goals": [], "constraints": [], "gates": [], "resources": [], "decisions": [], "revision": {}, "diffs": [], "risk": {}, "live_progress": {}}),
                 json!({"changes": [], "predicted_actions": []}),
             )
         };
@@ -1436,7 +1558,8 @@ fn client_launch_approval_resources(
     Ok(approvals)
 }
 
-fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<Value>> {
+fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Vec<Value>> {
+    let store = &state.store;
     let sessions = store.planning_sessions(history)?;
     let mut resources = sessions
         .into_iter()
@@ -1458,6 +1581,10 @@ fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<V
                 _ => json!({ "type": "new-mission" }),
             };
             let decisions = client_launch_decision_resources(store, &session)?;
+            let visualization = client_launch_variant_resources(state, &session)?
+                .into_iter()
+                .rev()
+                .find_map(|variant| variant.get("visualization").cloned());
             let approval_ids = store.claims_for(&session.subject, None)?.into_iter().filter(|claim| claim.kind == "planning-session.approved").filter_map(|claim| claim.body.pointer("/fields/candidate_revision").and_then(Value::as_u64).map(|revision| format!("launch-approval/{}/{revision}", session.id))).collect::<Vec<_>>();
             Ok(json!({
                 "id": format!("launch/{}", session.id),
@@ -1471,6 +1598,7 @@ fn client_launch_resources(store: &Store, history: bool) -> anyhow::Result<Vec<V
                 "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
                 "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
                 "approvals": approval_ids,
+                "visualization": visualization,
                 "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
             }))
         })
@@ -1524,7 +1652,13 @@ async fn client_work(
     let history = query.history;
     let snapshot_unix_ms = client_snapshot_time(&snapshot);
     let items = blocking_store(move || {
-        client_work_resources(&store, actor.as_deref(), history, snapshot_unix_ms)
+        client_work_resources(
+            &store,
+            actor.as_deref(),
+            history,
+            snapshot_unix_ms,
+            snapshot.store_index,
+        )
     })
     .await?;
     client_page(&state, &snapshot, "work", items, &query).map(Json)
@@ -1542,6 +1676,7 @@ async fn client_work_detail(
             query.actor.as_deref(),
             query.history,
             client_snapshot_time(&snapshot),
+            snapshot.store_index,
         )
         .map_err(ApiError::internal)?,
         "work",
@@ -1578,8 +1713,13 @@ async fn client_sessions(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_session_resources(&state.store, query.history, &snapshot.created_at)
-        .map_err(ApiError::internal)?;
+    let items = client_session_resources(
+        &state.store,
+        query.history,
+        &snapshot.created_at,
+        snapshot.store_index,
+    )
+    .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "sessions", items, &query).map(Json)
 }
 
@@ -1591,11 +1731,16 @@ async fn client_sessions_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
-        return client_v0::timeline_value(&state, &snapshot, &session, id, query.limit);
+        return client_v0::timeline_value(&state, &snapshot, &session, id, &query);
     }
     client_detail(
-        client_session_resources(&state.store, query.history, &snapshot.created_at)
-            .map_err(ApiError::internal)?,
+        client_session_resources(
+            &state.store,
+            query.history,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .map_err(ApiError::internal)?,
         "session",
         &id,
     )
@@ -1652,7 +1797,7 @@ async fn client_launches(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_launch_resources(&state.store, query.history).map_err(ApiError::internal)?;
+    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "launches", items, &query).map(Json)
 }
 
@@ -1662,7 +1807,7 @@ async fn client_launches_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     client_detail(
-        client_launch_resources(&state.store, query.history).map_err(ApiError::internal)?,
+        client_launch_resources(&state, query.history).map_err(ApiError::internal)?,
         "launch",
         &id,
     )
@@ -3271,20 +3416,36 @@ async fn request_launch_decision(
             "a launch question must contain 1 through 2000 bytes",
         )));
     }
-    let choices = request
-        .choices
+    let options = request
+        .options
         .iter()
-        .map(|choice| choice.trim().to_owned())
+        .map(|option| LaunchDecisionOption {
+            id: option.id.trim().to_owned(),
+            label: option.label.trim().to_owned(),
+            description: option
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        })
         .collect::<Vec<_>>();
-    let unique = choices.iter().collect::<std::collections::BTreeSet<_>>();
-    if choices.is_empty()
-        || choices.len() > 20
-        || choices.iter().any(String::is_empty)
-        || unique.len() != choices.len()
+    let unique = options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let boolean = matches!(request.decision_type, LaunchDecisionType::Boolean);
+    if (boolean && !options.is_empty())
+        || (!boolean && options.is_empty())
+        || options.len() > 20
+        || options
+            .iter()
+            .any(|option| option.id.is_empty() || option.label.is_empty())
+        || unique.len() != options.len()
     {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-launch-choices",
-            "a launch question needs 1 through 20 distinct non-empty choices",
+            "invalid-launch-options",
+            "boolean questions have no options; choice and rank questions need 1 through 20 options with distinct non-empty IDs and labels",
         )));
     }
     let digest = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
@@ -3299,8 +3460,12 @@ async fn request_launch_decision(
             ("revision".into(), Value::from(1)),
             ("question".into(), Value::String(question.to_owned())),
             (
-                "choices".into(),
-                serde_json::to_value(&choices).map_err(ApiError::internal)?,
+                "decision_type".into(),
+                serde_json::to_value(&request.decision_type).map_err(ApiError::internal)?,
+            ),
+            (
+                "options".into(),
+                serde_json::to_value(&options).map_err(ApiError::internal)?,
             ),
             ("requester".into(), Value::String(session.requester.clone())),
             ("planner".into(), Value::String(session.planner.clone())),
@@ -3313,8 +3478,9 @@ async fn request_launch_decision(
         &session.planner,
         &session.requester,
         &format!(
-            "{decision_id}\n{question}\nChoices: {}",
-            choices.join(" | ")
+            "{decision_id}\n{question}\nDecision: {}",
+            serde_json::to_string(&json!({"type": request.decision_type, "options": options}))
+                .map_err(ApiError::internal)?
         ),
         "Launch decision requested",
     )?;
@@ -3325,6 +3491,46 @@ async fn request_launch_decision(
         .find(|value| value["id"] == decision_id)
         .ok_or_else(|| ApiError::internal("the recorded launch decision is unavailable"))?;
     Ok(Json(value))
+}
+
+fn valid_launch_decision_response(
+    decision_type: &LaunchDecisionType,
+    options: &[LaunchDecisionOption],
+    response: &LaunchDecisionResponse,
+) -> bool {
+    let option_ids = options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    match (decision_type, response) {
+        (LaunchDecisionType::Boolean, LaunchDecisionResponse::Boolean(_)) => true,
+        (LaunchDecisionType::SingleChoice, LaunchDecisionResponse::SingleChoice(value)) => {
+            option_ids.contains(value.as_str())
+        }
+        (LaunchDecisionType::MultipleChoice, LaunchDecisionResponse::MultipleChoice(values)) => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == values.len()
+                && values
+                    .iter()
+                    .all(|value| option_ids.contains(value.as_str()))
+        }
+        (LaunchDecisionType::Rank, LaunchDecisionResponse::Rank(values)) => {
+            values.len() == options.len()
+                && values
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == values.len()
+                && values
+                    .iter()
+                    .all(|value| option_ids.contains(value.as_str()))
+        }
+        _ => false,
+    }
 }
 
 async fn answer_launch_decision(
@@ -3349,8 +3555,18 @@ async fn answer_launch_decision(
             "the launch decision revision changed",
         )));
     }
+    let response = serde_json::to_value(&request.response).map_err(ApiError::internal)?;
+    let explanation = request
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     if current["state"] == "answered" {
-        if current["answer"].as_str() == Some(request.answer.as_str()) {
+        if current["response"] == response
+            && current["explanation"]
+                == serde_json::to_value(&explanation).map_err(ApiError::internal)?
+        {
             return Ok(Json(current.clone()));
         }
         return Err(ApiError::bad(St3Error::new(
@@ -3358,30 +3574,36 @@ async fn answer_launch_decision(
             "a launch decision answer is immutable",
         )));
     }
-    let choices = current["choices"].as_array().cloned().unwrap_or_default();
-    if !choices
-        .iter()
-        .any(|choice| choice.as_str() == Some(request.answer.as_str()))
-    {
+    let decision_type: LaunchDecisionType =
+        serde_json::from_value(current["decision_type"].clone())
+            .map_err(|_| ApiError::internal("launch decision has an invalid type"))?;
+    let options: Vec<LaunchDecisionOption> = serde_json::from_value(current["options"].clone())
+        .map_err(|_| ApiError::internal("launch decision has invalid options"))?;
+    let valid = valid_launch_decision_response(&decision_type, &options, &request.response);
+    if !valid {
         return Err(ApiError::bad(St3Error::new(
             "invalid-launch-answer",
-            "the answer must equal one of the question choices",
+            "the structured response must match the decision type and contain unique option IDs from the offered options; rank responses must include every option exactly once",
         )));
+    }
+    let mut answer_fields = BTreeMap::from([
+        ("decision_id".into(), Value::String(decision_id.clone())),
+        (
+            "expected_revision".into(),
+            Value::from(request.expected_revision),
+        ),
+        ("response".into(), response.clone()),
+        ("requester".into(), Value::String(session.requester.clone())),
+    ]);
+    if let Some(explanation) = &explanation {
+        answer_fields.insert("explanation".into(), Value::String(explanation.clone()));
     }
     record_planning_event(
         &state,
         &session,
         "planning-session.question-answered",
         Some(&request.actor),
-        BTreeMap::from([
-            ("decision_id".into(), Value::String(decision_id.clone())),
-            (
-                "expected_revision".into(),
-                Value::from(request.expected_revision),
-            ),
-            ("answer".into(), Value::String(request.answer.clone())),
-            ("requester".into(), Value::String(session.requester.clone())),
-        ]),
+        answer_fields,
         &format!("launch-answer:{}:{}", session.id, request.idempotency_key),
     )?;
     send_planning_message(
@@ -3389,7 +3611,10 @@ async fn answer_launch_decision(
         &format!("launch-answer-message:{}:{decision_id}", session.id),
         &session.requester,
         &session.planner,
-        &format!("{decision_id}\nAnswer: {}", request.answer),
+        &format!(
+            "{decision_id}\nResponse: {}",
+            serde_json::to_string(&response).map_err(ApiError::internal)?
+        ),
         "Launch decision answered",
     )?;
     close_planning_message(
@@ -4243,6 +4468,70 @@ async fn post_claim(
         signal_changed(&state);
     }
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct HarnessDiagnosticRequest {
+    actor: String,
+    code: String,
+    reason: String,
+    severity: String,
+    status: String,
+    incarnation_id: Option<String>,
+    idempotency_key: String,
+}
+
+async fn post_harness_diagnostic(
+    State(state): State<AppState>,
+    Json(request): Json<HarnessDiagnosticRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = if request.actor.starts_with("agent/") {
+        request.actor
+    } else if !request.actor.contains('/') && !request.actor.trim().is_empty() {
+        format!("agent/{}", request.actor)
+    } else {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-diagnostic-actor",
+            "a harness diagnostic requires one concrete agent subject",
+        )));
+    };
+    if !matches!(request.severity.as_str(), "warning" | "error") {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-diagnostic-severity",
+            "a harness diagnostic severity must be warning or error",
+        )));
+    }
+    if request.code.trim().is_empty() || request.reason.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-harness-diagnostic",
+            "a harness diagnostic requires a nonempty code and reason",
+        )));
+    }
+    let mut fields = BTreeMap::from([
+        ("code".into(), Value::String(request.code)),
+        ("reason".into(), Value::String(request.reason)),
+        ("severity".into(), Value::String(request.severity)),
+        ("status".into(), Value::String(request.status)),
+    ]);
+    if let Some(incarnation) = request.incarnation_id {
+        fields.insert("incarnation_id".into(), Value::String(incarnation));
+    }
+    let (record, appended) = state
+        .store
+        .append_claim_outcome(&ClaimInput {
+            subject: actor.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(actor),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key),
+        })
+        .map_err(ApiError::bad)?;
+    if appended {
+        signal_changed(&state);
+    }
+    Ok(Json(record))
 }
 
 async fn get_claim(
@@ -5950,9 +6239,11 @@ fn stage_eval_documents(
     Ok(())
 }
 
+#[derive(Debug)]
 struct LiveSession {
     runtime_id: String,
     incarnation_id: String,
+    owner_host_id: String,
     terminal: bool,
     driver: Option<String>,
 }
@@ -5966,12 +6257,41 @@ fn live_session(
         .store
         .status(Some(subject))
         .map_err(ApiError::internal)?;
-    let actual = status
+    let selected = status
         .subjects
         .first()
-        .and_then(|item| item.actual.as_ref())
+        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
+    if !matches!(selected.reachability.as_str(), "reachable" | "local") {
+        return Err(ApiError::bad(St3Error::new(
+            "runtime-authority-indeterminate",
+            format!("subject `{subject}` has indeterminate runtime authority"),
+        )));
+    }
+    let origin = selected.actual_origin.as_deref().ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subject `{subject}` has no selected runtime origin"
+        ))
+    })?;
+    if origin != state.store.origin() {
+        return Err(ApiError::bad(St3Error::new(
+            "runtime-not-local",
+            format!(
+                "subject `{subject}` is owned by `{}` and cannot be controlled through `{}`",
+                client_host_id(origin),
+                client_host_id(&state.node)
+            ),
+        )));
+    }
+    let actual = selected
+        .actual
+        .as_ref()
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     let fields = actual.get("fields").unwrap_or(actual);
+    if fields.get("status").and_then(Value::as_str) != Some("running") {
+        return Err(ApiError::not_found(format!(
+            "subject `{subject}` has no running session"
+        )));
+    }
     let runtime_id = fields
         .get("runtime_id")
         .and_then(Value::as_str)
@@ -6001,6 +6321,7 @@ fn live_session(
     Ok(LiveSession {
         runtime_id: runtime_id.into(),
         incarnation_id: incarnation_id.into(),
+        owner_host_id: client_host_id(origin),
         terminal,
         driver: member.and_then(|member| member.driver),
     })
@@ -7393,6 +7714,62 @@ mission "invalid-message" state="ready" {
         assert_eq!(store.index().unwrap(), before);
     }
 
+    #[test]
+    fn launch_decision_responses_preserve_type_membership_uniqueness_and_rank_order() {
+        let options = vec![
+            LaunchDecisionOption {
+                id: "a".into(),
+                label: "A".into(),
+                description: Some("first option".into()),
+            },
+            LaunchDecisionOption {
+                id: "b".into(),
+                label: "B".into(),
+                description: None,
+            },
+        ];
+        assert!(valid_launch_decision_response(
+            &LaunchDecisionType::Boolean,
+            &[],
+            &LaunchDecisionResponse::Boolean(true)
+        ));
+        assert!(valid_launch_decision_response(
+            &LaunchDecisionType::SingleChoice,
+            &options,
+            &LaunchDecisionResponse::SingleChoice("a".into())
+        ));
+        assert!(!valid_launch_decision_response(
+            &LaunchDecisionType::SingleChoice,
+            &options,
+            &LaunchDecisionResponse::SingleChoice("missing".into())
+        ));
+        assert!(valid_launch_decision_response(
+            &LaunchDecisionType::MultipleChoice,
+            &options,
+            &LaunchDecisionResponse::MultipleChoice(vec!["b".into(), "a".into()])
+        ));
+        assert!(!valid_launch_decision_response(
+            &LaunchDecisionType::MultipleChoice,
+            &options,
+            &LaunchDecisionResponse::MultipleChoice(vec!["a".into(), "a".into()])
+        ));
+        assert!(valid_launch_decision_response(
+            &LaunchDecisionType::Rank,
+            &options,
+            &LaunchDecisionResponse::Rank(vec!["b".into(), "a".into()])
+        ));
+        assert!(!valid_launch_decision_response(
+            &LaunchDecisionType::Rank,
+            &options,
+            &LaunchDecisionResponse::Rank(vec!["a".into()])
+        ));
+        assert!(!valid_launch_decision_response(
+            &LaunchDecisionType::Rank,
+            &options,
+            &LaunchDecisionResponse::MultipleChoice(vec!["a".into(), "b".into()])
+        ));
+    }
+
     #[tokio::test]
     async fn planning_requires_an_exact_preview_and_publishes_without_a_run() {
         let root = tempfile::tempdir().unwrap();
@@ -7695,7 +8072,19 @@ version 2
             serde_json::to_value(LaunchDecisionRequest {
                 actor: planner.into(),
                 question: "Which verification level?".into(),
-                choices: vec!["focused".into(), "full".into()],
+                decision_type: LaunchDecisionType::SingleChoice,
+                options: vec![
+                    LaunchDecisionOption {
+                        id: "focused".into(),
+                        label: "Focused".into(),
+                        description: Some("Run the focused verification suite".into()),
+                    },
+                    LaunchDecisionOption {
+                        id: "full".into(),
+                        label: "Full".into(),
+                        description: None,
+                    },
+                ],
                 idempotency_key: "launch-decision-verification".into(),
             })
             .unwrap(),
@@ -7709,7 +8098,8 @@ version 2
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
                 actor: "person/nathan".into(),
-                answer: "full".into(),
+                response: LaunchDecisionResponse::SingleChoice("full".into()),
+                explanation: Some("release candidate requires the full suite".into()),
                 expected_revision: 1,
                 idempotency_key: "launch-decision-verification-answer".into(),
             })
@@ -7718,13 +8108,21 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{answered}");
         assert_eq!(answered["state"], "answered");
-        assert_eq!(answered["answer"], "full");
+        assert_eq!(
+            answered["response"],
+            json!({"type":"single-choice","value":"full"})
+        );
+        assert_eq!(
+            answered["explanation"],
+            "release candidate requires the full suite"
+        );
         let (status, immutable) = json_request(
             app.clone(),
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
                 actor: "person/nathan".into(),
-                answer: "focused".into(),
+                response: LaunchDecisionResponse::SingleChoice("focused".into()),
+                explanation: None,
                 expected_revision: 1,
                 idempotency_key: "launch-decision-verification-conflict".into(),
             })
@@ -7748,7 +8146,7 @@ version 2
             .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unauthorized}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{unauthorized}");
         assert_eq!(unauthorized["code"], "launch-review-not-authorized");
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
@@ -9435,6 +9833,42 @@ version 2
             json_request(app, "/v1/claims", serde_json::to_value(changed).unwrap()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mismatch}");
         assert_eq!(mismatch["code"], "idempotency-mismatch");
+    }
+
+    #[tokio::test]
+    async fn harness_diagnostic_has_a_dedicated_idempotent_local_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let request = json!({
+            "actor": "agent/recovery-owner",
+            "code": "driver-failed",
+            "reason": "the harness transport exited",
+            "severity": "error",
+            "status": "active",
+            "incarnation_id": "runtime:one",
+            "idempotency_key": "harness-diagnostic-test"
+        });
+        let (status, first) =
+            json_request(app.clone(), "/v1/diagnostics/harness", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["kind"], "harness.diagnostic");
+        assert_eq!(first["subject"], "agent/recovery-owner");
+        let (status, replay) = json_request(app, "/v1/diagnostics/harness", request).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(
+            state
+                .store
+                .claims_for("agent/recovery-owner", Some("harness.diagnostic"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (status, denied) =
+            json_request(fabric_router(state), "/v1/diagnostics/harness", json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
     }
 
     #[tokio::test]

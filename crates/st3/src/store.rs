@@ -16,19 +16,20 @@ use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
-    AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
-    DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput, LoopRoundView,
-    LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView,
-    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
-    OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
-    PlannedAction, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
-    PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
-    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome,
-    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector, WorkWakeView,
+    AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, ContextUsage,
+    DependencySpec, DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput,
+    LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind,
+    MissionOutputView, MissionResponse, MissionRevisionOperation, MissionRunDeclaration,
+    MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    NormalizedIntent, OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan,
+    OperationalRepairResult, PlannedAction, PlanningCandidateView, PlanningPreviewView,
+    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
+    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
+    UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -4712,7 +4713,10 @@ impl Store {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
 
-    fn append_claim_outcome(&self, input: &ClaimInput) -> Result<(ClaimRecord, bool), St3Error> {
+    pub(crate) fn append_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
@@ -4768,7 +4772,22 @@ impl Store {
             }
         }
         let stored_fields = normalize_resource_observation(&transaction, input)?;
-        validate_message_transition(&transaction, input)?;
+        if validate_message_transition(&transaction, input)? {
+            let latest_id = latest_claim_id_tx(&transaction, &input.subject)
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    St3Error::new("internal", "an idempotent message transition has no head")
+                })?;
+            let latest = claim_by_id_tx(&transaction, &latest_id)
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "internal",
+                        "an idempotent message transition head is missing",
+                    )
+                })?;
+            return Ok((latest, false));
+        }
         let predecessor = latest_claim_id_tx(&transaction, &input.subject).map_err(internal)?;
         let predecessors = predecessor.into_iter().collect::<Vec<_>>();
         let mut body = json!({
@@ -5149,6 +5168,8 @@ impl Store {
         for subject in subject_names {
             let desired = desired_row_at(&connection, &subject, at_index)?;
             let actual = latest_actual_at(&connection, &subject, at_index)?;
+            let (actual_claim, actual_origin, actual_origin_conflict) =
+                selected_actual_source_at(&connection, &subject, at_index)?;
             let harness = current_harness_at(&connection, &subject, at_index)?;
             let claims = claim_ids_at(&connection, &subject, at_index)?;
             let conflicts = desired_conflicts_at(
@@ -5174,7 +5195,7 @@ impl Store {
                 .and_then(|value| value.get("status"))
                 .and_then(Value::as_str);
             let unknown_claim = has_unknown_claim_at(&connection, &subject, at_index)?;
-            let reachability = if unknown_claim.is_some() {
+            let reachability = if unknown_claim.is_some() || actual_origin_conflict {
                 "indeterminate".to_owned()
             } else {
                 actual
@@ -5231,14 +5252,18 @@ impl Store {
                     reason: reason.clone(),
                 });
             }
-            let reason = unknown_claim
-                .map(|kind| format!("claim kind `{kind}` is not registered"))
+            let reason = actual_origin_conflict
+                .then(|| "concurrent runtime observations have indeterminate authority".to_owned())
                 .or_else(|| {
-                    actual
-                        .as_ref()
-                        .and_then(|value| value.get("reason"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
+                    unknown_claim
+                        .map(|kind| format!("claim kind `{kind}` is not registered"))
+                        .or_else(|| {
+                            actual
+                                .as_ref()
+                                .and_then(|value| value.get("reason"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
                 });
             let desired_value = desired
                 .as_ref()
@@ -5255,6 +5280,8 @@ impl Store {
                 desired_revision: desired.as_ref().map(|row| row.revision.clone()),
                 desired: desired_value,
                 actual,
+                actual_claim,
+                actual_origin,
                 harness,
                 conflicts,
                 claims,
@@ -5275,6 +5302,63 @@ impl Store {
 
     pub fn events_after(&self, after: u64, subject: Option<&str>) -> Result<Vec<EventRecord>> {
         self.events_after_filtered(after, subject, None)
+    }
+
+    pub fn events_after_bounded(&self, after: u64, limit: usize) -> Result<Vec<EventRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT store_index, kind, subject, body FROM events
+             WHERE store_index > ?1 ORDER BY store_index LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![after, limit.min(i64::MAX as usize) as i64], |row| {
+                let body = row.get::<_, String>(3)?;
+                Ok(EventRecord {
+                    store_index: row.get(0)?,
+                    kind: row.get(1)?,
+                    subject: row.get(2)?,
+                    body: serde_json::from_str(&body).unwrap_or(Value::Null),
+                })
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn event_bounds(&self) -> Result<(u64, u64)> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT COALESCE(MIN(store_index), 0), COALESCE(MAX(store_index), 0) FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prune_events_before(&self, retain_from: u64) -> Result<usize> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .execute("DELETE FROM events WHERE store_index < ?1", [retain_from])
+            .map_err(Into::into)
+    }
+
+    /// Return the acceptance time that deterministically names a projection at `store_index`.
+    /// Empty stores use Unix epoch; a projection never incorporates request wall-clock time.
+    pub fn projection_time_at(&self, store_index: u64) -> Result<u128> {
+        if store_index == 0 {
+            return Ok(0);
+        }
+        let connection = self.readers.get();
+        let value = connection
+            .query_row(
+                "SELECT accepted_at_unix_ms FROM claims WHERE store_index <= ?1 ORDER BY store_index DESC LIMIT 1",
+                [store_index],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or_default();
+        Ok(value)
     }
 
     pub fn events_after_filtered(
@@ -6492,6 +6576,182 @@ impl Store {
         let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(params![subject, kind], claim_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Aggregate durable provider usage without mixing context-window occupancy
+    /// with spend. Per incarnation, a cumulative total wins over response
+    /// deltas; otherwise the non-overlapping response deltas are summed.
+    pub fn usage_summary_at(
+        &self,
+        subject: &str,
+        incarnation: Option<&str>,
+        at_index: Option<u64>,
+    ) -> Result<Option<UsageSummary>> {
+        #[derive(Default)]
+        struct Spend {
+            cumulative: Option<(u64, u64, u64, u64, Option<f64>, Option<String>)>,
+            response_total: u64,
+            response_input: u64,
+            response_output: u64,
+            response_cached: u64,
+            response_cost: f64,
+            response_has_cost: bool,
+            response_currency: Option<String>,
+        }
+
+        let connection = self.readers.get();
+        let at_index = at_index.unwrap_or(i64::MAX as u64);
+        let mut statement = connection.prepare(
+            "SELECT store_index, body, accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='harness.usage' AND store_index<=?2
+             ORDER BY store_index",
+        )?;
+        let rows = statement.query_map(params![subject, at_index], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut spend = BTreeMap::<String, Spend>::new();
+        let mut context = None::<(u64, ContextUsage)>;
+        let mut saw = false;
+        for row in rows {
+            let (store_index, body, accepted_at) = row?;
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            let claim_incarnation = fields
+                .get("incarnation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if incarnation.is_some_and(|expected| expected != claim_incarnation) {
+                continue;
+            }
+            saw = true;
+            match fields.get("semantics").and_then(Value::as_str) {
+                Some("context_occupancy") => {
+                    context = Some((
+                        store_index,
+                        ContextUsage {
+                            used_tokens: fields.get("context_used_tokens").and_then(Value::as_u64),
+                            window_tokens: fields
+                                .get("context_window_tokens")
+                                .and_then(Value::as_u64),
+                            used_percent: fields
+                                .get("context_used_percent")
+                                .and_then(Value::as_f64),
+                            model: fields
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            observed_at_unix_ms: accepted_at.parse().unwrap_or_default(),
+                        },
+                    ));
+                }
+                Some("session_cumulative") => {
+                    let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let candidate = (
+                        total,
+                        fields
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields.get("cost").and_then(Value::as_f64),
+                        fields
+                            .get("currency")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
+                    if group
+                        .cumulative
+                        .as_ref()
+                        .is_none_or(|current| candidate.0 >= current.0)
+                    {
+                        group.cumulative = Some(candidate);
+                    }
+                }
+                Some("response") => {
+                    let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
+                    group.response_total = group.response_total.saturating_add(total);
+                    group.response_input = group.response_input.saturating_add(
+                        fields
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                    group.response_output = group.response_output.saturating_add(
+                        fields
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                    group.response_cached = group.response_cached.saturating_add(
+                        fields
+                            .get("cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                    if let Some(cost) = fields.get("cost").and_then(Value::as_f64) {
+                        group.response_cost += cost;
+                        group.response_has_cost = true;
+                    }
+                    if let Some(currency) = fields.get("currency").and_then(Value::as_str) {
+                        group.response_currency = Some(currency.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !saw {
+            return Ok(None);
+        }
+        let mut summary = UsageSummary {
+            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
+            context: context.map(|(_, value)| value),
+            ..UsageSummary::default()
+        };
+        let mut cost = 0.0;
+        let mut has_cost = false;
+        for group in spend.into_values() {
+            summary.incarnation_count += 1;
+            if let Some((total, input, output, cached, group_cost, currency)) = group.cumulative {
+                summary.total_tokens = summary.total_tokens.saturating_add(total);
+                summary.input_tokens = summary.input_tokens.saturating_add(input);
+                summary.output_tokens = summary.output_tokens.saturating_add(output);
+                summary.cached_tokens = summary.cached_tokens.saturating_add(cached);
+                if let Some(value) = group_cost {
+                    cost += value;
+                    has_cost = true;
+                }
+                summary.currency = summary.currency.or(currency);
+            } else {
+                summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
+                summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
+                summary.output_tokens = summary.output_tokens.saturating_add(group.response_output);
+                summary.cached_tokens = summary.cached_tokens.saturating_add(group.response_cached);
+                if group.response_has_cost {
+                    cost += group.response_cost;
+                    has_cost = true;
+                }
+                summary.currency = summary.currency.or(group.response_currency);
+            }
+        }
+        summary.cost = has_cost.then_some(cost);
+        Ok(Some(summary))
     }
 
     pub fn claims_page(
@@ -9945,13 +10205,13 @@ fn has_unknown_claim_at(
 fn validate_message_transition(
     transaction: &Transaction<'_>,
     input: &ClaimInput,
-) -> Result<(), St3Error> {
+) -> Result<bool, St3Error> {
     let requested = match input.kind.as_str() {
         "message.sent" => "sent",
         "message.delivered" => "delivered",
         "message.read" => "read",
         "message.closed" => "closed",
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     if !input.subject.starts_with("message/") {
         return Err(St3Error::new(
@@ -10003,6 +10263,9 @@ fn validate_message_transition(
             .filter(|kind| *kind == "message")
             .map(|_| "sent")
     };
+    if requested != "sent" && current == Some(requested) {
+        return Ok(true);
+    }
     let valid = matches!(
         (current, requested),
         (None, "sent")
@@ -10023,7 +10286,7 @@ fn validate_message_transition(
             ),
         ));
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10247,6 +10510,71 @@ fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Error>
 
 fn latest_actual(connection: &Connection, subject: &str) -> Result<Option<Value>> {
     latest_actual_at(connection, subject, None)
+}
+
+fn selected_actual_source_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+) -> Result<(Option<String>, Option<String>, bool)> {
+    let at_index = at_index.unwrap_or(i64::MAX as u64);
+    let mut statement = connection.prepare(
+        "SELECT id, kind, origin, predecessors FROM claims
+         WHERE subject=?1 AND store_index<=?2
+         ORDER BY store_index",
+    )?;
+    let rows = statement
+        .query_map(params![subject, at_index], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?).unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = rows
+        .iter()
+        .rev()
+        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .or_else(|| {
+            rows.iter().rev().find(|(_, kind, _, _)| {
+                kind != "intent.desired"
+                    && !kind.starts_with("harness.")
+                    && kind != "runtime.readiness-deadline-reached"
+            })
+        });
+    let Some((selected_id, _, selected_origin, _)) = selected else {
+        return Ok((None, None, false));
+    };
+    let predecessors = rows
+        .iter()
+        .map(|(id, _, _, predecessors)| (id.as_str(), predecessors.as_slice()))
+        .collect::<BTreeMap<_, _>>();
+    let descends_from = |ancestor: &str| {
+        let mut pending = vec![selected_id.as_str()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if current == ancestor {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(parents) = predecessors.get(current) {
+                pending.extend(parents.iter().map(String::as_str));
+            }
+        }
+        false
+    };
+    let runtime_conflict = rows.iter().any(|(id, kind, _, _)| {
+        kind == "runtime.observed" && id != selected_id && !descends_from(id)
+    });
+    Ok((
+        Some(selected_id.clone()),
+        Some(selected_origin.clone()),
+        runtime_conflict,
+    ))
 }
 
 fn latest_actual_at(
@@ -18488,9 +18816,74 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             "delivered",
         )
         .unwrap();
-        append("message.read", "read", Some("agent/worker"), "read").unwrap();
-        append("message.closed", "closed", Some("agent/worker"), "closed").unwrap();
+        let read = append("message.read", "read", Some("agent/worker"), "read").unwrap();
+        let repeated_read =
+            append("message.read", "read", Some("agent/worker"), "read-again").unwrap();
+        assert_eq!(repeated_read.id, read.id);
+        let closed = append("message.closed", "closed", Some("agent/worker"), "closed").unwrap();
+        let repeated_close = append(
+            "message.closed",
+            "closed",
+            Some("agent/worker"),
+            "closed-again",
+        )
+        .unwrap();
+        assert_eq!(repeated_close.id, closed.id);
         assert_eq!(store.messages(None, true).unwrap()[0].status, "closed");
+    }
+
+    #[test]
+    fn concurrent_message_close_converges_to_one_claim() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let subject = "message/concurrent-close";
+        for (kind, status, key) in [
+            ("message.sent", "sent", "concurrent-sent"),
+            ("message.delivered", "delivered", "concurrent-delivered"),
+            ("message.read", "read", "concurrent-read"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "message.closed".into(),
+                        actor: Some("agent/worker".into()),
+                        fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("concurrent-close-{index}")),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let records = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(records.iter().all(|record| record.id == records[0].id));
+        assert_eq!(
+            store
+                .claims_for(subject, Some("message.closed"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -21942,5 +22335,69 @@ message "human-attention" {
         let actual = store.latest_actual_value(subject).unwrap().unwrap();
         assert!(actual.get("deadline_unix_ms").is_none());
         assert!(actual.get("reason").is_none());
+    }
+
+    #[test]
+    fn usage_aggregation_separates_occupancy_and_deduplicates_cumulative_incarnations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("usage.sqlite"), "usage-node").unwrap();
+        let subject = "agent/usage-owner";
+        let append = |semantics: &str,
+                      incarnation: &str,
+                      total: Option<u64>,
+                      context_used: Option<u64>,
+                      key: &str| {
+            let mut fields = BTreeMap::from([
+                ("semantics".into(), Value::String(semantics.into())),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]);
+            if let Some(total) = total {
+                fields.insert("total_tokens".into(), Value::from(total));
+            }
+            if let Some(used) = context_used {
+                fields.insert("context_used_tokens".into(), Value::from(used));
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+        append("session_cumulative", "one", Some(100), None, "one-100");
+        append("response", "one", Some(10), None, "one-response");
+        append("session_cumulative", "one", Some(150), None, "one-150");
+        append("response", "two", Some(20), None, "two-response-1");
+        append("response", "two", Some(30), None, "two-response-2");
+        append(
+            "context_occupancy",
+            "two",
+            None,
+            Some(999),
+            "occupancy-arrived-last",
+        );
+
+        // The default path must use a SQLite-representable bound rather than u64::MAX.
+        let usage = store
+            .usage_summary_at(subject, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.total_tokens, 200);
+        assert_eq!(usage.incarnation_count, 2);
+        assert_eq!(usage.context.unwrap().used_tokens, Some(999));
+        assert_eq!(
+            store
+                .usage_summary_at(subject, Some("one"), None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            150
+        );
     }
 }

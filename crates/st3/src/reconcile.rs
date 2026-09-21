@@ -3854,22 +3854,17 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn mission_run_token_usage(&self, run: &MissionRunView) -> Result<u64> {
         let desired = self.store.desired_subjects()?;
-        Ok(desired
+        desired
             .iter()
             .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
-            .filter_map(|subject| {
-                self.store
-                    .latest_claim(&subject.subject, Some("harness.usage"))
-                    .ok()
-                    .flatten()
+            .try_fold(0_u64, |total, subject| {
+                Ok(total.saturating_add(
+                    self.store
+                        .usage_summary_at(&subject.subject, None, None)?
+                        .map(|usage| usage.total_tokens)
+                        .unwrap_or_default(),
+                ))
             })
-            .filter_map(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/total_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .sum())
     }
 
     fn loop_best(

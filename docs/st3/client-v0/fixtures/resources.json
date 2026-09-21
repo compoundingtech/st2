@@ -12,7 +12,19 @@
   {
     "id": "launch/release", "kind": "launch", "revision": "l2", "updated_at": "2026-09-20T11:02:00Z",
     "title": "Release", "phase": "review", "request": "Prepare the release mission.", "target": { "type": "new-mission" },
-    "variants": ["launch-variant/release/default"], "decisions": ["launch-decision/release/region"], "approvals": ["launch-approval/release/alex"]
+    "variants": ["launch-variant/release/default"], "decisions": ["launch-decision/release/region"], "approvals": ["launch-approval/release/alex"],
+    "visualization": {
+      "version": "st3.visualization.v0", "views": ["graph", "timeline"], "mission": "mission/release",
+      "nodes": [{"id":"step/build","kind":"step","label":"Build","path":"build","goals":["Build artifacts"],"constraints":["Pinned toolchain"],"assignment":null,"timeout_ms":60000,"retry":{},"gates":[],"loop":null,"resources":[],"source_references":[],"runtime":{"state":"ready"}}],
+      "edges": [{"id":"edge/build/deploy","kind":"dependency","from":"step/build","to":"step/deploy","gate":{"status":"completed"}}],
+      "groups": [{"id":"queue/release","kind":"queue","members":["step/build"]}],
+      "timeline": { "entries": [{"node":"step/build","ordinal":0}] },
+      "swimlanes": [{"id":"lane/0","assignment":"unassigned","nodes":["step/build"]}],
+      "goals": ["Ship release"], "constraints": [], "gates": [], "resources": [],
+      "decisions": [{"id":"launch-decision/release/region","kind":"launch-decision","revision":"ld1","updated_at":"2026-09-20T11:04:00Z","launch_id":"launch/release","question":"Which region?","state":"answered","requested_at":"2026-09-20T11:03:30Z","decision_type":"single-choice","options":[{"id":"eu","label":"Europe","description":"Deploy in the EU region"},{"id":"us","label":"United States"}],"response":{"type":"single-choice","value":"eu"},"explanation":"Keeps data residency in-region"}],
+      "revision": {"candidate":2}, "diffs": [{"changes":[{"path":"steps.build"}],"predicted_actions":[{"type":"restart"}]}],
+      "risk": {"blockers":[]}, "live_progress": {"state":"review"}
+    }
   },
   {
     "id": "launch-variant/release/default", "kind": "launch-variant", "revision": "lv2", "updated_at": "2026-09-20T11:03:00Z",
@@ -23,7 +35,9 @@
   {
     "id": "launch-decision/release/region", "kind": "launch-decision", "revision": "ld1", "updated_at": "2026-09-20T11:04:00Z",
     "launch_id": "launch/release", "question": "Which region?", "state": "answered", "requested_at": "2026-09-20T11:03:30Z",
-    "choices": ["eu", "us"], "answer": "eu"
+    "decision_type": "single-choice",
+    "options": [{"id":"eu","label":"Europe","description":"Deploy in the EU region"},{"id":"us","label":"United States"}],
+    "response": {"type":"single-choice","value":"eu"}, "explanation": "Keeps data residency in-region"
   },
   {
     "id": "launch-approval/release/alex", "kind": "launch-approval", "revision": "la1", "updated_at": "2026-09-20T11:05:00Z",
@@ -32,7 +46,9 @@
   },
   {
     "id": "mission/release", "kind": "mission", "revision": "mr7", "updated_at": "2026-09-20T11:06:00Z",
-    "title": "Release", "state": "running", "mission_revision": "sha256:mission7", "runs": ["mission-run/release/1"]
+    "title": "Release", "state": "running", "mission_revision": "sha256:mission7", "runs": ["mission-run/release/1"],
+    "run_generations": { "mission-run/release/1": "run-generation/release/1/g1" },
+    "visualization": { "version": "st3.visualization.v0", "views": ["graph"], "mission": "mission/release", "nodes": [], "edges": [], "groups": [], "timeline": { "entries": [] }, "swimlanes": [], "goals": ["Ship release"], "constraints": [], "gates": [], "resources": [], "decisions": [], "revision": {"current":"sha256:mission7"}, "diffs": [], "risk": {"blockers":[]}, "live_progress": {"state":"running"} }
   },
   {
     "id": "work/release/1/build", "kind": "work", "revision": "w4", "updated_at": "2026-09-20T11:07:00Z",
@@ -46,7 +62,7 @@
   },
   {
     "id": "runtime/release-agent", "kind": "runtime", "revision": "rt5", "updated_at": "2026-09-20T11:09:00Z",
-    "runtime_kind": "agent", "owner_id": "agent/release", "state": "running", "runtime_id": "runtime-9",
+    "runtime_kind": "agent", "owner_id": "agent/release", "owner_host_id": "host/host-a", "state": "running", "runtime_id": "runtime-9",
     "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3"
   },
   {

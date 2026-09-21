@@ -1285,6 +1285,8 @@ mod tests {
                     "terminal": true
                 }
             })),
+            actual_claim: Some("claim/actual".into()),
+            actual_origin: Some("test-node".into()),
             harness: None,
             conflicts: Vec::new(),
             claims: vec!["claim/actual".into()],

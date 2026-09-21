@@ -372,6 +372,7 @@ async fn client_post_json(app: axum::Router, uri: &str, body: Value) -> (StatusC
             Request::builder()
                 .method("POST")
                 .uri(uri)
+                .header("x-st3-person", "person/nathan")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -401,6 +402,54 @@ async fn client_json_auth(app: axum::Router, uri: &str, credential: &str) -> (St
     (status, value)
 }
 
+async fn client_post_json_auth(
+    app: axum::Router,
+    uri: &str,
+    credential: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
+async fn client_post_json_person(
+    app: axum::Router,
+    uri: &str,
+    person: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("x-st3-person", person)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
 #[tokio::test]
 async fn completed_read_surface_is_versioned_and_cursor_gaps_require_resync() {
     let root = tempfile::tempdir().unwrap();
@@ -419,9 +468,75 @@ async fn completed_read_surface_is_versioned_and_cursor_gaps_require_resync() {
 }
 
 #[tokio::test]
+async fn unchanged_store_index_names_one_stable_snapshot_and_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let app = st3::api::router(state.clone());
+
+    let (_, empty_first) = client_json(app.clone(), "/v1/client/capabilities").await;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let (_, empty_second) = client_json(app.clone(), "/v1/client/capabilities").await;
+    assert_eq!(empty_first["snapshot"], empty_second["snapshot"]);
+    assert_eq!(empty_first["value"], empty_second["value"]);
+    assert_eq!(empty_first["snapshot"]["store_index"], 0);
+    assert_eq!(
+        empty_first["snapshot"]["created_at"],
+        "1970-01-01T00:00:00.000Z"
+    );
+
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "agent/stable-snapshot".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/stable-snapshot".into()),
+            fields: std::collections::BTreeMap::from([
+                ("runtime_id".into(), Value::String("stable-runtime".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("stable-runtime:i1".into()),
+                ),
+                ("status".into(), Value::String("running".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    for path in ["/v1/client/runtimes", "/v1/client/operations"] {
+        let (_, first) = client_json(app.clone(), path).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let (_, second) = client_json(app.clone(), path).await;
+        assert_eq!(first["snapshot"], second["snapshot"], "{path}");
+        assert_eq!(first["value"], second["value"], "{path}");
+    }
+
+    let (_, before) = client_json(app.clone(), "/v1/client/agents?limit=1").await;
+    state
+        .store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "agent/snapshot-changed".into(),
+            kind: "runtime.observed".into(),
+            actor: Some("agent/snapshot-changed".into()),
+            fields: std::collections::BTreeMap::from([
+                ("runtime_id".into(), Value::String("changed-runtime".into())),
+                ("status".into(), Value::String("running".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let (_, after) = client_json(app, "/v1/client/capabilities").await;
+    assert_ne!(before["snapshot"]["id"], after["snapshot"]["id"]);
+}
+
+#[tokio::test]
 async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let root = tempfile::tempdir().unwrap();
-    let app = st3::api::router(test_state(root.path()));
+    let state = test_state(root.path());
+    let app = st3::api::router(state.clone());
+    let fabric = st3::api::fabric_router(state);
     let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
     let snapshot = capabilities["snapshot"]["id"].as_str().unwrap();
     let action = serde_json::json!({
@@ -444,7 +559,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
         app.clone(),
         "/v1/client/pairings",
         serde_json::json!({
-            "api_version": "st3.client.v0", "device_name": "Test phone"
+            "api_version": "st3.client.v0", "device_name": "Test phone", "person_id": "person/nathan"
         }),
     )
     .await;
@@ -466,7 +581,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     assert!(credential.len() >= 32);
     let device = paired["value"]["device_id"].as_str().unwrap();
     let (status, remote_capabilities) =
-        client_json_auth(app.clone(), "/v1/client/capabilities", credential).await;
+        client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
     assert_eq!(status, StatusCode::OK, "{remote_capabilities}");
     assert_eq!(remote_capabilities["value"]["transport"], "fabric-loopback");
     let (status, reused) = client_post_json(
@@ -486,8 +601,271 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     });
     let (status, revoked) = client_post_json(app.clone(), "/v1/client/actions", revoke).await;
     assert_eq!(status, StatusCode::OK, "{revoked}");
-    let (status, denied) = client_json_auth(app, "/v1/client/capabilities", credential).await;
+    let (status, denied) = client_json_auth(fabric, "/v1/client/capabilities", credential).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+}
+
+#[tokio::test]
+async fn paired_credential_exercises_only_its_exact_person_delegation() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    for (subject, reviewer) in [
+        ("attention/nathan-paired", "person/nathan"),
+        ("attention/alex-paired", "person/alex"),
+    ] {
+        store
+            .request_attention(
+                subject,
+                &st3::model::AttentionRequest {
+                    reviewer: reviewer.into(),
+                    title: format!("Attention for {reviewer}"),
+                    reason: "Paired authority conformance".into(),
+                    severity: "error".into(),
+                    targets: vec!["mission/paired-proof".into()],
+                    actor: "daemon/runtime".into(),
+                    idempotency_key: format!("paired-{subject}"),
+                },
+            )
+            .unwrap();
+    }
+    let local = st3::api::router(state.clone());
+    let fabric = st3::api::fabric_router(state.clone());
+
+    let (status, challenge) = client_post_json_person(
+        local.clone(),
+        "/v1/client/pairings",
+        "person/nathan",
+        serde_json::json!({
+            "api_version": "st3.client.v0", "device_name": "Nathan's phone", "person_id": "person/nathan"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let (status, paired) = client_post_json(
+        local.clone(),
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "code": challenge["value"]["code"],
+            "device_public_key": "paired-authority-public-key-000000000000000000"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    assert_eq!(paired["value"]["person_id"], "person/nathan");
+    let credential = paired["value"]["credential"].as_str().unwrap();
+
+    let (status, capabilities) =
+        client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    let capability_state = |id: &str| {
+        capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == id)
+            .unwrap()["state"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(capability_state("attention.resolve"), "granted");
+    assert_eq!(capability_state("launch.create"), "granted");
+    assert_eq!(capability_state("message.send"), "ungranted");
+
+    let (status, attention) =
+        client_json_auth(fabric.clone(), "/v1/client/attention", credential).await;
+    assert_eq!(status, StatusCode::OK, "{attention}");
+    let item = |id: &str| {
+        attention["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap()
+    };
+    let nathan = item("attention/nathan-paired");
+    let resolve = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-attention-nathan",
+        "type": "attention.resolve", "idempotency_key": "paired-attention-nathan-0001",
+        "fence": {
+            "snapshot_id": attention["snapshot"]["id"],
+            "subject_revisions": { "attention/nathan-paired": nathan["revision"] }
+        },
+        "parameters": { "attention_id": "attention/nathan-paired", "outcome": "resolved" }
+    });
+    let (status, resolved) =
+        client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, resolve).await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+
+    let (_, attention) = client_json_auth(fabric.clone(), "/v1/client/attention", credential).await;
+    let alex = attention["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "attention/alex-paired")
+        .unwrap();
+    let cross_attention = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-attention-alex",
+        "type": "attention.resolve", "idempotency_key": "paired-attention-alex-000001",
+        "fence": {
+            "snapshot_id": attention["snapshot"]["id"],
+            "subject_revisions": { "attention/alex-paired": alex["revision"] }
+        },
+        "parameters": { "attention_id": "attention/alex-paired", "outcome": "resolved" }
+    });
+    let (status, denied) = client_post_json_auth(
+        fabric.clone(),
+        "/v1/client/actions",
+        credential,
+        cross_attention,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+
+    let (_, current) =
+        client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
+    let ungranted = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-message-denied",
+        "type": "message.send", "idempotency_key": "paired-message-denied-0001",
+        "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "to": "person/nathan", "content": "not delegated" }
+    });
+    let (status, _) =
+        client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, ungranted).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let spoofed = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-spoof-denied",
+        "type": "attention.resolve", "idempotency_key": "paired-spoof-denied-0001",
+        "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "attention_id": "attention/alex-paired", "outcome": "resolved", "actor": "person/alex" }
+    });
+    let (status, _) =
+        client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, spoofed).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (_, current) =
+        client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
+    let create = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-launch-create",
+        "type": "launch.create", "idempotency_key": "paired-launch-create-0001",
+        "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": {
+            "title": "Nathan launch", "request": "Draft a paired mission.",
+            "target": { "type": "new-mission", "mission_id": "mission/paired-nathan", "workspace": workspace }
+        }
+    });
+    let (status, created) =
+        client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, create).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let launch_id = created["value"]["affected_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        store
+            .planning_session(launch_id.trim_start_matches("launch/"))
+            .unwrap()
+            .unwrap()
+            .requester,
+        "person/nathan"
+    );
+
+    let (status, alex_launch) = client_post_json_person(
+        local.clone(),
+        "/v1/launches",
+        "person/alex",
+        serde_json::to_value(st3::model::PlanningSessionStartRequest {
+            mission: "paired-alex".into(),
+            run: None,
+            request: b"Draft Alex's mission.".to_vec(),
+            workspace: workspace.display().to_string(),
+            requester: Some("person/alex".into()),
+            model: None,
+            effort: None,
+            idempotency_key: "paired-alex-launch-0001".into(),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{alex_launch}");
+    let alex_session_id = alex_launch["value"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("unexpected launch response: {alex_launch}"));
+    let alex_id = format!("launch/{alex_session_id}");
+    let (_, alex_detail) = client_json_auth(
+        fabric.clone(),
+        &format!("/v1/client/launches/{}", alex_session_id),
+        credential,
+    )
+    .await;
+    let cross_launch = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-launch-alex-cancel",
+        "type": "launch.cancel", "idempotency_key": "paired-launch-alex-cancel-01",
+        "fence": {
+            "snapshot_id": alex_detail["snapshot"]["id"],
+            "subject_revisions": { (alex_id.clone()): alex_detail["value"]["revision"] }
+        },
+        "parameters": { "target_id": alex_id }
+    });
+    let (status, denied) = client_post_json_auth(
+        fabric.clone(),
+        "/v1/client/actions",
+        credential,
+        cross_launch,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+    let expired_credential = "expired-paired-credential-000000000000000000";
+    store
+        .append_claim(&st3::model::ClaimInput {
+            subject: "custom/client/pairing-expired-proof".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/nathan".into()),
+            fields: std::collections::BTreeMap::from([
+                (
+                    "credential_hash".into(),
+                    Value::String(hex::encode(Sha256::digest(expired_credential.as_bytes()))),
+                ),
+                ("person_id".into(), Value::String("person/nathan".into())),
+                (
+                    "session_actor".into(),
+                    Value::String("person/nathan/session/expired".into()),
+                ),
+                ("scopes".into(), serde_json::json!(["read.projections"])),
+                ("expires_at_unix_ms".into(), serde_json::json!(1)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let (status, _) = client_json_auth(
+        fabric.clone(),
+        "/v1/client/capabilities",
+        expired_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (_, local_capabilities) = client_json(local.clone(), "/v1/client/capabilities").await;
+    let revoke = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/paired-revoke-proof",
+        "type": "pairing.revoke", "idempotency_key": "paired-revoke-proof-00001",
+        "fence": { "snapshot_id": local_capabilities["snapshot"]["id"], "subject_revisions": {} },
+        "parameters": { "target_id": paired["value"]["device_id"] }
+    });
+    let (status, revoked) = client_post_json(local, "/v1/client/actions", revoke).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (status, _) = client_json_auth(fabric, "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -524,7 +902,7 @@ async fn core_launch_and_mission_actions_use_session_identity_and_exact_fences()
         .to_owned();
     let session_id = launch_id.trim_start_matches("launch/");
     let session = store.planning_session(session_id).unwrap().unwrap();
-    assert_eq!(session.requester, "person/local/session/unix");
+    assert_eq!(session.requester, "person/nathan");
 
     let (status, current) =
         client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;

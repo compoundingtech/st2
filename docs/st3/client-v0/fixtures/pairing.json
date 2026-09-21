@@ -6,8 +6,8 @@
     "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:01Z"
   },
   "value": {
-    "kind": "paired-session", "device_id": "device/phone-7", "session_actor": "person/alex/session/device-7",
-    "credential": "fixture-only-not-a-real-secret-000000000000", "scopes": ["read.projections", "terminal.read"],
+    "kind": "paired-session", "device_id": "device/phone-7", "person_id": "person/alex", "session_actor": "person/alex/session/device-7",
+    "credential": "fixture-only-not-a-real-secret-000000000000", "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"],
     "expires_at": "2026-10-20T12:00:01Z"
   }
 }

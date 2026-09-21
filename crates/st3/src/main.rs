@@ -22,8 +22,9 @@ use st3::model::{
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
-    LaunchDecisionRequest, LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest,
-    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
+    LaunchStartRequest, MessageLifecycleRequest, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
@@ -423,8 +424,11 @@ struct LaunchRunArgs {
 struct LaunchQuestionArgs {
     session: String,
     question: String,
-    #[arg(long = "choice", required = true)]
-    choices: Vec<String>,
+    #[arg(long = "type", value_parser = parse_launch_decision_type)]
+    decision_type: LaunchDecisionType,
+    /// Structured JSON option: {"id":"stable-id","label":"Label","description":"optional"}.
+    #[arg(long = "option", value_parser = parse_launch_decision_option)]
+    options: Vec<LaunchDecisionOption>,
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
 }
@@ -433,7 +437,11 @@ struct LaunchQuestionArgs {
 struct LaunchAnswerArgs {
     session: String,
     decision: String,
-    answer: String,
+    /// Structured JSON response such as {"type":"multiple-choice","value":["a","b"]}.
+    #[arg(value_parser = parse_launch_decision_response)]
+    response: LaunchDecisionResponse,
+    #[arg(long)]
+    explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
     #[arg(long = "as")]
@@ -1651,7 +1659,8 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                     &LaunchDecisionRequest {
                         actor: args.actor,
                         question: args.question,
-                        choices: args.choices,
+                        decision_type: args.decision_type,
+                        options: args.options,
                         idempotency_key: format!("launch-question:{nonce}"),
                     },
                 )
@@ -1668,7 +1677,8 @@ async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) 
                     ),
                     &LaunchDecisionAnswerRequest {
                         actor: args.actor.unwrap_or_else(|| "person/requester".into()),
-                        answer: args.answer,
+                        response: args.response,
+                        explanation: args.explanation,
                         expected_revision: args.expected_revision,
                         idempotency_key: format!("launch-answer:{nonce}"),
                     },
@@ -2653,7 +2663,9 @@ async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> 
             |_| String::new(),
         );
         let events: Vec<EventRecord> = client
-            .get(&format!("/v1/events?after={cursor}{scope}"))
+            .get(&format!(
+                "/v1/events?after={cursor}{scope}&wait=true&timeout_ms=30000"
+            ))
             .await?;
         for event in events {
             cursor = cursor.max(event.store_index);
@@ -4223,33 +4235,26 @@ async fn run_harness_diagnostic(
     json_output: bool,
 ) -> Result<()> {
     let actor = normalize_agent_subject(&args.actor);
-    let mut fields = BTreeMap::from([
-        ("code".into(), Value::String(args.code.clone())),
-        ("reason".into(), Value::String(args.reason.clone())),
-        ("severity".into(), Value::String(args.severity)),
-        ("status".into(), Value::String(args.status)),
-    ]);
-    if let Some(incarnation) = &args.incarnation {
-        fields.insert("incarnation_id".into(), Value::String(incarnation.clone()));
-    }
     let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
         actor.as_str(),
         args.incarnation.as_deref(),
         args.code.as_str(),
         args.reason.as_str(),
+        args.severity.as_str(),
+        args.status.as_str(),
     ))?));
     let response: ClaimRecord = client
         .post(
-            "/v1/claims",
-            &ClaimInput {
-                subject: actor.clone(),
-                kind: "harness.diagnostic".into(),
-                actor: Some(actor),
-                fields,
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!("harness-diagnostic:{}", &digest[..32])),
-            },
+            "/v1/diagnostics/harness",
+            &json!({
+                "actor": actor,
+                "code": args.code,
+                "reason": args.reason,
+                "severity": args.severity,
+                "status": args.status,
+                "incarnation_id": args.incarnation,
+                "idempotency_key": format!("harness-diagnostic:{}", &digest[..32]),
+            }),
         )
         .await?;
     if json_output {
@@ -6193,6 +6198,7 @@ async fn run_st2_native_driver(
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
+    let mut last_usage_fingerprint = None;
     let mut ready = false;
     let mut last_control_warning = None;
     loop {
@@ -6207,6 +6213,10 @@ async fn run_st2_native_driver(
                         fields: BTreeMap::from([
                             ("status".into(), Value::String("exited".into())),
                             ("runtime_id".into(), Value::String(runtime_id.clone())),
+                            (
+                                "incarnation_id".into(),
+                                Value::String(incarnation.clone()),
+                            ),
                             ("exit_code".into(), Value::from(if outcome.is_ok() { 0 } else { 1 })),
                         ]),
                         evidence: Vec::new(),
@@ -6260,6 +6270,15 @@ async fn run_st2_native_driver(
                             Some(&incarnation),
                             &observed,
                             &mut last_activity_fingerprint,
+                        )
+                        .await?;
+                        publish_harness_usage(
+                            client,
+                            subject,
+                            driver,
+                            &incarnation,
+                            &agent_dir,
+                            &mut last_usage_fingerprint,
                         )
                         .await?;
                     }
@@ -6480,6 +6499,98 @@ async fn publish_harness_activity(
             },
         )
         .await?;
+    *last_fingerprint = Some(fingerprint);
+    Ok(())
+}
+
+async fn publish_harness_usage(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    incarnation: &str,
+    agent_dir: &Path,
+    last_fingerprint: &mut Option<String>,
+) -> Result<()> {
+    let Some(observed) =
+        st2::harness_context::read(&st2::harness_context::harness_context_path(agent_dir))
+    else {
+        return Ok(());
+    };
+    // A context-window occupancy reading and cumulative session spend are
+    // different measurements. Publish them as distinct durable records; never
+    // manufacture response-token buckets from occupancy.
+    let mut readings = Vec::new();
+    if observed.used_tokens.is_some()
+        || observed.window_tokens.is_some()
+        || observed.used_percent.is_some()
+    {
+        let mut fields = BTreeMap::from([
+            (
+                "semantics".into(),
+                Value::String("context_occupancy".into()),
+            ),
+            ("driver".into(), Value::String(driver.into())),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+        ]);
+        if let Some(value) = observed.used_tokens {
+            fields.insert("context_used_tokens".into(), Value::from(value));
+        }
+        if let Some(value) = observed.window_tokens {
+            fields.insert("context_window_tokens".into(), Value::from(value));
+        }
+        if let Some(value) = observed.used_percent {
+            fields.insert("context_used_percent".into(), Value::from(value));
+        }
+        if let Some(value) = &observed.model {
+            fields.insert("model".into(), Value::String(value.clone()));
+        }
+        readings.push(fields);
+    }
+    if let Some(total) = observed.session_total_tokens {
+        let mut fields = BTreeMap::from([
+            (
+                "semantics".into(),
+                Value::String("session_cumulative".into()),
+            ),
+            ("driver".into(), Value::String(driver.into())),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+            ("total_tokens".into(), Value::from(total)),
+        ]);
+        if let Some(value) = observed.cost_usd {
+            fields.insert("cost".into(), Value::from(value));
+            fields.insert("currency".into(), Value::String("USD".into()));
+        }
+        if let Some(value) = &observed.model {
+            fields.insert("model".into(), Value::String(value.clone()));
+        }
+        readings.push(fields);
+    }
+    if readings.is_empty() {
+        return Ok(());
+    }
+    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&readings)?));
+    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    for fields in readings {
+        let semantics = fields["semantics"].as_str().unwrap_or("unknown").to_owned();
+        let _: ClaimRecord = client
+            .post(
+                "/v1/claims",
+                &ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "harness-usage:{subject}:{incarnation}:{semantics}:{fingerprint}"
+                    )),
+                },
+            )
+            .await?;
+    }
     *last_fingerprint = Some(fingerprint);
     Ok(())
 }
@@ -6753,6 +6864,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut ready = false;
+    let mut last_usage_fingerprint = None;
     let mut last_control_warning = None;
     loop {
         tokio::select! {
@@ -6818,6 +6930,15 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                             idempotency_key: Some(format!("codex-activity:{subject}:{fingerprint}")),
                         }).await?;
                     }
+                    publish_harness_usage(
+                        client,
+                        subject,
+                        "codex",
+                        &incarnation,
+                        &agent_dir,
+                        &mut last_usage_fingerprint,
+                    )
+                    .await?;
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
@@ -7437,6 +7558,22 @@ fn parse_input(value: &str) -> Result<(String, String), String> {
         return Err("a mission input name is invalid".into());
     }
     Ok((name.into(), value.into()))
+}
+
+fn parse_launch_decision_type(value: &str) -> Result<LaunchDecisionType, String> {
+    serde_json::from_value(Value::String(value.to_owned())).map_err(|_| {
+        "decision type must be boolean, single-choice, multiple-choice, or rank".into()
+    })
+}
+
+fn parse_launch_decision_option(value: &str) -> Result<LaunchDecisionOption, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("invalid structured decision option: {error}"))
+}
+
+fn parse_launch_decision_response(value: &str) -> Result<LaunchDecisionResponse, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("invalid structured decision response: {error}"))
 }
 
 fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<String, String>> {

@@ -153,6 +153,35 @@ pub struct DesiredSubject {
     pub owner_step: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct UsageSummary {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    pub incarnation_count: usize,
+    pub aggregation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub observed_at_unix_ms: u128,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MissionState {
@@ -837,17 +866,47 @@ pub struct PlanningApprovalRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchDecisionType {
+    Boolean,
+    SingleChoice,
+    MultipleChoice,
+    Rank,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LaunchDecisionOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value", rename_all = "kebab-case")]
+pub enum LaunchDecisionResponse {
+    Boolean(bool),
+    SingleChoice(String),
+    MultipleChoice(Vec<String>),
+    Rank(Vec<String>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LaunchDecisionRequest {
     pub actor: String,
     pub question: String,
-    pub choices: Vec<String>,
+    pub decision_type: LaunchDecisionType,
+    #[serde(default)]
+    pub options: Vec<LaunchDecisionOption>,
     pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LaunchDecisionAnswerRequest {
     pub actor: String,
-    pub answer: String,
+    pub response: LaunchDecisionResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
     pub expected_revision: u32,
     pub idempotency_key: String,
 }
@@ -1091,6 +1150,10 @@ pub struct SubjectStatus {
     pub desired_revision: Option<String>,
     pub desired: Option<Value>,
     pub actual: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_claim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<CurrentHarnessView>,
     pub conflicts: Vec<String>,

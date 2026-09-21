@@ -182,12 +182,15 @@ missing mutations or request graph replication.
 
 ## Pairing and remote access
 
-Pairing is device-to-person and requires an authenticated person on the local Unix API to begin.
+Pairing is device-to-person. Its begin request names the concrete initiating `person/*` identity and
+is accepted only on the trusted local Unix API; the daemon persists that person as the delegator.
 The response shows a short-lived single-use code and pairing ID. A remote device reaches the
 loopback gateway through Fabric, proves the code, supplies its public key, and receives a scoped
-credential bound to that key. The resulting session returns its derived actor and granted scopes.
+credential bound to that key. The resulting session returns the exact delegated person, its derived
+device-session actor, and granted scopes.
 Pairing codes expire after five minutes, reveal no fleet secret, and cannot request their own actor
-or scopes. Revocation takes effect for new requests and closes active feeds and terminal streams.
+or scopes. Revocation takes effect for every subsequent request, including a new bounded terminal
+WebSocket exchange.
 
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
@@ -195,16 +198,19 @@ must distinguish unavailable, ungranted, and unsupported features.
 
 ## Terminal protocol
 
-Terminal access is a client protocol, not raw PTY ownership. `terminal.attach` returns a short-lived,
-single-use stream capability and a WebSocket URL on the same Unix or loopback gateway. The WebSocket
-subprotocol is `st3.client.terminal.v0`. The first server message is an atomic screen snapshot with
-runtime incarnation, dimensions, cursor state, title, ordered screen lines, and `next_sequence`.
-
-Subsequent server frames have contiguous sequence numbers and are one of `output`, `resize`,
-`title`, `bell`, `exit`, or `resync`. On reconnect, the client supplies the runtime incarnation and
-last applied sequence. The server resumes while retained; otherwise it sends a new atomic screen
-snapshot. A changed incarnation always requires a new snapshot. Input and resize are fenced typed
-actions. Attach and detach affect only the viewer; detaching never stops the runtime.
+Terminal access is a client protocol, not raw PTY ownership. V0 exposes a real but bounded viewer
+lifecycle rather than an unbounded push feed. `terminal.attach` returns a short-lived, single-use
+stream capability and URL bound to the authenticated session, terminal, and runtime incarnation;
+`terminal.detach` idempotently invalidates that viewer. A client opens the URL on the same Unix or
+Fabric-loopback gateway with WebSocket subprotocol `st3.client.terminal.v0`. Authentication,
+single-use capability consumption, and runtime-incarnation validation happen before upgrade.
+The first server message is an atomic screen snapshot with runtime incarnation, dimensions, cursor
+state, title, ordered screen lines, and `next_sequence`. The optional second message is one bounded,
+resume-fenced frame page; the server then closes explicitly. `after == next_sequence` produces an
+empty page, while any other retained/resume position produces a bounded `resync` frame carrying the
+atomic screen. A changed incarnation rejects the exchange, so the client reconnects with the new
+incarnation. Reconnect requires a fresh `terminal.attach`, providing explicit reattach/resync
+semantics. Input and resize remain fenced typed actions.
 
 Read-only terminal scope permits screen snapshots and frames but rejects input and resize. Frame and
 screen payloads obey negotiated byte limits and use explicit `redacted` or `truncated` markers.
@@ -214,7 +220,8 @@ screen payloads obey negotiated byte limits and use explicit `redacted` or `trun
 Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe message,
 `retryable`, structured details, and optional `retry_after_ms`. Required v0 codes are `not-found`,
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
-`cursor-gap`, `page-cursor-expired`, `rate-limited`, and `internal`.
+`cursor-gap`, `page-cursor-expired`, `rate-limited`, `runtime-not-local`,
+`runtime-authority-indeterminate`, and `internal`.
 
 Adding optional fields is compatible. Removing or retyping a field, changing ordering or token
 rules, adding a required action parameter, or changing action semantics requires a new capability

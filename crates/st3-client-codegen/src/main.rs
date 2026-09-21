@@ -2,7 +2,14 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
+const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
+const SWIFT_MODELS_TEMPLATE: &str = include_str!("../templates/Models.swift.in");
+const SWIFT_CLIENT_TEMPLATE: &str = include_str!("../templates/Client.swift.in");
 
 fn main() -> Result<()> {
     let check = std::env::args()
@@ -14,13 +21,46 @@ fn main() -> Result<()> {
     let operations_bytes = std::fs::read(&operations_path).context("read operations manifest")?;
     let schema_bytes = std::fs::read(&schema_path).context("read client schema")?;
     let operations: Value = serde_json::from_slice(&operations_bytes)?;
+    let schema: Value = serde_json::from_slice(&schema_bytes)?;
     let actions = operations["actions"]
         .as_object()
         .context("actions object")?;
     let reads = operations["reads"].as_array().context("reads array")?;
     let digest = hex_digest(&[&schema_bytes, &operations_bytes]);
-    let rust = rust_contract(&digest, actions.keys().map(String::as_str), reads)?;
+    let rust = format_rust(&rust_contract(
+        &digest,
+        actions.keys().map(String::as_str),
+        reads,
+    )?)?;
     let swift = swift_contract(&digest, actions.keys().map(String::as_str), reads)?;
+    let rust_models = format_rust(&render_marker(
+        RUST_MODELS_TEMPLATE,
+        "    // @st3-codegen:rust-action-constructors",
+        &rust_action_constructors(actions)?,
+    )?)?;
+    let rust_client = format_rust(&render_marker(
+        RUST_CLIENT_TEMPLATE,
+        "    // @st3-codegen:rust-operation-methods",
+        &rust_operation_methods(reads, actions)?,
+    )?)?;
+    let swift_models = render_marker(
+        SWIFT_MODELS_TEMPLATE,
+        "    // @st3-codegen:swift-action-constructors",
+        &swift_action_constructors(actions)?,
+    )?;
+    let swift_client = render_marker(
+        SWIFT_CLIENT_TEMPLATE,
+        "    // @st3-codegen:swift-operation-methods",
+        &swift_operation_methods(reads, actions)?,
+    )?;
+    validate_surfaces(
+        &schema,
+        &operations,
+        &rust_models,
+        &rust_client,
+        &swift_models,
+        &swift_client,
+    )?;
     output(
         &root.join("crates/st3-client/src/contract.rs"),
         &rust,
@@ -31,6 +71,453 @@ fn main() -> Result<()> {
         &swift,
         check,
     )?;
+    output(
+        &root.join("crates/st3-client/src/generated.rs"),
+        &rust_models,
+        check,
+    )?;
+    output(
+        &root.join("crates/st3-client/src/lib.rs"),
+        &rust_client,
+        check,
+    )?;
+    output(
+        &root.join("clients/swift/St3Client/Sources/St3Client/Models.swift"),
+        &swift_models,
+        check,
+    )?;
+    output(
+        &root.join("clients/swift/St3Client/Sources/St3Client/Client.swift"),
+        &swift_client,
+        check,
+    )?;
+    Ok(())
+}
+
+fn format_rust(source: &str) -> Result<String> {
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start rustfmt for generated Rust client artifact")?;
+    child
+        .stdin
+        .take()
+        .context("open rustfmt stdin")?
+        .write_all(source.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "rustfmt rejected generated Rust client artifact: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout).context("rustfmt emitted non-UTF-8")
+}
+
+fn render_marker(template: &str, marker: &str, generated: &str) -> Result<String> {
+    if template.matches(marker).count() != 1 {
+        bail!("template must contain exactly one `{marker}` marker");
+    }
+    Ok(template.replace(marker, generated))
+}
+
+fn action_parameter<'a>(action: &str, definition: &'a Value) -> Result<&'a str> {
+    definition["parameters"]
+        .as_str()
+        .with_context(|| format!("action `{action}` has no parameter model"))
+}
+
+fn action_method(action: &str) -> String {
+    action.replace(['.', '-'], "_")
+}
+
+fn rust_action_constructors(actions: &serde_json::Map<String, Value>) -> Result<String> {
+    let mut out = String::new();
+    for (action, definition) in actions {
+        let method = action_method(action);
+        let variant = pascal(action);
+        let parameters = action_parameter(action, definition)?;
+        writeln!(
+            out,
+            "    pub fn {method}(id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Self, serde_json::Error> {{\n        Self::new(id, ActionType::{variant}, idempotency_key, fence, &parameters)\n    }}"
+        )?;
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn swift_action_constructors(actions: &serde_json::Map<String, Value>) -> Result<String> {
+    let mut out = String::new();
+    for (action, definition) in actions {
+        let method = lower_camel(&pascal(action));
+        let action_case = lower_camel(&pascal(action));
+        let parameters = action_parameter(action, definition)?;
+        writeln!(
+            out,
+            "    public static func {method}(id: String, idempotencyKey: String, fence: Fence, parameters: {parameters}) throws -> Self {{ try .init(id: id, type: .{action_case}, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }}"
+        )?;
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn rust_operation_methods(
+    reads: &[Value],
+    actions: &serde_json::Map<String, Value>,
+) -> Result<String> {
+    let mut out = String::new();
+    for read in reads {
+        let id = read["id"].as_str().context("read id")?;
+        let path = read["path"].as_str().context("read path")?;
+        let method = action_method(id);
+        if id == "capabilities.get" {
+            writeln!(
+                out,
+                "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
+            )?;
+        } else if id == "timeline.list" {
+            writeln!(
+                out,
+                "    pub async fn timeline(&self, session_id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<TimelinePage>, ClientError> {{ self.timeline_page_internal(session_id, cursor, limit).await }}"
+            )?;
+        } else if id == "events.list" {
+            writeln!(
+                out,
+                "    pub async fn events(&self, after: Option<&str>, limit: Option<usize>, wait_ms: Option<u64>) -> Result<Envelope<EventPage>, ClientError> {{ self.events_internal(after, limit, wait_ms).await }}"
+            )?;
+        } else if id == "terminal.screen" {
+            writeln!(
+                out,
+                "    pub async fn terminal_screen(&self, terminal_id: &str) -> Result<Envelope<TerminalScreen>, ClientError> {{ self.terminal_screen_internal(terminal_id).await }}"
+            )?;
+        } else if id.ends_with(".get") {
+            let collection = path
+                .trim_start_matches("/v1/client/")
+                .split('/')
+                .next()
+                .context("read collection")?;
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {{ self.resource_internal(\"{collection}\", id).await }}"
+            )?;
+        } else if id.starts_with("launch-") {
+            let child = id.trim_start_matches("launch-").trim_end_matches(".list");
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, launch_id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<Page>, ClientError> {{ self.launch_children(launch_id, \"{child}\", cursor, limit).await }}"
+            )?;
+        } else if id.ends_with(".list") {
+            let collection = path
+                .trim_start_matches("/v1/client/")
+                .split('/')
+                .next()
+                .context("read collection")?;
+            writeln!(
+                out,
+                "    pub async fn {method}(&self, cursor: Option<&str>, limit: Option<usize>, history: bool) -> Result<Envelope<Page>, ClientError> {{ self.list_internal(\"{collection}\", cursor, limit, history).await }}"
+            )?;
+        } else {
+            bail!("no Rust read surface renderer for `{id}`");
+        }
+    }
+    for (action, definition) in actions {
+        let method = action_method(action);
+        let parameters = action_parameter(action, definition)?;
+        writeln!(
+            out,
+            "    pub async fn {method}(&self, id: impl Into<String>, idempotency_key: impl Into<String>, fence: Fence, parameters: {parameters}) -> Result<Envelope<ActionResult>, ClientError> {{ let request = ActionRequest::{method}(id, idempotency_key, fence, parameters).map_err(|error| ClientError::Protocol(error.to_string()))?; self.action_internal(&request).await }}"
+        )?;
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn swift_operation_methods(
+    reads: &[Value],
+    actions: &serde_json::Map<String, Value>,
+) -> Result<String> {
+    let mut out = String::new();
+    for read in reads {
+        let id = read["id"].as_str().context("read id")?;
+        let path = read["path"].as_str().context("read path")?;
+        let method = lower_camel(&pascal(id));
+        if id == "capabilities.get" {
+            continue;
+        } else if id == "timeline.list" || id == "events.list" || id == "terminal.screen" {
+            continue;
+        } else if id.ends_with(".get") {
+            let collection = path
+                .trim_start_matches("/v1/client/")
+                .split('/')
+                .next()
+                .context("read collection")?;
+            writeln!(
+                out,
+                "    public func {method}(id: String) async throws -> Envelope<Resource> {{ try await resource(\"{collection}\", id: id) }}"
+            )?;
+        } else if id.starts_with("launch-") {
+            let child = id.trim_start_matches("launch-").trim_end_matches(".list");
+            writeln!(
+                out,
+                "    public func {method}(launchID: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcePage> {{ var query: [URLQueryItem] = []; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/launches/\\(launchID.replacingOccurrences(of: \"launch/\", with: \"\"))/{child}\", query: query) }}"
+            )?;
+        } else if id.ends_with(".list") {
+            let collection = path
+                .trim_start_matches("/v1/client/")
+                .split('/')
+                .next()
+                .context("read collection")?;
+            writeln!(
+                out,
+                "    public func {method}(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {{ try await list(\"{collection}\", cursor: cursor, limit: limit, history: history) }}"
+            )?;
+        } else {
+            bail!("no Swift read surface renderer for `{id}`");
+        }
+    }
+    for (action, definition) in actions {
+        let method = lower_camel(&pascal(action));
+        let parameters = action_parameter(action, definition)?;
+        writeln!(
+            out,
+            "    public func {method}(id: String, idempotencyKey: String, fence: Fence, parameters: {parameters}) async throws -> Envelope<ActionResult> {{ try await submit(try .{method}(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }}"
+        )?;
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn struct_block<'a>(source: &'a str, declaration: &str) -> Result<&'a str> {
+    let start = source
+        .find(declaration)
+        .with_context(|| format!("client surface has no `{declaration}`"))?;
+    let tail = &source[start..];
+    let end = tail
+        .find("\n}")
+        .map(|offset| offset + 2)
+        .unwrap_or(tail.len());
+    Ok(&tail[..end])
+}
+
+fn schema_properties<'a>(definition: &'a Value) -> Option<&'a serde_json::Map<String, Value>> {
+    definition
+        .get("properties")
+        .and_then(Value::as_object)
+        .or_else(|| {
+            definition
+                .get("allOf")?
+                .as_array()?
+                .iter()
+                .find_map(|part| part.get("properties").and_then(Value::as_object))
+        })
+}
+
+fn rust_field(name: &str) -> String {
+    match name {
+        "type" => "entry_type".into(),
+        "final" => "is_final".into(),
+        "loop" => "loop_spec".into(),
+        other => other.into(),
+    }
+}
+
+fn lower_camel_snake(value: &str) -> String {
+    let mut parts = value.split('_');
+    let mut out = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        if matches!(part, "id" | "url" | "ms") {
+            out.push_str(&part.to_ascii_uppercase());
+        } else if part == "ids" {
+            out.push_str("IDs");
+        } else {
+            out.push_str(&pascal(part));
+        }
+    }
+    out
+}
+
+fn validate_model(
+    schema: &Value,
+    definition: &str,
+    rust_name: &str,
+    swift_name: &str,
+    rust: &str,
+    swift: &str,
+) -> Result<()> {
+    let model = &schema["$defs"][definition];
+    if model.is_null() {
+        bail!("client schema has no `{definition}` definition");
+    }
+    let properties = schema_properties(model)
+        .with_context(|| format!("client schema `{definition}` has no properties"))?;
+    let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
+    let swift_block = struct_block(swift, &format!("public struct {swift_name}:"))?;
+    for property in properties.keys().filter(|name| name.as_str() != "kind") {
+        let rust_field = rust_field(property);
+        if !rust_block.contains(&format!("pub {rust_field}:")) {
+            bail!("Rust `{rust_name}` does not model schema field `{property}`");
+        }
+        let swift_field = match property.as_str() {
+            "final" => "isFinal".into(),
+            other => lower_camel_snake(other),
+        };
+        if !swift_block.contains(&swift_field) {
+            bail!("Swift `{swift_name}` does not model schema field `{property}`");
+        }
+    }
+    Ok(())
+}
+
+fn validate_surfaces(
+    schema: &Value,
+    operations: &Value,
+    rust: &str,
+    rust_client: &str,
+    swift: &str,
+    swift_client: &str,
+) -> Result<()> {
+    let refs = schema["$defs"]["Resource"]["oneOf"]
+        .as_array()
+        .context("Resource.oneOf")?;
+    for reference in refs {
+        let definition = reference["$ref"]
+            .as_str()
+            .and_then(|value| value.rsplit('/').next())
+            .context("Resource reference")?;
+        validate_model(
+            schema,
+            definition,
+            definition,
+            &format!("{definition}Resource"),
+            &rust,
+            &swift,
+        )?;
+        let swift_case = lower_camel(definition);
+        if !rust.contains(&format!("    {definition}({definition}),"))
+            || !swift.contains(&format!(".{swift_case}("))
+        {
+            bail!("Resource discriminator `{definition}` is absent from a generated client");
+        }
+    }
+    for definition in [
+        "TimelineEntry",
+        "TimelinePage",
+        "PairingBegin",
+        "PairingChallenge",
+        "PairingComplete",
+        "PairedSession",
+        "TerminalAttachment",
+        "StructuredDiff",
+        "Visualization",
+        "VisualizationNode",
+        "VisualizationEdge",
+        "VisualizationGroup",
+    ] {
+        validate_model(schema, definition, definition, definition, &rust, &swift)?;
+    }
+    for token in [
+        "pub async fn pairing_begin",
+        "pub async fn pairing_complete",
+        "pub async fn terminal_frames",
+        "Endpoint::Unix",
+        "Endpoint::FabricLoopback",
+    ] {
+        if !rust_client.contains(token) {
+            bail!("Rust client surface is missing `{token}`");
+        }
+    }
+    for token in [
+        "func capabilities(",
+        "func timeline(",
+        "cursor: String?",
+        "func events(",
+        "func beginPairing(",
+        "func completePairing(",
+        "func terminalScreen(",
+        "func terminalFrames(",
+    ] {
+        if !swift_client.contains(token) {
+            bail!("Swift client surface is missing `{token}`");
+        }
+    }
+    let reads = operations["reads"].as_array().context("reads array")?;
+    for read in reads {
+        let method = read["method"].as_str().context("read method")?;
+        if method != "GET" {
+            bail!("read operation uses unsupported method `{method}`");
+        }
+        let path = read["path"].as_str().context("read path")?;
+        if !path.starts_with("/v1/client/") {
+            bail!("read operation `{path}` escapes the client boundary");
+        }
+        let rust_method = match read["id"].as_str().context("read id")? {
+            "capabilities.get" => "capabilities".into(),
+            "timeline.list" => "timeline".into(),
+            "events.list" => "events".into(),
+            "terminal.screen" => "terminal_screen".into(),
+            id => action_method(id),
+        };
+        let swift_method = lower_camel(&pascal(read["id"].as_str().unwrap()));
+        let swift_method = match read["id"].as_str().unwrap() {
+            "capabilities.get" => "capabilities".into(),
+            "timeline.list" => "timeline".into(),
+            "events.list" => "events".into(),
+            "terminal.screen" => "terminalScreen".into(),
+            _ => swift_method,
+        };
+        if !rust_client.contains(&format!("pub async fn {rust_method}("))
+            || !swift_client.contains(&format!("public func {swift_method}("))
+        {
+            bail!(
+                "read operation `{}` has no typed Rust/Swift method",
+                read["id"]
+            );
+        }
+    }
+    let action_schema = schema["$defs"]["ActionRequest"]["oneOf"]
+        .as_array()
+        .context("ActionRequest.oneOf")?;
+    for (action, definition) in operations["actions"]
+        .as_object()
+        .context("actions object")?
+    {
+        let parameters = action_parameter(action, definition)?;
+        let branch = action_schema
+            .iter()
+            .find(|branch| {
+                branch["properties"]["type"]["const"].as_str() == Some(action)
+                    || branch["properties"]["type"]["enum"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(action)))
+            })
+            .with_context(|| format!("action `{action}` absent from ActionRequest schema"))?;
+        if let Some(reference) = branch["properties"]["parameters"]["$ref"].as_str() {
+            if reference.rsplit('/').next() != Some(parameters) {
+                bail!("action `{action}` parameter model disagrees with schema");
+            }
+        } else {
+            let properties = branch["properties"]["parameters"]["properties"]
+                .as_object()
+                .with_context(|| format!("action `{action}` has no parameter properties"))?;
+            let rust_block = struct_block(rust, &format!("pub struct {parameters} {{"))?;
+            let swift_block = struct_block(swift, &format!("public struct {parameters}:"))?;
+            for property in properties.keys() {
+                if !rust_block.contains(&format!("pub {}:", rust_field(property)))
+                    || !swift_block.contains(&lower_camel_snake(property))
+                {
+                    bail!("action `{action}` typed parameter model omits `{property}`");
+                }
+            }
+        }
+        let rust_method = action_method(action);
+        let swift_method = lower_camel(&pascal(action));
+        if !rust.contains(&format!("pub fn {rust_method}("))
+            || !rust_client.contains(&format!("pub async fn {rust_method}("))
+            || !swift.contains(&format!("public static func {swift_method}("))
+            || !swift_client.contains(&format!("public func {swift_method}("))
+        {
+            bail!("action `{action}` has no typed Rust/Swift constructor and client method");
+        }
+    }
     Ok(())
 }
 
@@ -163,4 +650,73 @@ fn lower_camel(value: &str) -> String {
         .next()
         .map(|first| first.to_ascii_lowercase().to_string() + chars.as_str())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_output(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "st3-client-codegen-{}-{nonce}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn check_rejects_model_and_route_drift_and_generation_restores_stable_bytes() -> Result<()> {
+        let operations: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/operations.json"
+        ))?;
+        let actions = operations["actions"].as_object().context("actions")?;
+        let reads = operations["reads"].as_array().context("reads")?;
+        let models = format_rust(&render_marker(
+            RUST_MODELS_TEMPLATE,
+            "    // @st3-codegen:rust-action-constructors",
+            &rust_action_constructors(actions)?,
+        )?)?;
+        let client = format_rust(&render_marker(
+            RUST_CLIENT_TEMPLATE,
+            "    // @st3-codegen:rust-operation-methods",
+            &rust_operation_methods(reads, actions)?,
+        )?)?;
+        let cases = [
+            (
+                "generated.rs",
+                models.as_str(),
+                models.replacen("pub attention_id: String,", "", 1),
+            ),
+            (
+                "lib.rs",
+                client.as_str(),
+                client.replacen(
+                    "pub async fn attention_list(",
+                    "async fn removed_attention_list(",
+                    1,
+                ),
+            ),
+        ];
+        for (name, expected, drifted) in cases {
+            assert_ne!(
+                expected, drifted,
+                "test mutation must change generated output"
+            );
+            let path = temporary_output(name);
+            output(&path, &drifted, false)?;
+            assert!(output(&path, expected, true).is_err());
+            output(&path, expected, false)?;
+            let first = std::fs::read(&path)?;
+            output(&path, expected, false)?;
+            let second = std::fs::read(&path)?;
+            assert_eq!(first, second, "second generation must be byte-identical");
+            output(&path, expected, true)?;
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
 }

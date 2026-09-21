@@ -1300,6 +1300,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.timeline",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            Some("harnesses"),
+            false,
+            &[],
+        ),
+        (
             "harness.context-clear.requested",
             &["agent"],
             WritePolicy::AuthorizedRequester,
@@ -1949,8 +1958,49 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("input_tokens", integer()),
             ("output_tokens", integer()),
             ("total_tokens", integer()),
+            ("cached_tokens", integer()),
+            ("context_used_tokens", integer()),
+            ("context_window_tokens", integer()),
+            ("context_used_percent", number()),
+            ("cost", number()),
+            ("currency", string()),
+            (
+                "semantics",
+                required_enum(&["context_occupancy", "session_cumulative", "response"]),
+            ),
+            ("driver", required_string()),
             ("model", string()),
-            ("incarnation_id", string()),
+            ("incarnation_id", required_string()),
+        ],
+        "harness.timeline" => &[
+            (
+                "operation",
+                required_enum(&["append", "replace", "finalize"]),
+            ),
+            ("entry_id", required_string()),
+            ("revision", required_integer()),
+            (
+                "role",
+                required_enum(&["system", "user", "assistant", "tool"]),
+            ),
+            (
+                "entry_type",
+                required_enum(&[
+                    "message",
+                    "content",
+                    "tool_call",
+                    "tool_result",
+                    "status",
+                    "error",
+                    "usage",
+                    "redaction",
+                    "truncation",
+                ]),
+            ),
+            ("final", required_boolean()),
+            ("body", required_object()),
+            ("driver", required_string()),
+            ("incarnation_id", required_string()),
         ],
         "harness.context-clear.requested" => &[
             ("runtime_id", string()),
@@ -2050,14 +2100,19 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("decision_id", string()),
             ("revision", integer()),
             ("question", string()),
-            ("choices", array()),
+            (
+                "decision_type",
+                required_enum(&["boolean", "single-choice", "multiple-choice", "rank"]),
+            ),
+            ("options", array()),
             ("requester", reference()),
             ("planner", reference()),
         ],
         "planning-session.question-answered" => &[
             ("decision_id", string()),
             ("expected_revision", integer()),
-            ("answer", string()),
+            ("response", object()),
+            ("explanation", string()),
             ("requester", reference()),
         ],
         "revision-proposal.created" => &[
@@ -2164,6 +2219,9 @@ fn boolean() -> FieldSpec {
 fn integer() -> FieldSpec {
     field(ValueType::Integer)
 }
+fn number() -> FieldSpec {
+    field(ValueType::Number)
+}
 fn object() -> FieldSpec {
     field(ValueType::Object)
 }
@@ -2181,6 +2239,13 @@ fn required_integer() -> FieldSpec {
     FieldSpec {
         required: true,
         ..integer()
+    }
+}
+
+fn required_boolean() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..boolean()
     }
 }
 
@@ -2373,6 +2438,7 @@ mod tests {
                 "harness.context-clear.result",
                 "harness.diagnostic",
                 "harness.observed",
+                "harness.timeline",
                 "harness.usage",
                 "intent.desired",
                 "loop.round-result",
