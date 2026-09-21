@@ -503,6 +503,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
             }
         }
+        let mut work_message_agents = Vec::new();
         for subject in &active {
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
@@ -526,7 +527,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if subject.kind == "agent"
                         && let Some(incarnation) = observation.incarnation_id.as_deref()
                     {
-                        self.reconcile_work_messages(&subject.subject, incarnation)?;
+                        work_message_agents.push((subject.subject.clone(), incarnation.to_owned()));
                     }
                 }
                 Some(observation)
@@ -613,6 +614,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_subscription_missions(&desired)?;
         self.reconcile_provider_capacity_retries(&desired)?;
         self.evaluate_mission_runs()?;
+        // Mission state is the primary control-plane projection. Evaluate it before
+        // wake-message bookkeeping so a large mailbox or work history cannot starve
+        // newly-created runs of their first readiness pass.
+        for (agent, incarnation) in work_message_agents {
+            self.reconcile_work_messages(&agent, &incarnation)?;
+        }
         Ok(())
     }
 
@@ -865,7 +872,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
         let incarnation_key = harness_incarnation_key(incarnation);
         let messages = self.store.messages(Some(agent), false)?;
-        let work = self.store.work(Some(agent), true)?;
+        let work = self.store.work_for_reconcile(agent)?;
         let harness = self.store.current_harness(agent)?;
 
         if !harness.as_ref().is_some_and(CurrentHarnessView::is_ready) {

@@ -1690,6 +1690,7 @@ impl Store {
         let variables = mission_run_variables(&current, &mission.revision);
         let (compatible, reviewers) =
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
+        let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
             match &cutover {
@@ -2351,6 +2352,7 @@ impl Store {
         } else {
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
         };
+        let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         if !protected_approved && matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
             return Err(St3Error::new(
                 "revision-needs-drained-cutover",
@@ -2428,14 +2430,9 @@ impl Store {
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             let constraints = interpolate_goals(&constraints, &step_variables)?;
-            let status = carried
-                .map(|old| match old.status.as_str() {
-                    "claimed" | "working" | "verifying" => "ready",
-                    status => status,
-                })
-                .unwrap_or("pending");
-            let worker_reported =
-                carried.is_some_and(|old| old.worker_reported && status != "ready");
+            let (status, worker_reported) = carried
+                .map(carried_step_projection)
+                .unwrap_or(("pending", false));
             let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
             let not_before = carried
                 .and_then(|old| old.not_before_unix_ms)
@@ -2756,6 +2753,23 @@ impl Store {
         include_terminal: bool,
         snapshot_unix_ms: u128,
     ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal(actor, include_terminal, snapshot_unix_ms, true)
+    }
+
+    /// Return the work fields needed by the reconciler without computing CLI-only
+    /// timing and wake annotations. Those annotations scan immutable history and
+    /// are intentionally too expensive for the daemon's inner control loop.
+    pub fn work_for_reconcile(&self, actor: &str) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)
+    }
+
+    fn work_at_snapshot_internal(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+        detailed: bool,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -2778,7 +2792,11 @@ impl Store {
         let views = rows.collect::<Result<Vec<_>, _>>()?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
-            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            if detailed {
+                enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            } else {
+                enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
+            }
             let run_phase: String = connection.query_row(
                 "SELECT phase FROM mission_runs WHERE id=?1",
                 [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
@@ -5202,6 +5220,30 @@ impl Store {
                         &item.reason,
                         now,
                     )?);
+                }
+                "mission-dispatch-stall" => {
+                    let step_runs = item
+                        .details
+                        .get("step_runs")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            St3Error::new(
+                                "invalid-repair-plan",
+                                format!("repair item `{}` has no safe root steps", item.id),
+                            )
+                        })?;
+                    for step_run in step_runs.iter().filter_map(Value::as_str) {
+                        if let Some(claim) = repair_step_state_tx(
+                            &transaction,
+                            &self.origin,
+                            step_run,
+                            "ready",
+                            &item.reason,
+                            now,
+                        )? {
+                            claim_ids.push(claim);
+                        }
+                    }
                 }
                 class => {
                     return Err(St3Error::new(
@@ -8958,6 +9000,7 @@ fn adopt_declared_mission_revision_tx(
     let variables = mission_run_variables(&current, &next.revision);
     let (compatible, reviewers) =
         analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
+    let compatible = carried_revision_step_paths(&old, &next, &current.steps, compatible);
     if !reviewers.is_empty() || matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
         if operation.cancellation.is_some() {
             return Err(St3Error::new(
@@ -9099,13 +9142,9 @@ fn adopt_declared_mission_revision_tx(
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         let constraints = interpolate_goals(&constraints, &step_variables)?;
-        let status = carried
-            .map(|old| match old.status.as_str() {
-                "claimed" | "working" | "verifying" => "ready",
-                value => value,
-            })
-            .unwrap_or("pending");
-        let worker_reported = carried.is_some_and(|old| old.worker_reported && status != "ready");
+        let (status, worker_reported) = carried
+            .map(carried_step_projection)
+            .unwrap_or(("pending", false));
         let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
         let not_before = carried
             .and_then(|old| old.not_before_unix_ms)
@@ -12146,6 +12185,143 @@ fn operational_repair_plan_tx(
         )?;
     }
 
+    let mut dispatch_stalls = connection.prepare(
+        "SELECT mission_runs.id, mission_runs.current_generation_id,
+                mission_runs.updated_at_unix_ms, mission_revisions.body
+         FROM mission_runs
+         JOIN run_generations
+           ON run_generations.id=mission_runs.current_generation_id
+         JOIN mission_revisions
+           ON mission_revisions.mission_id=mission_runs.mission_id
+          AND mission_revisions.revision=run_generations.revision
+         WHERE mission_runs.status='running' AND mission_runs.phase='normal'
+         ORDER BY mission_runs.id",
+    )?;
+    let dispatch_stalls = dispatch_stalls
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (run, generation, updated, mission_body) in dispatch_stalls {
+        let updated = updated.parse::<u128>().unwrap_or(snapshot_unix_ms);
+        if snapshot_unix_ms.saturating_sub(updated) < 60_000 {
+            continue;
+        }
+        let mission = match serde_json::from_str::<MissionSpec>(&mission_body) {
+            Ok(mission) => mission,
+            Err(_) => continue,
+        };
+        if !mission.baselines.is_empty() {
+            continue;
+        }
+        let mut statement = connection.prepare(
+            "SELECT subject, step_path, status, agentless, assignee, available_to,
+                    not_before_unix_ms
+             FROM step_runs WHERE generation_id=?1 ORDER BY subject",
+        )?;
+        let steps = statement
+            .query_map([&generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let normal = steps
+            .iter()
+            .filter(|(_, path, _, _, _, _, _)| {
+                crate::mission::find_step(&mission, path).is_some_and(|step| !step.finally)
+            })
+            .collect::<Vec<_>>();
+        if normal.is_empty()
+            || normal.iter().any(|(_, _, status, _, _, _, _)| {
+                matches!(
+                    status.as_str(),
+                    "ready" | "claimed" | "working" | "verifying" | "blocked"
+                )
+            })
+        {
+            continue;
+        }
+        let desired_agent = |agent: &str| -> rusqlite::Result<bool> {
+            connection
+                .query_row(
+                    "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
+                    [agent],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|row| row.is_some())
+        };
+        let mut safe_step_runs = Vec::new();
+        for (subject, path, status, agentless, assignee, available_to, not_before) in normal {
+            if status != "pending"
+                || not_before
+                    .as_deref()
+                    .and_then(|value| value.parse::<u128>().ok())
+                    .is_some_and(|deadline| deadline > snapshot_unix_ms)
+            {
+                continue;
+            }
+            let Some(step) = crate::mission::find_step(&mission, path) else {
+                continue;
+            };
+            if !step.dependencies.is_empty() || !step.baselines.is_empty() {
+                continue;
+            }
+            let available = if *agentless {
+                true
+            } else {
+                let mut candidates = assignee.iter().cloned().collect::<Vec<_>>();
+                candidates
+                    .extend(serde_json::from_str::<Vec<String>>(available_to).unwrap_or_default());
+                candidates
+                    .into_iter()
+                    .any(|candidate| desired_agent(&candidate).unwrap_or(false))
+            };
+            if available {
+                safe_step_runs.push(subject.clone());
+            }
+        }
+        if safe_step_runs.is_empty() {
+            continue;
+        }
+        let subject = format!("mission-run/{run}");
+        let mut affected = vec![subject.clone()];
+        affected.extend(safe_step_runs.iter().cloned());
+        push_operational_repair_item(
+            &mut items,
+            "mission-dispatch-stall",
+            &subject,
+            affected,
+            "a running mission has safely admissible root work that remained pending for more than one minute",
+            BTreeMap::from([
+                (
+                    "generation".into(),
+                    Value::String(format!("run-generation/{generation}")),
+                ),
+                (
+                    "step_runs".into(),
+                    Value::Array(safe_step_runs.into_iter().map(Value::String).collect()),
+                ),
+                (
+                    "updated_at_unix_ms".into(),
+                    Value::String(updated.to_string()),
+                ),
+            ]),
+        )?;
+    }
+
     let mut cancelled_final = connection.prepare(
         "SELECT id, current_generation_id, updated_at_unix_ms
          FROM mission_runs
@@ -14946,6 +15122,63 @@ fn compatible_step_paths(old: &MissionSpec, new: &MissionSpec) -> BTreeSet<Strin
         .collect()
 }
 
+/// Preserve work when the step itself and every step it depends on are
+/// unchanged. Mission-level constraints and selectors affect future execution,
+/// so an active lease is released back to ready, but they must not silently
+/// erase a completed result or a submission already awaiting verification.
+fn carried_revision_step_paths(
+    old: &MissionSpec,
+    new: &MissionSpec,
+    current: &[StepRunView],
+    mut compatible: BTreeSet<String>,
+) -> BTreeSet<String> {
+    let old_definitions = flattened_step_definition_hashes(old);
+    let new_definitions = flattened_step_definition_hashes(new);
+    let dependencies = flattened_dependencies(new);
+    let mut unstable = new_definitions
+        .iter()
+        .filter(|(path, hash)| old_definitions.get(*path) != Some(*hash))
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let additions = dependencies
+            .iter()
+            .filter(|(path, dependencies)| {
+                !unstable.contains(*path)
+                    && dependencies
+                        .iter()
+                        .any(|dependency| unstable.contains(dependency))
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            break;
+        }
+        unstable.extend(additions);
+    }
+    compatible.extend(current.iter().filter_map(|step| {
+        (new_definitions.contains_key(&step.step) && !unstable.contains(&step.step))
+            .then(|| step.step.clone())
+    }));
+    compatible
+}
+
+fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
+    flatten_mission_step_specs(mission)
+        .into_iter()
+        .map(|step| (step.path.clone(), step.definition_hash.clone()))
+        .collect()
+}
+
+fn carried_step_projection(step: &StepRunView) -> (&str, bool) {
+    match step.status.as_str() {
+        "claimed" | "working" => ("ready", false),
+        "verifying" if step.worker_reported => ("verifying", true),
+        "verifying" => ("ready", false),
+        status => (status, step.worker_reported),
+    }
+}
+
 fn flattened_dependencies(mission: &MissionSpec) -> BTreeMap<String, BTreeSet<String>> {
     fn collect(
         mission: &MissionSpec,
@@ -15050,6 +15283,19 @@ fn enrich_step_queue_at(
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
+    enrich_step_definition(connection, view)
+}
+
+fn enrich_step_queue_for_reconcile_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    apply_effective_step_state(connection, view, snapshot_unix_ms)?;
+    enrich_step_definition(connection, view)
+}
+
+fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -21298,6 +21544,89 @@ mission "cancelled-final-repair" state="ready" {
     }
 
     #[test]
+    fn operational_repair_activates_a_stale_safe_mission_root() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+mission "dispatch-repair" state="ready" {
+  goal "Recover a missed readiness pass."
+  step "root" { agentless }
+  step "later" { agentless; depends-on { step "root" completed } }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "dispatch-repair-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "dispatch-repair".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "dispatch-repair-run".into(),
+            })
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_runs SET updated_at_unix_ms='0' WHERE id=?1",
+                [&run.id],
+            )
+            .unwrap();
+
+        let plan = store.operational_repair_plan().unwrap();
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.class == "mission-dispatch-stall")
+            .expect("the missed initial readiness pass needs a bounded repair");
+        assert_eq!(item.subject, run.subject);
+        assert_eq!(
+            item.details["step_runs"],
+            json!([format!(
+                "step-run/{}/root",
+                generation_id_from_subject(&run.generation)
+            )])
+        );
+
+        let result = store.apply_operational_repair(&plan.token).unwrap();
+        assert!(result.applied >= 1);
+        let repaired = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            repaired
+                .steps
+                .iter()
+                .find(|step| step.step == "root")
+                .unwrap()
+                .status,
+            "ready"
+        );
+        assert_eq!(
+            repaired
+                .steps
+                .iter()
+                .find(|step| step.step == "later")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
+    }
+
+    #[test]
     fn an_active_nested_lease_can_publish_its_parent_mission_output() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
@@ -21715,6 +22044,112 @@ version 2
         );
         assert_eq!(revised.root_revision, run.root_revision);
         assert_eq!(revised.revision, second.revision);
+    }
+
+    #[test]
+    fn a_mission_constraint_revision_preserves_completed_and_submitted_work() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |constraint: &str, key: &str| {
+            let source = format!(
+                r#"
+version 2
+
+  agent "worker" {{ workspace "."; command "true" }}
+  mission "revision-delivery" state="ready" {{
+    goal "Keep delivered work across mission guidance edits."
+    constraint {constraint:?}
+    step "completed" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Finish once." }}
+    step "submitted" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Verify once." }}
+  }}
+
+"#
+            );
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let planned = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.missions["revision-delivery"].clone()
+        };
+        let first = publish("Use the first mission constraint.", "delivery-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "delivery-run".into(),
+            })
+            .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
+        let completed = run
+            .steps
+            .iter()
+            .find(|step| step.step == "completed")
+            .unwrap()
+            .subject
+            .clone();
+        store.set_step_state(&completed, "completed", None).unwrap();
+        let submitted = run
+            .steps
+            .iter()
+            .find(|step| step.step == "submitted")
+            .unwrap()
+            .subject
+            .clone();
+        store.set_step_state(&submitted, "ready", None).unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some(worker.clone()),
+            incarnation: Some("worker-one".into()),
+            summary: Some("the result is ready for verification".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&submitted, "claim", &request("delivery-claim"))
+            .unwrap();
+        store
+            .work_action(&submitted, "complete", &request("delivery-submit"))
+            .unwrap();
+
+        let second = publish(
+            "Use the revised mission constraint without redoing delivered work.",
+            "delivery-two",
+        );
+        let revised = store
+            .adopt_mission_revision(
+                &run.id,
+                &second,
+                "person/test",
+                "clarify mission-wide guidance",
+                "delivery-cutover",
+            )
+            .unwrap();
+
+        let completed = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "completed")
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        let submitted = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "submitted")
+            .unwrap();
+        assert_eq!(submitted.status, "verifying");
+        assert!(submitted.worker_reported);
+        assert!(submitted.claimant.is_none());
+        assert!(submitted.claim_incarnation.is_none());
     }
 
     #[test]
