@@ -1149,13 +1149,36 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
             json!({ "reason": "session-timeline-invalidated" }),
         );
     }
-    if record.kind.starts_with("custom.client.pairing-")
-        || record.kind.starts_with("custom.client.terminal-")
-    {
+    if record.kind.starts_with("custom.client.pairing-") {
         return (
             "capabilities.changed".into(),
             Vec::new(),
             json!({ "reason": "authenticated-client-capabilities-changed" }),
+        );
+    }
+    if record.kind.starts_with("custom.client.terminal-") {
+        let resource_ids = fields
+            .get("terminal_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                state
+                    .store
+                    .claims_for(&record.subject, Some("custom.client.terminal-attached"))
+                    .ok()?
+                    .into_iter()
+                    .next()?
+                    .body
+                    .pointer("/fields/terminal_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .map(|terminal| vec![terminal.to_owned()])
+            .unwrap_or_default();
+        return (
+            "upsert".into(),
+            resource_ids,
+            json!({ "reason": "terminal-viewer-lifecycle-changed" }),
         );
     }
     let mut resource_ids = Vec::new();
@@ -2975,7 +2998,7 @@ mod tests {
                 store_index: 8,
                 kind: "custom.client.terminal-attached".into(),
                 subject: "custom/client/terminal-secret".into(),
-                body: json!({"fields": {"capability": "TERMINAL-PLAINTEXT", "stream_url": "?secret=yes"}}),
+                body: json!({"fields": {"terminal_id": "terminal/agent/viewer", "capability": "TERMINAL-PLAINTEXT", "stream_url": "?secret=yes"}}),
             },
             EventRecord {
                 store_index: 9,
@@ -2990,6 +3013,43 @@ mod tests {
             assert!(!encoded.contains("PRIVATE-MESSAGE"));
             assert!(!encoded.contains("stream_url"));
             assert!(!encoded.contains("credential"));
+        }
+        let pairing = safe_event_projection(
+            &state,
+            &EventRecord {
+                store_index: 10,
+                kind: "custom.client.pairing-revoked".into(),
+                subject: "custom/client/pairing-device".into(),
+                body: json!({"fields": {"device_id": "device/example"}}),
+            },
+        );
+        assert_eq!(pairing.0, "capabilities.changed");
+        for (index, kind) in [
+            "custom.client.terminal-attached",
+            "custom.client.terminal-consumed",
+            "custom.client.terminal-detached",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let projected = safe_event_projection(
+                &state,
+                &EventRecord {
+                    store_index: 11 + index as u64,
+                    kind: kind.into(),
+                    subject: "custom/client/terminal-attachment-viewer".into(),
+                    body: json!({"fields": {
+                        "terminal_id": "terminal/agent/viewer",
+                        "attachment_id": "terminal-attachment/viewer"
+                    }}),
+                },
+            );
+            assert_eq!(projected.0, "upsert", "{kind}");
+            assert_eq!(projected.1, ["terminal/agent/viewer"], "{kind}");
+            assert_eq!(
+                projected.2["reason"], "terminal-viewer-lifecycle-changed",
+                "{kind}"
+            );
         }
         let gap = validate_event_cursor("event-node", true, 10, 50, 90).unwrap_err();
         assert_eq!(gap.status, StatusCode::GONE);
@@ -3689,6 +3749,54 @@ mod tests {
         let consumed = terminal_attachment_response(&restarted, &session, &attachment_id).unwrap();
         assert_eq!(consumed["state"], "consumed");
         assert!(consumed["stream_capability"].is_null());
+        let detach = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/terminal-detach-after-consume".into(),
+            action_type: "terminal.detach".into(),
+            idempotency_key: "terminal-detach-after-consume-0001".into(),
+            fence: Fence {
+                snapshot_id: "snapshot/test".into(),
+                subject_revisions: BTreeMap::new(),
+                mission_generation: None,
+                step_definition: None,
+                attempt: None,
+                readiness_epoch: None,
+                runtime_incarnation: Some("terminal-runtime:i1".into()),
+                terminal_sequence: None,
+                preview_token: None,
+            },
+            parameters: json!({ "target_id": attachment_id }),
+        };
+        detach_terminal_attachment(&restarted, &session, &detach).unwrap();
+        let lifecycle = restarted
+            .store
+            .claims_for(
+                &terminal_attachment_subject(consumed["attachment_id"].as_str().unwrap()).unwrap(),
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|claim| claim.kind.starts_with("custom.client.terminal-"))
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 3);
+        for claim in lifecycle {
+            let projected = safe_event_projection(
+                &restarted,
+                &EventRecord {
+                    store_index: claim.store_index,
+                    kind: claim.kind.clone(),
+                    subject: claim.subject.clone(),
+                    body: claim.body.clone(),
+                },
+            );
+            assert_eq!(projected.0, "upsert", "{}", claim.kind);
+            assert_eq!(
+                projected.1,
+                ["terminal/agent/terminal-owner"],
+                "{}",
+                claim.kind
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,10 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 
 #[test]
 fn generated_models_decode_every_stream_fixture() {
+    assert!(
+        std::mem::size_of::<TimelineBody>() <= 128,
+        "the discriminated timeline body must keep large variants boxed"
+    );
     let capabilities: Envelope<Capabilities> = decode("capabilities.json");
     assert_eq!(capabilities.value.limits.max_page_items, 200);
     let events: Envelope<EventPage> = decode("events.json");

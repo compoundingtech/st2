@@ -96,4 +96,3 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .eventsList: "/v1/client/events",
     .terminalScreen: "/v1/client/terminals/{id}/screen",
 ]
-

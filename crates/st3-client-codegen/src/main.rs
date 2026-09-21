@@ -526,6 +526,10 @@ fn validate_surfaces(
 }
 
 fn output(path: &Path, contents: &str, check: bool) -> Result<()> {
+    // Generated artifacts have one canonical EOF: no blank trailing lines and
+    // exactly one final newline. Templates and renderers are allowed to use
+    // whichever trailing whitespace is clearest for their own implementation.
+    let contents = format!("{}\n", contents.trim_end());
     if check {
         let current =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -539,7 +543,7 @@ fn output(path: &Path, contents: &str, check: bool) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(path, &contents).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
 }

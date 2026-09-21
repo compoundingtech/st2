@@ -597,7 +597,7 @@ pub enum TimelineBody {
     ToolResult(TimelineToolResultBody),
     Status(TimelineStatusBody),
     Error(TimelineErrorBody),
-    Usage(TimelineUsageBody),
+    Usage(Box<TimelineUsageBody>),
     Redaction(TimelineRedactionBody),
     Truncation(TimelineTruncationBody),
 }
