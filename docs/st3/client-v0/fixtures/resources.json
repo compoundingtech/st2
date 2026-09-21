@@ -67,6 +67,11 @@
     "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3"
   },
   {
+    "id": "device/ios-release", "kind": "device", "revision": "dv2", "updated_at": "2026-09-20T11:09:30Z",
+    "person_id": "person/nathan", "session_actor": "person/nathan/session/ios-release", "state": "active",
+    "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z"
+  },
+  {
     "id": "operation/transport-host-b", "kind": "operation", "revision": "op2", "updated_at": "2026-09-20T11:10:00Z",
     "component": "transport", "severity": "warning", "state": "degraded", "summary": "Peer is retrying", "targets": ["host/host-b"]
   },

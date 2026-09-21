@@ -304,6 +304,21 @@ fn require_scope(session: &ClientSession, scope: &str) -> Result<(), ApiError> {
     }
 }
 
+pub(super) fn person_filter(
+    session: &ClientSession,
+    requested: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if session.authority_actor.starts_with("person/") {
+        if requested.is_some_and(|person| person != session.authority_actor) {
+            return Err(forbidden(
+                "the authenticated client cannot read another person's private projection",
+            ));
+        }
+        return Ok(Some(session.authority_actor.clone()));
+    }
+    Ok(requested.map(str::to_owned))
+}
+
 fn mission_visualization(
     store: &Store,
     mission_id: &str,
@@ -626,6 +641,146 @@ pub(super) async fn operations(
     require_scope(&session, "read.projections")?;
     let items = operation_resources(&state, &snapshot.created_at)?;
     client_page(&state, &snapshot, "operations", items, &query).map(Json)
+}
+
+pub(super) async fn now(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let person = person_filter(&session, query.person.as_deref())?;
+    let mut items =
+        super::client_attention_resources(&state.store, person.as_deref(), query.history)
+            .map_err(ApiError::internal)?;
+    let mut work = super::client_work_resources(
+        &state.store,
+        query.actor.as_deref(),
+        query.history,
+        client_snapshot_time(&snapshot),
+        snapshot.store_index,
+    )
+    .map_err(ApiError::internal)?;
+    if let Some(owner_run) = query.owner_run.as_deref() {
+        work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
+    }
+    items.extend(work);
+    items.extend(
+        operation_resources(&state, &snapshot.created_at)?
+            .into_iter()
+            .filter(|item| item["severity"] != "info"),
+    );
+    let priority = |item: &Value| match item["kind"].as_str() {
+        Some("attention") => 0,
+        Some("work") => 1,
+        Some("operation") => 2,
+        _ => 3,
+    };
+    items.sort_by(|left, right| {
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    client_page(&state, &snapshot, "now", items, &query).map(Json)
+}
+
+pub(super) async fn machines(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let items = runtime_resources(&state, query.history, &snapshot, &session)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "machines", items, &query).map(Json)
+}
+
+fn device_resources(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    person: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let before = snapshot.store_index.checked_add(1);
+    let mut claims = state
+        .store
+        .claims_page(None, None, 0, before, false, 100_000)
+        .map_err(ApiError::internal)?
+        .claims;
+    claims.sort_by_key(|claim| claim.store_index);
+    let mut paired = BTreeMap::<String, (&ClaimRecord, Option<&ClaimRecord>)>::new();
+    for claim in &claims {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let Some(device_id) = fields.get("device_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match claim.kind.as_str() {
+            "custom.client.pairing-completed"
+                if fields.get("person_id").and_then(Value::as_str) == Some(person) =>
+            {
+                paired.insert(device_id.to_owned(), (claim, None));
+            }
+            "custom.client.pairing-revoked" => {
+                if let Some(entry) = paired.get_mut(device_id) {
+                    entry.1 = Some(claim);
+                }
+            }
+            _ => {}
+        }
+    }
+    let at = client_snapshot_time(snapshot);
+    let mut resources = paired
+        .into_iter()
+        .map(|(device_id, (completed, revoked))| {
+            let fields = completed.body.get("fields").unwrap_or(&completed.body);
+            let expires_at = fields
+                .get("expires_at_unix_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or_default();
+            let selected = revoked.unwrap_or(completed);
+            let state_name = if revoked.is_some() {
+                "revoked"
+            } else if expires_at <= at {
+                "expired"
+            } else {
+                "active"
+            };
+            json!({
+                "id": device_id,
+                "kind": "device",
+                "revision": selected.id,
+                "updated_at": client_timestamp(selected.accepted_at_unix_ms),
+                "person_id": person,
+                "session_actor": fields.get("session_actor").cloned().unwrap_or(Value::Null),
+                "state": state_name,
+                "scopes": fields.get("scopes").cloned().unwrap_or_else(|| json!([])),
+                "expires_at": client_timestamp(expires_at),
+                "operational": {
+                    "layer": if state_name == "active" { "current" } else { "history" },
+                    "actionable": state_name == "active",
+                    "reasons": if state_name == "active" { Vec::<&str>::new() } else { vec![state_name] }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    Ok(resources)
+}
+
+pub(super) async fn devices(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let person = person_filter(&session, query.person.as_deref())?
+        .filter(|person| person.starts_with("person/"))
+        .ok_or_else(|| forbidden("device inventory requires an explicitly authenticated person"))?;
+    let items = device_resources(&state, &snapshot, &person)?;
+    client_page(&state, &snapshot, "devices", items, &query).map(Json)
 }
 
 pub(super) async fn operation_detail(
@@ -2317,6 +2472,18 @@ async fn dispatch_action(
     match request.action_type.as_str() {
         "attention.resolve" => {
             let target = parameter_string(p, "attention_id")?;
+            let attention = state
+                .store
+                .attention_request(&target)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("attention `{target}` does not exist"))
+                })?;
+            if attention.reviewer != *authority_actor {
+                return Err(forbidden(format!(
+                    "attention `{target}` belongs to another person"
+                )));
+            }
             let result = resolve_attention(
                 State(state.clone()),
                 AxumPath(target),

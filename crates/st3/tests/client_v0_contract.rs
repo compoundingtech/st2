@@ -100,6 +100,9 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         .collect::<BTreeSet<_>>();
     for required in [
         "capabilities.get",
+        "now.list",
+        "machines.list",
+        "devices.list",
         "attention.list",
         "messages.list",
         "launches.list",
@@ -199,6 +202,7 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         "mission",
         "operation",
         "runtime",
+        "device",
         "session",
         "work",
     ]);
@@ -402,6 +406,23 @@ async fn client_json_auth(app: axum::Router, uri: &str, credential: &str) -> (St
     (status, value)
 }
 
+async fn client_json_person(app: axum::Router, uri: &str, person: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("x-st3-person", person)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, value)
+}
+
 async fn client_post_json_auth(
     app: axum::Router,
     uri: &str,
@@ -454,7 +475,7 @@ async fn client_post_json_person(
 async fn completed_read_surface_is_versioned_and_cursor_gaps_require_resync() {
     let root = tempfile::tempdir().unwrap();
     let app = st3::api::router(test_state(root.path()));
-    for collection in ["missions", "runtimes", "operations"] {
+    for collection in ["now", "machines", "missions", "runtimes", "operations"] {
         let (status, envelope) =
             client_json(app.clone(), &format!("/v1/client/{collection}")).await;
         assert_eq!(status, StatusCode::OK, "{collection}: {envelope}");
@@ -578,8 +599,16 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     .await;
     assert_eq!(status, StatusCode::OK, "{paired}");
     let credential = paired["value"]["credential"].as_str().unwrap();
-    assert!(credential.len() >= 32);
     let device = paired["value"]["device_id"].as_str().unwrap();
+    let (status, devices) =
+        client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let encoded_devices = serde_json::to_string(&devices).unwrap();
+    assert_eq!(devices["value"]["items"][0]["id"], device);
+    assert_eq!(devices["value"]["items"][0]["state"], "active");
+    assert!(!encoded_devices.contains("credential_hash"));
+    assert!(!encoded_devices.contains("device_public_key"));
+    assert!(credential.len() >= 32);
     let (status, remote_capabilities) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
     assert_eq!(status, StatusCode::OK, "{remote_capabilities}");
@@ -601,6 +630,15 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     });
     let (status, revoked) = client_post_json(app.clone(), "/v1/client/actions", revoke).await;
     assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (status, devices) =
+        client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    assert_eq!(devices["value"]["items"][0]["id"], device);
+    assert_eq!(devices["value"]["items"][0]["state"], "revoked");
+    let encoded_devices = serde_json::to_string(&devices).unwrap();
+    assert!(!encoded_devices.contains(credential));
+    assert!(!encoded_devices.contains("credential_hash"));
+    assert!(!encoded_devices.contains("device_public_key"));
     let (status, denied) = client_json_auth(fabric, "/v1/client/capabilities", credential).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
 }
@@ -705,18 +743,33 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     assert_eq!(status, StatusCode::OK, "{resolved}");
 
     let (_, attention) = client_json_auth(fabric.clone(), "/v1/client/attention", credential).await;
-    let alex = attention["value"]["items"]
-        .as_array()
+    assert!(
+        attention["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "attention/alex-paired")
+    );
+    let (status, cross_person_read) = client_json_auth(
+        fabric.clone(),
+        "/v1/client/attention?person=person%2Falex",
+        credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{cross_person_read}");
+    let alex_revision = store
+        .claims_for("attention/alex-paired", None)
         .unwrap()
-        .iter()
-        .find(|item| item["id"] == "attention/alex-paired")
-        .unwrap();
+        .last()
+        .unwrap()
+        .id
+        .clone();
     let cross_attention = serde_json::json!({
         "api_version": "st3.client.v0", "id": "action/paired-attention-alex",
         "type": "attention.resolve", "idempotency_key": "paired-attention-alex-000001",
         "fence": {
             "snapshot_id": attention["snapshot"]["id"],
-            "subject_revisions": { "attention/alex-paired": alex["revision"] }
+            "subject_revisions": { "attention/alex-paired": alex_revision }
         },
         "parameters": { "attention_id": "attention/alex-paired", "outcome": "resolved" }
     });
@@ -727,7 +780,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         cross_attention,
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
 
     let (_, current) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;

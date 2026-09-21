@@ -331,7 +331,10 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             .unwrap()
             .is_empty()
     );
-    let alex_page = client.attention_list(None, None, false).await.unwrap();
+    // A person-scoped client cannot enumerate another person's private inbox. Use
+    // the read-only local projection to obtain the exact cross-person fence, then
+    // prove the named-person mutation is still rejected.
+    let alex_page = read_only.attention_list(None, None, false).await.unwrap();
     let alex = alex_page
         .value
         .items

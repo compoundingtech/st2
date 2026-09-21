@@ -462,6 +462,19 @@ pub struct Runtime {
     pub terminal_access: Option<TerminalAccess>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Device {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub person_id: String,
+    pub session_actor: String,
+    pub state: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub expires_at: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Operation {
     #[serde(flatten)]
     pub header: ResourceHeader,
@@ -515,6 +528,7 @@ pub enum Resource {
     Work(Work),
     Agent(Agent),
     Runtime(Runtime),
+    Device(Device),
     Operation(Operation),
     History(History),
     Session(Session),
@@ -533,6 +547,7 @@ impl Resource {
             Self::Work(v) => &v.header,
             Self::Agent(v) => &v.header,
             Self::Runtime(v) => &v.header,
+            Self::Device(v) => &v.header,
             Self::Operation(v) => &v.header,
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,

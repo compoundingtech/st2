@@ -35,6 +35,7 @@ pub struct Client {
     endpoint: Endpoint,
     http: reqwest::Client,
     deadlines: ClientDeadlines,
+    person: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,11 +69,27 @@ impl Client {
                 .build()
                 .expect("the st3 HTTP client configuration is valid"),
             deadlines,
+            person: None,
         }
     }
 
     pub fn unix(path: impl Into<PathBuf>) -> Self {
         Self::new(Endpoint::Unix(path.into()))
+    }
+
+    /// Name the concrete human authority carried over the trusted Unix boundary.
+    /// Ordinary [`Client::unix`] sessions intentionally remain read-only.
+    pub fn unix_as(path: impl Into<PathBuf>, person: impl Into<String>) -> Result<Self> {
+        let person = person.into();
+        anyhow::ensure!(
+            person.starts_with("person/")
+                && person.matches('/').count() == 1
+                && !person.chars().any(char::is_whitespace),
+            "Unix person authority must be one concrete `person/<id>` subject"
+        );
+        let mut client = Self::unix(path);
+        client.person = Some(person);
+        Ok(client)
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -103,19 +120,23 @@ impl Client {
                     &bytes,
                     self.deadlines.connect,
                     deadline,
+                    self.person.as_deref(),
                 )
                 .await?
             }
             Endpoint::Http(base) => {
                 let started = tokio::time::Instant::now();
                 let url = format!("{base}{path}");
-                let request = match method {
+                let mut request = match method {
                     "GET" => self.http.get(&url),
                     "POST" => self.http.post(&url).body(bytes),
                     other => anyhow::bail!("unsupported HTTP method {other}"),
                 }
                 .header("content-type", "application/json")
                 .header("connection", "close");
+                if let Some(person) = self.person.as_deref() {
+                    request = request.header("x-st3-person", person);
+                }
                 let endpoint = url.clone();
                 let response = tokio::time::timeout(deadline, request.send())
                     .await
@@ -279,6 +300,7 @@ async fn unix_request(
     body: &[u8],
     connect_deadline: Duration,
     deadline: Duration,
+    person: Option<&str>,
 ) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -298,10 +320,13 @@ async fn unix_request(
     })?;
     let remaining = deadline.saturating_sub(started.elapsed());
     let response = tokio::time::timeout(remaining, async {
+        let person_header = person
+            .map(|person| format!("X-St3-Person: {person}\r\n"))
+            .unwrap_or_default();
         stream
             .write_all(
                 format!(
-                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{person_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .as_bytes(),
@@ -403,6 +428,7 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     use axum::routing::get;
     use axum::{Json, Router};
     use serde_json::{Value, json};
@@ -411,11 +437,22 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     fn test_api() -> Router {
-        Router::new().route(
-            "/v1/test",
-            get(|| async { Json(test_envelope(json!({"method": "get"}))) })
-                .post(|Json(body): Json<Value>| async move { Json(test_envelope(body)) }),
-        )
+        Router::new()
+            .route(
+                "/v1/test",
+                get(|| async { Json(test_envelope(json!({"method": "get"}))) })
+                    .post(|Json(body): Json<Value>| async move { Json(test_envelope(body)) }),
+            )
+            .route(
+                "/v1/person",
+                get(|headers: HeaderMap| async move {
+                    Json(test_envelope(json!({
+                        "person": headers
+                            .get("x-st3-person")
+                            .and_then(|value| value.to_str().ok())
+                    })))
+                }),
+            )
     }
 
     fn test_envelope(value: Value) -> ApiResponse<Value> {
@@ -443,6 +480,7 @@ mod tests {
                 .build()
                 .unwrap(),
             deadlines,
+            person: None,
         }
     }
 
@@ -528,6 +566,34 @@ mod tests {
         }
         assert!(socket.exists(), "the Unix API socket did not start");
         assert_request_transports(Client::unix(&socket)).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_unix_as_carries_explicit_person_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, test_api())
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let ordinary: Value = Client::unix(&socket).get("/v1/person").await.unwrap();
+        assert!(ordinary["person"].is_null());
+        let named: Value = Client::unix_as(&socket, "person/nathan")
+            .unwrap()
+            .get("/v1/person")
+            .await
+            .unwrap();
+        assert_eq!(named["person"], "person/nathan");
+        assert!(Client::unix_as(&socket, "person/nathan\r\nx-forged: yes").is_err());
         server.abort();
     }
 

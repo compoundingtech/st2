@@ -72,7 +72,7 @@ fn generated_models_decode_every_stream_fixture() {
 #[test]
 fn generated_resource_union_decodes_all_kinds() {
     let resources: Vec<Resource> = serde_json::from_slice(&fixture("resources.json")).unwrap();
-    assert_eq!(resources.len(), 13);
+    assert_eq!(resources.len(), 14);
     assert!(
         resources
             .iter()
@@ -102,14 +102,33 @@ fn generated_resource_union_decodes_all_kinds() {
         .unwrap();
     assert_eq!(work.blocked_reason, None);
     assert!(work.blockers.is_empty());
+    let device = resources
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Device(device) => Some(device),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(device.person_id, "person/nathan");
+    assert_eq!(device.state, "active");
 }
 
 #[test]
 fn generated_action_union_and_machine_manifest_stay_in_lockstep() {
     let action: ActionRequest = decode("action.json");
+    let operations: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/st3/client-v0/schemas/operations.json"
+    ))
+    .unwrap();
     assert_eq!(action.action_type(), &ActionType::WorkComplete);
-    assert_eq!(ACTION_NAMES.len(), 30);
-    assert_eq!(READ_OPERATIONS.len(), 27);
+    assert_eq!(
+        ACTION_NAMES.len(),
+        operations["actions"].as_object().unwrap().len()
+    );
+    assert_eq!(
+        READ_OPERATIONS.len(),
+        operations["reads"].as_array().unwrap().len()
+    );
     assert_eq!(CONTRACT_SHA256.len(), 64);
 }
 

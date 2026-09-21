@@ -101,7 +101,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "operation", "history", "session"] },
+        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "device", "operation", "history", "session"] },
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
@@ -471,6 +471,23 @@
         }
       ]
     },
+    "Device": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        {
+          "type": "object",
+          "required": ["kind", "person_id", "session_actor", "state", "scopes", "expires_at"],
+          "properties": {
+            "kind": { "const": "device" },
+            "person_id": { "$ref": "#/$defs/Id" },
+            "session_actor": { "$ref": "#/$defs/Id" },
+            "state": { "enum": ["active", "expired", "revoked"] },
+            "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "expires_at": { "$ref": "#/$defs/Timestamp" }
+          }
+        }
+      ]
+    },
     "Operation": {
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
@@ -530,6 +547,7 @@
         { "$ref": "#/$defs/LaunchDecision" }, { "$ref": "#/$defs/LaunchApproval" },
         { "$ref": "#/$defs/Mission" }, { "$ref": "#/$defs/Work" },
         { "$ref": "#/$defs/Agent" }, { "$ref": "#/$defs/Runtime" },
+        { "$ref": "#/$defs/Device" },
         { "$ref": "#/$defs/Operation" }, { "$ref": "#/$defs/History" },
         { "$ref": "#/$defs/Session" }
       ]
@@ -537,7 +555,7 @@
     "GoldenResourceSet": {
       "type": "array",
       "items": { "$ref": "#/$defs/Resource" },
-      "minItems": 13,
+      "minItems": 14,
       "contains": { "type": "object", "properties": { "kind": { "const": "session" } }, "required": ["kind"] }
     },
     "Page": {

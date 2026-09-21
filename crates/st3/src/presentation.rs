@@ -498,12 +498,12 @@ pub(crate) fn render_human_review_list(
         let _ = writeln!(output, "    owner: {}", review.owner);
         let _ = writeln!(
             output,
-            "    approve: st3 review approve {} --actor {}",
+            "    approve: st3 attention approve {} --as {}",
             review.owner, review.reviewer
         );
         let _ = writeln!(
             output,
-            "    reject:  st3 review reject {} --actor {}",
+            "    reject:  st3 attention reject {} --as {}",
             review.owner, review.reviewer
         );
     }
@@ -1388,11 +1388,11 @@ mod tests {
         assert!(rendered.contains("review: resource/release"));
         assert!(
             rendered
-                .contains("st3 review approve step-run/release/one/publish --actor person/nathan")
+                .contains("st3 attention approve step-run/release/one/publish --as person/nathan")
         );
         assert!(
             rendered
-                .contains("st3 review reject step-run/release/one/publish --actor person/nathan")
+                .contains("st3 attention reject step-run/release/one/publish --as person/nathan")
         );
     }
 

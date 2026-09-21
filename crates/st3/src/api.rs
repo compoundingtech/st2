@@ -108,6 +108,7 @@ struct ClientListQuery {
     history: bool,
     person: Option<String>,
     actor: Option<String>,
+    owner_run: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -119,6 +120,7 @@ struct ClientPageCursor {
     history: bool,
     person: Option<String>,
     actor: Option<String>,
+    owner_run: Option<String>,
     expires_at_unix_ms: u128,
 }
 
@@ -204,6 +206,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/now", get(client_v0::now))
+        .route("/v1/client/machines", get(client_v0::machines))
+        .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
         .route("/v1/client/messages", get(client_messages))
@@ -679,6 +684,7 @@ fn client_page(
             || cursor.history != query.history
             || cursor.person != query.person
             || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
             || query
                 .limit
                 .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
@@ -713,6 +719,7 @@ fn client_page(
             history: query.history,
             person: query.person.clone(),
             actor: query.actor.clone(),
+            owner_run: query.owner_run.clone(),
             expires_at_unix_ms,
         })?)
     } else {
@@ -1782,20 +1789,24 @@ async fn client_sessions_detail(
 async fn client_attention(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_attention_resources(&state.store, query.person.as_deref(), query.history)
+    let person = client_v0::person_filter(&session, query.person.as_deref())?;
+    let items = client_attention_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "attention", items, &query).map(Json)
 }
 
 async fn client_attention_detail(
     State(state): State<AppState>,
+    Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let person = client_v0::person_filter(&session, query.person.as_deref())?;
     client_detail(
-        client_attention_resources(&state.store, query.person.as_deref(), query.history)
+        client_attention_resources(&state.store, person.as_deref(), query.history)
             .map_err(ApiError::internal)?,
         "attention",
         &id,
@@ -1805,20 +1816,24 @@ async fn client_attention_detail(
 async fn client_messages(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_message_resources(&state.store, query.person.as_deref(), query.history)
+    let person = client_v0::person_filter(&session, query.person.as_deref())?;
+    let items = client_message_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "messages", items, &query).map(Json)
 }
 
 async fn client_messages_detail(
     State(state): State<AppState>,
+    Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let person = client_v0::person_filter(&session, query.person.as_deref())?;
     client_detail(
-        client_message_resources(&state.store, query.person.as_deref(), query.history)
+        client_message_resources(&state.store, person.as_deref(), query.history)
             .map_err(ApiError::internal)?,
         "message",
         &id,
