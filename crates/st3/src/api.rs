@@ -2468,11 +2468,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     });
     let mut driver_gaps = Vec::new();
     for desired_subject in desired.iter().filter(|desired| {
-        desired
-            .member
-            .as_ref()
-            .and_then(|member| member.driver.as_ref())
-            .is_some()
+        !terminal_owned.contains(&desired.subject)
+            && desired
+                .member
+                .as_ref()
+                .and_then(|member| member.driver.as_ref())
+                .is_some()
     }) {
         let selected = state
             .store
