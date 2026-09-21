@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -816,14 +816,8 @@ fn client_work_resources(
                 "working" => "claimed",
                 other => other,
             };
-            let usage = aggregate_usage(
-                store,
-                desired
-                    .iter()
-                    .filter(|subject| subject.owner_step.as_deref() == Some(work.subject.as_str()))
-                    .map(|subject| subject.subject.as_str()),
-                Some(snapshot_index),
-            )?;
+            let usage =
+                aggregate_usage_for_step(store, &desired, &work.subject, Some(snapshot_index))?;
             Ok(json!({
                 "id": work.subject,
                 "kind": "work",
@@ -878,6 +872,43 @@ fn aggregate_usage<'a>(
         total.currency = total.currency.clone().or(usage.currency);
     }
     Ok(aggregate)
+}
+
+fn aggregate_usage_for_step(
+    store: &Store,
+    desired: &[crate::model::DesiredSubject],
+    step: &str,
+    at_index: Option<u64>,
+) -> anyhow::Result<Option<crate::model::UsageSummary>> {
+    aggregate_usage(
+        store,
+        desired
+            .iter()
+            .filter(|subject| subject.owner_step.as_deref() == Some(step))
+            .map(|subject| subject.subject.as_str()),
+        at_index,
+    )
+}
+
+fn aggregate_usage_for_runs(
+    store: &Store,
+    desired: &[crate::model::DesiredSubject],
+    runs: &BTreeSet<&str>,
+    at_index: Option<u64>,
+) -> anyhow::Result<Option<crate::model::UsageSummary>> {
+    aggregate_usage(
+        store,
+        desired
+            .iter()
+            .filter(|subject| {
+                subject
+                    .owner_run
+                    .as_deref()
+                    .is_some_and(|run| runs.contains(run))
+            })
+            .map(|subject| subject.subject.as_str()),
+        at_index,
+    )
 }
 
 fn client_agent_resources(store: &Store, history: bool, at: &str) -> anyhow::Result<Vec<Value>> {

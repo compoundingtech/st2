@@ -169,6 +169,18 @@ pub fn run_observe(
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let timeline_incarnation = std::env::var(SESSION_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| wrapperless_token(&payload))
+        .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
+    let mut timeline =
+        crate::harness_timeline::Writer::new(&agent_dir, "claude", timeline_incarnation);
+    if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
+        // Timeline observability is fail-open just like state/context publication: a record fault
+        // must not hold up the hook process Claude is waiting on.
+        tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
+    }
     // The numeric axis is independent of the categorical one and is applied first, because the
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop

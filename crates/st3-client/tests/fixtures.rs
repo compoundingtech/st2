@@ -20,6 +20,43 @@ fn generated_models_decode_every_stream_fixture() {
     assert_eq!(events.value.items.len(), 2);
     let timeline: Envelope<TimelinePage> = decode("timeline.json");
     assert_eq!(timeline.value.items.len(), 10);
+    assert!(matches!(
+        timeline.value.items[0].body,
+        TimelineBody::Status(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[1].body,
+        TimelineBody::Message(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[2].body,
+        TimelineBody::Content(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[4].body,
+        TimelineBody::ToolCall(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[5].body,
+        TimelineBody::ToolResult(_)
+    ));
+    let TimelineBody::Usage(usage) = &timeline.value.items[6].body else {
+        panic!("usage discriminator was not preserved");
+    };
+    assert_eq!(usage.total_tokens, Some(500));
+    assert_eq!(usage.attribution.agent_id, "agent/release-agent");
+    assert!(matches!(
+        timeline.value.items[7].body,
+        TimelineBody::Redaction(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[8].body,
+        TimelineBody::Truncation(_)
+    ));
+    assert!(matches!(
+        timeline.value.items[9].body,
+        TimelineBody::Error(_)
+    ));
     let screen: Envelope<TerminalScreen> = decode("terminal-screen.json");
     assert_eq!(screen.value.lines.len(), 3);
     let frames: Envelope<TerminalFramePage> = decode("terminal-frames.json");

@@ -543,6 +543,8 @@ struct CodexInboxDelivery {
     /// The numeric axis's producer, beside the categorical one. `None` only where the record has
     /// nowhere safe to stage — observability never blocks a launch.
     context: Option<CodexContextProducer>,
+    /// Crash-safe normalized conversation operations for the client-v0 timeline.
+    timeline: crate::harness_timeline::Writer,
     /// The native-driver boundary record. Codex publishes exactly one stage on it — the provider
     /// credential — because every earlier boundary is already fail-closed at admission: an
     /// incompatible protocol refuses the launch instead of degrading into an observation.
@@ -625,6 +627,8 @@ impl CodexInboxDelivery {
                 None
             }
         };
+        let timeline =
+            crate::harness_timeline::Writer::new(&config.agent_dir, "codex", runtime.incarnation());
         // The record belongs to this incarnation: the protocol gate already admitted the version
         // it names, so `support` is a measured fact rather than a probe result.
         let diagnostics = driver_diagnostic::Publisher::new(
@@ -650,6 +654,7 @@ impl CodexInboxDelivery {
             harness_evidence: false,
             pending_observation: None,
             context,
+            timeline,
             diagnostics,
         })
     }
@@ -679,6 +684,11 @@ impl CodexInboxDelivery {
     /// response carries another reading, and the record ages visibly through `ageMs` until it
     /// lands (HC-R06, HC-T05).
     fn observe_context(&mut self, message: &Value, thread_id: &str) {
+        if let Err(error) =
+            crate::harness_timeline::observe_codex(&mut self.timeline, message, thread_id)
+        {
+            tracing::warn!("st2 codex: harness-timeline write failed: {error:#}");
+        }
         if let Some(context) = self.context.as_mut()
             && let Err(error) = context.observe(message, thread_id)
         {

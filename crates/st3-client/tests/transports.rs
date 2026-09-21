@@ -8,8 +8,10 @@ use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
 use st3::store::Store;
 use st3_client::{
-    AttentionResolveParameters, Capabilities, Client, Envelope, Fence, LaunchVariantParameters,
-    PairingBegin, PairingComplete, Resource, TargetParameters, TerminalAttachment,
+    AttentionResolveParameters, Capabilities, Client, ClientError, Envelope, ErrorCode, Fence,
+    LaunchVariantParameters, PairingBegin, PairingComplete, Resource, TargetParameters,
+    TerminalAttachment, TerminalInputMode, TerminalInputParameters, TerminalResizeParameters,
+    TimelineBody, TimelineUsageSemantics,
 };
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -55,6 +57,32 @@ fn publish_terminal(state: &AppState, incarnation: &str) {
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: None,
+        })
+        .unwrap();
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "agent/terminal-demo".into(),
+            kind: "harness.timeline".into(),
+            actor: Some("agent/terminal-demo".into()),
+            fields: BTreeMap::from([
+                ("operation".into(), Value::String("append".into())),
+                (
+                    "entry_id".into(),
+                    Value::String(format!("timeline-entry/usage-{incarnation}")),
+                ),
+                ("sequence".into(), Value::from(1)),
+                ("revision".into(), Value::from(1)),
+                ("role".into(), Value::String("system".into())),
+                ("entry_type".into(), Value::String("usage".into())),
+                ("final".into(), Value::Bool(true)),
+                ("body".into(), serde_json::json!({"total_tokens":7})),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("timeline-usage-{incarnation}")),
         })
         .unwrap();
 }
@@ -259,6 +287,34 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             .is_err(),
         "plain Unix clients cannot approve launches"
     );
+    let sessions = read_only.sessions_list(None, None, false).await.unwrap();
+    let session = sessions
+        .value
+        .items
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Session(session) if session.owner_id == "agent/terminal-demo" => {
+                Some(session)
+            }
+            _ => None,
+        })
+        .expect("the advertised runtime has a typed session resource");
+    let timeline = read_only
+        .timeline(&session.header.id, None, None)
+        .await
+        .expect("the generated route strips and encodes the projected session ID");
+    let usage = timeline
+        .value
+        .items
+        .iter()
+        .find_map(|entry| match &entry.body {
+            TimelineBody::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .expect("source usage without semantics still decodes as a typed usage body");
+    assert_eq!(usage.semantics, TimelineUsageSemantics::Response);
+    assert_eq!(usage.driver, "codex");
+    assert_eq!(usage.total_tokens, Some(7));
     client
         .attention_resolve(
             "action/attention-resolve-generated-client",
@@ -312,6 +368,65 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             .is_err(),
         "person/nathan cannot resolve person/alex attention"
     );
+
+    let read_only_attachment = attach_terminal(&read_only, "unix-read-only").await;
+    let read_only_stream = read_only
+        .terminal_frames(
+            &read_only_attachment.terminal_id,
+            None,
+            Some(&read_only_attachment.runtime_incarnation),
+            read_only_attachment.stream_capability.as_deref().unwrap(),
+            Some(1_000),
+        )
+        .await
+        .expect("a plain Unix client may consume its read-only viewer capability");
+    assert_eq!(
+        read_only_stream.screen.value.lines[0].text,
+        "terminal ready"
+    );
+    let read_only_fence = read_only.capabilities().await.unwrap();
+    for denied in [
+        read_only
+            .terminal_input(
+                "action/read-only-terminal-input",
+                "read-only-terminal-input-0001",
+                Fence {
+                    snapshot_id: read_only_fence.snapshot.id.clone(),
+                    runtime_incarnation: Some(read_only_attachment.runtime_incarnation.clone()),
+                    terminal_sequence: Some(read_only_fence.snapshot.store_index),
+                    ..Fence::default()
+                },
+                TerminalInputParameters {
+                    terminal_id: read_only_attachment.terminal_id.clone(),
+                    mode: TerminalInputMode::Line,
+                    value: "must not be written".into(),
+                },
+            )
+            .await,
+        read_only
+            .terminal_resize(
+                "action/read-only-terminal-resize",
+                "read-only-terminal-resize-0001",
+                Fence {
+                    snapshot_id: read_only_fence.snapshot.id.clone(),
+                    runtime_incarnation: Some(read_only_attachment.runtime_incarnation.clone()),
+                    terminal_sequence: Some(read_only_fence.snapshot.store_index),
+                    ..Fence::default()
+                },
+                TerminalResizeParameters {
+                    terminal_id: read_only_attachment.terminal_id.clone(),
+                    rows: 40,
+                    columns: 120,
+                },
+            )
+            .await,
+    ] {
+        assert!(
+            matches!(denied, Err(ClientError::Api(ErrorCode::Forbidden, _, _))),
+            "terminal input and resize require terminal.control"
+        );
+    }
+    detach_terminal(&read_only, &read_only_attachment, "unix-read-only").await;
 
     let first_attachment = attach_terminal(&client, "unix-first").await;
     let first = client

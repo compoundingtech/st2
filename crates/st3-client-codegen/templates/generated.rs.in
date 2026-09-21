@@ -552,11 +552,10 @@ pub struct TimelineEntry {
     pub revision: u32,
     pub timestamp: String,
     pub role: TimelineRole,
-    #[serde(rename = "type")]
-    pub entry_type: TimelineType,
     #[serde(rename = "final")]
     pub is_final: bool,
-    pub body: Value,
+    #[serde(flatten)]
+    pub body: TimelineBody,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -584,6 +583,160 @@ pub enum TimelineType {
     Truncation,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", content = "body", rename_all = "snake_case")]
+pub enum TimelineBody {
+    Message(TimelineMessageBody),
+    Content(TimelineContentBody),
+    ToolCall(TimelineToolCallBody),
+    ToolResult(TimelineToolResultBody),
+    Status(TimelineStatusBody),
+    Error(TimelineErrorBody),
+    Usage(TimelineUsageBody),
+    Redaction(TimelineRedactionBody),
+    Truncation(TimelineTruncationBody),
+}
+
+impl TimelineBody {
+    pub fn entry_type(&self) -> TimelineType {
+        match self {
+            Self::Message(_) => TimelineType::Message,
+            Self::Content(_) => TimelineType::Content,
+            Self::ToolCall(_) => TimelineType::ToolCall,
+            Self::ToolResult(_) => TimelineType::ToolResult,
+            Self::Status(_) => TimelineType::Status,
+            Self::Error(_) => TimelineType::Error,
+            Self::Usage(_) => TimelineType::Usage,
+            Self::Redaction(_) => TimelineType::Redaction,
+            Self::Truncation(_) => TimelineType::Truncation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineMessageBody {
+    pub message_id: String,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineContentBody {
+    pub media_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachment_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TimelineToolCallBody {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TimelineToolResultBody {
+    pub call_id: String,
+    pub status: TimelineToolStatus,
+    pub media_type: String,
+    pub content: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineToolStatus {
+    Success,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineStatusBody {
+    pub status: TimelineStatus,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineStatus {
+    Queued,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TimelineErrorBody {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub details: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TimelineUsageBody {
+    pub semantics: TimelineUsageSemantics,
+    pub driver: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_used_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_used_percent: Option<f64>,
+    #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default)]
+    pub currency: Option<String>,
+    pub attribution: TimelineAttribution,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineUsageSemantics {
+    ContextOccupancy,
+    SessionCumulative,
+    Response,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineAttribution {
+    pub agent_id: String,
+    pub mission_run_id: Option<String>,
+    pub generation_id: Option<String>,
+    pub step_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineRedactionBody {
+    pub reason: String,
+    pub withheld_bytes: u64,
+    #[serde(default)]
+    pub withheld_items: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineTruncationBody {
+    pub reason: String,
+    pub omitted_from_sequence: u64,
+    pub omitted_to_sequence: u64,
+    #[serde(default)]
+    pub continuation_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

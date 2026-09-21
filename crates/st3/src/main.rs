@@ -6199,6 +6199,7 @@ async fn run_st2_native_driver(
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
+    let mut published_timeline = BTreeSet::new();
     let mut ready = false;
     let mut last_control_warning = None;
     loop {
@@ -6282,6 +6283,15 @@ async fn run_st2_native_driver(
                         )
                         .await?;
                     }
+                    publish_harness_timeline(
+                        client,
+                        subject,
+                        driver,
+                        &incarnation,
+                        &agent_dir,
+                        &mut published_timeline,
+                    )
+                    .await?;
                     if driver != "claude" {
                         forward_projected_messages(
                             client,
@@ -6595,6 +6605,84 @@ async fn publish_harness_usage(
     Ok(())
 }
 
+async fn publish_harness_timeline(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    incarnation: &str,
+    agent_dir: &Path,
+    published: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Some(record) =
+        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+    else {
+        return Ok(());
+    };
+    // A replaced harness can leave a valid predecessor record at this stable path. It is history,
+    // not authority for the live runtime, and must never be relabelled as the successor.
+    if record.driver != driver || record.incarnation_id != incarnation {
+        return Ok(());
+    }
+    for operation in record.operations {
+        let publication = format!(
+            "{}:{}:{}:{}",
+            operation.incarnation_id, operation.entry_id, operation.revision, operation.operation
+        );
+        if published.contains(&publication) {
+            continue;
+        }
+        // Usage ownership is graph state, not a driver fact. Persist no placeholder/null owner
+        // fields here; the client projection joins the exact desired owner run/generation/step at
+        // its snapshot index and overwrites attribution on every explicit usage entry.
+        let body = operation.body;
+        let fields = BTreeMap::from([
+            (
+                "operation".into(),
+                Value::String(operation.operation.clone()),
+            ),
+            ("entry_id".into(), Value::String(operation.entry_id.clone())),
+            ("sequence".into(), Value::from(operation.sequence)),
+            ("revision".into(), Value::from(operation.revision)),
+            ("role".into(), Value::String(operation.role)),
+            ("entry_type".into(), Value::String(operation.entry_type)),
+            ("final".into(), Value::Bool(operation.final_entry)),
+            ("body".into(), body),
+            ("driver".into(), Value::String(operation.driver)),
+            (
+                "incarnation_id".into(),
+                Value::String(operation.incarnation_id),
+            ),
+            (
+                "observed_at_unix_ms".into(),
+                Value::from(operation.observed_at_unix_ms),
+            ),
+        ]);
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+        let _: ClaimRecord = client
+            .post(
+                "/v1/claims",
+                &ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("harness-timeline:{subject}:{digest}")),
+                },
+            )
+            .await?;
+        published.insert(publication);
+    }
+    // The producer is bounded to the same order of magnitude. Forget publications no longer in
+    // its record so this in-memory acceleration is bounded too; durable API idempotency remains
+    // the restart/replay authority.
+    if published.len() > 8_192 {
+        published.clear();
+    }
+    Ok(())
+}
+
 async fn publish_harness_state(
     client: &Client,
     subject: &str,
@@ -6865,6 +6953,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     let mut renewed_minute = None;
     let mut ready = false;
     let mut last_usage_fingerprint = None;
+    let mut published_timeline = BTreeSet::new();
     let mut last_control_warning = None;
     loop {
         tokio::select! {
@@ -6937,6 +7026,15 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         &incarnation,
                         &agent_dir,
                         &mut last_usage_fingerprint,
+                    )
+                    .await?;
+                    publish_harness_timeline(
+                        client,
+                        subject,
+                        "codex",
+                        &incarnation,
+                        &agent_dir,
+                        &mut published_timeline,
                     )
                     .await?;
                     Ok(())

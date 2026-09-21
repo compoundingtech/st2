@@ -24,6 +24,7 @@ use crate::native_channel::{channel_content, write_json};
 use crate::{context, driver_diagnostic, harness_context, harness_state, message};
 
 const POLL: Duration = Duration::from_millis(250);
+const MAX_CHANNEL_LINE_BYTES: usize = 128 * 1024;
 
 /// How old durable working state may be and still be restored, matching the lifecycle hooks'
 /// `ST_REHYDRATE_STALE_S` default. Stale state is worse than none: it describes a world the agent
@@ -125,9 +126,19 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let session_context = session_context(&agent_dir, identity);
     let (input_tx, input_rx) = mpsc::channel();
     thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if input_tx.send(line).is_err() {
-                break;
+        let mut stdin = io::stdin().lock();
+        loop {
+            match read_bounded_line(&mut stdin, MAX_CHANNEL_LINE_BYTES) {
+                Ok(Some(line)) => {
+                    if input_tx.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = input_tx.send(Err(error));
+                    break;
+                }
             }
         }
     });
@@ -192,7 +203,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     // an agent directory with no parent has nowhere safe to stage a temporary file.
     let mut context_writer = match harness_context::Writer::new(&agent_dir, identity, kind.harness)
     {
-        Ok(writer) => Some(writer.with_session(context_session)),
+        Ok(writer) => Some(writer.with_session(context_session.clone())),
         Err(error) => {
             tracing::warn!(
                 "st2 {} channel: harness context is unavailable: {error}",
@@ -201,6 +212,8 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
             None
         }
     };
+    let mut timeline_writer =
+        crate::harness_timeline::Writer::new(&agent_dir, kind.label, context_session);
     channel_loop(
         &input_rx,
         &mut stdout,
@@ -208,11 +221,52 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         &agent_dir,
         &mut writer,
         context_writer.as_mut(),
+        &mut timeline_writer,
         identity,
         kind,
         POLL,
         harness_state::HARNESS_STATE_REFRESH,
     )
+}
+
+/// Read one LF-delimited frame without ever allocating more than `limit` bytes. An oversized or
+/// invalid-UTF-8 frame is drained and returned as an empty line so the observational channel stays
+/// alive for the next valid frame.
+fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut overflow = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if bytes.is_empty() && !overflow {
+                return Ok(None);
+            }
+            return Ok(Some(if overflow {
+                String::new()
+            } else {
+                String::from_utf8(bytes).unwrap_or_default()
+            }));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let content = newline.map_or(available, |position| &available[..position]);
+        if !overflow {
+            if bytes.len().saturating_add(content.len()) <= limit {
+                bytes.extend_from_slice(content);
+            } else {
+                overflow = true;
+                bytes.clear();
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(if overflow {
+                String::new()
+            } else {
+                String::from_utf8(bytes).unwrap_or_default()
+            }));
+        }
+    }
 }
 
 /// The channel's steady state: forward inbox entries out, fold extension frames in, and keep the
@@ -226,6 +280,7 @@ fn channel_loop(
     agent_dir: &Path,
     writer: &mut harness_state::Writer,
     mut context_writer: Option<&mut harness_context::Writer>,
+    timeline_writer: &mut crate::harness_timeline::Writer,
     identity: &str,
     kind: &ChannelKind,
     poll: Duration,
@@ -249,6 +304,14 @@ fn channel_loop(
                 // The typed turn result, decoded once: it feeds two independent records and the
                 // credential edge must not depend on the categorical write landing.
                 let turn = frame.as_ref().and_then(turn_result);
+                if let Some(frame) = frame.as_ref()
+                    && let Err(error) =
+                        crate::harness_timeline::observe_channel_frame(timeline_writer, frame)
+                {
+                    tracing::warn!(
+                        "st2 {label} channel: recording harness timeline failed: {error:#}"
+                    );
+                }
                 if let Some(observation) = frame
                     .as_ref()
                     .and_then(state_observation)
@@ -653,6 +716,22 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn oversized_channel_lines_are_drained_without_allocating_or_losing_the_next_frame() {
+        let mut input = Vec::from([b'x'; 256]);
+        input.extend_from_slice(b"\n{\"type\":\"state\",\"state\":\"idle\"}\n");
+        let mut reader = std::io::Cursor::new(input);
+        assert_eq!(
+            read_bounded_line(&mut reader, 32).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 64).unwrap().as_deref(),
+            Some(r#"{"type":"state","state":"idle"}"#)
+        );
+        assert_eq!(read_bounded_line(&mut reader, 64).unwrap(), None);
+    }
+
     /// Only the two words pi's own turn boundaries can vouch for become observations. Everything
     /// else — other frame types, unknown state words, missing fields — is dropped, so a newer
     /// extension asset cannot push this channel into recording something it cannot prove.
@@ -731,6 +810,7 @@ mod tests {
         let run_frame = || {
             let mut writer =
                 harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "omp", "test");
             let (tx, rx) = mpsc::channel();
             tx.send(Ok(r#"{"type":"pre_compact"}"#.to_string()))
                 .unwrap();
@@ -742,6 +822,7 @@ mod tests {
                 agent_dir,
                 &mut writer,
                 None,
+                &mut timeline,
                 "h.worker",
                 &OMP_KIND,
                 Duration::from_millis(1),
@@ -793,6 +874,7 @@ mod tests {
         let record = harness_state::harness_state_path(agent_dir);
         let mut writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "pi", "test");
         let (tx, rx) = mpsc::channel();
 
         tx.send(Ok(r#"{"type":"state","state":"active"}"#.to_string()))
@@ -809,6 +891,7 @@ mod tests {
             agent_dir,
             &mut writer,
             None,
+            &mut timeline,
             "h.worker",
             &PI_KIND,
             Duration::from_millis(2),
@@ -851,6 +934,7 @@ mod tests {
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
                 .with_session(session);
         wrapper_writer.ended("signal 9").unwrap();
+        let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "pi", "test");
         let terminal = std::fs::read(&record).unwrap();
 
         let (tx, rx) = mpsc::channel();
@@ -865,6 +949,7 @@ mod tests {
             agent_dir,
             &mut channel_writer,
             None,
+            &mut timeline,
             "h.worker",
             &PI_KIND,
             Duration::from_millis(2),
@@ -1384,6 +1469,7 @@ mod tests {
         let run = |frames: &[&str]| {
             let mut writer =
                 harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "omp", "test");
             let (tx, rx) = mpsc::channel();
             for frame in frames {
                 tx.send(Ok((*frame).to_string())).unwrap();
@@ -1396,6 +1482,7 @@ mod tests {
                 agent_dir,
                 &mut writer,
                 None,
+                &mut timeline,
                 "h.worker",
                 &OMP_KIND,
                 Duration::from_millis(1),
@@ -1458,6 +1545,7 @@ mod tests {
         std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
         let mut writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "pi", "test");
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(
             r#"{"type":"turn","error":{"reason":"401 invalid x-api-key","errorId":16781312}}"#
@@ -1472,6 +1560,7 @@ mod tests {
             agent_dir,
             &mut writer,
             None,
+            &mut timeline,
             "h.worker",
             &PI_KIND,
             Duration::from_millis(1),

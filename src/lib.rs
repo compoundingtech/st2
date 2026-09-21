@@ -35,6 +35,7 @@ mod flock;
 mod fsatomic;
 pub mod harness_context;
 pub mod harness_state;
+pub mod harness_timeline;
 pub mod harness_version;
 pub mod hooks;
 pub mod host_lock;

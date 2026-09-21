@@ -2,6 +2,11 @@ import XCTest
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testTimelineRouteIDStripsPrefixAndEncodesOneSegment() {
+        XCTAssertEqual(St3Client.routedSessionID("session/release-agent/9"), "release-agent%2F9")
+        XCTAssertEqual(St3Client.routedSessionID("release agent/9"), "release%20agent%2F9")
+    }
+
     func testCapabilitiesFixtureDecodes() throws {
         let json = #"{"api_version":"st3.client.v0","request_id":"request/1","snapshot":{"id":"snapshot/host/1/a","host_id":"host/a","store_index":1,"projection_version":"client-projection.v0","created_at":"2026-09-20T12:00:00Z"},"value":{"kind":"capabilities","session_actor":"person/a/session/b","transport":"fabric-loopback","capabilities":[],"limits":{"max_page_items":200,"max_event_items":500,"max_response_bytes":1048576,"max_wait_ms":30000},"event_cursor":"event-cursor/a/1","oldest_event_cursor":"event-cursor/a/0","schemas":["schema.json"]}}"#
         let value = try JSONDecoder().decode(Envelope<Capabilities>.self, from: Data(json.utf8))
@@ -55,5 +60,25 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(history.storeIndex, 1842)
         guard case .session(let session) = resources[12] else { return XCTFail("session discriminator lost") }
         XCTAssertEqual(session.timelineCursor, "timeline-cursor/release-agent/9/8")
+    }
+
+    func testTimelineFixturePreservesEveryTypedBody() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/timeline.json"))
+        let timeline = try JSONDecoder().decode(Envelope<TimelinePage>.self, from: data).value
+        guard case .status = timeline.items[0].body else { return XCTFail("status body lost") }
+        guard case .message = timeline.items[1].body else { return XCTFail("message body lost") }
+        guard case .content(let content) = timeline.items[2].body else { return XCTFail("content body lost") }
+        XCTAssertEqual(content.text, "Build the release.")
+        guard case .toolCall(let call) = timeline.items[4].body else { return XCTFail("tool call lost") }
+        XCTAssertEqual(call.name, "shell")
+        guard case .toolResult = timeline.items[5].body else { return XCTFail("tool result lost") }
+        guard case .usage(let usage) = timeline.items[6].body else { return XCTFail("usage body lost") }
+        XCTAssertEqual(usage.totalTokens, 500)
+        XCTAssertEqual(usage.attribution.agentID, "agent/release-agent")
+        guard case .redaction = timeline.items[7].body else { return XCTFail("redaction lost") }
+        guard case .truncation = timeline.items[8].body else { return XCTFail("truncation lost") }
+        guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
     }
 }

@@ -132,6 +132,14 @@ impl ClientSession {
     }
 }
 
+fn session_claim_actor(session: &ClientSession) -> String {
+    session
+        .authority_actor
+        .starts_with("person/")
+        .then(|| session.authority_actor.clone())
+        .unwrap_or_else(|| "requester".into())
+}
+
 pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     let mut capabilities = ALL_SCOPES
         .iter()
@@ -386,19 +394,7 @@ fn mission_resources(store: &Store, snapshot_index: u64) -> anyhow::Result<Vec<V
                 .iter()
                 .map(|run| run.subject.as_str())
                 .collect::<BTreeSet<_>>();
-            let usage = aggregate_usage(
-                store,
-                desired
-                    .iter()
-                    .filter(|subject| {
-                        subject
-                            .owner_run
-                            .as_deref()
-                            .is_some_and(|run| run_ids.contains(run))
-                    })
-                    .map(|subject| subject.subject.as_str()),
-                Some(snapshot_index),
-            )?;
+            let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let visualization = mission_visualization(store, &mission, &latest.revision, state)?;
             Ok::<Value, anyhow::Error>(json!({
                 "id": mission,
@@ -646,6 +642,94 @@ pub(super) async fn operation_detail(
     )
 }
 
+fn timeline_attribution(owner: &str, desired: &[crate::model::DesiredSubject]) -> Value {
+    let ownership = desired.iter().find(|desired| desired.subject == owner);
+    json!({
+        "agent_id": owner,
+        "mission_run_id": ownership.and_then(|value| value.owner_run.as_deref()),
+        "generation_id": ownership.and_then(|value| value.owner_generation.as_deref()),
+        "step_id": ownership.and_then(|value| value.owner_step.as_deref()),
+    })
+}
+
+fn timeline_retention_is_explicit(claims: &[ClaimRecord], has_older: bool) -> bool {
+    if !has_older {
+        return true;
+    }
+    let earliest_retained = claims
+        .iter()
+        .filter_map(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            (fields.get("entry_type").and_then(Value::as_str) != Some("truncation"))
+                .then(|| fields.get("sequence").and_then(Value::as_u64))
+                .flatten()
+        })
+        .min();
+    let Some(required_through) = earliest_retained.and_then(|sequence| sequence.checked_sub(1))
+    else {
+        return false;
+    };
+    let mut intervals = claims
+        .iter()
+        .filter_map(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            (fields.get("operation").and_then(Value::as_str) == Some("append")
+                && fields.get("entry_type").and_then(Value::as_str) == Some("truncation"))
+            .then(|| {
+                fields
+                    .pointer("/body/omitted_from_sequence")
+                    .and_then(Value::as_u64)
+                    .zip(
+                        fields
+                            .pointer("/body/omitted_to_sequence")
+                            .and_then(Value::as_u64),
+                    )
+            })
+            .flatten()
+            .filter(|(from, to)| from <= to)
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut covered_through = 0_u64;
+    for (from, to) in intervals {
+        if from > covered_through.saturating_add(1) {
+            break;
+        }
+        covered_through = covered_through.max(to);
+        if covered_through >= required_through {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalized_timeline_usage_body(
+    body: Value,
+    attribution: &Value,
+    source_driver: Option<&str>,
+) -> Value {
+    let mut body = body.as_object().cloned().unwrap_or_default();
+    if !matches!(
+        body.get("semantics").and_then(Value::as_str),
+        Some("context_occupancy" | "session_cumulative" | "response")
+    ) {
+        // Legacy/provider events without declared cumulative semantics are one
+        // response observation; treating them as cumulative would undercount.
+        body.insert("semantics".into(), Value::String("response".into()));
+    }
+    if let Some(driver) = source_driver.filter(|driver| !driver.is_empty()) {
+        body.insert("driver".into(), Value::String(driver.into()));
+    } else if !body
+        .get("driver")
+        .and_then(Value::as_str)
+        .is_some_and(|driver| !driver.is_empty())
+    {
+        body.insert("driver".into(), Value::String("unknown".into()));
+    }
+    body.insert("attribution".into(), attribution.clone());
+    Value::Object(body)
+}
+
 pub(super) fn timeline_value(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -669,24 +753,73 @@ pub(super) fn timeline_value(
         .as_str()
         .ok_or_else(|| ApiError::internal("a session resource has no owner"))?;
     let incarnation = resource["runtime_incarnation"].as_str();
-    let attribution = state
-        .store
-        .desired_subjects()
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|desired| desired.subject == owner);
-    let attribution = json!({
-        "agent_id": owner,
-        "mission_run_id": attribution.as_ref().and_then(|value| value.owner_run.as_deref()),
-        "generation_id": attribution.as_ref().and_then(|value| value.owner_generation.as_deref()),
-        "step_id": attribution.as_ref().and_then(|value| value.owner_step.as_deref()),
-    });
+    let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
+    let attribution = timeline_attribution(owner, &desired);
     let before = snapshot.store_index.checked_add(1);
-    let claims = state
+    let timeline_page = if let Some(incarnation) = incarnation {
+        state
+            .store
+            .timeline_claims_for_incarnation_at(owner, incarnation, before, true, 4_096)
+            .map_err(ApiError::internal)?
+    } else {
+        crate::model::ClaimsPage {
+            claims: Vec::new(),
+            next_cursor: None,
+        }
+    };
+    let has_older_timeline = timeline_page.next_cursor.is_some();
+    let mut timeline_claims = timeline_page.claims;
+    timeline_claims.reverse();
+    timeline_claims.retain(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        incarnation.is_some_and(|expected| {
+            fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
+        })
+    });
+    if !timeline_retention_is_explicit(&timeline_claims, has_older_timeline) {
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            code: "cursor-gap".into(),
+            message: "older timeline history was omitted without a typed truncation interval"
+                .into(),
+            details: serde_json::Map::from_iter([("full_resync".into(), Value::Bool(true))]),
+        });
+    }
+    let mut retained_entries = BTreeSet::new();
+    for claim in &timeline_claims {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let Some(entry_id) = fields.get("entry_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let operation = fields.get("operation").and_then(Value::as_str);
+        if !retained_entries.contains(entry_id) && operation != Some("append") {
+            return Err(ApiError {
+                status: StatusCode::GONE,
+                code: "cursor-gap".into(),
+                message: "the retained timeline begins after an entry's append operation".into(),
+                details: serde_json::Map::from_iter([("full_resync".into(), Value::Bool(true))]),
+            });
+        }
+        retained_entries.insert(entry_id.to_owned());
+    }
+    let mut owner_claims = state
         .store
-        .claims_page(None, None, 0, before, false, 1_000_000)
+        .claims_page(Some(owner), None, 0, before, true, 10_000)
         .map_err(ApiError::internal)?
         .claims;
+    owner_claims.reverse();
+    owner_claims.retain(|claim| claim.kind != "harness.timeline");
+    let mut message_claims = state
+        .store
+        .claims_for_kind_at("message.sent", before, true, 10_000)
+        .map_err(ApiError::internal)?
+        .claims;
+    message_claims.reverse();
+    let mut claims = timeline_claims;
+    claims.extend(owner_claims);
+    claims.extend(message_claims);
+    claims.sort_by_key(|claim| claim.store_index);
+    claims.dedup_by_key(|claim| claim.id.clone());
     let session_leaf = session_id.trim_start_matches("session/");
     let mut items = Vec::<Value>::new();
     let mut explicit = BTreeMap::<String, usize>::new();
@@ -701,10 +834,18 @@ pub(super) fn timeline_value(
     };
     for claim in claims {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let timestamp = client_timestamp(claim.accepted_at_unix_ms);
+        let timestamp = client_timestamp(
+            fields
+                .get("observed_at_unix_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(claim.accepted_at_unix_ms),
+        );
         let base_sequence = claim.store_index.saturating_mul(4);
         if claim.subject == owner && claim.kind == "harness.timeline" {
-            if !applies_to_incarnation(fields) {
+            if !incarnation.is_some_and(|expected| {
+                fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
+            }) {
                 continue;
             }
             let Some(operation) = fields.get("operation").and_then(Value::as_str) else {
@@ -726,7 +867,18 @@ pub(super) fn timeline_value(
                 .get("final")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let body = fields.get("body").cloned().unwrap_or_else(|| json!({}));
+            let sequence = fields
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(base_sequence + 3);
+            let mut body = fields.get("body").cloned().unwrap_or_else(|| json!({}));
+            if entry_type == "usage" {
+                body = normalized_timeline_usage_body(
+                    body,
+                    &attribution,
+                    fields.get("driver").and_then(Value::as_str),
+                );
+            }
             let transition_valid = match operation {
                 "append" => !explicit.contains_key(id) && revision == 1,
                 "replace" | "finalize" => explicit.get(id).is_some_and(|index| {
@@ -748,7 +900,7 @@ pub(super) fn timeline_value(
             if !transition_valid || !tool_order_valid {
                 items.push(json!({
                     "id": entry_id(&claim, "invalid-transition"),
-                    "sequence": base_sequence + 3,
+                    "sequence": sequence,
                     "revision": 1,
                     "timestamp": timestamp,
                     "role": "system",
@@ -772,7 +924,7 @@ pub(super) fn timeline_value(
                 explicit.insert(id.to_owned(), items.len());
                 items.push(json!({
                     "id": id,
-                    "sequence": base_sequence + 3,
+                    "sequence": sequence,
                     "revision": revision,
                     "timestamp": timestamp,
                     "role": role,
@@ -863,7 +1015,11 @@ pub(super) fn timeline_value(
             }
             let mut body = fields.as_object().cloned().unwrap_or_default();
             body.remove("incarnation_id");
-            body.insert("attribution".into(), attribution.clone());
+            let body = normalized_timeline_usage_body(
+                Value::Object(body),
+                &attribution,
+                fields.get("driver").and_then(Value::as_str),
+            );
             items.push(json!({
                 "id": entry_id(&claim, "usage"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": "system", "type": "usage",
@@ -1676,7 +1832,7 @@ fn create_terminal_attachment(
     let appended = state.store.append_claim(&ClaimInput {
         subject,
         kind: "custom.client.terminal-attached".into(),
-        actor: Some(session.actor.clone()),
+        actor: Some(session_claim_actor(session)),
         fields: BTreeMap::from([
             ("attachment_id".into(), Value::String(attachment_id.clone())),
             ("terminal_id".into(), Value::String(terminal_id.clone())),
@@ -1783,7 +1939,7 @@ fn consume_terminal_attachment(
         .append_claim(&ClaimInput {
             subject: attached.subject.clone(),
             kind: "custom.client.terminal-consumed".into(),
-            actor: Some(session.actor.clone()),
+            actor: Some(session_claim_actor(session)),
             fields: BTreeMap::from([(
                 "attachment_id".into(),
                 field("attachment_id")
@@ -1845,7 +2001,7 @@ fn detach_terminal_attachment(
         .append_claim(&ClaimInput {
             subject,
             kind: "custom.client.terminal-detached".into(),
-            actor: Some(session.actor.clone()),
+            actor: Some(session_claim_actor(session)),
             fields: BTreeMap::from([(
                 "attachment_id".into(),
                 Value::String(attachment_id.clone()),
@@ -2600,11 +2756,6 @@ pub(super) async fn action(
     Extension(session): Extension<ClientSession>,
     Json(request): Json<ActionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if !session.authority_actor.starts_with("person/") {
-        return Err(forbidden(
-            "client mutations require explicit concrete person authority",
-        ));
-    }
     if request.api_version != CLIENT_API_VERSION
         || !request.id.starts_with("action/")
         || !(16..=256).contains(&request.idempotency_key.len())
@@ -2621,6 +2772,15 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
+    let read_only_terminal_lifecycle = matches!(
+        request.action_type.as_str(),
+        "terminal.attach" | "terminal.detach"
+    );
+    if !read_only_terminal_lifecycle && !session.authority_actor.starts_with("person/") {
+        return Err(forbidden(
+            "client mutations require explicit concrete person authority",
+        ));
+    }
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
     let request_digest = hex::encode(Sha256::digest(&encoded));
     let receipt_digest = hex::encode(Sha256::digest(
@@ -2714,7 +2874,7 @@ pub(super) async fn action(
     let receipt_write = state.store.append_claim(&ClaimInput {
         subject: receipt_subject.clone(),
         kind: "custom.client.action-result".into(),
-        actor: Some(session.actor.clone()),
+        actor: Some(session_claim_actor(&session)),
         fields: BTreeMap::from([
             (
                 "authority_actor".into(),
@@ -3046,6 +3206,44 @@ mod tests {
             ),
             "timeline-content-finalize",
         );
+        let mut wrong_incarnation = timeline(
+            "append",
+            "timeline-entry/wrong-incarnation",
+            1,
+            "assistant",
+            "content",
+            true,
+            json!({"media_type":"text/plain", "text":"must not cross incarnations"}),
+        );
+        wrong_incarnation.insert(
+            "incarnation_id".into(),
+            Value::String("timeline-runtime:old".into()),
+        );
+        append(
+            "harness.timeline",
+            wrong_incarnation,
+            "timeline-wrong-incarnation",
+        );
+        let mut missing_incarnation = timeline(
+            "append",
+            "timeline-entry/missing-incarnation",
+            1,
+            "assistant",
+            "content",
+            true,
+            json!({"media_type":"text/plain", "text":"must be rejected"}),
+        );
+        missing_incarnation.remove("incarnation_id");
+        let missing = state.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: missing_incarnation,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("timeline-missing-incarnation".into()),
+        });
+        assert_eq!(missing.unwrap_err().code, "missing-claim-field");
         for (entry_id, role, entry_type, body) in [
             (
                 "timeline-entry/tool-call",
@@ -3071,11 +3269,20 @@ mod tests {
                 "truncation",
                 json!({"reason":"limit", "omitted_from_sequence":90, "omitted_to_sequence":99}),
             ),
+            (
+                "timeline-entry/usage-without-source-semantics",
+                "system",
+                "usage",
+                json!({"total_tokens":7}),
+            ),
         ] {
             append(
                 "harness.timeline",
                 timeline("append", entry_id, 1, role, entry_type, true, body),
-                &format!("timeline-{entry_type}"),
+                &format!(
+                    "timeline-{}",
+                    entry_id.trim_start_matches("timeline-entry/")
+                ),
             );
         }
         append(
@@ -3162,9 +3369,229 @@ mod tests {
         assert_eq!(final_content["revision"], 3);
         assert_eq!(final_content["final"], true);
         assert_eq!(final_content["body"]["text"], "final");
+        let inferred_usage = entries
+            .iter()
+            .find(|entry| entry["id"] == "timeline-entry/usage-without-source-semantics")
+            .unwrap();
+        assert_eq!(inferred_usage["body"]["semantics"], "response");
+        assert_eq!(inferred_usage["body"]["driver"], "codex");
+        assert_eq!(inferred_usage["body"]["attribution"]["agent_id"], subject);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["id"] != "timeline-entry/wrong-incarnation"),
+            "explicit timeline claims are fenced to the live incarnation"
+        );
         assert!(entries.windows(2).all(|pair| {
             pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap()
         }));
+    }
+
+    #[test]
+    fn timeline_retention_requires_an_actual_typed_gap_interval() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "timeline-retention-node");
+        let subject = "agent/timeline-retention-owner";
+        let incarnation = "timeline-retention-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("timeline-retention-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("timeline-retention-runtime".into()),
+            })
+            .unwrap();
+        let append_entry = |sequence: u64, entry_type: &str, body: Value| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("operation".into(), Value::String("append".into())),
+                        (
+                            "entry_id".into(),
+                            Value::String(format!("timeline-entry/retention-{sequence}")),
+                        ),
+                        ("sequence".into(), Value::from(sequence)),
+                        ("revision".into(), Value::from(1)),
+                        ("role".into(), Value::String("system".into())),
+                        ("entry_type".into(), Value::String(entry_type.into())),
+                        ("final".into(), Value::Bool(true)),
+                        ("body".into(), body),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("timeline-retention-{sequence}")),
+                })
+                .unwrap();
+        };
+        for sequence in 1..=4_097 {
+            append_entry(
+                sequence,
+                "status",
+                json!({"status":"running", "detail":format!("event {sequence}")}),
+            );
+        }
+        let session = ClientSession::local(None).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let session_id = client_session_resources(
+            &state.store,
+            true,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let gap = timeline_value(
+            &state,
+            &snapshot,
+            &session,
+            session_id.trim_start_matches("session/"),
+            &ClientListQuery::default(),
+        )
+        .unwrap_err();
+        assert_eq!(gap.status, StatusCode::GONE);
+        assert_eq!(gap.code, "cursor-gap");
+        assert_eq!(gap.details.get("full_resync"), Some(&Value::Bool(true)));
+
+        append_entry(
+            4_098,
+            "truncation",
+            json!({
+                "reason":"producer-retention",
+                "omitted_from_sequence":1,
+                "omitted_to_sequence":1
+            }),
+        );
+        let snapshot = new_client_snapshot(&state);
+        let insufficient = timeline_value(
+            &state,
+            &snapshot,
+            &session,
+            session_id.trim_start_matches("session/"),
+            &ClientListQuery::default(),
+        )
+        .unwrap_err();
+        assert_eq!(insufficient.code, "cursor-gap");
+
+        append_entry(
+            4_099,
+            "truncation",
+            json!({
+                "reason":"producer-retention",
+                "omitted_from_sequence":1,
+                "omitted_to_sequence":3
+            }),
+        );
+        let snapshot = new_client_snapshot(&state);
+        let _ = timeline_value(
+            &state,
+            &snapshot,
+            &session,
+            session_id.trim_start_matches("session/"),
+            &ClientListQuery::default(),
+        )
+        .expect("the typed retention intervals cover the complete omitted logical prefix");
+    }
+
+    #[test]
+    fn usage_attribution_and_rollups_follow_exact_step_and_mission_ownership() {
+        let store = Store::open_memory("usage-attribution-node").unwrap();
+        let desired = [
+            crate::model::DesiredSubject {
+                subject: "agent/usage-a".into(),
+                kind: "agent".into(),
+                desired: json!({}),
+                member: None,
+                owner_run: Some("mission-run/example/one".into()),
+                owner_generation: Some("run-generation/gen-one".into()),
+                owner_step: Some("step-run/gen-one/step-a".into()),
+            },
+            crate::model::DesiredSubject {
+                subject: "agent/usage-b".into(),
+                kind: "agent".into(),
+                desired: json!({}),
+                member: None,
+                owner_run: Some("mission-run/example/one".into()),
+                owner_generation: Some("run-generation/gen-one".into()),
+                owner_step: Some("step-run/gen-one/step-b".into()),
+            },
+            crate::model::DesiredSubject {
+                subject: "agent/usage-other".into(),
+                kind: "agent".into(),
+                desired: json!({}),
+                member: None,
+                owner_run: Some("mission-run/example/two".into()),
+                owner_generation: Some("run-generation/gen-two".into()),
+                owner_step: Some("step-run/gen-two/step-c".into()),
+            },
+        ];
+        for (subject, total) in [
+            ("agent/usage-a", 10_u64),
+            ("agent/usage-b", 20),
+            ("agent/usage-other", 99),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        (
+                            "semantics".into(),
+                            Value::String("session_cumulative".into()),
+                        ),
+                        ("driver".into(), Value::String("codex".into())),
+                        (
+                            "incarnation_id".into(),
+                            Value::String(format!("{subject}:i1")),
+                        ),
+                        ("total_tokens".into(), Value::from(total)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("usage-{total}")),
+                })
+                .unwrap();
+        }
+        let attribution = timeline_attribution("agent/usage-a", &desired);
+        assert_eq!(attribution["agent_id"], "agent/usage-a");
+        assert_eq!(attribution["mission_run_id"], "mission-run/example/one");
+        assert_eq!(attribution["generation_id"], "run-generation/gen-one");
+        assert_eq!(attribution["step_id"], "step-run/gen-one/step-a");
+
+        let step = aggregate_usage_for_step(&store, &desired, "step-run/gen-one/step-a", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.total_tokens, 10);
+        let mission = aggregate_usage_for_runs(
+            &store,
+            &desired,
+            &BTreeSet::from(["mission-run/example/one"]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mission.total_tokens, 30);
+        assert_eq!(mission.incarnation_count, 2);
     }
 
     #[test]

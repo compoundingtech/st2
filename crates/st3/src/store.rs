@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
+ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
+WHERE kind='harness.timeline';
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
@@ -6783,6 +6787,116 @@ impl Store {
                 break;
             }
         }
+        let next_cursor = if claims.len() > limit {
+            claims.pop();
+            claims.last().map(|claim| claim.store_index)
+        } else {
+            None
+        };
+        Ok(ClaimsPage {
+            claims,
+            next_cursor,
+        })
+    }
+
+    /// Bounded claim history for one subject/kind projection, backed by the composite index.
+    pub fn claims_for_subject_kind_at(
+        &self,
+        subject: &str,
+        kind: &str,
+        before_index: Option<u64>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ClaimsPage> {
+        let connection = self.readers.get();
+        let order = if descending { "DESC" } else { "ASC" };
+        let query = format!(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind=?2 AND (?3 IS NULL OR store_index<?3)
+             ORDER BY store_index {order} LIMIT ?4"
+        );
+        let mut statement = connection.prepare(&query)?;
+        let rows = statement.query_map(
+            params![subject, kind, before_index, limit.saturating_add(1) as u64],
+            claim_from_row,
+        )?;
+        let mut claims = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if claims.len() > limit {
+            claims.pop();
+            claims.last().map(|claim| claim.store_index)
+        } else {
+            None
+        };
+        Ok(ClaimsPage {
+            claims,
+            next_cursor,
+        })
+    }
+
+    /// Bounded timeline history for exactly one runtime incarnation. The
+    /// expression index keeps old incarnations from consuming the page bound.
+    pub fn timeline_claims_for_incarnation_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        before_index: Option<u64>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ClaimsPage> {
+        let connection = self.readers.get();
+        let order = if descending { "DESC" } else { "ASC" };
+        let query = format!(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims
+             WHERE subject=?1 AND kind='harness.timeline'
+               AND json_extract(body, '$.fields.incarnation_id')=?2
+               AND (?3 IS NULL OR store_index<?3)
+             ORDER BY store_index {order} LIMIT ?4"
+        );
+        let mut statement = connection.prepare(&query)?;
+        let rows = statement.query_map(
+            params![
+                subject,
+                incarnation,
+                before_index,
+                limit.saturating_add(1) as u64
+            ],
+            claim_from_row,
+        )?;
+        let mut claims = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if claims.len() > limit {
+            claims.pop();
+            claims.last().map(|claim| claim.store_index)
+        } else {
+            None
+        };
+        Ok(ClaimsPage {
+            claims,
+            next_cursor,
+        })
+    }
+
+    /// Bounded claim history for one kind, backed by `claims_kind_index`.
+    pub fn claims_for_kind_at(
+        &self,
+        kind: &str,
+        before_index: Option<u64>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ClaimsPage> {
+        let connection = self.readers.get();
+        let order = if descending { "DESC" } else { "ASC" };
+        let query = format!(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE kind=?1 AND (?2 IS NULL OR store_index<?2)
+             ORDER BY store_index {order} LIMIT ?3"
+        );
+        let mut statement = connection.prepare(&query)?;
+        let rows = statement.query_map(
+            params![kind, before_index, limit.saturating_add(1) as u64],
+            claim_from_row,
+        )?;
+        let mut claims = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let next_cursor = if claims.len() > limit {
             claims.pop();
             claims.last().map(|claim| claim.store_index)

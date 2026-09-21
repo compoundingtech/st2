@@ -353,7 +353,11 @@ fn validate_model(
     let swift_block = struct_block(swift, &format!("public struct {swift_name}:"))?;
     for property in properties.keys().filter(|name| name.as_str() != "kind") {
         let rust_field = rust_field(property);
-        if !rust_block.contains(&format!("pub {rust_field}:")) {
+        let rust_discriminated_timeline = definition == "TimelineEntry"
+            && property == "type"
+            && rust_block.contains("pub body: TimelineBody")
+            && rust.contains("#[serde(tag = \"type\", content = \"body\"");
+        if !rust_block.contains(&format!("pub {rust_field}:")) && !rust_discriminated_timeline {
             bail!("Rust `{rust_name}` does not model schema field `{property}`");
         }
         let swift_field = match property.as_str() {

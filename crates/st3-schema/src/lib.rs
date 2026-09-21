@@ -1978,6 +1978,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                 required_enum(&["append", "replace", "finalize"]),
             ),
             ("entry_id", required_string()),
+            ("sequence", integer()),
             ("revision", required_integer()),
             (
                 "role",
@@ -2001,6 +2002,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("body", required_object()),
             ("driver", required_string()),
             ("incarnation_id", required_string()),
+            ("observed_at_unix_ms", integer()),
         ],
         "harness.context-clear.requested" => &[
             ("runtime_id", string()),
