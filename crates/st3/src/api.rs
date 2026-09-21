@@ -4675,11 +4675,18 @@ async fn status(
     .map(Json)
 }
 
+#[derive(Default, Deserialize)]
+struct SessionListQuery {
+    #[serde(default)]
+    history: bool,
+}
+
 async fn list_sessions(
     State(state): State<AppState>,
+    Query(query): Query<SessionListQuery>,
 ) -> Result<Json<Vec<crate::model::SubjectStatus>>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || store.terminal_statuses())
+    blocking_store(move || store.terminal_statuses(query.history))
         .await
         .map(Json)
 }

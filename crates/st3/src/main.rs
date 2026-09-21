@@ -428,7 +428,11 @@ struct PlanningCancelArgs {
 
 #[derive(Subcommand)]
 enum PtyCommand {
-    Ls,
+    /// List current terminal sessions; use --all for stopped history.
+    Ls {
+        #[arg(long)]
+        all: bool,
+    },
     Attach(PtyAttachArgs),
     Peek(PtySubjectArgs),
     Send(PtySendArgs),
@@ -1902,8 +1906,13 @@ async fn run_pty(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        PtyCommand::Ls => {
-            let sessions: Vec<st3::model::SubjectStatus> = client.get("/v1/sessions").await?;
+        PtyCommand::Ls { all } => {
+            let path = if all {
+                "/v1/sessions?history=true"
+            } else {
+                "/v1/sessions"
+            };
+            let sessions: Vec<st3::model::SubjectStatus> = client.get(path).await?;
             if json_output {
                 print_value(&sessions, true)
             } else {
@@ -6169,6 +6178,18 @@ mod tests {
         };
         assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
         assert!(!args.force);
+    }
+
+    #[test]
+    fn terminal_history_is_explicit() {
+        let cli = Cli::try_parse_from(["st3", "terminals", "ls", "--all"]).unwrap();
+        let Command::Terminals {
+            command: PtyCommand::Ls { all },
+        } = cli.command
+        else {
+            panic!("the terminal list command did not parse");
+        };
+        assert!(all);
     }
 
     #[test]

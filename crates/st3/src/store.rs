@@ -5530,7 +5530,7 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn terminal_statuses(&self) -> Result<Vec<SubjectStatus>> {
+    pub fn terminal_statuses(&self, include_history: bool) -> Result<Vec<SubjectStatus>> {
         let subjects = {
             let connection = self.readers.get();
             let mut statement = connection.prepare(
@@ -5545,7 +5545,9 @@ impl Store {
         };
         let mut statuses = Vec::with_capacity(subjects.len());
         for subject in subjects {
-            if let Some(status) = self.status(Some(&subject))?.subjects.into_iter().next() {
+            if let Some(status) = self.status(Some(&subject))?.subjects.into_iter().next()
+                && (include_history || status.projection.actionable)
+            {
                 statuses.push(status);
             }
         }
@@ -10833,8 +10835,11 @@ fn selected_actual_source_at(
         }
         false
     };
-    let runtime_conflict = rows.iter().any(|(id, kind, _, _)| {
-        kind == "runtime.observed" && id != selected_id && !descends_from(id)
+    let runtime_conflict = rows.iter().any(|(id, kind, origin, _)| {
+        kind == "runtime.observed"
+            && id != selected_id
+            && origin != selected_origin
+            && !descends_from(id)
     });
     Ok((
         Some(selected_id.clone()),
@@ -16988,6 +16993,86 @@ observer "ordered/file" {
         let second = store.latest_actual_value(subject).unwrap().unwrap();
         assert_eq!(second["status"], "stopped");
         assert!(store.actual_cache.lock().unwrap().get(subject).unwrap().0 > first_index);
+    }
+
+    #[test]
+    fn a_same_origin_restart_window_does_not_create_runtime_conflict() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/run/worker";
+        let observe = |status: &str, incarnation: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        observe("running", "one");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.restart-window-reset".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("desired_token".into(), Value::String("desired-one".into())),
+                    ("incarnation_id".into(), Value::String("one".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the stable interval elapsed".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        observe("running", "two");
+
+        let status = store.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "reachable");
+        assert_ne!(
+            status.subjects[0].reason.as_deref(),
+            Some("concurrent runtime observations have indeterminate authority")
+        );
+    }
+
+    #[test]
+    fn concurrent_cross_origin_runtime_observations_are_indeterminate() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        for (store, incarnation) in [(&left, "left-one"), (&right, "right-one")] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/run/worker".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        left.import_replication("right", &right.export_replication(0).unwrap())
+            .unwrap();
+
+        let status = left.status(Some("agent/run/worker")).unwrap();
+        assert_eq!(status.subjects[0].reachability, "indeterminate");
+        assert_eq!(
+            status.subjects[0].reason.as_deref(),
+            Some("concurrent runtime observations have indeterminate authority")
+        );
     }
 
     #[test]
