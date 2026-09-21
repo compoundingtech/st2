@@ -144,6 +144,31 @@ impl Client {
         }
     }
 
+    /// Connect directly to the paired-only Unix gateway. This is primarily useful for local
+    /// conformance and carrier diagnostics; remote applications normally use `fabric_loopback`
+    /// through the tailnet HTTPS proxy.
+    pub fn unix_gateway(path: impl AsRef<Path>, credential: impl Into<String>) -> Self {
+        Self {
+            endpoint: Endpoint::Unix(path.as_ref().to_owned()),
+            credential: Some(credential.into()),
+            local_person: None,
+            http: reqwest::Client::new(),
+            max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+        }
+    }
+
+    /// Connect to the remote gateway before a device credential exists. The server permits only
+    /// pairing completion on this unauthenticated transport.
+    pub fn fabric_pairing(base_url: impl Into<String>) -> Self {
+        Self {
+            endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
+            credential: None,
+            local_person: None,
+            http: reqwest::Client::new(),
+            max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+        }
+    }
+
     pub fn fabric_loopback(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
         Self {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
@@ -915,7 +940,7 @@ impl Client {
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 let request = websocket_request(
                     &format!("ws://localhost{path}"),
-                    None,
+                    self.credential.as_deref(),
                     self.local_person.as_deref(),
                     Some(stream_capability),
                 )?;

@@ -3,6 +3,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use http_body_util::Empty;
+use hyper::client::conn::http1;
+use hyper::{Request, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
@@ -89,12 +94,32 @@ fn publish_terminal(state: &AppState, incarnation: &str) {
 
 async fn wait_for_socket(socket: &Path) {
     for _ in 0..100 {
-        if socket.exists() {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("Unix server socket {} did not appear", socket.display());
+}
+
+async fn unix_status(socket: &Path, path: &str, credential: Option<&str>) -> StatusCode {
+    let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "localhost");
+    if let Some(credential) = credential {
+        request = request.header("authorization", format!("Bearer {credential}"));
+    }
+    sender
+        .send_request(request.body(Empty::<Bytes>::new()).unwrap())
+        .await
+        .unwrap()
+        .status()
 }
 
 async fn attach_terminal(client: &Client, suffix: &str) -> TerminalAttachment {
@@ -616,7 +641,13 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         })
         .await
         .unwrap();
-    let paired = local
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{address}");
+    let paired = Client::fabric_pairing(&base)
         .pairing_complete(
             &challenge.value.pairing_id,
             &PairingComplete {
@@ -628,11 +659,54 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         .await
         .unwrap();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let app = st3::api::fabric_router(state);
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let base = format!("http://{address}");
+    let gateway_socket = root.path().join("st3-client.sock");
+    let server_gateway_socket = gateway_socket.clone();
+    let gateway_app = st3::api::fabric_router(state.clone());
+    let gateway_server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_gateway_socket, gateway_app).await },
+        );
+    wait_for_socket(&gateway_socket).await;
+    assert_eq!(
+        unix_status(&gateway_socket, "/v1/health", None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        unix_status(&gateway_socket, "/v1/client/capabilities", None).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        Client::unix(&gateway_socket).capabilities().await.is_err(),
+        "the paired-only Unix gateway must reject an ordinary local session"
+    );
+    let direct_gateway = Client::unix_gateway(&gateway_socket, &paired.value.credential);
+    let direct_capabilities = direct_gateway.capabilities().await.unwrap();
+    assert_eq!(
+        direct_capabilities.value.transport,
+        st3_client::TransportKind::FabricLoopback
+    );
+    assert_eq!(
+        unix_status(
+            &gateway_socket,
+            "/v1/schema",
+            Some(&paired.value.credential)
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "the client gateway must never expose privileged non-client routes"
+    );
+    let direct_attachment = attach_terminal(&direct_gateway, "gateway-unix").await;
+    direct_gateway
+        .terminal_frames(
+            &direct_attachment.terminal_id,
+            None,
+            Some("terminal-demo-runtime:fabric-i1"),
+            direct_attachment.stream_capability.as_deref().unwrap(),
+            Some(1_000),
+        )
+        .await
+        .unwrap();
+
     let http = reqwest::Client::new();
 
     let client = Client::fabric_loopback(&base, &paired.value.credential);
@@ -745,7 +819,46 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
             .is_err(),
         "credential revocation must invalidate an unused stream capability"
     );
+    assert!(
+        direct_gateway.capabilities().await.is_err(),
+        "the revoked bearer must also fail on the paired-only Unix gateway"
+    );
+    local
+        .capabilities()
+        .await
+        .expect("the privileged local socket remains independent");
 
     server.abort();
+    gateway_server.abort();
     unix_server.abort();
+    let _ = server.await;
+    let _ = gateway_server.await;
+    let _ = unix_server.await;
+
+    let restarted_local_socket = socket.clone();
+    let restarted_local_app = st3::api::router(state.clone());
+    let restarted_local = tokio::spawn(async move {
+        st3::api::serve_unix(&restarted_local_socket, restarted_local_app).await
+    });
+    let restarted_gateway_socket = gateway_socket.clone();
+    let restarted_gateway_app = st3::api::fabric_router(state);
+    let restarted_gateway = tokio::spawn(async move {
+        st3::api::serve_unix(&restarted_gateway_socket, restarted_gateway_app).await
+    });
+    wait_for_socket(&socket).await;
+    wait_for_socket(&gateway_socket).await;
+    Client::unix_as(&socket, "person/nathan")
+        .capabilities()
+        .await
+        .expect("the privileged local socket restarts independently");
+    assert_eq!(
+        unix_status(&gateway_socket, "/v1/health", None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        unix_status(&gateway_socket, "/v1/client/capabilities", None).await,
+        StatusCode::FORBIDDEN
+    );
+    restarted_gateway.abort();
+    restarted_local.abort();
 }

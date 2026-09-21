@@ -22,6 +22,7 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub pty_root: Option<PathBuf>,
     pub socket: PathBuf,
+    pub client_gateway_socket: PathBuf,
     pub peer_listen: Option<String>,
     pub peers: Vec<PeerConfig>,
 }
@@ -29,10 +30,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let state_dir = xdg_dir("XDG_STATE_HOME", ".local/state").join("st3");
-        let socket = env::var_os("XDG_RUNTIME_DIR")
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir.join("run"))
-            .join("st3.sock");
+            .unwrap_or_else(|| state_dir.join("run"));
+        let socket = runtime_dir.join("st3.sock");
+        let client_gateway_socket = runtime_dir.join("st3-client.sock");
         Self {
             node: host_name(),
             fleet_id: None,
@@ -40,6 +42,7 @@ impl Default for Config {
             state_dir,
             pty_root: None,
             socket,
+            client_gateway_socket,
             peer_listen: None,
             peers: Vec::new(),
         }
@@ -85,11 +88,18 @@ impl Config {
         if config.socket.as_os_str().is_empty() {
             config.socket = defaults.socket;
         }
+        if config.client_gateway_socket.as_os_str().is_empty() {
+            config.client_gateway_socket = defaults.client_gateway_socket;
+        }
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        anyhow::ensure!(
+            self.socket != self.client_gateway_socket,
+            "the privileged local socket and paired client gateway socket must be different"
+        );
         let fleet_configured = self.fleet_id.is_some() || self.shared_secret_file.is_some();
         let peers_configured = self.peer_listen.is_some() || !self.peers.is_empty();
         anyhow::ensure!(
@@ -185,6 +195,21 @@ mod tests {
         assert!(config.peer_listen.is_none());
         assert!(config.peers.is_empty());
         assert!(config.socket.ends_with("st3.sock"));
+        assert!(config.client_gateway_socket.ends_with("st3-client.sock"));
+        assert_ne!(config.socket, config.client_gateway_socket);
+    }
+
+    #[test]
+    fn privileged_and_paired_client_sockets_must_be_distinct() {
+        let mut config = Config::default();
+        config.client_gateway_socket = config.socket.clone();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("different")
+        );
     }
 
     #[test]

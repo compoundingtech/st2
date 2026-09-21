@@ -24,6 +24,53 @@ Request bodies never select an actor. Device credentials are scoped, individuall
 different from fleet replication secrets. A remote client is always online: v0 has no offline
 mutation queue, push notification service, cached graph authority, or multi-master replication.
 
+### Tailnet HTTPS carrier
+
+`st3 up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
+`st3-client.sock` is the paired-only client gateway backed by `fabric_router`. The latter rejects
+ordinary requests without a paired bearer credential, except for pairing completion. The socket
+paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
+`--client-gateway-socket` for a foreground daemon. They must never name the same path.
+
+On a Tailscale host, publish only the paired-only socket:
+
+```sh
+CLIENT_GATEWAY_SOCKET="${XDG_RUNTIME_DIR:-$HOME/.local/state/st3/run}/st3-client.sock"
+tailscale serve --bg --yes "unix:${CLIENT_GATEWAY_SOCKET}"
+tailscale serve status
+```
+
+This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
+gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
+single-use attachment capability. Begin pairing over the trusted local socket with, for example,
+`st3 devices --as person/nathan pair "Nathan iPhone"`; complete pairing from the remote device over
+the served gateway. To remove the carrier without changing graph credentials or daemon state:
+
+```sh
+tailscale serve reset
+```
+
+Warning: `tailscale serve reset` clears all Serve configuration on the host, not only the st3
+gateway.
+
+The equivalent trusted-peer Fabric carrier lifecycle is:
+
+```sh
+fabric expose st3-client-v0 --socket /ABS/st3-client.sock
+fabric dial HOST st3-client-v0
+fabric unexpose st3-client-v0
+```
+
+Expose and unexpose change only the socket exposure; existing peer grants stay intact and remain
+the authority for access. Daemon startup never runs either carrier command, enables Funnel, or
+changes Tailscale/Fabric policy.
+
+Never point `tailscale serve` at `st3.sock`. That socket intentionally carries privileged local
+control routes and is not an authenticated remote-client boundary. The transport conformance test
+starts both Unix routers, proves the gateway rejects an ordinary local client, completes pairing on
+the Fabric-like carrier, and exercises authenticated HTTP plus terminal WebSocket traffic through
+the paired-only socket.
+
 Every JSON response has `api_version`, `request_id`, and either `value` or a versioned error. Read
 responses also carry one `snapshot`:
 

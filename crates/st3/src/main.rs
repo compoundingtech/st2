@@ -12,7 +12,7 @@ use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use st3::api::{AppState, router, serve_unix};
+use st3::api::{AppState, fabric_router, router, serve_unix};
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
@@ -196,6 +196,9 @@ struct UpArgs {
     pty_root: Option<PathBuf>,
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Separate paired-only client gateway socket suitable for a tailnet HTTPS proxy.
+    #[arg(long)]
+    client_gateway_socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
     #[arg(long)]
@@ -1099,6 +1102,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Some(socket) = args.socket {
         config.socket = socket;
     }
+    if let Some(socket) = args.client_gateway_socket {
+        config.client_gateway_socket = socket;
+    }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
     }
@@ -1193,7 +1199,17 @@ async fn run_up(args: UpArgs) -> Result<()> {
     )?);
     tokio::spawn(reconciler.run());
     eprintln!("st3: local API listening at {}", config.socket.display());
-    serve_unix(&config.socket, router(state)).await
+    eprintln!(
+        "st3: paired client gateway listening at {}",
+        config.client_gateway_socket.display()
+    );
+    let local_socket = config.socket.clone();
+    let client_gateway_socket = config.client_gateway_socket.clone();
+    tokio::try_join!(
+        serve_unix(&local_socket, router(state.clone())),
+        serve_unix(&client_gateway_socket, fabric_router(state)),
+    )?;
+    Ok(())
 }
 
 async fn run_launch(client: &Client, command: LaunchCommand, json_output: bool) -> Result<()> {

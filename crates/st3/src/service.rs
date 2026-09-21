@@ -34,8 +34,10 @@ impl ServiceSpec {
             "the memory limit must be greater than zero"
         );
         anyhow::ensure!(
-            config.state_dir.is_absolute() && config.socket.is_absolute(),
-            "the service state directory and socket must be absolute"
+            config.state_dir.is_absolute()
+                && config.socket.is_absolute()
+                && config.client_gateway_socket.is_absolute(),
+            "the service state directory and sockets must be absolute"
         );
         anyhow::ensure!(
             config
@@ -62,6 +64,8 @@ impl ServiceSpec {
             self.config.state_dir.display().to_string(),
             "--socket".into(),
             self.config.socket.display().to_string(),
+            "--client-gateway-socket".into(),
+            self.config.client_gateway_socket.display().to_string(),
         ];
         if let Some(pty_root) = &self.config.pty_root {
             arguments.extend(["--pty-root".into(), pty_root.display().to_string()]);
@@ -118,6 +122,7 @@ pub fn install(mut config: Config) -> Result<()> {
     let current = env::current_dir().context("resolve the service install directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
+    config.client_gateway_socket = absolute_from(&current, &config.client_gateway_socket);
     config.pty_root = config
         .pty_root
         .as_ref()
@@ -215,6 +220,7 @@ pub fn restart(mut config: Config) -> Result<()> {
     let current = env::current_dir().context("resolve the service restart directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
+    config.client_gateway_socket = absolute_from(&current, &config.client_gateway_socket);
     config.pty_root = config
         .pty_root
         .as_ref()
@@ -226,6 +232,7 @@ pub fn reset(mut config: Config) -> Result<()> {
     let current = env::current_dir().context("resolve the service reset directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
+    config.client_gateway_socket = absolute_from(&current, &config.client_gateway_socket);
     config.pty_root = config
         .pty_root
         .as_ref()
@@ -246,8 +253,15 @@ pub fn reset(mut config: Config) -> Result<()> {
             Err(error) => return Err(error).context("erase the st3 socket"),
         }
     }
+    if !config.client_gateway_socket.starts_with(&config.state_dir) {
+        match fs::remove_file(&config.client_gateway_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("erase the st3 client gateway socket"),
+        }
+    }
     start_native_service()?;
-    wait_for_socket(&config.socket)?;
+    wait_for_service_sockets(&config)?;
     println!("reset\t{}", config.state_dir.display());
     Ok(())
 }
@@ -369,7 +383,7 @@ fn restart_native_service(config: &Config) -> Result<()> {
     if config.fleet_id.is_some() {
         run_command("systemctl", &["--user", "start", REPLICATION_SERVICE_NAME])?;
     }
-    wait_for_socket(&config.socket)
+    wait_for_service_sockets(config)
 }
 
 #[cfg(target_os = "linux")]
@@ -444,7 +458,7 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
                 fs::remove_file(&replication_plist)?;
             }
         }
-        wait_for_socket(&spec.config.socket)
+        wait_for_service_sockets(&spec.config)
     })();
     if let Err(error) = install {
         let rollback = (|| -> Result<()> {
@@ -532,7 +546,7 @@ fn restart_native_service(config: &Config) -> Result<()> {
             &["bootstrap", &domain, &plist.display().to_string()],
         )?;
     }
-    wait_for_socket(&config.socket)
+    wait_for_service_sockets(config)
 }
 
 #[cfg(target_os = "macos")]
@@ -641,7 +655,7 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
                 run_command("systemctl", &["--user", "daemon-reload"])?;
             }
         }
-        wait_for_socket(&spec.config.socket)
+        wait_for_service_sockets(&spec.config)
     })();
     if let Err(error) = install {
         let rollback = (|| -> Result<()> {
@@ -805,6 +819,11 @@ fn replication_systemd_user_unit_path() -> Result<PathBuf> {
         .context("HOME and XDG_CONFIG_HOME are not set")?
         .join("systemd/user")
         .join(REPLICATION_SERVICE_NAME))
+}
+
+fn wait_for_service_sockets(config: &Config) -> Result<()> {
+    wait_for_socket(&config.socket)?;
+    wait_for_socket(&config.client_gateway_socket)
 }
 
 fn wait_for_socket(socket: &Path) -> Result<()> {
@@ -1004,6 +1023,7 @@ mod tests {
             state_dir: "/var/lib/st3".into(),
             pty_root: Some("/var/lib/pty".into()),
             socket: "/run/user/1000/st3.sock".into(),
+            client_gateway_socket: "/run/user/1000/st3-client.sock".into(),
             peer_listen: Some("127.0.0.1:31313".into()),
             peers: vec![PeerConfig {
                 name: "node-b".into(),
@@ -1015,6 +1035,7 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/bin/st3 up --node node-a"));
         assert!(unit.contains("--state-dir /var/lib/st3"));
         assert!(unit.contains("--pty-root /var/lib/pty"));
+        assert!(unit.contains("--client-gateway-socket /run/user/1000/st3-client.sock"));
         assert!(unit.contains("--peer node-b=http://127.0.0.1:31314"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("Restart=on-failure"));
