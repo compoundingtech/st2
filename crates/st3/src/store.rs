@@ -18,13 +18,13 @@ use crate::model::{
     ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
     AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, ContextUsage,
     DependencySpec, DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput,
-    LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind,
-    MissionOutputView, MissionResponse, MissionRevisionOperation, MissionRunDeclaration,
-    MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
-    NormalizedIntent, OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan,
-    OperationalRepairResult, PlannedAction, PlanningCandidateView, PlanningPreviewView,
-    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
-    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionDefinitionView,
+    MissionInputKind, MissionOutputView, MissionResponse, MissionRevisionOperation,
+    MissionRunDeclaration, MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec,
+    MissionState, NormalizedIntent, OperationalAnnotation, OperationalRepairItem,
+    OperationalRepairPlan, OperationalRepairResult, PlannedAction, PlanningCandidateView,
+    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
+    ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
     ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
     ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
     RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
@@ -827,6 +827,33 @@ impl Store {
         body.map(|body| serde_json::from_str(&body))
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// Return every current published mission definition, including definitions with no runs.
+    pub fn mission_definitions(&self) -> Result<Vec<MissionDefinitionView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT r.body, c.accepted_at_unix_ms
+             FROM mission_definitions d
+             JOIN mission_revisions r
+               ON r.mission_id=d.mission_id AND r.revision=d.revision
+             JOIN claims c ON c.id=d.claim_id
+             ORDER BY d.mission_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                let body = row.get::<_, String>(0)?;
+                let accepted = row.get::<_, String>(1)?;
+                Ok((body, accepted))
+            })?
+            .map(|row| {
+                let (body, accepted) = row?;
+                Ok(MissionDefinitionView {
+                    mission: serde_json::from_str(&body)?,
+                    updated_at_unix_ms: accepted.parse()?,
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

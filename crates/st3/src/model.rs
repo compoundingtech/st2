@@ -1648,6 +1648,12 @@ pub struct MissionRunRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MissionDefinitionView {
+    pub mission: MissionSpec,
+    pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionRunView {
     pub subject: String,
     pub id: String,

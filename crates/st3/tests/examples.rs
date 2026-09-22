@@ -146,6 +146,32 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
 }
 
 #[test]
+fn walkthrough_work_fails_fast_before_the_standing_agent_exists() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/st3/walkthrough-work.kdl");
+    let source = fs::read_to_string(&file).expect("read walkthrough work mission");
+    let intent = st3::parse_intent(&source, "local").expect("parse walkthrough work mission");
+    let store = st3::store::Store::open_memory("local").unwrap();
+    let preview = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: Some(file.display().to_string()),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        preview.blockers,
+        [
+            "message `message/example/garden-work-ready` references undeclared recipient `agent/example/garden-owner/standing/owner`"
+        ]
+    );
+}
+
+#[test]
 fn the_declarative_gates_dream_fixture_previews_without_rewriting() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/declarative-gates.kdl");

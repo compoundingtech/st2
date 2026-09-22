@@ -12,10 +12,10 @@ Omission has no effect. Removing a declaration from a later file does not stop o
 
 The removed wrapper keyword is an error. There is no compatibility form.
 
-There is no generic public `publish` or `preview` command. A person uses `st3 launch` to create,
-review, and approve a mission. An authorized agent uses `st3 work publish-mission` from the exact
-claimed producing step. This keeps intent, authority, and provenance on one typed path instead of a
-raw mutation escape hatch.
+`st3 missions publish FILE --as ACTOR` previews and publishes exact authored mission KDL. A person
+can instead use `st3 launch` to create, review, and approve a conversationally planned mission. An
+authorized agent uses `st3 work publish-mission` from the exact claimed producing step for generated
+nested work. Every route keeps intent, authority, and provenance on a typed operation.
 
 ## Definitions do not start work
 
@@ -206,11 +206,14 @@ mission-authority {
 
 Put this block inside the agent declaration. Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix.
 
-Publishing requires `publish` authority, a claimed producing step, and an exact `produces-mission` match. Use `st3 work publish-mission`.
+An agent publishing a generated nested mission needs `publish` authority, a claimed producing step,
+and an exact `produces-mission` match. Use `st3 work publish-mission` for that case.
 
 Starting requires separate `start` authority. Revising requires separate `revise` authority and structural authority in the current generation.
 
-There is no generic mission publication command. A candidate definition cannot grant authority to the same agent.
+Use `st3 missions publish FILE --as ACTOR` for exact authored KDL. Agent actors still need matching
+authority in their current desired declaration; a candidate definition cannot grant authority to
+its own publisher. Explicit person actors remain the trusted local-operator boundary.
 
 Persons and internal system actions are unchanged. The identity check assumes a trusted local runtime because `--as` can name another actor.
 

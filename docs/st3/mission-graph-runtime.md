@@ -1239,8 +1239,9 @@ Store a summary, a redacted sample, or a hash when later work needs durable evid
 
 ## Review, approve, and start
 
-The public CLI has no generic preview or publish escape hatch. `st3 launch preview SESSION` validates
-the exact planner candidate, resolves documents, displays changes, and returns the approval hash.
+`st3 missions publish FILE --as ACTOR` previews and publishes exact authored KDL with authority and
+subject-head checks. `st3 launch preview SESSION` validates a planner candidate, resolves documents,
+displays changes, and returns the approval hash.
 `st3 launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
 `st3 launch approve-and-launch` performs the approval and idempotent start as one product workflow.
 An authorized agent uses `st3 work publish-mission`, fenced to its claimed producing step.

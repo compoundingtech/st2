@@ -387,18 +387,38 @@ fn mission_resources(
     for run in store.mission_runs()? {
         missions.entry(run.mission.clone()).or_default().push(run);
     }
+    let definitions = store
+        .mission_definitions()?
+        .into_iter()
+        .map(|definition| {
+            (
+                definition.mission.subject.clone(),
+                (definition.mission, definition.updated_at_unix_ms),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for mission in definitions.keys() {
+        missions.entry(mission.clone()).or_default();
+    }
     let desired = store.desired_subjects()?;
     let mut values = missions
         .into_iter()
         .map(|(mission, mut runs)| {
             runs.sort_by_key(|run| run.created_at_unix_ms);
-            let latest = runs.last().expect("mission has at least one run");
-            let state = if runs.iter().any(|run| run.status == "running") {
+            let definition = definitions.get(&mission);
+            let latest = runs.last();
+            let state = if runs.is_empty() {
+                "ready"
+            } else if runs.iter().any(|run| run.status == "running") {
                 "running"
             } else if runs.iter().any(|run| run.status == "standing") {
                 "standing"
             } else {
-                match latest.status.as_str() {
+                match latest
+                    .expect("a nonempty run list has a latest run")
+                    .status
+                    .as_str()
+                {
                     "completed" => "completed",
                     "failed" => "failed",
                     "cancelled" => "cancelled",
@@ -414,16 +434,24 @@ fn mission_resources(
                 .map(|run| run.subject.as_str())
                 .collect::<BTreeSet<_>>();
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
-            let visualization = mission_visualization(store, &mission, &latest.revision, state)?;
+            let revision = latest
+                .map(|run| run.revision.as_str())
+                .or_else(|| definition.map(|(definition, _)| definition.revision.as_str()))
+                .expect("a mission resource has a definition or a run");
+            let updated_at_unix_ms = latest
+                .map(|run| run.updated_at_unix_ms)
+                .or_else(|| definition.map(|(_, updated_at)| *updated_at))
+                .expect("a mission resource has a definition or a run timestamp");
+            let visualization = mission_visualization(store, &mission, revision, state)?;
             let historical = matches!(state, "completed" | "failed" | "cancelled");
             Ok::<Value, anyhow::Error>(json!({
                 "id": mission,
                 "kind": "mission",
-                "revision": latest.revision,
-                "updated_at": client_timestamp(latest.updated_at_unix_ms),
-                "title": latest.mission.strip_prefix("mission/").unwrap_or(&latest.mission),
+                "revision": revision,
+                "updated_at": client_timestamp(updated_at_unix_ms),
+                "title": mission.strip_prefix("mission/").unwrap_or(&mission),
                 "state": state,
-                "mission_revision": latest.revision,
+                "mission_revision": revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
                 "run_generations": run_generations,
                 "visualization": visualization,
@@ -3692,6 +3720,51 @@ mod tests {
             configured_peers: Vec::new(),
             native_session_home: None,
         }
+    }
+
+    #[test]
+    fn mission_resources_include_published_definitions_without_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "zero-run-node");
+        let source = r#"version 2
+mission "example/zero-run" state="ready" {
+  goal "Remain visible before the first run starts."
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "zero-run-node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: Some("zero-run.kdl".into()),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "publish-zero-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+
+        let resources =
+            mission_resources(&state.store, state.store.index().unwrap(), true).unwrap();
+        let mission = resources
+            .iter()
+            .find(|value| value["id"] == "mission/example/zero-run")
+            .expect("the zero-run definition is listed");
+        assert_eq!(mission["state"], "ready");
+        assert_eq!(mission["runs"], json!([]));
+        assert_eq!(mission["operational"]["actionable"], true);
+        assert_eq!(
+            mission["mission_revision"],
+            intent.missions["example/zero-run"].revision
+        );
     }
 
     #[tokio::test]
