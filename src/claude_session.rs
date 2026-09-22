@@ -120,6 +120,7 @@ fn prepare_st3_channel_argv(
     identity: &str,
     argv: Vec<String>,
 ) -> Result<Vec<String>> {
+    let argv = bind_st3_mcp_config_values(argv)?;
     if !requires_st3_channel(&argv) {
         return Ok(argv);
     }
@@ -137,12 +138,34 @@ fn prepare_st3_channel_argv(
     }
 }
 
+/// Bind each authored MCP config to its option so Claude's variadic parser cannot consume the
+/// positional boot prompt as another config path. The joined spelling is accepted by Claude's
+/// option parser and is equivalent for one config; applying this function twice is a no-op.
+fn bind_st3_mcp_config_values(argv: Vec<String>) -> Result<Vec<String>> {
+    let mut output = Vec::with_capacity(argv.len());
+    let mut index = 0;
+    while index < argv.len() {
+        if argv[index] == "--mcp-config" {
+            let raw = argv
+                .get(index + 1)
+                .context("the Claude --mcp-config option has no value")?;
+            output.push(format!("--mcp-config={raw}"));
+            index += 2;
+        } else {
+            output.push(argv[index].clone());
+            index += 1;
+        }
+    }
+    Ok(output)
+}
+
 fn development_st3_channel_argv(
     argv: Vec<String>,
     executable: &Path,
     _catalog_root: &Path,
     identity: &str,
 ) -> Result<Vec<String>> {
+    let argv = bind_st3_mcp_config_values(argv)?;
     let subject = format!("agent/{identity}");
     let st3_server = serde_json::json!({
         "type": "stdio",
@@ -859,13 +882,12 @@ mod tests {
         )
         .unwrap();
 
-        let config_indexes = output
+        let configs = output
             .iter()
-            .enumerate()
-            .filter_map(|(index, arg)| (arg == "--mcp-config").then_some(index))
+            .filter_map(|arg| arg.strip_prefix("--mcp-config="))
             .collect::<Vec<_>>();
-        assert_eq!(config_indexes.len(), 1, "Claude receives one MCP config");
-        let mcp: serde_json::Value = serde_json::from_str(&output[config_indexes[0] + 1]).unwrap();
+        assert_eq!(configs.len(), 1, "Claude receives one bound MCP config");
+        let mcp: serde_json::Value = serde_json::from_str(configs[0]).unwrap();
         assert_eq!(mcp["mcpServers"]["xcode"], xcode["mcpServers"]["xcode"]);
         assert_eq!(mcp["mcpServers"]["st3"]["command"], "/opt/st3/bin/st3");
         assert_eq!(
@@ -883,7 +905,28 @@ mod tests {
                 .any(|arg| arg == "--dangerously-load-development-channels=server:st3")
         );
         assert!(!output.iter().any(|arg| arg == "--channels"));
+        assert!(!output.iter().any(|arg| arg == "--mcp-config"));
         assert_eq!(output.last().map(String::as_str), Some("prompt"));
+    }
+
+    #[test]
+    fn st3_binds_an_authored_mcp_config_before_the_boot_prompt() {
+        let output = bind_st3_mcp_config_values(vec![
+            "claude".into(),
+            "--mcp-config".into(),
+            r#"{"mcpServers":{"xcode":{"command":"mcpbridge"}}}"#.into(),
+            "boot prompt".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            output,
+            vec![
+                "claude",
+                r#"--mcp-config={"mcpServers":{"xcode":{"command":"mcpbridge"}}}"#,
+                "boot prompt"
+            ]
+        );
     }
 
     #[test]
