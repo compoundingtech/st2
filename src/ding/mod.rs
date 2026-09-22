@@ -1,4 +1,4 @@
-//! Native inbox-to-terminal DING delivery.
+//! Native inbox-to-terminal PING delivery.
 //!
 //! Fresh delivery first proves an empty maintained composer, bracketed-pastes without Return, then
 //! requires two adjacent adapter observations to prove the exact retained composer is safe before
@@ -12,7 +12,7 @@
 //! notice text in its submitted-prompt or queued-message pattern while the live composer is empty.
 //! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
 //! Startup can adopt an exact staged recovery or backlog notice before coalescing remaining unread
-//! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
+//! work into one generic recovery PING. `busy` never suppresses a notification; fresh `dnd` does.
 
 use std::collections::{HashSet, VecDeque};
 use std::os::unix::process::CommandExt as _;
@@ -43,7 +43,7 @@ const SENDER_MAX_CHARS: usize = 80;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
-const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
+const RECOVERY_POKE: &str = "[PING] unread st2 messages remain; check your inbox";
 // Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
 // successful pane write is misreported as a timeout and retried, duplicating the owned payload.
 const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -173,7 +173,7 @@ fn relationship_marker(
     "?".to_string()
 }
 
-/// The `[DING] …` line an agent sees for one newly arrived message. Consumers must key on the
+/// The `[PING] …` line an agent sees for one newly arrived message. Consumers must key on the
 /// prefix and stable id rather than descriptive words. Subject and sender are bounded, normalized
 /// untrusted fields. The marker describes the relationship implied by the claimed sender identity;
 /// it does not authenticate that identity.
@@ -200,7 +200,7 @@ fn poke_text_with_resolver(
         relationship_marker(resolver, this_host, recipient, msg.from.as_deref())
     };
     format!(
-        "[DING] {marker} {from}: {subject} [id:{}]",
+        "[PING] {marker} {from}: {subject} [id:{}]",
         poke_reference(msg)
     )
 }
@@ -352,7 +352,7 @@ fn run_submit_fence(
     }
 }
 
-/// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
+/// How PING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
 /// real `pty`.
 pub trait Poker {
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
@@ -587,7 +587,7 @@ fn transport_and_observe_with_window(
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
         tracing::warn!(
-            "st2 ding: DING transport became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: PING transport became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -609,7 +609,7 @@ fn observe_receipt_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ding: post-submit receipt observation failed; retaining staged ownership: {error}"
+                    "st2 ping: post-submit receipt observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -638,7 +638,7 @@ fn retry_staged_with_window(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: staged retry observation failed; retaining ownership: {error}"
+                "st2 ping: staged retry observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -670,7 +670,7 @@ fn submit_retained_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: final retained-composer observation failed; retaining ownership: {error}"
+                "st2 ping: final retained-composer observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -688,14 +688,14 @@ fn submit_retained_after_final_observation(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
-                "st2 ding: pre-submit receipt failed; retaining staged ownership: {error}"
+                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -746,7 +746,7 @@ fn observed_poke_with_window(
     // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
     if let Err(error) = stage() {
         tracing::warn!(
-            "st2 ding: paste command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: paste command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -757,7 +757,7 @@ fn observed_poke_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ding: post-paste observation failed; retaining staged ownership: {error}"
+                    "st2 ping: post-paste observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -798,7 +798,7 @@ fn submit_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: final composer observation failed; retaining staged ownership: {error}"
+                "st2 ping: final composer observation failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -817,14 +817,14 @@ fn submit_after_final_observation(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
-                "st2 ding: pre-submit receipt failed; retaining staged ownership: {error}"
+                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -1144,7 +1144,7 @@ pub fn run_ding(
         });
     }
     eprintln!(
-        "st2 ding: ready — found {} existing unread message(s){}; watching for new arrivals.",
+        "st2 ping: ready — found {} existing unread message(s){}; watching for new arrivals.",
         backlog.len(),
         if backlog.is_empty() {
             ""
@@ -1166,7 +1166,7 @@ pub fn run_ding(
 
         let alive = poker.session_alive();
         if watch.step(alive) == WatchStep::Gone {
-            eprintln!("st2 ding: target pty session is gone — exiting.");
+            eprintln!("st2 ping: target pty session is gone — exiting.");
             break;
         }
 
@@ -1228,7 +1228,7 @@ pub fn run_ding(
                             Ok(None) => startup_adoption_pending = false,
                             Err(error) => {
                                 tracing::warn!(
-                                    "st2 ding: startup staged-notice adoption failed: {error}"
+                                    "st2 ping: startup staged-notice adoption failed: {error}"
                                 )
                             }
                         }
@@ -1241,7 +1241,7 @@ pub fn run_ding(
                     && let Some(reason) = report.deferred
                 {
                     tracing::warn!(
-                        "st2 ding: delivery deferred for '{}', no input performed: {reason}",
+                        "st2 ping: delivery deferred for '{}', no input performed: {reason}",
                         context.recipient
                     );
                 }
@@ -1250,7 +1250,7 @@ pub fn run_ding(
             }
         } else if !watch.seen_alive && !logged_waiting {
             eprintln!(
-                "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
+                "st2 ping: target pty session not yet registered; waiting before enabling exit-when-gone."
             );
             logged_waiting = true;
         }
@@ -1374,7 +1374,7 @@ fn flush_pending_inbox(
                 break;
             }
             Err(error) => {
-                tracing::warn!("st2 ding: {error}");
+                tracing::warn!("st2 ping: {error}");
                 break;
             }
         }
@@ -1382,7 +1382,7 @@ fn flush_pending_inbox(
     report
 }
 
-/// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
+/// Set by SIGINT/SIGTERM so `st2 ping` exits cleanly when st2 tears the sidecar down.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop_signal(_signal: libc::c_int) {

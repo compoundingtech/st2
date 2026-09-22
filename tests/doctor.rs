@@ -539,7 +539,7 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
     );
     assert!(
         stdout.contains(
-            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no DING"
+            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no PING"
         ),
         "{stdout}"
     );

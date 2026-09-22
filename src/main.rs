@@ -86,7 +86,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Service(cmd) => service_cmd(cmd),
         Command::ClaudeChannel(cmd) => claude_channel_cmd(cmd),
         Command::Hooks(cmd) => hooks_cmd(cmd),
-        Command::Ding {
+        Command::Ping {
             session,
             identity,
             agent_id,
@@ -1066,7 +1066,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         if !spec.has_delivery_transport() {
             report_advisory(
                 &format!("{bus_id} delivery transport missing"),
-                "declare `ding`, `deliver`, or a driver block; agent receives no DING",
+                "declare `ding`, `deliver`, or a driver block; agent receives no PING",
             );
         }
         for task in &spec.tasks {
@@ -1735,7 +1735,7 @@ fn ding_cmd(
         None => acting_route(&catalog_root, &this_host, &ctx)?,
     };
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
-    // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
+    // id. So `st2 ping --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
     let session = session.unwrap_or(named);
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
@@ -1745,7 +1745,7 @@ fn ding_cmd(
     let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
-        "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
+        "st2 ping: watching {}'s inbox ({}) → poking pty '{session}'",
         id,
         inbox.display()
     );

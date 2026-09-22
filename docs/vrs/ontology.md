@@ -708,7 +708,7 @@ outside this family entirely.
   reason. `unknown` is a value, not a failure, and st2 never infers a trigger a
   harness did not state.
 - Use [message](../../src/message.rs) for the durable record and
-  [DING](../../src/ding/mod.rs) for its terminal notification.
+  [PING](../../src/ding/mod.rs) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable
   [event](04-stream/requirements.md) record; the R13–R15 filesystem-watcher
   usage is a **watcher event**. New requirements text keeps the qualification.
