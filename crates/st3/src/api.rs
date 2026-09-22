@@ -823,21 +823,30 @@ fn client_work_resources(
     } else {
         store.work_at_snapshot(actor, false, snapshot_unix_ms)?
     };
-    work.sort_by(|left, right| {
-        let priority = |status: &str| match status {
-            "ready" => 0,
-            "claimed" | "working" => 1,
-            "verifying" => 2,
-            "blocked" => 3,
-            "pending" | "waiting" => 4,
-            _ => 5,
-        };
-        priority(&left.status)
-            .cmp(&priority(&right.status))
-            .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
-            .then_with(|| left.step.cmp(&right.step))
-            .then_with(|| left.subject.cmp(&right.subject))
-    });
+    if history {
+        work.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| left.subject.cmp(&right.subject))
+        });
+    } else {
+        work.sort_by(|left, right| {
+            let priority = |status: &str| match status {
+                "ready" => 0,
+                "claimed" | "working" => 1,
+                "verifying" => 2,
+                "blocked" => 3,
+                "pending" | "waiting" => 4,
+                _ => 5,
+            };
+            priority(&left.status)
+                .cmp(&priority(&right.status))
+                .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
+                .then_with(|| left.step.cmp(&right.step))
+                .then_with(|| left.subject.cmp(&right.subject))
+        });
+    }
     let desired = store.desired_subjects()?;
     work.into_iter()
         .map(|work| {
@@ -966,12 +975,54 @@ fn client_agent_resources(
             let observed = fields
                 .and_then(|fields| fields.get("status"))
                 .and_then(Value::as_str);
-            let state = match observed {
-                Some("running" | "ready" | "working" | "idle") => "running",
-                Some("starting" | "pending") => "starting",
-                Some("waiting") => "waiting",
-                Some("failed") => "failed",
-                Some("stopped" | "exited" | "absent") => "stopped",
+            let driver = subject
+                .harness
+                .as_ref()
+                .and_then(|harness| harness.driver.clone())
+                .or_else(|| subject.desired.as_ref().and_then(desired_harness_driver));
+            let harness_state = subject
+                .harness
+                .as_ref()
+                .map(|harness| harness.state.clone());
+            // A live wrapper is necessary but not sufficient for a running agent. Native
+            // harnesses only become running once the current runtime incarnation has produced a
+            // ready observation; an ended or indeterminate harness must never be painted green
+            // merely because its wrapper process still has a running observation.
+            let state = match (
+                observed,
+                driver.as_deref(),
+                harness_state.as_deref(),
+                subject.reachability.as_str(),
+            ) {
+                (Some("running" | "ready" | "working" | "idle"), _, _, reachability)
+                    if reachability != "reachable" =>
+                {
+                    "waiting"
+                }
+                (
+                    Some("running" | "ready" | "working" | "idle"),
+                    Some(_),
+                    Some("ready" | "working" | "idle"),
+                    _,
+                ) => "running",
+                (
+                    Some("running" | "ready" | "working" | "idle"),
+                    Some(_),
+                    Some("ended" | "failed"),
+                    _,
+                ) => "failed",
+                (
+                    Some("running" | "ready" | "working" | "idle"),
+                    Some(_),
+                    Some("indeterminate" | "unknown"),
+                    _,
+                ) => "waiting",
+                (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
+                (Some("running" | "ready" | "working" | "idle"), None, _, _) => "running",
+                (Some("starting" | "pending"), _, _, _) => "starting",
+                (Some("waiting"), _, _, _) => "waiting",
+                (Some("failed"), _, _, _) => "failed",
+                (Some("stopped" | "exited" | "absent"), _, _, _) => "stopped",
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
@@ -984,14 +1035,20 @@ fn client_agent_resources(
                 .and_then(|fields| fields.get("incarnation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let driver = subject
+            let updated_at = subject
                 .harness
                 .as_ref()
-                .map(|harness| harness.driver.clone());
-            let harness_state = subject
-                .harness
-                .as_ref()
-                .map(|harness| harness.state.clone());
+                .map(|harness| client_timestamp(harness.observed_at_unix_ms))
+                .or_else(|| {
+                    subject.actual_claim.as_deref().and_then(|claim| {
+                        store
+                            .claim_by_id(claim)
+                            .ok()
+                            .flatten()
+                            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+                    })
+                })
+                .unwrap_or_else(|| at.to_owned());
             let name = subject
                 .desired
                 .as_ref()
@@ -1013,7 +1070,7 @@ fn client_agent_resources(
                 "id": subject.subject,
                 "kind": "agent",
                 "revision": revision,
-                "updated_at": at,
+                "updated_at": updated_at,
                 "name": name,
                 "state": state,
                 "reachability": subject.reachability,
@@ -1037,6 +1094,19 @@ fn client_agent_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(agents.into_iter().map(|(_, value)| value).collect())
+}
+
+fn desired_harness_driver(desired: &Value) -> Option<String> {
+    desired
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("harness"))?
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn client_session_resources(
@@ -4344,6 +4414,7 @@ async fn put_document(
 #[derive(Deserialize)]
 struct DocumentQuery {
     name: Option<String>,
+    prefix: Option<String>,
     #[serde(default)]
     history: bool,
     limit: Option<usize>,
@@ -4357,7 +4428,19 @@ async fn list_documents(
     let history = query.history;
     let store = state.store.clone();
     let mut items = blocking_store(move || {
-        store.list_documents(query.name.as_deref(), history, limit.saturating_add(1))
+        let mut items = store.list_documents(
+            query.name.as_deref(),
+            history,
+            if query.prefix.is_some() {
+                201
+            } else {
+                limit.saturating_add(1)
+            },
+        )?;
+        if let Some(prefix) = query.prefix {
+            items.retain(|item| item.name.starts_with(&prefix));
+        }
+        Ok(items)
     })
     .await?;
     let has_more = items.len() > limit;
@@ -9005,6 +9088,111 @@ mission "wake" state="ready" {
         let wake = projected.wake.expect("wake projection");
         assert_eq!(wake.attempts, 1);
         assert_eq!(wake.assignee_state, "idle");
+    }
+
+    #[test]
+    fn agent_state_requires_current_harness_evidence_for_native_drivers() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "agent-health" state="ready" {
+  goal "Exercise agent health projection."
+  agent "worker" { workspace "/tmp"; harness "codex" {} }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "agent-health-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "agent-health".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "agent-health-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let subject = format!("agent/{}/worker", run.id);
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("incarnation-1".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("agent-health-runtime".into()),
+            })
+            .unwrap();
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "starting");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("incarnation-1".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("agent-health-ready".into()),
+            })
+            .unwrap();
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "running");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ended".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("incarnation-1".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("agent-health-ended".into()),
+            })
+            .unwrap();
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["state"], "failed");
     }
 
     #[tokio::test]

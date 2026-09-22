@@ -4784,6 +4784,8 @@ impl Store {
             created_index: record.store_index,
             latest: true,
             binding_claim_id: record.id,
+            created_at_unix_ms: record.accepted_at_unix_ms,
+            owner: record.actor.or(Some(record.origin)),
         };
         transaction
             .execute(
@@ -4819,8 +4821,9 @@ impl Store {
         let connection = self.readers.get();
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
-                     ,d.binding_claim_id
+                     ,d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
                      FROM documents d JOIN blobs b ON b.hash=d.hash
+                     JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
                        AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
                      ORDER BY d.name, d.created_index DESC LIMIT ?3";
@@ -4833,6 +4836,14 @@ impl Store {
                 created_index: row.get(3)?,
                 latest: row.get::<_, i64>(4)? != 0,
                 binding_claim_id: row.get(5)?,
+                created_at_unix_ms: row.get::<_, String>(6)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                owner: row.get::<_, Option<String>>(7)?.or(row.get(8)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -10005,8 +10016,10 @@ fn find_document(
         .query_row(
             "SELECT d.name, d.hash, b.size, d.created_index,
              d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name),
-             d.binding_claim_id
-             FROM documents d JOIN blobs b ON b.hash=d.hash WHERE d.name=?1 AND d.hash=?2",
+             d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
+             FROM documents d JOIN blobs b ON b.hash=d.hash
+             JOIN claims c ON c.id=d.binding_claim_id
+             WHERE d.name=?1 AND d.hash=?2",
             params![name, hash],
             |row| {
                 Ok(DocumentVersion {
@@ -10016,6 +10029,14 @@ fn find_document(
                     created_index: row.get(3)?,
                     latest: row.get::<_, i64>(4)? != 0,
                     binding_claim_id: row.get(5)?,
+                    created_at_unix_ms: row.get::<_, String>(6)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    owner: row.get::<_, Option<String>>(7)?.or(row.get(8)?),
                 })
             },
         )

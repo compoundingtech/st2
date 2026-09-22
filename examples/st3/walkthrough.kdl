@@ -1,0 +1,19 @@
+version 2
+
+mission "example/walkthrough" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Run one harmless local check and leave a visible receipt in the selected workspace."
+  constraint "Write only the walkthrough receipt inside the disposable workspace."
+
+  step "write-receipt" {
+    agentless
+    exec "check" {
+      workspace "."
+      argv "sh" "-lc" "printf 'st3 walkthrough complete\n' > st3-walkthrough-result.txt"
+      restart "never"
+    }
+    gate "the local check exits successfully" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/check" is 0
+    }
+  }
+}

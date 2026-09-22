@@ -586,6 +586,9 @@ struct ActivityArgs {
     limit: usize,
     #[arg(short = 'f', long)]
     follow: bool,
+    /// Include lease renewals and other non-material heartbeat records.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -605,8 +608,8 @@ enum DevicesCommand {
 #[derive(Args)]
 struct DevicesArgs {
     /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", value_parser = parse_person_subject)]
-    person: String,
+    #[arg(long = "as", value_parser = parse_person_subject, global = true)]
+    person: Option<String>,
     /// Include expired and revoked device history.
     #[arg(long)]
     all: bool,
@@ -834,7 +837,7 @@ enum AttentionCommand {
     /// List all current human attention items.
     Ls {
         #[arg(long = "as", value_parser = parse_person_subject)]
-        actor: String,
+        actor: Option<String>,
         /// Include resolved and historical attention.
         #[arg(long)]
         all: bool,
@@ -848,7 +851,7 @@ enum AttentionCommand {
     Show {
         subject: String,
         #[arg(long = "as", value_parser = parse_person_subject)]
-        actor: String,
+        actor: Option<String>,
     },
     /// Request attention after an explicit fault.
     Request(AttentionRequestArgs),
@@ -1119,7 +1122,7 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
+    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -1226,15 +1229,24 @@ async fn run(cli: Cli) -> Result<()> {
             run_mission_view(&client, &endpoint, command, cli.json).await
         }
         Command::Attention { command } => {
-            run_attention(&client, &endpoint, command, cli.json).await
+            run_attention(
+                &client,
+                &endpoint,
+                config.person.as_deref(),
+                command,
+                cli.json,
+            )
+            .await
         }
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
-        Command::Agents { command } => run_agents(&client, &endpoint, command, cli.json).await,
+        Command::Agents { command } => run_agents(&endpoint, command, cli.json).await,
         Command::Conversations { command } => {
             run_message(&client, &endpoint, command, cli.json).await
         }
         Command::Activity(args) => run_activity(&endpoint, args, cli.json).await,
-        Command::Devices(args) => run_devices(endpoint.clone(), args, cli.json).await,
+        Command::Devices(args) => {
+            run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
+        }
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
         Command::Terminals { command } => run_pty(&client, &endpoint, command, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
@@ -2283,7 +2295,7 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
         if json_output {
             println!("{}", serde_json::to_string(&claim)?);
         } else {
-            println!("{}\t{}\t{}", claim.store_index, claim.kind, claim.subject);
+            print_trace_claim(&claim);
         }
     }
     if !args.follow {
@@ -2305,10 +2317,65 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
             if json_output {
                 println!("{}", serde_json::to_string(&event)?);
             } else {
-                println!("{}\t{}\t{}", event.store_index, event.kind, event.subject);
+                let claims: ClaimsPage = client
+                    .get(&format!(
+                        "/v1/claims?subject={}&after_index={}&order=asc&limit=1",
+                        urlencoding::encode(&event.subject),
+                        event.store_index.saturating_sub(1)
+                    ))
+                    .await?;
+                if let Some(claim) = claims
+                    .claims
+                    .into_iter()
+                    .find(|claim| claim.store_index == event.store_index)
+                {
+                    print_trace_claim(&claim);
+                } else {
+                    println!(
+                        "{}\t{}\t{}\t(no claim details)",
+                        event.store_index, event.kind, event.subject
+                    );
+                }
             }
         }
     }
+}
+
+fn print_trace_claim(claim: &ClaimRecord) {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let summary = ["state", "status", "verdict", "action", "reason"]
+        .into_iter()
+        .filter_map(|key| {
+            fields
+                .get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| format!("{key}={}", trace_scalar(value)))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let timestamp = chrono::DateTime::from_timestamp_millis(
+        claim.accepted_at_unix_ms.min(i64::MAX as u128) as i64,
+    )
+    .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .unwrap_or_else(|| claim.accepted_at_unix_ms.to_string());
+    if summary.is_empty() {
+        println!(
+            "{}\t{}\t{}\t{}",
+            claim.store_index, timestamp, claim.kind, claim.subject
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            claim.store_index, timestamp, claim.kind, claim.subject, summary
+        );
+    }
+}
+
+fn trace_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<()> {
@@ -2374,12 +2441,68 @@ async fn run_now(
     if args.all {
         command.push_str(" --all");
     }
-    print_product_page(
-        &format!("NOW FOR {person}"),
-        &response,
-        json_output,
-        &command,
-    )
+    if json_output {
+        print_value(&response, true)
+    } else {
+        print!("{}", render_now_page(&response.value, &command));
+        Ok(())
+    }
+}
+
+fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
+    let mut needs_you = page.clone();
+    needs_you
+        .items
+        .retain(|item| matches!(item, ClientResource::Attention(_)));
+    needs_you.page.next_cursor = None;
+    let mut unhealthy = page.clone();
+    unhealthy.items.retain(|item| match item {
+        ClientResource::Operation(_) => true,
+        ClientResource::Agent(agent) => {
+            agent.reachability != "reachable"
+                || matches!(agent.state.as_str(), "failed" | "waiting" | "stopped")
+        }
+        ClientResource::Runtime(runtime) => runtime.state != "running",
+        _ => false,
+    });
+    unhealthy.page.next_cursor = None;
+    let mut working = page.clone();
+    working.items.retain(|item| {
+        !matches!(
+            item,
+            ClientResource::Attention(_) | ClientResource::Operation(_)
+        ) && !matches!(item, ClientResource::Agent(agent)
+                if agent.reachability != "reachable"
+                    || matches!(agent.state.as_str(), "failed" | "waiting" | "stopped"))
+            && !matches!(item, ClientResource::Runtime(runtime) if runtime.state != "running")
+    });
+    let mut output = String::new();
+    output.push_str(&render_product_page(
+        "NEEDS YOU",
+        &needs_you,
+        continuation_command,
+    ));
+    output.push('\n');
+    output.push_str(&render_product_page(
+        "WORKING",
+        &working,
+        continuation_command,
+    ));
+    output.push('\n');
+    output.push_str(&render_product_page(
+        "UNHEALTHY",
+        &unhealthy,
+        continuation_command,
+    ));
+    if let Some(cursor) = page.page.next_cursor.as_deref() {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "More items are available: {continuation_command} --cursor {cursor} --limit {}",
+            page.page.limit
+        );
+    }
+    output
 }
 
 async fn run_machines(endpoint: &Endpoint, args: MachinesArgs, json_output: bool) -> Result<()> {
@@ -2415,14 +2538,19 @@ async fn run_activity(endpoint: &Endpoint, args: ActivityArgs, json_output: bool
             )
             .await?;
         cursor = Some(response.value.resume_cursor.clone());
-        print_activity_page(&response, json_output)?;
+        print_activity_page(&response, json_output, args.all)?;
         if !args.follow {
             return Ok(());
         }
     }
 }
 
-async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -> Result<()> {
+async fn run_devices(
+    endpoint: Endpoint,
+    configured_person: Option<&str>,
+    args: DevicesArgs,
+    json_output: bool,
+) -> Result<()> {
     let DevicesArgs {
         person,
         all,
@@ -2430,6 +2558,7 @@ async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -
         limit,
         command,
     } = args;
+    let person = configured_human(person.as_deref(), configured_person, "devices")?;
     let client = generated_client(&endpoint, Some(&person))?;
     match command.unwrap_or(DevicesCommand::Ls) {
         DevicesCommand::Ls => {
@@ -2479,6 +2608,19 @@ async fn run_devices(endpoint: Endpoint, args: DevicesArgs, json_output: bool) -
             print_client_value(&response, json_output)
         }
     }
+}
+
+fn configured_human(
+    explicit: Option<&str>,
+    configured: Option<&str>,
+    command: &str,
+) -> Result<String> {
+    let person = explicit.or(configured).with_context(|| {
+        format!(
+            "st3 {command} needs `--as person/NAME` or `person = \"person/NAME\"` in the st3 config"
+        )
+    })?;
+    parse_person_subject(person).map_err(anyhow::Error::msg)
 }
 
 fn print_client_value<T: serde::Serialize>(
@@ -2546,6 +2688,9 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     "{}  work  {}  {}  attempt {}",
                     item.header.id, item.state, item.path, item.attempt
                 );
+                if let Some(claimant) = &item.claimant {
+                    let _ = writeln!(output, "  assigned: {claimant}");
+                }
                 let _ = writeln!(output, "  action: st3 work show {}", item.header.id);
             }
             ClientResource::Mission(item) => {
@@ -2612,23 +2757,25 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
             }
             ClientResource::Machine(item) => {
                 let _ = writeln!(output, "{}  {}", item.header.id, item.state);
+                if item.capacity.state == "unknown" {
+                    let _ = writeln!(output, "  capacity not reported");
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "  capacity {} — {}",
+                        item.capacity.state, item.capacity.reason
+                    );
+                }
                 let _ = writeln!(
                     output,
-                    "  capacity {} — {}",
-                    item.capacity.state, item.capacity.reason
-                );
-                let _ = writeln!(
-                    output,
-                    "  occupancy {} running · inventory {}",
+                    "  runtimes {} running · {} known",
                     item.occupancy.running_runtimes,
                     item.runtime_ids.len()
                 );
-                let _ = writeln!(
-                    output,
-                    "  work {} · projects {}",
-                    item.work.len(),
-                    item.projects.len()
-                );
+                let _ = writeln!(output, "  assigned work {}", item.work.len());
+                if !item.projects.is_empty() {
+                    let _ = writeln!(output, "  projects {}", item.projects.len());
+                }
                 for transport in &item.transports {
                     let _ = write!(
                         output,
@@ -2693,35 +2840,67 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
 fn print_activity_page(
     response: &ClientEnvelope<ClientEventPage>,
     json_output: bool,
+    all: bool,
 ) -> Result<()> {
     if json_output {
         return print_value(response, true);
     }
-    print!("{}", render_activity_page(&response.value));
+    print!("{}", render_activity_page_with_all(&response.value, all));
     Ok(())
 }
 
+#[cfg(test)]
 fn render_activity_page(page: &ClientEventPage) -> String {
+    render_activity_page_with_all(page, false)
+}
+
+fn render_activity_page_with_all(page: &ClientEventPage, all: bool) -> String {
     use std::fmt::Write as _;
 
+    let items = page
+        .items
+        .iter()
+        .filter(|item| {
+            all || !matches!(
+                item.body.get("change").and_then(Value::as_str),
+                Some("work.renewed" | "replication.heartbeat")
+            )
+        })
+        .collect::<Vec<_>>();
     let mut output = String::new();
-    let _ = writeln!(output, "ACTIVITY  {}", page.items.len());
-    if page.items.is_empty() {
-        let _ = writeln!(output, "No changes after {}.", page.resume_cursor);
+    let _ = writeln!(output, "ACTIVITY  {}", items.len());
+    if items.is_empty() {
+        let _ = writeln!(
+            output,
+            "No material changes. Resume after {}.",
+            page.resume_cursor
+        );
     }
-    for item in &page.items {
+    for item in items {
         let resources = if item.resource_ids.is_empty() {
-            "-".to_owned()
+            item.body
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_owned()
         } else {
             item.resource_ids.join(",")
         };
+        let change = item
+            .body
+            .get("change")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| client_event_type_label(&item.event_type));
+        let state = item
+            .body
+            .get("state")
+            .and_then(Value::as_str)
+            .map(|state| format!(" → {state}"))
+            .unwrap_or_default();
         let _ = writeln!(
             output,
-            "{}  {}  {}  {}",
-            item.next_cursor,
-            client_event_type_label(&item.event_type),
-            resources,
-            item.timestamp
+            "{}  {}{}  {}  cursor {}",
+            resources, change, state, item.timestamp, item.next_cursor
         );
     }
     if page.has_more {
@@ -3046,12 +3225,14 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
             if json_output {
                 print_value(&plan, true)?;
             } else {
+                if plan.items.is_empty() {
+                    println!("No operational repairs are needed.");
+                    return Ok(());
+                }
                 println!(
-                    "repair\t{}\titems={}\tsnapshot={}\t{}",
-                    plan.status,
+                    "REPAIR PLAN  {} items · snapshot {}",
                     plan.items.len(),
-                    plan.snapshot_index,
-                    plan.token
+                    plan.snapshot_index
                 );
                 for item in &plan.items {
                     println!(
@@ -3062,6 +3243,10 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
                         println!("  affected\t{subject}");
                     }
                 }
+                println!(
+                    "Apply this exact plan with: st3 repair apply {}",
+                    plan.token
+                );
             }
         }
         RepairCommand::Apply { token } => {
@@ -3404,6 +3589,22 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
         }
         DocCommand::Get { reference, output } => {
+            let reference = if reference.contains('@') {
+                reference
+            } else {
+                let versions: DocumentListResponse = client
+                    .get(&format!(
+                        "/v1/documents?name={}&limit=1",
+                        urlencoding::encode(&reference)
+                    ))
+                    .await?;
+                let selected = versions
+                    .items
+                    .into_iter()
+                    .find(|version| version.latest)
+                    .with_context(|| format!("document `{reference}` does not exist"))?;
+                format!("{}@{}", selected.name, selected.hash)
+            };
             let path = format!(
                 "/v1/documents/content?reference={}",
                 urlencoding::encode(&reference)
@@ -3431,7 +3632,7 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             );
             let mut path = name.map_or_else(
                 || "/v1/documents?".to_owned(),
-                |name| format!("/v1/documents?name={}&", urlencoding::encode(&name)),
+                |name| format!("/v1/documents?prefix={}&", urlencoding::encode(&name)),
             );
             path.push_str(&format!("history={all}&limit={limit}"));
             let response: DocumentListResponse = client.get(&path).await?;
@@ -3443,9 +3644,21 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                 }
                 for version in response.items {
                     let latest = if version.latest { " latest" } else { "" };
+                    let hash = all
+                        .then(|| format!("@{}", version.hash))
+                        .unwrap_or_default();
+                    let created = chrono::DateTime::from_timestamp_millis(
+                        version.created_at_unix_ms.min(i64::MAX as u128) as i64,
+                    )
+                    .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| "unknown-date".into());
                     println!(
-                        "{}@{} {} bytes{latest}",
-                        version.name, version.hash, version.size
+                        "{}{} {} bytes · {} · {}{latest}",
+                        version.name,
+                        hash,
+                        version.size,
+                        created,
+                        version.owner.as_deref().unwrap_or("unknown-owner")
                     );
                 }
                 if response.has_more {
@@ -3617,12 +3830,7 @@ fn render_import_session(session: &st3_client::Session) -> String {
     output
 }
 
-async fn run_agents(
-    client: &Client,
-    endpoint: &Endpoint,
-    command: AgentsCommand,
-    json_output: bool,
-) -> Result<()> {
+async fn run_agents(endpoint: &Endpoint, command: AgentsCommand, json_output: bool) -> Result<()> {
     let (args, tree) = match command {
         AgentsCommand::Ls(args) => (args, false),
         AgentsCommand::Tree(args) => (args, true),
@@ -3632,15 +3840,9 @@ async fn run_agents(
             } else {
                 format!("agent/{subject}")
             };
-            let mut path = format!("/v1/status?subject={}", urlencoding::encode(&subject));
-            if all {
-                path.push_str("&history=true");
-            }
-            let response: StatusResponse = client.get(&path).await?;
-            let agent = response
-                .subjects
-                .into_iter()
-                .find(|candidate| candidate.subject == subject)
+            let response = generated_client(endpoint, None)?
+                .agents_get(&subject)
+                .await
                 .with_context(|| {
                     if all {
                         format!("agent `{subject}` does not exist")
@@ -3650,7 +3852,14 @@ async fn run_agents(
                         )
                     }
                 })?;
-            return print_value(&agent, json_output);
+            if json_output {
+                return print_value(&response, true);
+            }
+            let ClientResource::Agent(agent) = response.value else {
+                anyhow::bail!("`{subject}` is not an agent resource");
+            };
+            print!("{}", render_client_agent(&agent));
+            return Ok(());
         }
     };
     anyhow::ensure!(
@@ -3689,6 +3898,32 @@ async fn run_agents(
         render_client_agents(&response.value, tree, args.enrich, &continuation)
     );
     Ok(())
+}
+
+fn render_client_agent(agent: &st3_client::Agent) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "AGENT  {}", agent.header.id);
+    let _ = writeln!(output, "NAME         {}", agent.name);
+    let _ = writeln!(output, "STATE        {}", agent.state);
+    let _ = writeln!(output, "REACHABILITY {}", agent.reachability);
+    let _ = writeln!(
+        output,
+        "HARNESS      {} · {}",
+        agent.driver.as_deref().unwrap_or("none"),
+        agent.harness_state.as_deref().unwrap_or("unobserved")
+    );
+    if let Some(incarnation) = &agent.incarnation_id {
+        let _ = writeln!(output, "INCARNATION  {incarnation}");
+    }
+    if let Some(owner) = &agent.owner_run_id {
+        let _ = writeln!(output, "MISSION      {owner}");
+    }
+    for runtime in &agent.runtime_ids {
+        let _ = writeln!(output, "RUNTIME      {runtime}");
+    }
+    output
 }
 
 fn render_client_agents(
@@ -4023,6 +4258,7 @@ async fn run_review_decision(
 async fn run_attention(
     client: &Client,
     endpoint: &Endpoint,
+    configured_person: Option<&str>,
     command: AttentionCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -4033,6 +4269,7 @@ async fn run_attention(
             cursor,
             limit,
         } => {
+            let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the attention limit must be 1 through 200"
@@ -4049,6 +4286,7 @@ async fn run_attention(
             )
         }
         AttentionCommand::Show { subject, actor } => {
+            let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
             let normalized = normalize_member_subject(&subject, "attention");
             let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
             let item = client
@@ -5142,6 +5380,18 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
+    if args.driver == "claude-mcp" {
+        anyhow::ensure!(
+            args.argv.is_empty(),
+            "the Claude channel takes no provider argv"
+        );
+        let subject = args
+            .subject
+            .as_deref()
+            .context("the Claude channel has no subject")?;
+        let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
+        return st2::claude_mcp::run(&catalog, &identity);
+    }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
             .identity
@@ -5228,6 +5478,7 @@ async fn run_st2_native_driver(
     argv: Vec<String>,
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
+    let interactive_claude = claude_uses_interactive_mode(driver, &argv);
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     publish_harness_state(
@@ -5250,6 +5501,13 @@ async fn run_st2_native_driver(
     let task_runtime = runtime_id.clone();
     let task_driver = driver.to_owned();
     let mut task = tokio::task::spawn_blocking(move || match task_driver.as_str() {
+        "claude" if interactive_claude => st2::claude_session::run_controlled_paths(
+            &task_catalog,
+            &task_agent,
+            task_identity,
+            task_runtime,
+            argv,
+        ),
         "claude" => st2::claude_stream::run_controlled_paths(
             &task_catalog,
             &task_state,
@@ -5330,7 +5588,9 @@ async fn run_st2_native_driver(
                                     ("driver".into(), Value::String(driver.into())),
                                     (
                                         "transport".into(),
-                                        Value::String(if driver == "claude" {
+                                        Value::String(if driver == "claude" && interactive_claude {
+                                            "remote-control".into()
+                                        } else if driver == "claude" {
                                             "stream-json".into()
                                         } else {
                                             "native".into()
@@ -5398,11 +5658,15 @@ async fn run_st2_native_driver(
                             subject,
                             &inbox,
                             &archive,
-                            "stream-json",
-                            NativeDeliveryReceipts::Claude {
-                                state_dir: &driver_state,
-                                identity: &identity,
-                                runtime_id: &runtime_id,
+                            if interactive_claude { "claude-channel" } else { "stream-json" },
+                            if interactive_claude {
+                                NativeDeliveryReceipts::ClaudeChannel
+                            } else {
+                                NativeDeliveryReceipts::Claude {
+                                    state_dir: &driver_state,
+                                    identity: &identity,
+                                    runtime_id: &runtime_id,
+                                }
                             },
                         )
                         .await?;
@@ -5442,6 +5706,13 @@ async fn run_st2_native_driver(
             }
         }
     }
+}
+
+fn claude_uses_interactive_mode(driver: &str, argv: &[String]) -> bool {
+    driver == "claude"
+        && argv
+            .iter()
+            .any(|arg| arg == "--remote-control" || arg.starts_with("--remote-control="))
 }
 
 fn prepare_native_driver(subject: &str) -> Result<(PathBuf, PathBuf, String, String)> {
@@ -6314,6 +6585,7 @@ async fn forward_projected_messages(
             identity,
             runtime_id,
         } => st2::claude_stream::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        NativeDeliveryReceipts::ClaudeChannel => Ok(BTreeSet::new()),
         NativeDeliveryReceipts::OpenCode {
             catalog_root,
             identity,
@@ -6386,6 +6658,9 @@ enum NativeDeliveryReceipts<'a> {
         identity: &'a str,
         runtime_id: &'a str,
     },
+    /// Interactive Claude channels expose no model-consumption receipt. Keep the graph message
+    /// queued instead of claiming delivery merely because the MCP child accepted bytes.
+    ClaudeChannel,
     OpenCode {
         catalog_root: &'a Path,
         identity: &'a str,
@@ -6743,6 +7018,7 @@ mod tests {
                 "attention/release-review  attention  high  open  Review release\n",
                 "  action: st3 attention show launch/release --as person/nathan\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
+                "  assigned: agent/release\n",
                 "  action: st3 work show work/release/1/build\n",
                 "operation/transport-host-b  operation  warning  degraded  Peer is retrying\n",
                 "  recovery: st3 doctor\n",
@@ -6863,9 +7139,9 @@ mod tests {
             concat!(
                 "MACHINES  1\n",
                 "machine/host-a  local\n",
-                "  capacity unknown — no capacity observation\n",
-                "  occupancy 1 running · inventory 1\n",
-                "  work 1 · projects 0\n",
+                "  capacity not reported\n",
+                "  runtimes 1 running · 1 known\n",
+                "  assigned work 1\n",
                 "  transport unix local · last success 2026-09-20T11:09:10Z\n",
                 "  inspect: st3 subject show host/host-a\n",
                 "More items are available: st3 machines --cursor cursor/next --limit 100\n",
@@ -6895,8 +7171,8 @@ mod tests {
             render_activity_page(&events.value),
             concat!(
                 "ACTIVITY  2\n",
-                "event-cursor/epoch-a/92  upsert  work/release/1/build  2026-09-20T12:00:01Z\n",
-                "event-cursor/epoch-a/93  timeline.delta  session/release-agent/9  2026-09-20T12:00:02Z\n",
+                "work/release/1/build  upsert  2026-09-20T12:00:01Z  cursor event-cursor/epoch-a/92\n",
+                "session/release-agent/9  timeline.delta  2026-09-20T12:00:02Z  cursor event-cursor/epoch-a/93\n",
             )
         );
         assert_eq!(
@@ -6909,7 +7185,7 @@ mod tests {
             }),
             concat!(
                 "ACTIVITY  0\n",
-                "No changes after event-cursor/epoch-a/93.\n",
+                "No material changes. Resume after event-cursor/epoch-a/93.\n",
                 "More changes are available after event-cursor/epoch-a/93.\n",
             )
         );
@@ -7241,6 +7517,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_control_selects_the_interactive_claude_driver() {
+        assert!(claude_uses_interactive_mode(
+            "claude",
+            &["claude".into(), "--remote-control".into(), "cos".into()]
+        ));
+        assert!(claude_uses_interactive_mode(
+            "claude",
+            &["claude".into(), "--remote-control=cos".into()]
+        ));
+        assert!(!claude_uses_interactive_mode(
+            "claude",
+            &["claude".into(), "--model".into(), "opus".into()]
+        ));
+        assert!(!claude_uses_interactive_mode(
+            "codex",
+            &["codex".into(), "--remote-control".into()]
+        ));
+    }
+
+    #[test]
     fn message_references_round_trip_nested_ids_and_projected_files() {
         assert_eq!(
             normalize_message_reference("message/kickoff/run-1"),
@@ -7371,10 +7667,8 @@ mod tests {
     }
 
     #[test]
-    fn every_human_authorized_cli_path_rejects_ambient_or_shorthand_identity() {
+    fn human_mutations_reject_missing_or_shorthand_identity() {
         let missing = [
-            vec!["st3", "attention", "ls"],
-            vec!["st3", "attention", "show", "attention/item"],
             vec![
                 "st3",
                 "missions",
@@ -7387,7 +7681,6 @@ mod tests {
             vec!["st3", "launch", "approve", "launch/demo", "hash"],
             vec!["st3", "launch", "run", "launch/demo"],
             vec!["st3", "launch", "cancel", "launch/demo"],
-            vec!["st3", "devices"],
             vec!["st3", "import", "run", "session/demo"],
         ];
         for argv in missing {
@@ -7504,7 +7797,7 @@ mod tests {
         else {
             panic!("the review list command did not parse");
         };
-        assert_eq!(actor, "person/nathan");
+        assert_eq!(actor.as_deref(), Some("person/nathan"));
 
         let approve = Cli::try_parse_from([
             "st3",
@@ -7534,7 +7827,7 @@ mod tests {
         else {
             panic!("the attention list command did not parse");
         };
-        assert_eq!(actor, "person/nathan");
+        assert_eq!(actor.as_deref(), Some("person/nathan"));
 
         let request = Cli::try_parse_from([
             "st3",

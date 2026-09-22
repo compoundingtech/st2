@@ -9,11 +9,16 @@ Validate every example with the repository contract test:
 cargo test -p st3 --test examples
 ```
 
-The public CLI intentionally has no generic KDL publish escape hatch. A person launches a planning
-conversation with `st3 launch start ... --as person/NAME`, reviews its exact candidate with
-`st3 launch preview`, and approves it with `st3 launch approve-and-launch`. An authorized agent can
-publish a generated nested mission with `st3 work publish-mission` only while it owns the declared
-producing step.
+For an exact hand-authored definition, a person uses
+`st3 missions publish FILE --as person/NAME`. Publication creates an immutable ready revision but
+does not start a run. For conversational planning, use `st3 launch start`, review the exact
+candidate with `st3 launch preview`, and approve it with `st3 launch approve-and-launch`. An
+authorized agent can publish a generated nested mission with `st3 work publish-mission` only while
+it owns the declared producing step.
+
+[`WALKTHROUGH.md`](WALKTHROUGH.md) demonstrates the complete safe local path: inspect, publish,
+verify that a zero-run definition is listed, start one pinned run, follow it, and inspect its
+receipt.
 
 Keep durable mission KDL in a Git repository even when a planner authored it. The examples use local
 names and workspaces; change those before production use.
@@ -31,6 +36,7 @@ names and workspaces; change those before production use.
 - [`resource-observation.kdl`](resource-observation.kdl) gates work on a local observed resource.
 - [`mission-revision.kdl`](mission-revision.kdl) prepares a mission for controlled run generations.
 - [`loop-until-green.kdl`](loop-until-green.kdl) repeats one child mission until its exit gates pass or its round limit ends.
+- [`walkthrough.kdl`](walkthrough.kdl) is the harmless finite mission used by the start-to-finish walkthrough.
 
 `concurrent-intake.kdl` and `recurring-stewardship.kdl` contain a zero revision placeholder. Publish
 the child mission first. Replace the placeholder with the exact revision from `st3 missions show`.

@@ -318,9 +318,12 @@ pub(crate) fn render_human_value(value: &Value, style: OutputStyle) -> String {
     let mut output = String::new();
     match value {
         Value::Object(fields) => {
-            let title = object_identity(fields).unwrap_or("RESULT");
-            let _ = writeln!(output, "{}", style.heading(title));
-            render_object_fields(&mut output, fields, 0, style, None);
+            if let Some(title) = object_identity(fields) {
+                let _ = writeln!(output, "{}", style.heading(title));
+                render_object_fields(&mut output, fields, 0, style, Some(title));
+            } else {
+                render_object_fields(&mut output, fields, 0, style, None);
+            }
         }
         Value::Array(items) => {
             let _ = writeln!(output, "{}", style.heading("RESULTS"));

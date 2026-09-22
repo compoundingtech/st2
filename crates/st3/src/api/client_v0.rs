@@ -1687,7 +1687,12 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     (
         event_type.into(),
         resource_ids,
-        json!({ "reason": "client-projection-invalidated" }),
+        json!({
+            "reason": "client-projection-invalidated",
+            "change": record.kind,
+            "subject": record.subject,
+            "state": fields.get("state").or_else(|| fields.get("status")).cloned()
+        }),
     )
 }
 

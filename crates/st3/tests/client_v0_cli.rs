@@ -420,10 +420,7 @@ mission "cli/child" state="ready" {
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
 
     for (arguments, heading) in [
-        (
-            vec!["now", "--as", "person/nathan"],
-            "NOW FOR person/nathan",
-        ),
+        (vec!["now", "--as", "person/nathan"], "NEEDS YOU"),
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
         (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),

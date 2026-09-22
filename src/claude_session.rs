@@ -65,9 +65,120 @@ pub fn run(
     .with_context(|| format!("running Claude driver '{runtime_id}'"))
 }
 
+/// Run one interactive Claude provider for an st3-owned agent directory.
+///
+/// ST3 keeps its native-driver catalog private, so it supplies the resolved paths instead of
+/// asking the legacy catalog resolver to find them. This path is deliberately interactive: it
+/// preserves capabilities such as Claude Remote Control that are incompatible with `--print`.
+pub fn run_controlled_paths(
+    catalog_root: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    claude_argv: Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !claude_argv.is_empty(),
+        "Claude driver '{runtime_id}' has no provider argv"
+    );
+    let claude_argv = prepare_st3_channel_argv(catalog_root, &identity, claude_argv)?;
+    let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
+    crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
+        .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
+    install_signal_handler();
+    let observer = SessionObserver::new(agent_dir, &identity, "claude", &runtime_id)?;
+    let env = [
+        (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
+        (SESSION_ENV.to_string(), observer.session().to_string()),
+        (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
+    ];
+    run_provider(
+        "Claude",
+        &status::status_path(agent_dir),
+        &claude_argv,
+        &env,
+        status::STATUS_REFRESH,
+        PROVIDER_POLL,
+        &STOP,
+        Some(&observer),
+    )
+    .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
+}
+
 fn requires_st2_channel(argv: &[String]) -> bool {
     argv.windows(2)
         .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::CHANNEL)
+}
+
+fn requires_st3_channel(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::ST3_CHANNEL)
+}
+
+fn prepare_st3_channel_argv(
+    catalog_root: &Path,
+    identity: &str,
+    argv: Vec<String>,
+) -> Result<Vec<String>> {
+    if !requires_st3_channel(&argv) {
+        return Ok(argv);
+    }
+    match crate::claude_channel::verify_st3_installed() {
+        Ok(()) => Ok(argv),
+        Err(error) => {
+            eprintln!(
+                "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
+                 warning: using Claude's interactive st3 development channel"
+            );
+            let executable = std::env::current_exe()
+                .context("resolving the st3 executable for the Claude development channel")?;
+            development_st3_channel_argv(argv, &executable, catalog_root, identity)
+        }
+    }
+}
+
+fn development_st3_channel_argv(
+    argv: Vec<String>,
+    executable: &Path,
+    _catalog_root: &Path,
+    identity: &str,
+) -> Result<Vec<String>> {
+    let subject = format!("agent/{identity}");
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            "st3": {
+                "type": "stdio",
+                "command": executable,
+                "args": ["driver", "claude-mcp", "--subject", subject]
+            }
+        }
+    });
+    let mut output = Vec::with_capacity(argv.len() + 1);
+    let mut index = 0;
+    let mut replaced = false;
+    while index < argv.len() {
+        if !replaced
+            && argv[index] == "--channels"
+            && argv.get(index + 1).map(String::as_str) == Some(crate::claude_channel::ST3_CHANNEL)
+        {
+            output.extend([
+                "--mcp-config".to_string(),
+                serde_json::to_string(&mcp)
+                    .context("serializing the Claude st3 development channel")?,
+                "--dangerously-load-development-channels=server:st3".to_string(),
+            ]);
+            replaced = true;
+            index += 2;
+            continue;
+        }
+        output.push(argv[index].clone());
+        index += 1;
+    }
+    anyhow::ensure!(
+        replaced,
+        "the st3 Claude plugin channel selector is missing"
+    );
+    Ok(output)
 }
 
 /// Prefer the approved plugin, but preserve an interactive development path when it is absent.

@@ -1088,6 +1088,10 @@ pub struct DocumentVersion {
     pub created_index: u64,
     pub latest: bool,
     pub binding_claim_id: String,
+    #[serde(default)]
+    pub created_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
