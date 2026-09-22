@@ -16127,8 +16127,15 @@ fn terminalize_projected_generation_steps_tx(
              SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
                  lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                  updated_at_unix_ms=?3
-             WHERE generation_id=?1 AND status NOT IN ('completed','failed','cancelled')",
-            params![generation_id, reason, updated_at_unix_ms.to_string()],
+             WHERE generation_id=?1
+               AND (status NOT IN ('completed','failed','cancelled')
+                    OR (status='cancelled' AND blocked_reason=?4))",
+            params![
+                generation_id,
+                reason,
+                updated_at_unix_ms.to_string(),
+                "the root mission run is terminal"
+            ],
         )
         .map_err(internal)?;
     Ok(())
@@ -16146,8 +16153,15 @@ fn terminalize_projected_run_steps_tx(
              SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
                  lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                  updated_at_unix_ms=?3
-             WHERE run_id=?1 AND status NOT IN ('completed','failed','cancelled')",
-            params![run_id, reason, updated_at_unix_ms.to_string()],
+             WHERE run_id=?1
+               AND (status NOT IN ('completed','failed','cancelled')
+                    OR (status='cancelled' AND blocked_reason=?4))",
+            params![
+                run_id,
+                reason,
+                updated_at_unix_ms.to_string(),
+                "the root mission run is terminal"
+            ],
         )
         .map_err(internal)?;
     Ok(())
@@ -17103,6 +17117,88 @@ mission "origin-owned" state="ready" {
                 .active_mission_runs_for_origin("other")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_terminal_reason_replaces_only_a_provisional_root_cancellation() {
+        let store = Store::open_memory("node").unwrap();
+        let mission = publish_mission(
+            &store,
+            r#"version 2
+mission "terminal-replay" state="ready" {
+  goal "Keep terminal mission projection deterministic."
+  step "provisional" { agentless }
+  step "finished" { agentless }
+}
+"#,
+            "publish-terminal-replay",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.id,
+                revision: Some(mission.revision),
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "terminal-replay-run".into(),
+            })
+            .unwrap();
+        let generation = generation_id_from_subject(&run.generation);
+
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE step_runs SET status='cancelled', blocked_reason='the root mission run is terminal' WHERE generation_id=?1 AND step_path='provisional'",
+                [generation],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE step_runs SET status='completed', blocked_reason='preserved completion' WHERE generation_id=?1 AND step_path='finished'",
+                [generation],
+            )
+            .unwrap();
+        terminalize_projected_generation_steps_tx(
+            &transaction,
+            generation,
+            "the exact supersede reason",
+            now_ms(),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let projected = connection
+            .prepare(
+                "SELECT step_path, status, blocked_reason FROM step_runs WHERE generation_id=?1 ORDER BY step_path",
+            )
+            .unwrap()
+            .query_map([generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            projected,
+            vec![
+                (
+                    "finished".into(),
+                    "completed".into(),
+                    Some("preserved completion".into())
+                ),
+                (
+                    "provisional".into(),
+                    "cancelled".into(),
+                    Some("the exact supersede reason".into())
+                ),
+            ]
         );
     }
 
