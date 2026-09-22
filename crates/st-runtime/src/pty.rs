@@ -31,6 +31,27 @@ pub struct PtyObservation {
     pub tags: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyStats {
+    name: String,
+    process: PtyStatsProcess,
+    daemon: PtyStatsDaemon,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyStatsProcess {
+    alive: bool,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyStatsDaemon {
+    pid: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct PtyRuntime {
     binary: String,
@@ -168,9 +189,35 @@ impl PtyRuntime {
             .find(|item| item.name == id)
             .with_context(|| format!("PTY `{id}` is not present"))?;
         ensure_incarnation(id, &observation, expected_incarnation)?;
-        let pid = observation
+        let daemon_pid = observation
             .pid
             .with_context(|| format!("PTY `{id}` has no process identity"))?;
+
+        // `pty list` exposes the supporting daemon PID, not the process group leader running
+        // inside the terminal. Signalling that PID makes the registry disappear while leaving
+        // the provider tree alive. Resolve the terminal child through the same daemon and fence
+        // it against the list snapshot before delivering the signal.
+        let output = self.command().args(["stats", id, "--json"]).output()?;
+        let bytes = require_success("read PTY process identity", output)?;
+        let stats: PtyStats =
+            serde_json::from_slice(&bytes).context("parse PTY process identity")?;
+        anyhow::ensure!(
+            stats.name == id,
+            "PTY stats returned `{}` for `{id}`",
+            stats.name
+        );
+        anyhow::ensure!(
+            stats.daemon.pid == daemon_pid,
+            "PTY `{id}` changed incarnation before signal {signal}"
+        );
+        anyhow::ensure!(
+            stats.process.alive,
+            "PTY `{id}` has no live terminal process"
+        );
+        let pid = stats
+            .process
+            .pid
+            .with_context(|| format!("PTY `{id}` has no terminal process identity"))?;
         let group = unsafe { libc::kill(-(pid as i32), signal) };
         if group != 0 {
             let direct = unsafe { libc::kill(pid as i32, signal) };
@@ -331,6 +378,8 @@ fn require_success(action: &str, output: Output) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
 
     fn fake_executable(root: &Path, name: &str, body: &str) -> PathBuf {
         let source = root.join(format!("{name}.source"));
@@ -378,6 +427,57 @@ exit 0
             .send_key_if("work", "escape", Some("41:old"))
             .unwrap_err();
         assert!(error.to_string().contains("changed incarnation"));
+    }
+
+    #[test]
+    fn terminal_signal_targets_the_terminal_process_group_not_the_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-signal",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  printf '[{"name":"work","status":"running","pid":42,"createdAt":"now"}]'
+  exit 0
+fi
+if [ "$1" = stats ]; then
+  process_pid="$(cat "$0.process")"
+  printf '{"name":"work","process":{"alive":true,"pid":%s},"daemon":{"pid":42}}' "$process_pid"
+  exit 0
+fi
+exit 1
+"#,
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap 'exit 0' HUP; while :; do sleep 1; done"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        fs::write(binary.with_extension("process"), child.id().to_string()).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        runtime
+            .signal_if("work", Some("42:now"), libc::SIGHUP)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal process group survived SIGHUP"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
