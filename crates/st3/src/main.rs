@@ -5537,6 +5537,9 @@ async fn run_st2_native_driver(
         None,
     )
     .await?;
+    let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
+    let predecessor_harness_record = fs::read(&harness_state_path).ok();
+    let mut current_harness_record_started = false;
     let driver_state = catalog
         .parent()
         .context("the native driver catalog has no private root")?
@@ -5615,10 +5618,15 @@ async fn run_st2_native_driver(
             }
             _ = interval.tick() => {
                 let tick: Result<()> = async {
-                    if let Some(observed) = st2::harness_state::read(
-                        &st2::harness_state::harness_state_path(&agent_dir),
-                        None,
-                    ) {
+                    let current_record = fs::read(&harness_state_path).ok();
+                    current_harness_record_started = harness_record_belongs_to_current_session(
+                        current_harness_record_started,
+                        predecessor_harness_record.as_deref(),
+                        current_record.as_deref(),
+                    );
+                    if current_harness_record_started
+                        && let Some(observed) = st2::harness_state::read(&harness_state_path, None)
+                    {
                         // A session claim is a startup fence, not an observation. Preserve the
                         // explicit `starting` state until a hook or the initialized ST3 channel
                         // supplies positive evidence; publishing the derived `claimed`
@@ -5769,6 +5777,18 @@ fn claude_uses_interactive_mode(driver: &str, argv: &[String]) -> bool {
         && argv
             .iter()
             .any(|arg| arg == "--remote-control" || arg.starts_with("--remote-control="))
+}
+
+/// A provider task and its control loop start concurrently. Until the wrapper writes its session
+/// claim, the harness-state path can still contain the predecessor's terminal record. Never
+/// publish those bytes under the successor's runtime incarnation; the first byte change is the
+/// wrapper's ownership fence, after which ownership sequencing prevents a predecessor rewrite.
+fn harness_record_belongs_to_current_session(
+    already_started: bool,
+    predecessor: Option<&[u8]>,
+    current: Option<&[u8]>,
+) -> bool {
+    already_started || current.is_some_and(|bytes| Some(bytes) != predecessor)
 }
 
 fn prepare_native_driver(subject: &str) -> Result<(PathBuf, PathBuf, String, String)> {
@@ -7596,6 +7616,32 @@ mod tests {
             "codex",
             &["codex".into(), "--remote-control".into()]
         ));
+    }
+
+    #[test]
+    fn successor_never_adopts_the_predecessors_terminal_harness_record() {
+        let predecessor = br#"{"state":"ended","exit":"exit 0"}"#;
+        assert!(!harness_record_belongs_to_current_session(
+            false,
+            Some(predecessor),
+            Some(predecessor),
+        ));
+        assert!(!harness_record_belongs_to_current_session(
+            false,
+            Some(predecessor),
+            None,
+        ));
+
+        let claim = br#"{"state":"ended","reason":"superseded","incarnation":"next"}"#;
+        assert!(harness_record_belongs_to_current_session(
+            false,
+            Some(predecessor),
+            Some(claim),
+        ));
+        assert!(
+            harness_record_belongs_to_current_session(true, Some(predecessor), Some(predecessor)),
+            "once the successor fenced ownership, predecessor bytes cannot regain ownership"
+        );
     }
 
     #[test]
