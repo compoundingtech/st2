@@ -155,6 +155,12 @@ impl ExecRuntime {
                 generation.schema
             ))));
         }
+        // A terminal generation is durable evidence about this exact exec. In particular, do not
+        // let an unrelated process that later reuses the PID make a completed generation look
+        // live again on platforms whose best available start token is the PID itself.
+        if generation.exit_code.is_some() || generation.exit_signal.is_some() {
+            return Ok(Some(ExecObservation::Exited(generation)));
+        }
         let owned_exit = {
             let mut children = self
                 .owned_children
@@ -418,6 +424,31 @@ mod tests {
         let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ESRCH));
 
         assert!(process_is_absent(&error));
+    }
+
+    #[test]
+    fn a_terminal_record_stays_exited_when_its_pid_is_live() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let pid = std::process::id();
+        let generation = ExecGeneration {
+            schema: SCHEMA.into(),
+            pid,
+            created_at_unix_ms: 1,
+            start_token: process_start_token(pid).unwrap(),
+            generation_id: "completed-generation".into(),
+            exit_code: Some(0),
+            exit_signal: None,
+            isolation_mode: "detached".into(),
+            scope_unit: None,
+        };
+        fs::create_dir_all(&runtime.state_dir).unwrap();
+        runtime.write_generation("completed", &generation).unwrap();
+
+        assert_eq!(
+            runtime.observe("completed").unwrap(),
+            Some(ExecObservation::Exited(generation))
+        );
     }
 
     fn wait_for_exit(runtime: &ExecRuntime, id: &str) -> ExecGeneration {
