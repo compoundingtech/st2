@@ -5437,7 +5437,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .as_deref()
             .context("the Claude channel has no subject")?;
         let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
-        return st2::claude_mcp::run(&catalog, &identity);
+        return st2::claude_mcp::run_st3(&catalog, &identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
@@ -5619,76 +5619,85 @@ async fn run_st2_native_driver(
                         &st2::harness_state::harness_state_path(&agent_dir),
                         None,
                     ) {
-                        if !ready
-                            && !matches!(
-                                observed.state,
-                                st2::harness_state::Activity::Unknown
-                                    | st2::harness_state::Activity::Ended
-                            )
-                        {
-                            let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                                subject: subject.into(),
-                                kind: "harness.observed".into(),
-                                actor: Some(subject.into()),
-                                fields: BTreeMap::from([
-                                    ("state".into(), Value::String("ready".into())),
-                                    ("driver".into(), Value::String(driver.into())),
-                                    (
-                                        "transport".into(),
-                                        Value::String(if driver == "claude" && interactive_claude {
-                                            "remote-control".into()
-                                        } else if driver == "claude" {
-                                            "stream-json".into()
-                                        } else {
-                                            "native".into()
-                                        }),
-                                    ),
-                                    ("incarnation_id".into(), Value::String(incarnation.clone())),
-                                ]),
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: Some(format!("native-ready:{subject}:{driver}:{incarnation}")),
-                            }).await?;
-                            ready = true;
-                        }
-                        publish_harness_activity(
-                            client,
-                            subject,
-                            driver,
-                            Some(&incarnation),
-                            &observed,
-                            &mut last_activity_fingerprint,
-                        )
-                        .await?;
-                        if observed.reason.as_deref() == Some("providerCapacity") {
-                            let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
-                                driver,
-                                observed.since_ms,
-                                observed.reason.as_deref(),
-                            ))?));
-                            if last_capacity_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                                publish_provider_capacity_diagnostic(
-                                    client,
-                                    subject,
-                                    &incarnation,
-                                    observed.since_ms,
-                                    &fingerprint,
+                        // A session claim is a startup fence, not an observation. Preserve the
+                        // explicit `starting` state until a hook or the initialized ST3 channel
+                        // supplies positive evidence; publishing the derived `claimed`
+                        // indeterminacy would erase the more precise lifecycle state.
+                        let claim_placeholder =
+                            observed.state == st2::harness_state::Activity::Unknown
+                                && observed.reason.as_deref() == Some("claimed");
+                        if !claim_placeholder {
+                            if !ready
+                                && !matches!(
+                                    observed.state,
+                                    st2::harness_state::Activity::Unknown
+                                        | st2::harness_state::Activity::Ended
                                 )
-                                .await?;
-                                last_capacity_fingerprint = Some(fingerprint);
+                            {
+                                let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                                    subject: subject.into(),
+                                    kind: "harness.observed".into(),
+                                    actor: Some(subject.into()),
+                                    fields: BTreeMap::from([
+                                        ("state".into(), Value::String("ready".into())),
+                                        ("driver".into(), Value::String(driver.into())),
+                                        (
+                                            "transport".into(),
+                                            Value::String(if driver == "claude" && interactive_claude {
+                                                "remote-control".into()
+                                            } else if driver == "claude" {
+                                                "stream-json".into()
+                                            } else {
+                                                "native".into()
+                                            }),
+                                        ),
+                                        ("incarnation_id".into(), Value::String(incarnation.clone())),
+                                    ]),
+                                    evidence: Vec::new(),
+                                    expected_subject: None,
+                                    idempotency_key: Some(format!("native-ready:{subject}:{driver}:{incarnation}")),
+                                }).await?;
+                                ready = true;
                             }
-                        } else {
-                            last_capacity_fingerprint = None;
+                            publish_harness_activity(
+                                client,
+                                subject,
+                                driver,
+                                Some(&incarnation),
+                                &observed,
+                                &mut last_activity_fingerprint,
+                            )
+                            .await?;
+                            if observed.reason.as_deref() == Some("providerCapacity") {
+                                let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                                    driver,
+                                    observed.since_ms,
+                                    observed.reason.as_deref(),
+                                ))?));
+                                if last_capacity_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                                    publish_provider_capacity_diagnostic(
+                                        client,
+                                        subject,
+                                        &incarnation,
+                                        observed.since_ms,
+                                        &fingerprint,
+                                    )
+                                    .await?;
+                                    last_capacity_fingerprint = Some(fingerprint);
+                                }
+                            } else {
+                                last_capacity_fingerprint = None;
+                            }
+                            publish_harness_usage(
+                                client,
+                                subject,
+                                driver,
+                                &incarnation,
+                                &agent_dir,
+                                &mut last_usage_fingerprint,
+                            )
+                            .await?;
                         }
-                        publish_harness_usage(
-                            client,
-                            subject,
-                            driver,
-                            &incarnation,
-                            &agent_dir,
-                            &mut last_usage_fingerprint,
-                        )
-                        .await?;
                     }
                     publish_harness_timeline(
                         client,

@@ -19,7 +19,7 @@ use crate::driver_diagnostic::ProviderAuthEdge;
 use crate::harness_context::{self, Compaction, CompactionTrigger, Harness, RateLimits, Reading};
 use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
-    PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider, run_provider_ready,
+    PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
 };
 use crate::{driver_diagnostic, harness_state, message, status};
 
@@ -92,7 +92,7 @@ pub fn run_controlled_paths(
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
     ];
-    run_provider_ready(
+    run_provider(
         "Claude",
         &status::status_path(agent_dir),
         &claude_argv,
