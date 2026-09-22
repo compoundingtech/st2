@@ -33,6 +33,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
 | Mission Document Lift | Not supported | `st3/mission-document-lift` |
 | Mixed Worker Pool | Not supported | `st3/mixed-worker-pool` |
+| Cross-harness message wake | Not supported | `st3/cross-harness-message-wake` |
 | Planning Mode | Not supported | `st3/planning-mode` |
 | Run Generation Revision | Not supported | `st3/run-generation-revision` |
 | Mission Inputs | Not supported | `st3/mission-inputs` |
@@ -52,7 +53,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the launch API.
 
-The st3 corpus has 29 evals. Thirteen are model-free, and sixteen use at least one model.
+The st3 corpus has 41 evals. Twenty-four are model-free, and seventeen use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -84,15 +85,16 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Mission Document Lift | Codex × 1 | None |
 | st3 | Mixed Worker Pool | Claude Sonnet × 1, Codex × 1 | None |
+| st3 | Cross-harness message wake | Claude Sonnet × 1, Codex × 1 | None |
 | st3 | Planning Mode | Codex × 1, created by the launch API | None |
 | st3 | Run Generation Revision | Codex × 1, created by the launch API | None |
 | st3 | Continuous Stewardship | Codex × 1 | None |
 | st3 | Agent Migration Rehearsal | Codex × 1 | None |
 | st3 | Automatic GitHub Intake | Codex × 1 | None |
 
-The paired and st3-only corpus has 11 Claude seats and 38 Codex seats. It also has three Codex LLM judges.
+The paired and st3-only corpus has 12 Claude seats and 39 Codex seats. It also has three Codex LLM judges.
 
-The thirteen model-free st3 evals add no model seats and no LLM judges.
+The twenty-four model-free st3 evals add no model seats and no LLM judges.
 
 All Claude seats use `claude-sonnet-5`.
 

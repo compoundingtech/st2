@@ -12,6 +12,7 @@ This table records the purpose and the prompt boundary for every st3 eval.
 | `constraint-inheritance` | Keep. It proves that mission constraints reach nested steps. |
 | `context-resource-continuity` | Keep. It proves durable context across runtime replacement. |
 | `continuous-stewardship` | Rewrite. A real schedule now creates claimable finite mission runs. |
+| `cross-harness-message-wake` | Keep. It proves idle Codex and Claude wake through native message delivery, coordinate to consensus, and use no terminal-input fallback without disclosing that held-out check. |
 | `crash-escalation` | Keep. It proves bounded restart failure and graph diagnostics. |
 | `fork-in-the-road` | Keep. It proves parallel work and an explicit join. |
 | `ghost-bug` | Keep. It proves a multi-agent investigation with graph products. |

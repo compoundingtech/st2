@@ -325,7 +325,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_twenty_four_model_free_and_sixteen_model_backed_evals() {
+fn st3_eval_inventory_has_twenty_four_model_free_and_seventeen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -360,6 +360,7 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_sixteen_model_backed_evals(
         "automatic-github-intake",
         "claude-skill-inheritance",
         "continuous-stewardship",
+        "cross-harness-message-wake",
         "fork-in-the-road",
         "ghost-bug",
         "license-mit",
@@ -406,6 +407,32 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_sixteen_model_backed_evals(
             "{name} must use a model"
         );
     }
+}
+
+#[test]
+fn cross_harness_message_wake_is_black_box_and_uses_both_native_harnesses() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/cross-harness-message-wake");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "cross-harness-message-wake/eval.kdl"),
+        (1, 1)
+    );
+
+    for name in ["codex.md", "claude.md"] {
+        let prompt = fs::read_to_string(root.join("prompts").join(name)).unwrap();
+        let prompt = prompt.to_ascii_lowercase();
+        for leaked_failure_mode in ["pty", "terminal", "workaround"] {
+            assert!(
+                !prompt.contains(leaked_failure_mode),
+                "{name} primes the agent with `{leaked_failure_mode}`"
+            );
+        }
+    }
+
+    assert!(source.contains("judges/no-terminal-input.sh"));
+    assert!(source.contains("cross-harness-message-wake/controller"));
 }
 
 #[test]
