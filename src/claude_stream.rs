@@ -108,6 +108,7 @@ pub fn run_controlled_paths(
     let mut boot_replay = Some(boot_prompt);
     let mut pending: Option<PendingDelivery> = None;
     let mut next_inbox_refresh = Instant::now();
+    let mut next_heartbeat = Instant::now() + harness_state::HARNESS_STATE_REFRESH;
     let mut output_sequence = 0_u64;
 
     loop {
@@ -266,6 +267,8 @@ pub fn run_controlled_paths(
             next_inbox_refresh = Instant::now() + INBOX_REFRESH;
         }
 
+        refresh_harness_state_if_due(&observer, &mut next_heartbeat, Instant::now());
+
         if let Some(exit) = child.try_wait().context("polling Claude stream process")? {
             let label = describe_exit(exit);
             observer.ended(&label);
@@ -273,6 +276,17 @@ pub fn run_controlled_paths(
             return Ok(());
         }
         thread::sleep(POLL);
+    }
+}
+
+fn refresh_harness_state_if_due(
+    observer: &SessionObserver,
+    next_heartbeat: &mut Instant,
+    now: Instant,
+) {
+    if now >= *next_heartbeat {
+        observer.heartbeat();
+        *next_heartbeat = now + harness_state::HARNESS_STATE_REFRESH;
     }
 }
 
@@ -477,5 +491,36 @@ mod tests {
         let mut unacknowledged = replay;
         unacknowledged["isReplay"] = Value::Bool(false);
         assert_eq!(replayed_user_text(&unacknowledged), None);
+    }
+
+    #[test]
+    fn a_quiet_stream_session_refreshes_its_observed_harness_state() {
+        let root = tempfile::tempdir().unwrap();
+        let observer = SessionObserver::new(root.path(), "quiet", "claude", "runtime/quiet")
+            .expect("claim the stream session");
+        let mut writer = harness_state::Writer::new(
+            root.path(),
+            "quiet",
+            "claude",
+            Some("runtime/quiet".into()),
+        )
+        .with_ownership(observer.session().to_string(), observer.seq());
+        writer
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Empty,
+            ))
+            .unwrap();
+        let path = harness_state::harness_state_path(root.path());
+        let before = fs::read(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+
+        let now = Instant::now();
+        let mut next_heartbeat = now;
+        refresh_harness_state_if_due(&observer, &mut next_heartbeat, now);
+
+        assert_ne!(before, fs::read(path).unwrap());
+        assert!(next_heartbeat > now);
     }
 }
