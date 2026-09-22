@@ -45,6 +45,9 @@ const LOCK_NAME: &str = ".harness-state.lock";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Activity {
+    /// The provider child was successfully spawned, but no harness-specific observer has yet
+    /// reported whether it is idle or active. Unlike `Unknown`, this is positive live evidence.
+    Ready,
     Idle,
     Active,
     Child,
@@ -59,6 +62,7 @@ pub enum Activity {
 impl Activity {
     pub fn as_str(self) -> &'static str {
         match self {
+            Activity::Ready => "ready",
             Activity::Idle => "idle",
             Activity::Active => "active",
             Activity::Child => "child",

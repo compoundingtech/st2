@@ -144,6 +144,17 @@ impl SessionObserver {
         }
     }
 
+    /// Record the narrow fact proved by a successful spawn: the provider is live, while its
+    /// harness-specific activity is not yet known. Only ST3's interactive launch path asks for
+    /// this observation; legacy wrappers retain their existing hook-owned startup behavior.
+    fn ready(&self) {
+        let _ = self.writer().observe(harness_state::Observation::new(
+            harness_state::Activity::Ready,
+            harness_state::BlockedOn::None,
+            harness_state::InputBuffer::Unknown,
+        ));
+    }
+
     /// Best-effort terminal record; observation must never turn a clean teardown into an error.
     pub(crate) fn ended(&self, exit: &str) {
         let _ = self.writer().ended(exit);
@@ -215,6 +226,41 @@ pub(crate) fn run_provider(
     }
 }
 
+/// [`run_provider`], additionally recording positive readiness immediately after the provider
+/// child has spawned. This is for interactive sessions whose optional activity hooks may be
+/// suppressed by provider-specific settings: child liveness still proves `ready`, never `idle`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_provider_ready(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<()> {
+    match run_provider_observed_inner(
+        provider,
+        status_path,
+        argv,
+        env,
+        refresh_interval,
+        poll,
+        stop,
+        observed,
+        true,
+    )? {
+        ProviderOutcome::Exited(exit) => {
+            if let Some(observed) = observed {
+                observed.ended(&describe_exit(exit));
+            }
+            completed_provider(provider, exit)
+        }
+        ProviderOutcome::Stopped(_) => Ok(()),
+    }
+}
+
 /// [`run_provider`], but reporting how the session ended instead of judging it, so a wrapper can
 /// record its own terminal observation before deciding what the exit means. The stop path still
 /// writes the observer's terminal record in-line, because after SIGKILL escalation no caller code
@@ -229,6 +275,31 @@ pub(crate) fn run_provider_observed(
     poll: Duration,
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
+) -> Result<ProviderOutcome> {
+    run_provider_observed_inner(
+        provider,
+        status_path,
+        argv,
+        env,
+        refresh_interval,
+        poll,
+        stop,
+        observed,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_provider_observed_inner(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+    report_ready: bool,
 ) -> Result<ProviderOutcome> {
     let (program, args) = argv
         .split_first()
@@ -261,6 +332,11 @@ pub(crate) fn run_provider_observed(
             return Err(error).with_context(|| format!("starting {provider} provider {program}"));
         }
     };
+    if report_ready {
+        if let Some(observed) = observed {
+            observed.ready();
+        }
+    }
     let mut next_refresh = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -355,6 +431,61 @@ mod tests {
         assert_eq!(record.state, Activity::Ended);
         assert_eq!(record.exit.as_deref(), Some("exit unknown"));
         assert_eq!(record.reason.as_deref(), Some("launch-error"));
+    }
+
+    #[test]
+    fn the_ready_variant_reports_only_after_the_provider_spawned() {
+        use crate::harness_state::{self, Activity};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().to_path_buf();
+        let release = agent_dir.join("release-provider");
+        let status_path = crate::status::status_path(&agent_dir);
+        let provider_release = release.to_string_lossy().into_owned();
+        let thread_agent = agent_dir.clone();
+        let run = std::thread::spawn(move || {
+            let observer =
+                SessionObserver::new(&thread_agent, "hetz.worker", "claude", "hetz.worker")
+                    .unwrap();
+            let stop = AtomicBool::new(false);
+            run_provider_ready(
+                "test",
+                &status_path,
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "while [ ! -f \"$1\" ]; do sleep 0.01; done".into(),
+                    "sh".into(),
+                    provider_release,
+                ],
+                &[],
+                Duration::from_secs(60),
+                Duration::from_millis(5),
+                &stop,
+                Some(&observer),
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(observed) =
+                harness_state::read(&harness_state::harness_state_path(&agent_dir), None)
+            {
+                if observed.state == Activity::Ready {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "provider never became ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(release, b"go").unwrap();
+        run.join().unwrap().unwrap();
+        assert_eq!(
+            harness_state::read(&harness_state::harness_state_path(&agent_dir), None)
+                .unwrap()
+                .state,
+            Activity::Ended
+        );
     }
 
     /// The whole `(status, signal) -> label` table, including the `(None, None)` arm no reaped

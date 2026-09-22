@@ -133,6 +133,12 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Manage the ST3 Claude Code channel plugin and approval policy.
+    #[command(hide = true)]
+    ClaudeChannel {
+        #[command(subcommand)]
+        command: ClaudeChannelCommand,
+    },
     /// Inspect a typed subject card or its bounded history.
     Subject {
         #[command(subcommand)]
@@ -678,6 +684,30 @@ enum ServiceCommand {
     },
     /// Stop and remove st3 user services while preserving state files.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ClaudeChannelCommand {
+    /// Install or update the user plugin and its machine approval policy.
+    Install {
+        /// Install only the user plugin. An administrator will manage the machine policy.
+        #[arg(long)]
+        no_policy: bool,
+    },
+    /// Verify the embedded files, Claude registration, plugin, and machine policy.
+    Status,
+    /// Remove the user plugin, marketplace, embedded files, and machine policy.
+    Uninstall {
+        /// Keep the machine approval policy in place.
+        #[arg(long)]
+        keep_policy: bool,
+    },
+    /// Write only the machine policy. The main installer runs this through sudo.
+    #[command(hide = true)]
+    InstallPolicy,
+    /// Remove only the ST3-owned machine policy fragment.
+    #[command(hide = true)]
+    UninstallPolicy,
 }
 
 #[derive(Subcommand)]
@@ -1253,6 +1283,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Service { command } => run_service(command, cli.json),
+        Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Subject { command } => run_subject(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
         Command::Diagnostic(args) => run_harness_diagnostic(&client, args, cli.json).await,
@@ -1270,6 +1301,22 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Driver(args) => run_driver(&client, args, cli.catalog.as_deref()).await,
+    }
+}
+
+fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
+    match command {
+        ClaudeChannelCommand::Install { no_policy } => {
+            st2::claude_channel::install_st3(no_policy).map(|_| ())
+        }
+        ClaudeChannelCommand::Status => st2::claude_channel::status_st3(),
+        ClaudeChannelCommand::Uninstall { keep_policy } => {
+            st2::claude_channel::uninstall_st3(keep_policy)
+        }
+        ClaudeChannelCommand::InstallPolicy => {
+            st2::claude_channel::install_st3_policy().map(|_| ())
+        }
+        ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
     }
 }
 
@@ -5745,6 +5792,7 @@ fn prepare_native_driver_in(
 
 fn harness_activity_state(activity: st2::harness_state::Activity) -> &'static str {
     match activity {
+        st2::harness_state::Activity::Ready => "ready",
         st2::harness_state::Activity::Idle => "idle",
         st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
         st2::harness_state::Activity::Ended => "ended",
@@ -6881,6 +6929,12 @@ mod tests {
         let mut help = command.clone();
         let help = help.render_long_help().to_string();
         assert!(help.contains("Usage: st3"), "{help}");
+        assert!(
+            command
+                .find_subcommand("claude-channel")
+                .is_some_and(|command| command.is_hide_set()),
+            "the expert ST3 channel lifecycle must remain callable but hidden"
+        );
 
         for legacy in [
             "claude",
@@ -6894,7 +6948,6 @@ mod tests {
             "pty",
             "inspect",
             "wait",
-            "claude-channel",
             "doc",
             "eval",
             "graph",

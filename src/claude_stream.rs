@@ -426,7 +426,7 @@ mod tests {
             vec![
                 "claude".into(),
                 "--channels".into(),
-                "plugin:st3-channel@st2".into(),
+                "plugin:st3-channel@st3".into(),
                 "--input-format=text".into(),
                 "--output-format".into(),
                 "text".into(),
