@@ -320,7 +320,7 @@ pub(crate) fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()>
     Ok(())
 }
 
-fn stop_provider_group(
+pub(crate) fn stop_provider_group(
     child: &mut Child,
     observed: Option<&SessionObserver>,
 ) -> Result<Option<ExitStatus>> {

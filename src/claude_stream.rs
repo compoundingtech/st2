@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +23,9 @@ use sha2::{Digest as _, Sha256};
 use crate::delivery_ledger::{self, Begin, Correlation, Evidence, NegativeReceipt, Phase};
 use crate::harness_state::{self, Activity, BlockedOn, InputBuffer, Observation};
 use crate::harness_timeline::{EntryType, Role};
-use crate::provider_session::{SessionObserver, describe_exit, install_signal_handler};
+use crate::provider_session::{
+    STOP, SessionObserver, describe_exit, install_signal_handler, stop_provider_group,
+};
 use crate::{ding, harness_timeline, message, pretrust, run};
 
 const POLL: Duration = Duration::from_millis(100);
@@ -108,6 +111,15 @@ pub fn run_controlled_paths(
     let mut output_sequence = 0_u64;
 
     loop {
+        if STOP.load(Ordering::SeqCst) {
+            // Stream mode owns its child directly instead of going through run_provider's poll
+            // loop, so it must honor the shared stop edge itself. Without this check a terminal
+            // hangup kills only the supporting PTY daemon and leaves Claude's stream process
+            // group behind while the supervisor starts a successor.
+            drop(stdin);
+            stop_provider_group(&mut child, Some(&observer))?;
+            return Ok(());
+        }
         while let Ok(line) = line_rx.try_recv() {
             let line = line.context("reading Claude stream output")?;
             if line.trim().is_empty() {
