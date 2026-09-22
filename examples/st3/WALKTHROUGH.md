@@ -4,6 +4,16 @@ This walkthrough uses two complete files: a standing mission declares a durable 
 and a finite work mission assigns work to that owner. All names and data are invented. Use a
 disposable ST3 installation with a working Codex login, from the repository root.
 
+## Failure first: publication is not materialization
+
+The tempting sequence is to publish `walkthrough-standing.kdl`, see no agent, and conclude that
+there is no route from a definition to a worker. That conclusion confuses durable intent with a
+running instance. Publication creates an immutable mission definition only. The first
+`missions start` on that standing definition materializes its runtime. Until that happens, the
+finite mission's assigned steps have no agent that can claim them.
+
+The four-command sequence below is the supported way out. In particular, do not skip command 2.
+
 Create an empty workspace and inspect both files before changing graph state:
 
 ```sh

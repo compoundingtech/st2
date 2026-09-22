@@ -12,9 +12,15 @@ mission "example/revisable-change" state="ready" revisions="human-only" revision
     goal "Implement this request with focused tests: ${input.request}"
   }
 
-  step "verify" {
+  step "summarize-index" {
     available-to "agent/example/repository-owner/standing/repository-owner"
     depends-on { step "implement" completed }
+    goal "Add a concise summary of the invented archive index and record focused evidence."
+  }
+
+  step "verify" {
+    available-to "agent/example/repository-owner/standing/repository-owner"
+    depends-on { step "summarize-index" completed }
     goal "Verify the exact implementation and record evidence."
   }
 
