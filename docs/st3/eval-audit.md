@@ -12,7 +12,7 @@ This table records the purpose and the prompt boundary for every st3 eval.
 | `constraint-inheritance` | Keep. It proves that mission constraints reach nested steps. |
 | `context-resource-continuity` | Keep. It proves durable context across runtime replacement. |
 | `continuous-stewardship` | Rewrite. A real schedule now creates claimable finite mission runs. |
-| `cross-harness-message-wake` | Keep. It proves idle Codex and Claude wake through native message delivery, coordinate to consensus, and use no terminal-input fallback without disclosing that held-out check. |
+| `cross-harness-message-wake` | Keep. It proves Codex, Claude, Pi, and OMP wake both during startup and from exact idle through native message delivery, coordinate in pairs, and use no terminal-input fallback without disclosing that held-out check. |
 | `crash-escalation` | Keep. It proves bounded restart failure and graph diagnostics. |
 | `fork-in-the-road` | Keep. It proves parallel work and an explicit join. |
 | `ghost-bug` | Keep. It proves a multi-agent investigation with graph products. |
@@ -36,5 +36,6 @@ This table records the purpose and the prompt boundary for every st3 eval.
 | `signal-rename` | Repair. Personas now contain product facts only and rely on the generated boot contract. |
 | `test-writing` | Keep. It proves a direct coding mission with held-out gates. |
 | `weird-git-setup` | Keep. It proves work in a nonstandard repository layout. |
+| `work-wake-reliability` | Keep. It repeatedly proves fresh mission assignment, two live revisions, post-restart assignment, durable wake acknowledgement, cancellation, and agentless finalization without terminal input. |
 
 Eval personas can contain domain facts and fixture ownership. They cannot duplicate st3 conversations, claim, or boot procedures.

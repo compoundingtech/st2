@@ -884,7 +884,7 @@ An agent harness prompt is optional.
 st3 appends this exact text once to every agent launch:
 
 ```text
-Read @.st3/boot.md completely. Then list and claim your current st3 work.
+Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3 work.
 ```
 
 The shared render transaction writes the canonical `.st3/boot.md` before a native harness starts.
@@ -910,8 +910,15 @@ The default refusal prevents a spelling error from creating an unintended direct
 ## Native message delivery and work wake
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
-app-server turn requests, Claude uses its MCP channel, and the other maintained drivers use their
-durable native inbox adapters. st3 does not inject text or Enter into a terminal composer.
+app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
+exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions. OpenCode
+acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
+message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
+graph only from the durable provider receipt and never injects text or Enter into a terminal
+composer.
+
+Terminal control is reserved for diagnosed emergency recovery against an exact current
+incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
 current harness incarnation. Delivery is acknowledged by a new working turn or by claiming the

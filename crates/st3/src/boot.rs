@@ -27,6 +27,15 @@ Use `"$ST3_BIN" trace wait ... --as "$ST_AGENT"` only when claimed work needs a 
 
 The wait command exits early when a new message or a new eligible step needs your attention.
 
+Native conversation delivery and graph work dispatch are the ordinary wake paths. Never type
+into, attach to, or send synthetic keys such as Enter to an agent terminal to deliver a message
+or wake work.
+
+Terminal control is an emergency recovery path only after native delivery retries have failed and
+diagnostics identify the exact current incarnation. Before using it, verify that no person has a
+draft in the terminal, use an explicit person or operator identity, and record why it was necessary
+and what happened.
+
 When the harness itself fails, run `"$ST3_BIN" diagnostic --help` and report it through that dedicated authorized operation.
 
 When a person must act, run `"$ST3_BIN" attention request --help` and publish one explicit request for the responsible person.
@@ -78,5 +87,7 @@ mod tests {
         assert!(!BOOT_DOCUMENT.contains("message --help"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));
         assert!(BOOT_DOCUMENT.contains("diagnostic --help"));
+        assert!(BOOT_DOCUMENT.contains("Never type\ninto, attach to, or send synthetic keys"));
+        assert!(BOOT_DOCUMENT.contains("Terminal control is an emergency recovery path only"));
     }
 }

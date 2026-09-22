@@ -15,6 +15,7 @@ pub mod catalog_transaction;
 pub mod claude_channel;
 pub mod claude_mcp;
 pub mod claude_session;
+pub mod claude_stream;
 pub mod codex_app_server;
 pub mod context;
 pub mod delivery_ledger;

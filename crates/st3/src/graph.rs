@@ -1990,15 +1990,6 @@ fn driver_member(
     let effort = child_string(children, "effort")?;
     let extra = child_strings(children, "args")?.unwrap_or_default();
     let mut provider = vec![name.clone()];
-    if name == "claude" {
-        let dev_channels = unique_child(children, "dev-channels")?
-            .map(one_bool)
-            .transpose()?
-            .unwrap_or(false);
-        if dev_channels {
-            provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
-        }
-    }
     if let Some(model) = model {
         match name.as_str() {
             "codex" => provider.extend(["--model".into(), model]),
@@ -2511,7 +2502,7 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "dev-channels", "prompt", "args"],
+        "claude" => &["model", "effort", "prompt", "args"],
         "codex" | "pi" | "omp" => &["model", "effort", "prompt", "args"],
         "opencode" => &["model", "prompt", "args"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
@@ -2519,9 +2510,6 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     reject_unknown_children(body, allowed, "harness", &provider)?;
     for child in allowed {
         unique_child(body, child)?;
-    }
-    if let Some(node) = unique_child(body, "dev-channels")? {
-        one_bool(node)?;
     }
     Ok(())
 }
@@ -3547,24 +3535,6 @@ fn canonical_child_values(value: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn one_bool(node: &KdlNode) -> Result<bool, St3Error> {
-    ensure_no_properties(node)?;
-    ensure_no_children(node)?;
-    let [entry] = node.entries() else {
-        return Err(St3Error::new(
-            "wrong-argument-count",
-            format!("node `{}` needs one Boolean", node.name().value()),
-        ));
-    };
-    match entry.value() {
-        KdlValue::Bool(value) => Ok(*value),
-        _ => Err(St3Error::new(
-            "expected-boolean",
-            format!("node `{}` needs one Boolean", node.name().value()),
-        )),
-    }
-}
-
 fn property_bool(node: &KdlNode, property: &str) -> Result<Option<bool>, St3Error> {
     node.entries()
         .iter()
@@ -4423,7 +4393,7 @@ message "external" {
     }
 
     #[test]
-    fn claude_uses_the_approved_st3_channel_identity() {
+    fn claude_uses_the_native_stream_driver_without_a_channel() {
         let intent = parse_test_intent(
             r#"
 version 2
@@ -4431,7 +4401,6 @@ version 2
   agent "worker" {
     workspace "/work"
     harness "claude" {
-      dev-channels #true
       prompt "Work on the task."
     }
   }
@@ -4448,10 +4417,8 @@ version 2
         let crate::model::LaunchSpec::Argv(argv) = launch else {
             panic!("the native driver needs argv");
         };
-        assert!(
-            argv.windows(2)
-                .any(|pair| { pair == ["--channels", st2::claude_channel::ST3_CHANNEL] })
-        );
+        assert!(argv.iter().any(|arg| arg == "claude"));
+        assert!(!argv.iter().any(|arg| arg == "--channels"));
         assert!(
             !argv
                 .iter()

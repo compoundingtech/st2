@@ -15384,11 +15384,12 @@ fn enrich_step_wake_at(
         .as_ref()
         .map(|harness| harness.state.clone())
         .unwrap_or_else(|| "unavailable".into());
-    let incarnation_id = harness
+    let current_incarnation_id = harness
         .as_ref()
         .map(|harness| harness.incarnation_id.clone())
         .unwrap_or_else(|| "unknown".into());
-    let incarnation_key = hex::encode(Sha256::digest(incarnation_id.as_bytes()))[..12].to_owned();
+    let current_incarnation_key =
+        hex::encode(Sha256::digest(current_incarnation_id.as_bytes()))[..12].to_owned();
     let mut attempts = Vec::new();
     let mut statement = connection.prepare(
         "SELECT body, accepted_at_unix_ms FROM claims
@@ -15402,27 +15403,39 @@ fn enrich_step_wake_at(
         let (body, accepted) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
         let fields = body.get("fields").unwrap_or(&body);
-        let matches = fields
+        let matching_incarnation = fields
             .get("tags")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .any(|tag| {
-                work_wake_tag_matches(
-                    tag,
-                    &view.subject,
-                    view.attempt,
-                    view.readiness_epoch,
-                    &incarnation_key,
-                )
+            .find_map(|tag| {
+                work_wake_tag_incarnation(tag, &view.subject, view.attempt, view.readiness_epoch)
+                    .map(str::to_owned)
             });
-        if matches {
-            attempts.push(accepted.parse::<u128>().unwrap_or(0));
+        if let Some(incarnation) = matching_incarnation {
+            attempts.push((accepted.parse::<u128>().unwrap_or(0), incarnation));
         }
     }
-    let first_attempt = attempts.first().copied();
-    let last_attempt_at_unix_ms = attempts.last().copied();
+    let first_attempt = attempts.first().map(|(accepted, _)| *accepted);
+    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, _)| *accepted);
+    let wake_incarnation_key = attempts
+        .last()
+        .map(|(_, incarnation)| incarnation.as_str())
+        .unwrap_or(current_incarnation_key.as_str());
+    let wake_incarnation_id = harness_incarnation_for_key_at(
+        connection,
+        assignee,
+        wake_incarnation_key,
+        snapshot_unix_ms,
+    )?
+    .unwrap_or_else(|| {
+        if wake_incarnation_key == current_incarnation_key {
+            current_incarnation_id.clone()
+        } else {
+            wake_incarnation_key.to_owned()
+        }
+    });
     let acknowledged_by = if !attempts.is_empty()
         && matches!(
             view.status.as_str(),
@@ -15431,7 +15444,9 @@ fn enrich_step_wake_at(
         Some("claim".into())
     } else if first_attempt.is_some_and(|requested| {
         harness.as_ref().is_some_and(|harness| {
-            harness.state == "working" && harness.observed_at_unix_ms >= requested
+            current_incarnation_key == wake_incarnation_key
+                && harness.state == "working"
+                && harness.observed_at_unix_ms >= requested
         })
     }) {
         Some("turn".into())
@@ -15450,7 +15465,7 @@ fn enrich_step_wake_at(
                 assignee,
                 snapshot_unix_ms.to_string(),
                 view.subject,
-                incarnation_id
+                wake_incarnation_id
             ],
             |row| row.get::<_, String>(0),
         )
@@ -15471,7 +15486,7 @@ fn enrich_step_wake_at(
         view.wake = Some(WorkWakeView {
             assignee: assignee.into(),
             assignee_state,
-            incarnation_id,
+            incarnation_id: wake_incarnation_id,
             attempts: attempts.len().try_into().unwrap_or(u32::MAX),
             last_attempt_at_unix_ms,
             acknowledged_by,
@@ -15481,21 +15496,49 @@ fn enrich_step_wake_at(
     Ok(())
 }
 
-fn work_wake_tag_matches(
-    tag: &str,
+fn work_wake_tag_incarnation<'a>(
+    tag: &'a str,
     step_subject: &str,
     attempt: u32,
     readiness_epoch: u32,
-    incarnation_key: &str,
-) -> bool {
+) -> Option<&'a str> {
     let Some(tag) = tag.strip_prefix("st3-work:") else {
-        return false;
+        return None;
     };
     let mut parts = tag.rsplitn(4, '@');
-    parts.next() == Some(incarnation_key)
-        && parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(readiness_epoch)
+    let incarnation = parts.next()?;
+    (parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(readiness_epoch)
         && parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(attempt)
-        && parts.next() == Some(step_subject)
+        && parts.next() == Some(step_subject))
+    .then_some(incarnation)
+}
+
+fn harness_incarnation_for_key_at(
+    connection: &Connection,
+    subject: &str,
+    incarnation_key: &str,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT body FROM claims
+         WHERE subject=?1 AND kind='harness.observed' AND accepted_at_unix_ms<=?2
+         ORDER BY store_index DESC",
+    )?;
+    let rows = statement.query_map(params![subject, snapshot_unix_ms.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for row in rows {
+        let body = serde_json::from_str::<Value>(&row?).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        let Some(incarnation) = fields.get("incarnation_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = hex::encode(Sha256::digest(incarnation.as_bytes()));
+        if key.get(..12) == Some(incarnation_key) {
+            return Ok(Some(incarnation.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 fn step_execution_timing_at(
@@ -15551,6 +15594,20 @@ fn step_execution_timing_at(
         }
 
         match kind.as_str() {
+            "step-run.state"
+                if fields
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| matches!(status, "claimed" | "working")) =>
+            {
+                // Agentless execution has no `work.claimed` event. Its reconciler-owned
+                // `working` transition is therefore the authoritative opening edge. Worker
+                // claims may also carry this projection; keeping the earliest edge is
+                // idempotent and their following work event supplies the lease.
+                if started.is_none() {
+                    started = Some(accepted);
+                }
+            }
             "work.claimed" => {
                 if started.is_none() {
                     started = Some(accepted);

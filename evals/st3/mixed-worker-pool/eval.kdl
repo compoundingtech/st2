@@ -17,7 +17,6 @@ version 2
           workspace "${ST_WORKSPACE}"
           under "agent/${ST_MISSION_RUN}/pool.codex" reason="share one bounded work pool"
           harness "claude" {
-            dev-channels #true
             model "claude-sonnet-5"
             args "--permission-mode" "bypassPermissions"
           }

@@ -1119,7 +1119,7 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "opencode", "exec"])]
+    #[arg(value_parser = ["claude", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -1291,6 +1291,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.peers = args.peer;
     }
     config.validate()?;
+    st2::hooks::ensure_installed().context(
+        "publishing this st3 binary's required lifecycle hook set before starting the daemon",
+    )?;
     fs::create_dir_all(&config.state_dir)?;
     let store = Arc::new(Store::open(
         &config.state_dir.join("claims.sqlite3"),
@@ -4521,10 +4524,50 @@ async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Optio
         .map(str::to_owned))
 }
 
+fn pty_observation_incarnation(
+    actor: &str,
+    observations: &[st_runtime::PtyObservation],
+) -> Option<String> {
+    let subject = if actor.starts_with("agent/") {
+        actor
+    } else {
+        return None;
+    };
+    let observation = observations.iter().find(|observation| {
+        observation.status == "running"
+            && observation.tags.get("st3.subject").map(String::as_str) == Some(subject)
+    })?;
+    Some(format!(
+        "{}:{}",
+        observation.pid?,
+        observation.created_at.as_deref()?
+    ))
+}
+
+fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
+    let Some(root) = std::env::var_os("PTY_ROOT").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let observations = st_runtime::PtyRuntime::new(PathBuf::from(root))
+        .snapshot()
+        .context("reading the local PTY registry for the native driver incarnation")?;
+    Ok(pty_observation_incarnation(actor, &observations))
+}
+
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let has_local_pty_registry =
+        std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
-        if let Some(incarnation) = current_agent_incarnation(client, actor).await? {
+        // A restarted provider process can begin before the reconciler has projected its new PTY
+        // observation. Reading the graph immediately would then bind this new driver to the old
+        // incarnation forever. The local registry already contains the process executing us and
+        // is the exact source from which the reconciler will derive the graph incarnation.
+        if has_local_pty_registry {
+            if let Some(incarnation) = current_local_pty_incarnation(actor)? {
+                return Ok(incarnation);
+            }
+        } else if let Some(incarnation) = current_agent_incarnation(client, actor).await? {
             return Ok(incarnation);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -5099,29 +5142,27 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
-    if args.driver == "pi-channel" {
+    if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
             .identity
             .as_deref()
-            .context("the Pi channel has no identity")?;
-        let _ = catalog.context("the Pi channel has no native driver catalog")?;
+            .context("the pi-family channel has no identity")?;
+        let _ = catalog.context("the pi-family channel has no native driver catalog")?;
         anyhow::ensure!(
             args.argv.is_empty(),
-            "the Pi channel takes no provider argv"
+            "the pi-family channel takes no provider argv"
         );
-        return run_pi_channel(client, &normalize_agent_subject(identity)).await;
+        let driver = if args.driver == "omp-channel" {
+            "omp"
+        } else {
+            "pi"
+        };
+        return run_pi_channel(client, &normalize_agent_subject(identity), driver).await;
     }
     let subject = args
         .subject
         .as_deref()
         .context("the driver has no subject")?;
-    if args.driver == "claude-mcp" {
-        anyhow::ensure!(
-            args.argv.is_empty(),
-            "the Claude MCP driver takes no provider argv"
-        );
-        return run_claude_mcp(client, &normalize_agent_subject(subject)).await;
-    }
     if args.driver == "codex" {
         return run_codex_native(client, subject, args.argv).await;
     }
@@ -5198,34 +5239,25 @@ async fn run_st2_native_driver(
         None,
     )
     .await?;
-    let argv = if driver == "claude" {
-        match prepare_st3_claude_channel_argv(subject, argv) {
-            Ok(argv) => argv,
-            Err(error) => {
-                let reason = format!("{error:#}");
-                publish_harness_state(
-                    client,
-                    subject,
-                    driver,
-                    "blocked",
-                    Some(&incarnation),
-                    Some(&reason),
-                )
-                .await?;
-                request_claude_channel_attention(client, subject, Some(&incarnation), &reason)
-                    .await?;
-                return Err(error);
-            }
-        }
-    } else {
-        argv
-    };
+    let driver_state = catalog
+        .parent()
+        .context("the native driver catalog has no private root")?
+        .join("state");
     let task_catalog = catalog.clone();
+    let task_state = driver_state.clone();
+    let task_agent = agent_dir.clone();
     let task_identity = identity.clone();
     let task_runtime = runtime_id.clone();
     let task_driver = driver.to_owned();
     let mut task = tokio::task::spawn_blocking(move || match task_driver.as_str() {
-        "claude" => st2::claude_session::run(&task_catalog, task_identity, task_runtime, argv),
+        "claude" => st2::claude_stream::run_controlled_paths(
+            &task_catalog,
+            &task_state,
+            &task_agent,
+            task_identity,
+            task_runtime,
+            argv,
+        ),
         "pi" => st2::pi_session::run(&task_catalog, task_identity, task_runtime, argv),
         "omp" => st2::omp_session::run(&task_catalog, task_identity, task_runtime, argv),
         "opencode" => st2::opencode_session::run(&task_catalog, task_identity, task_runtime, argv),
@@ -5243,6 +5275,7 @@ async fn run_st2_native_driver(
     let mut published_timeline = BTreeSet::new();
     let mut ready = false;
     let mut last_control_warning = None;
+    let mut last_capacity_fingerprint = None;
     loop {
         tokio::select! {
             result = &mut task => {
@@ -5282,7 +5315,6 @@ async fn run_st2_native_driver(
                         None,
                     ) {
                         if !ready
-                            && driver != "claude"
                             && !matches!(
                                 observed.state,
                                 st2::harness_state::Activity::Unknown
@@ -5296,7 +5328,14 @@ async fn run_st2_native_driver(
                                 fields: BTreeMap::from([
                                     ("state".into(), Value::String("ready".into())),
                                     ("driver".into(), Value::String(driver.into())),
-                                    ("transport".into(), Value::String("native".into())),
+                                    (
+                                        "transport".into(),
+                                        Value::String(if driver == "claude" {
+                                            "stream-json".into()
+                                        } else {
+                                            "native".into()
+                                        }),
+                                    ),
                                     ("incarnation_id".into(), Value::String(incarnation.clone())),
                                 ]),
                                 evidence: Vec::new(),
@@ -5314,6 +5353,26 @@ async fn run_st2_native_driver(
                             &mut last_activity_fingerprint,
                         )
                         .await?;
+                        if observed.reason.as_deref() == Some("providerCapacity") {
+                            let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                                driver,
+                                observed.since_ms,
+                                observed.reason.as_deref(),
+                            ))?));
+                            if last_capacity_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                                publish_provider_capacity_diagnostic(
+                                    client,
+                                    subject,
+                                    &incarnation,
+                                    observed.since_ms,
+                                    &fingerprint,
+                                )
+                                .await?;
+                                last_capacity_fingerprint = Some(fingerprint);
+                            }
+                        } else {
+                            last_capacity_fingerprint = None;
+                        }
                         publish_harness_usage(
                             client,
                             subject,
@@ -5333,14 +5392,32 @@ async fn run_st2_native_driver(
                         &mut published_timeline,
                     )
                     .await?;
-                    if driver != "claude" {
+                    if driver == "claude" {
                         forward_projected_messages(
                             client,
                             subject,
                             &inbox,
                             &archive,
-                            "native",
-                            None,
+                            "stream-json",
+                            NativeDeliveryReceipts::Claude {
+                                state_dir: &driver_state,
+                                identity: &identity,
+                                runtime_id: &runtime_id,
+                            },
+                        )
+                        .await?;
+                    } else if driver == "opencode" {
+                        forward_projected_messages(
+                            client,
+                            subject,
+                            &inbox,
+                            &archive,
+                            "opencode-server",
+                            NativeDeliveryReceipts::OpenCode {
+                                catalog_root: &catalog,
+                                identity: &identity,
+                                runtime_id: &runtime_id,
+                            },
                         )
                         .await?;
                     }
@@ -5350,7 +5427,7 @@ async fn run_st2_native_driver(
                     tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
-            _ = work_interval.tick(), if driver != "claude" => {
+            _ = work_interval.tick() => {
                 let tick: Result<()> = async {
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
@@ -5365,90 +5442,6 @@ async fn run_st2_native_driver(
             }
         }
     }
-}
-
-fn prepare_st3_claude_channel_argv(subject: &str, argv: Vec<String>) -> Result<Vec<String>> {
-    let uses_channel = argv
-        .windows(2)
-        .any(|pair| pair[0] == "--channels" && pair[1] == st2::claude_channel::ST3_CHANNEL);
-    if !uses_channel {
-        return Ok(argv);
-    }
-    let allow_interactive_fallback = std::env::var_os("ST3_ALLOW_INTERACTIVE_CHANNEL_FALLBACK")
-        .as_deref()
-        == Some(std::ffi::OsStr::new("1"));
-    prepare_st3_claude_channel_argv_after_verification(
-        subject,
-        argv,
-        st2::claude_channel::verify_st3_installed(),
-        allow_interactive_fallback,
-    )
-}
-
-fn prepare_st3_claude_channel_argv_after_verification(
-    subject: &str,
-    argv: Vec<String>,
-    verification: Result<()>,
-    allow_interactive_fallback: bool,
-) -> Result<Vec<String>> {
-    match verification {
-        Ok(()) => Ok(argv),
-        Err(error) if allow_interactive_fallback => {
-            eprintln!(
-                "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
-                 warning: using Claude's interactive development channel; Claude can ask for confirmation\n\
-                 warning: run `st3 claude-channel install` and install its policy for unattended startup"
-            );
-            let executable = std::env::current_exe()
-                .context("resolving the st3 executable for the Claude development channel")?;
-            st3_development_channel_argv(argv, &executable, subject)
-        }
-        Err(error) => anyhow::bail!(
-            "the approved st3 Claude channel plugin is unavailable: {error:#}. Run `st3 claude-channel install`, then `sudo \"$(command -v st3)\" claude-channel install-policy`"
-        ),
-    }
-}
-
-fn st3_development_channel_argv(
-    argv: Vec<String>,
-    executable: &Path,
-    subject: &str,
-) -> Result<Vec<String>> {
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            "st3": {
-                "type": "stdio",
-                "command": executable,
-                "args": ["driver", "claude-mcp", "--subject", subject]
-            }
-        }
-    });
-    let mut output = Vec::with_capacity(argv.len() + 2);
-    let mut index = 0;
-    let mut replaced = false;
-    while index < argv.len() {
-        if !replaced
-            && argv[index] == "--channels"
-            && argv.get(index + 1).map(String::as_str) == Some(st2::claude_channel::ST3_CHANNEL)
-        {
-            output.extend([
-                "--mcp-config".to_string(),
-                mcp.to_string(),
-                "--strict-mcp-config".to_string(),
-                "--dangerously-load-development-channels=server:st3".to_string(),
-            ]);
-            replaced = true;
-            index += 2;
-            continue;
-        }
-        output.push(argv[index].clone());
-        index += 1;
-    }
-    anyhow::ensure!(
-        replaced,
-        "the st3 Claude plugin channel selector is missing"
-    );
-    Ok(output)
 }
 
 fn prepare_native_driver(subject: &str) -> Result<(PathBuf, PathBuf, String, String)> {
@@ -5760,45 +5753,7 @@ async fn publish_harness_state(
     Ok(())
 }
 
-async fn request_claude_channel_attention(
-    client: &Client,
-    subject: &str,
-    incarnation: Option<&str>,
-    reason: &str,
-) -> Result<()> {
-    let reviewer = "person/nathan";
-    let pending: Vec<AttentionItemView> = client
-        .get(&format!(
-            "/v1/attention?person={}",
-            urlencoding::encode(reviewer)
-        ))
-        .await?;
-    if pending.iter().any(|item| {
-        item.kind == "fault"
-            && item.targets.iter().any(|target| target == subject)
-            && item.title == "A Claude agent needs its approved channel"
-    }) {
-        return Ok(());
-    }
-    let incarnation_key = work_incarnation_key(incarnation);
-    let _: AttentionRequestView = client
-        .post(
-            "/v1/attention",
-            &AttentionRequest {
-                reviewer: reviewer.into(),
-                title: "A Claude agent needs its approved channel".into(),
-                reason: format!("`{subject}` cannot start unattended. {reason}"),
-                severity: "error".into(),
-                targets: vec![subject.into()],
-                actor: subject.into(),
-                idempotency_key: format!("claude-channel-policy:{subject}:{incarnation_key}"),
-            },
-        )
-        .await?;
-    Ok(())
-}
-
-async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
+async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
@@ -5862,8 +5817,8 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                             actor: Some(subject.into()),
                             fields: BTreeMap::from([
                                 ("state".into(), Value::String(status.into())),
-                                ("driver".into(), Value::String("pi".into())),
-                                ("transport".into(), Value::String("pi-channel".into())),
+                                ("driver".into(), Value::String(driver.into())),
+                                ("transport".into(), Value::String(format!("{driver}-channel"))),
                                 ("incarnation_id".into(), Value::String(incarnation.clone())),
                             ]),
                             evidence: Vec::new(),
@@ -6025,11 +5980,11 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         &inbox,
                         &archive,
                         "app-server",
-                        Some(CodexDeliveryReceipts {
+                        NativeDeliveryReceipts::Codex {
                             state_dir: &state_dir,
                             identity: &identity,
                             runtime_id: &runtime_id,
-                        }),
+                        },
                     )
                     .await?;
                     if let Some(observed) = st2::harness_state::read(
@@ -6337,7 +6292,7 @@ async fn forward_projected_messages(
     inbox: &Path,
     archive: &Path,
     transport: &str,
-    codex_receipts: Option<CodexDeliveryReceipts<'_>>,
+    receipts: NativeDeliveryReceipts<'_>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
     let messages: Vec<MessageView> = client
@@ -6348,15 +6303,23 @@ async fn forward_projected_messages(
         .await?;
     sync_closed_projected_messages(inbox, archive, &messages)?;
     let mut present = projected_message_files(inbox, archive)?;
-    let consumed = codex_receipts
-        .map(|receipts| {
-            st2::codex_app_server::consumed_delivery_filenames(
-                receipts.state_dir,
-                receipts.identity,
-                receipts.runtime_id,
-            )
-        })
-        .transpose()?;
+    let consumed = match receipts {
+        NativeDeliveryReceipts::Codex {
+            state_dir,
+            identity,
+            runtime_id,
+        } => st2::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        NativeDeliveryReceipts::Claude {
+            state_dir,
+            identity,
+            runtime_id,
+        } => st2::claude_stream::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        NativeDeliveryReceipts::OpenCode {
+            catalog_root,
+            identity,
+            runtime_id,
+        } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
+    }?;
     for message in messages
         .into_iter()
         .filter(|message| message.status == "sent")
@@ -6394,10 +6357,10 @@ async fn forward_projected_messages(
             present.insert(message.subject.clone(), filename.clone());
             filename
         };
-        // Generic native transports retain their existing synchronous acceptance boundary. Codex
-        // advances graph delivery only after its durable ledger proves the exact inbox file was
-        // consumed by a turn; materialization alone is merely queued native delivery.
-        if !native_delivery_receipted(consumed.as_ref(), &filename) {
+        // Receipt-backed transports advance graph delivery only after their durable ledger proves
+        // that the exact inbox file was consumed by a provider turn. Materialization alone is
+        // merely queued native delivery.
+        if !native_delivery_receipted(&consumed, &filename) {
             continue;
         }
         deliver_message(
@@ -6412,14 +6375,26 @@ async fn forward_projected_messages(
 }
 
 #[derive(Clone, Copy)]
-struct CodexDeliveryReceipts<'a> {
-    state_dir: &'a Path,
-    identity: &'a str,
-    runtime_id: &'a str,
+enum NativeDeliveryReceipts<'a> {
+    Codex {
+        state_dir: &'a Path,
+        identity: &'a str,
+        runtime_id: &'a str,
+    },
+    Claude {
+        state_dir: &'a Path,
+        identity: &'a str,
+        runtime_id: &'a str,
+    },
+    OpenCode {
+        catalog_root: &'a Path,
+        identity: &'a str,
+        runtime_id: &'a str,
+    },
 }
 
-fn native_delivery_receipted(codex_consumed: Option<&BTreeSet<String>>, filename: &str) -> bool {
-    codex_consumed.is_none_or(|filenames| filenames.contains(filename))
+fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> bool {
+    consumed.contains(filename)
 }
 
 fn sync_closed_projected_messages(
@@ -6465,207 +6440,6 @@ fn projected_message_files(inbox: &Path, archive: &Path) -> Result<BTreeMap<Stri
             })
         })
         .collect())
-}
-
-async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    let mut initialized = false;
-    let mut event_cursor = None;
-    let mut initial_sync = tokio::time::interval(Duration::from_secs(1));
-    initial_sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut renewal_interval = tokio::time::interval(Duration::from_secs(30));
-    renewal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut announced = BTreeSet::new();
-    let mut renewed_minute = None;
-    let mut ready = false;
-    let mut last_control_warning = None;
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { return Ok(()); };
-                if line.trim().is_empty() { continue; }
-                let request: Value = serde_json::from_str(&line).context("decode Claude MCP request")?;
-                let id = request.get("id").cloned();
-                let response = match request.get("method").and_then(Value::as_str) {
-                    Some("initialize") => id.map(|id| json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "protocolVersion": request.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-                            "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
-                            "serverInfo": {"name": "st3", "version": env!("CARGO_PKG_VERSION")}
-                        }
-                    })),
-                    Some("notifications/initialized") => {
-                        initialized = true;
-                        None
-                    }
-                    Some("tools/list") => id.map(|id| json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}})),
-                    Some("resources/list") => id.map(|id| json!({"jsonrpc":"2.0","id":id,"result":{"resources":[]}})),
-                    Some("prompts/list") => id.map(|id| json!({"jsonrpc":"2.0","id":id,"result":{"prompts":[]}})),
-                    Some("ping") => id.map(|id| json!({"jsonrpc":"2.0","id":id,"result":{}})),
-                    _ => None,
-                };
-                if let Some(response) = response {
-                    stdout.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                }
-            }
-            _ = initial_sync.tick(), if initialized && event_cursor.is_none() => {
-                let tick: Result<()> = async {
-                    let health: Value = client.get("/v1/health").await?;
-                    let cursor = health
-                        .get("store_index")
-                        .and_then(Value::as_u64)
-                        .context("the st3 health response lacks a store index")?;
-                    sync_claude_mcp_state(
-                        client,
-                        subject,
-                        &mut stdout,
-                        &mut announced,
-                        &mut ready,
-                    )
-                    .await?;
-                    event_cursor = Some(cursor);
-                    Ok(())
-                }.await;
-                if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
-                }
-            }
-            events = wait_for_channel_events(client, event_cursor.unwrap_or_default()), if initialized && event_cursor.is_some() => {
-                match events {
-                    Ok(events) => {
-                        if let Some(cursor) = event_cursor.as_mut() {
-                            for event in &events {
-                                *cursor = (*cursor).max(event.store_index);
-                            }
-                        }
-                        if !events.is_empty()
-                            && let Err(error) = sync_claude_mcp_state(
-                                client,
-                                subject,
-                                &mut stdout,
-                                &mut announced,
-                                &mut ready,
-                            )
-                            .await
-                        {
-                            tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                    Err(error) => {
-                        tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-            _ = renewal_interval.tick(), if initialized && event_cursor.is_some() => {
-                let tick: Result<()> = async {
-                    let minute = unix_minute()?;
-                    if renewed_minute != Some(minute) {
-                        renew_claimed_work(client, subject, minute).await?;
-                        renewed_minute = Some(minute);
-                    }
-                    Ok(())
-                }.await;
-                if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
-                }
-            }
-        }
-    }
-}
-
-async fn wait_for_channel_events(client: &Client, cursor: u64) -> Result<Vec<EventRecord>> {
-    client
-        .get(&format!(
-            "/v1/events?after={cursor}&wait=true&timeout_ms=30000"
-        ))
-        .await
-}
-
-async fn sync_claude_mcp_state(
-    client: &Client,
-    subject: &str,
-    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
-    announced: &mut BTreeSet<String>,
-    ready: &mut bool,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-
-    if !*ready {
-        let incarnation = wait_for_agent_incarnation(client, subject).await?;
-        let incarnation_key = work_incarnation_key(Some(&incarnation));
-        let mut fields = BTreeMap::from([
-            ("state".into(), Value::String("ready".into())),
-            ("driver".into(), Value::String("claude".into())),
-            ("transport".into(), Value::String("claude-channel".into())),
-        ]);
-        fields.insert("incarnation_id".into(), Value::String(incarnation));
-        let _: ClaimRecord = client
-            .post(
-                "/v1/claims",
-                &ClaimInput {
-                    subject: subject.into(),
-                    kind: "harness.observed".into(),
-                    actor: Some(subject.into()),
-                    fields,
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("claude-ready:{subject}:{incarnation_key}")),
-                },
-            )
-            .await?;
-        *ready = true;
-    }
-    let messages: Vec<MessageView> = client
-        .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
-        .await?;
-    for message in messages
-        .into_iter()
-        .filter(|message| message.status == "sent")
-    {
-        if !announced.contains(&message.subject) {
-            let content = message_content(client, &message).await?;
-            let content = message.title.as_ref().map_or(content.clone(), |title| {
-                format!("Subject: {title}\n\n{content}")
-            });
-            let notification = json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/claude/channel",
-                "params": {
-                    "content": content,
-                    "meta": {
-                        "from": message.from,
-                        "messageId": message.subject,
-                        "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
-                        "identity": subject
-                    }
-                }
-            });
-            stdout
-                .write_all(serde_json::to_string(&notification)?.as_bytes())
-                .await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-            announced.insert(message.subject.clone());
-        }
-        deliver_message(
-            client,
-            &message.subject,
-            subject,
-            format!("message-delivered:{}:{subject}", message.subject),
-        )
-        .await?;
-        announced.remove(&message.subject);
-    }
-    Ok(())
 }
 
 fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
@@ -7196,6 +6970,20 @@ mod tests {
     }
 
     #[test]
+    fn every_extension_harness_has_a_hidden_native_channel_driver() {
+        for driver in ["pi-channel", "omp-channel"] {
+            let cli =
+                Cli::try_parse_from(["st3", "driver", driver, "--subject", "agent/run/worker"])
+                    .unwrap_or_else(|error| panic!("{driver} did not parse: {error}"));
+            let Command::Driver(args) = cli.command else {
+                panic!("{driver} did not select the hidden driver command");
+            };
+            assert_eq!(args.driver, driver);
+            assert_eq!(args.subject.as_deref(), Some("agent/run/worker"));
+        }
+    }
+
+    #[test]
     fn pty_attach_accepts_an_explicit_nested_override() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -7413,6 +7201,28 @@ mod tests {
         validate_wait_condition("standing").unwrap();
         let run = serde_json::json!({ "status": "standing" });
         assert_eq!(projected_actual_status(Some(&run)), Some("standing"));
+    }
+
+    #[test]
+    fn native_driver_binds_the_local_pty_incarnation_instead_of_a_stale_graph_value() {
+        let observations = vec![st_runtime::PtyObservation {
+            name: "run.worker".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(42),
+            created_at: Some("2026-09-22T12:00:00.000Z".into()),
+            display_name: None,
+            tags: BTreeMap::from([("st3.subject".into(), "agent/run/worker".into())]),
+        }];
+
+        assert_eq!(
+            pty_observation_incarnation("agent/run/worker", &observations).as_deref(),
+            Some("42:2026-09-22T12:00:00.000Z")
+        );
+        assert_eq!(
+            pty_observation_incarnation("agent/run/other", &observations),
+            None
+        );
     }
 
     #[test]
@@ -7792,138 +7602,6 @@ mod tests {
     }
 
     #[test]
-    fn the_st3_development_channel_is_an_explicit_fallback() {
-        let argv = vec![
-            "claude".into(),
-            "--channels".into(),
-            st2::claude_channel::ST3_CHANNEL.into(),
-            "Do the work.".into(),
-        ];
-        let output =
-            st3_development_channel_argv(argv, Path::new("/opt/st3/bin/st3"), "agent/node.worker")
-                .unwrap();
-        assert!(
-            !output
-                .iter()
-                .any(|arg| arg == st2::claude_channel::ST3_CHANNEL)
-        );
-        assert!(
-            output
-                .iter()
-                .any(|arg| { arg == "--dangerously-load-development-channels=server:st3" })
-        );
-        let config = output
-            .windows(2)
-            .find(|pair| pair[0] == "--mcp-config")
-            .map(|pair| &pair[1])
-            .expect("the fallback has an MCP config");
-        let config: Value = serde_json::from_str(config).unwrap();
-        assert_eq!(
-            config["mcpServers"]["st3"]["args"],
-            json!(["driver", "claude-mcp", "--subject", "agent/node.worker"])
-        );
-    }
-
-    #[test]
-    fn unattended_claude_startup_refuses_a_missing_approved_channel() {
-        let argv = vec![
-            "claude".into(),
-            "--channels".into(),
-            st2::claude_channel::ST3_CHANNEL.into(),
-            "Do the work.".into(),
-        ];
-        let error = prepare_st3_claude_channel_argv_after_verification(
-            "agent/node.worker",
-            argv.clone(),
-            Err(anyhow::anyhow!("the managed policy is absent")),
-            false,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("plugin is unavailable"));
-        assert!(error.contains("claude-channel install"));
-        assert!(error.contains("claude-channel install-policy"));
-
-        let fallback = prepare_st3_claude_channel_argv_after_verification(
-            "agent/node.worker",
-            argv,
-            Err(anyhow::anyhow!("the managed policy is absent")),
-            true,
-        )
-        .unwrap();
-        assert!(
-            fallback.iter().any(|argument| {
-                argument == "--dangerously-load-development-channels=server:st3"
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn the_claude_channel_waits_for_a_graph_event() {
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("st3.sock");
-        let store = Arc::new(Store::open_memory("node").unwrap());
-        let notify = Arc::new(Notify::new());
-        let (event_notify, _event_receiver) = watch::channel(0_u64);
-        let app = router(AppState {
-            store,
-            notify,
-            event_notify,
-            node: "node".into(),
-            state_dir: root.path().into(),
-            pty_root: root.path().join("pty"),
-            pty_binary: PathBuf::from("pty"),
-            fleet_id: None,
-            configured_peers: Vec::new(),
-            native_session_home: None,
-        });
-        let server_socket = socket.clone();
-        let server = tokio::spawn(async move {
-            serve_unix(&server_socket, app).await.unwrap();
-        });
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(socket.exists(), "the test API did not create its socket");
-        let client = Client::unix(&socket);
-        let waiter_client = client.clone();
-        let waiter = tokio::spawn(async move { wait_for_channel_events(&waiter_client, 0).await });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            !waiter.is_finished(),
-            "the channel event wait returned without a graph event"
-        );
-
-        let claim: ClaimRecord = client
-            .post(
-                "/v1/claims",
-                &ClaimInput {
-                    subject: "custom/test/channel-wake".into(),
-                    kind: "custom.channel.changed".into(),
-                    actor: None,
-                    fields: BTreeMap::new(),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some("channel-wake".into()),
-                },
-            )
-            .await
-            .unwrap();
-        let events = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("the graph event did not wake the channel")
-            .unwrap()
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].store_index, claim.store_index);
-        assert_eq!(events[0].subject, "custom/test/channel-wake");
-        server.abort();
-    }
-
-    #[test]
     fn an_unread_native_message_is_ready_for_a_delivery_claim() {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
@@ -7945,19 +7623,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_graph_delivery_waits_for_the_exact_consumed_native_file() {
+    fn graph_delivery_waits_for_the_exact_consumed_native_file() {
         let first = "1786380000000-aaa111.md";
         let second = "1786380000001-bbb222.md";
         let transport_accepted_only = BTreeSet::new();
-        assert!(native_delivery_receipted(None, first));
-        assert!(!native_delivery_receipted(
-            Some(&transport_accepted_only),
-            first
-        ));
+        assert!(!native_delivery_receipted(&transport_accepted_only, first));
 
         let consumed = BTreeSet::from([first.to_owned()]);
-        assert!(native_delivery_receipted(Some(&consumed), first));
-        assert!(!native_delivery_receipted(Some(&consumed), second));
+        assert!(native_delivery_receipted(&consumed, first));
+        assert!(!native_delivery_receipted(&consumed, second));
     }
 
     #[test]

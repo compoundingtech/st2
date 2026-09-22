@@ -1,8 +1,8 @@
 version 2
 
-mission "eval/cross-harness-message-wake" state="ready" timeout="20m" {
+mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
   completion { when "all-steps-exhausted" }
-  goal "An idle Codex agent and an idle Claude agent wake through durable messages, coordinate with each other, and reach one consensus."
+  goal "Codex, Claude, Pi, and OMP wake through durable messages at startup and from exact idle, then reach paired consensus without terminal input."
 
   agent "wake.codex" {
     workspace "${ST_WORKSPACE}"
@@ -24,7 +24,6 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="20m" {
     harness "claude" {
       model "claude-sonnet-5"
       effort "medium"
-      dev-channels #true
       args "--permission-mode" "bypassPermissions"
     }
     restart "never"
@@ -34,9 +33,37 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="20m" {
     }
   }
 
-  step "exercise-message-wake" timeout="15m" {
+  agent "wake.pi" {
+    workspace "${ST_WORKSPACE}"
+    under "agent/${ST_MISSION_RUN}/wake.codex" reason="prove native Pi message wake"
+    harness "pi" {
+      model "openai-codex/gpt-5.6-terra"
+      effort "medium"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  agent "wake.omp" {
+    workspace "${ST_WORKSPACE}"
+    under "agent/${ST_MISSION_RUN}/wake.pi" reason="prove native OMP message wake"
+    harness "omp" {
+      model "openai-codex/gpt-5.6-terra"
+      effort "medium"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  step "exercise-message-wake" timeout="35m" {
     agentless
-    title "Both idle harnesses complete a message-only consensus"
+    title "All four harnesses complete startup and idle message-only consensus"
     exec "cross-harness-message-wake/controller" {
       host "local"
       workspace "${ST_WORKSPACE}"
@@ -49,14 +76,14 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="20m" {
     }
   }
 
-  step "held-out-gates" timeout="3m" {
+  step "held-out-gates" timeout="4m" {
     agentless
     depends-on { step "exercise-message-wake" completed }
     gate "the canonical conversation proves wake, exchange, and consensus" {
       exec "bash ./judges/coordination.sh"
       host "local"
       workspace "${ST_WORKSPACE}"
-      time-limit "2m"
+      time-limit "3m"
     }
     gate "no terminal input path participated" {
       exec "bash ./judges/no-terminal-input.sh"
@@ -71,6 +98,8 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="20m" {
       agentless
       stop "agent/${ST_MISSION_RUN}/wake.codex"
       stop "agent/${ST_MISSION_RUN}/wake.claude"
+      stop "agent/${ST_MISSION_RUN}/wake.pi"
+      stop "agent/${ST_MISSION_RUN}/wake.omp"
     }
   }
 }

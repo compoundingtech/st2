@@ -18,7 +18,7 @@
 //! subset check proving the exact API arms st2 depends on. Observation requires only the `/doc`
 //! check — its vocabulary already degrades to indeterminate on anything unrecognized.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -344,6 +344,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                     if let Some(sid) = event_session_id(&value) {
                         session.delivery.saw_session(sid);
                     }
+                    session.delivery.observe_event(&value)?;
                     machine.apply(&value);
                     if let Some(context) = session.context.as_mut() {
                         fresh_reading |= context.apply(&value);
@@ -1371,6 +1372,44 @@ impl Delivery {
         self.target_session = Some(session_id.to_string());
     }
 
+    /// An assistant message whose `parentID` is our exact stable client message is the first
+    /// provider-native proof that the model turn consumed that input. Storage read-back alone
+    /// deliberately does not release the graph message.
+    fn observe_event(&mut self, event: &Value) -> Result<()> {
+        if event.get("type").and_then(Value::as_str) != Some("message.updated") {
+            return Ok(());
+        }
+        let Some(info) = event.pointer("/properties/info") else {
+            return Ok(());
+        };
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Ok(());
+        }
+        let Some(parent_id) = info.get("parentID").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let session_id = info.get("sessionID").and_then(Value::as_str).or_else(|| {
+            event
+                .pointer("/properties/sessionID")
+                .and_then(Value::as_str)
+        });
+        let filenames = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.correlation.value == parent_id
+                    && session_id.is_none_or(|session_id| entry.binding == session_id)
+            })
+            .map(|entry| entry.filename.clone())
+            .collect::<Vec<_>>();
+        for filename in filenames {
+            self.ledger
+                .record(&filename, delivery_ledger::Evidence::Consumed)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn pump(&mut self, client: &Client) {
         self.pump_with_diagnostics(client, None);
@@ -1640,6 +1679,35 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     }
     let digest = format!("{:x}", hash.finalize());
     base.join("st2").join("opencode").join(&digest[..24])
+}
+
+/// Read the exact inbox files whose correlated OpenCode assistant turn started.
+pub fn consumed_delivery_filenames(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<BTreeSet<String>> {
+    let path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let owner = identity.to_owned();
+    let ledger = delivery_ledger::Ledger::open(
+        &path,
+        delivery_ledger::Harness::OpenCode.profile(),
+        identity,
+        runtime_id,
+        move |session, filename| stable_message_id(&owner, session, filename),
+    );
+    if let Some(reason) = ledger.quarantined() {
+        anyhow::bail!("OpenCode delivery receipt ledger is quarantined: {reason}");
+    }
+    Ok(ledger
+        .entries()
+        .iter()
+        .filter(|entry| entry.phase == delivery_ledger::Phase::Consumed)
+        .map(|entry| entry.filename.clone())
+        .collect())
 }
 
 #[cfg(test)]
@@ -2308,6 +2376,41 @@ mod tests {
         delivery.pump(&client);
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_the_correlated_assistant_turn_releases_an_opencode_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+        delivery.pump(&client);
+        let expected_id = stable_message_id("h.worker", "ses_target", &filename);
+
+        delivery
+            .observe_event(&event(&format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"ses_target","info":{{"role":"assistant","parentID":"msg_unrelated","sessionID":"ses_target"}}}}}}"#
+            )))
+            .unwrap();
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted)
+        );
+
+        delivery
+            .observe_event(&event(&format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"ses_target","info":{{"role":"assistant","parentID":"{expected_id}","sessionID":"ses_target"}}}}}}"#
+            )))
+            .unwrap();
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Consumed)
+        );
+        assert_eq!(
+            reopen_ledger(&state_path).retention(&filename),
+            delivery_ledger::Retention::Release
+        );
     }
 
     #[test]

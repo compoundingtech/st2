@@ -81,6 +81,31 @@ impl NativeRuntime {
     }
 }
 
+fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
+    if observation.status == "running"
+        && observation
+            .pid
+            .is_some_and(|pid| !local_process_is_alive(pid))
+    {
+        return "vanished".into();
+    }
+    observation.status.clone()
+}
+
+#[cfg(unix)]
+fn local_process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn local_process_is_alive(_pid: u32) -> bool {
+    true
+}
+
 impl RuntimeControl for NativeRuntime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
         self.pty
@@ -91,10 +116,11 @@ impl RuntimeControl for NativeRuntime {
                     (Some(pid), Some(created)) => Some(format!("{pid}:{created}")),
                     _ => None,
                 };
+                let status = observed_pty_status(&item);
                 Ok(RuntimeObservation {
                     runtime_id: item.name,
                     terminal: true,
-                    status: item.status,
+                    status,
                     exit_code: item.exit_code,
                     incarnation_id,
                 })
@@ -2026,18 +2052,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             ) {
                 continue;
             }
-            // An agentless step that owns a nested mission is a structural
-            // container, not claimable work. Admit it automatically so its
-            // nested steps can satisfy their parent fence. This transition is
-            // persisted on the generation-scoped step run, making repeated
-            // reconciliation and replay idempotent.
-            if view.status == "ready" && view.agentless && step.spec.nested_mission.is_some() {
+            // Agentless work has no worker claim to open its execution interval. Admit every
+            // eligible agentless step automatically before materializing declarations or waiting
+            // on gates, so its timeout and lifecycle are real instead of remaining `ready`
+            // forever. Nested missions need the persisted parent transition before their children
+            // can be evaluated; other agentless work can materialize in this same pass.
+            if view.status == "ready" && view.agentless {
                 changed |= self.store.set_step_state(
                     &view.subject,
                     "working",
-                    Some("the eligible nested mission started"),
+                    Some("the eligible agentless execution started"),
                 )?;
-                continue;
+                if step.spec.nested_mission.is_some() {
+                    continue;
+                }
             }
             changed |= self.materialize_step_declarations(run, &step, view)?;
             if let Some(reason) = self.step_declaration_failure(&view.subject)? {
@@ -7202,6 +7230,38 @@ mod tests {
     use super::*;
     use crate::graph::parse_test_intent as parse_intent;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_running_pty_with_a_dead_pid_is_observed_as_vanished() {
+        let observation = st_runtime::PtyObservation {
+            name: "stale-worker".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(i32::MAX as u32),
+            created_at: Some("2026-09-22T12:00:00.000Z".into()),
+            display_name: None,
+            tags: BTreeMap::new(),
+        };
+
+        assert_eq!(observed_pty_status(&observation), "vanished");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_pty_with_a_live_pid_remains_running() {
+        let observation = st_runtime::PtyObservation {
+            name: "live-worker".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(std::process::id()),
+            created_at: Some("2026-09-22T12:00:00.000Z".into()),
+            display_name: None,
+            tags: BTreeMap::new(),
+        };
+
+        assert_eq!(observed_pty_status(&observation), "running");
+    }
+
     #[derive(Default)]
     struct FakeRuntime {
         ptys: Mutex<Vec<RuntimeObservation>>,
@@ -8862,7 +8922,8 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
-            "ready"
+            "working",
+            "a wrong reviewer cannot complete the active review"
         );
         store
             .append_claim(&ClaimInput {
@@ -8878,7 +8939,8 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
-            "ready"
+            "working",
+            "an unbound verdict cannot complete the active review"
         );
         store
             .append_claim(&ClaimInput {
@@ -10559,6 +10621,72 @@ mission "scheduled-cycle" state="ready" {
                 .unwrap()
                 .iter()
                 .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn agentless_waits_open_an_execution_interval_and_time_out() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+
+              resource "never" { kind "custom.test.never-ready" }
+              mission "agentless-timeout" state="ready" timeout="1m" {
+                goal "Bound an agentless wait."
+                completion { when "all-steps-exhausted" }
+                step "wait" timeout="1ms" {
+                  agentless
+                  gate "the absent resource becomes ready" {
+                    field "state" "resource/never" is "ready"
+                  }
+                }
+              }
+        "#;
+        apply_source(&store, source, "agentless-timeout-source");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "agentless-timeout".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "agentless-timeout-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let active = store.mission_run(&run.id).unwrap().unwrap();
+        let wait = active
+            .steps
+            .iter()
+            .find(|step| step.step == "wait")
+            .unwrap();
+        assert_eq!(wait.status, "working");
+        assert!(wait.execution_started_at_unix_ms.is_some());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(terminal.status, "failed");
+        assert_eq!(terminal.phase, "terminal");
+        assert_eq!(
+            terminal
+                .steps
+                .iter()
+                .find(|step| step.step == "wait")
+                .unwrap()
+                .status,
+            "failed"
         );
     }
 
@@ -12959,6 +13087,34 @@ mission "work-alert" state="ready" {
                 .count(),
             2
         );
+
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("worker-three".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("worker-three-idle".into()),
+            })
+            .unwrap();
+        let historical_wake = store
+            .step_run(&step.subject)
+            .unwrap()
+            .unwrap()
+            .wake
+            .unwrap();
+        assert_eq!(historical_wake.attempts, 2);
+        assert_eq!(historical_wake.incarnation_id, "worker-two");
+        assert_eq!(historical_wake.acknowledged_by.as_deref(), Some("claim"));
     }
 
     #[test]

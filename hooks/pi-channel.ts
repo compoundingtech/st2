@@ -503,12 +503,10 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Seed the observed state with the idle proof's answer at open time, so the record does not
-    // wait for the first turn boundary to exist.
-    if (opened && typeof ctx.isIdle === "function") {
-      sendState(ctx.isIdle() ? "idle" : "active");
-    }
-    // And seed the context record, so a resumed session publishes the window it resumed INTO
+    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
+    // idle frame would authorize the channel to inject mail before pi has created the transcript
+    // for that prompt. `agent_settled` is the first transcript-ready lifecycle edge. Seed only the
+    // context record, so a resumed session still publishes the window it resumed INTO
     // rather than waiting for its first turn boundary. A fresh session reads `{tokens: 0}` here
     // and a post-compaction restart reads `{tokens: null}` — both are honest answers pi gives.
     if (opened) sendContext(ctx);

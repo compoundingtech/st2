@@ -1,18 +1,14 @@
 # Cross-harness message wake
 
-This paid black-box eval starts one Codex agent and one Claude agent with the normal generated boot contract. It waits until each native transport is quiescent (`idle` for Codex and `ready` or `idle` for Claude), sends each a private token through durable Small Talk, and requires them to reach the same result through a fact, agreement, and final-report exchange.
+This paid black-box eval covers every account-backed interactive harness: Codex, Claude, Pi, and OMP. Codex and Claude form one consensus pair; Pi and OMP form another.
 
-The agent-facing messages describe only the coordination task. They do not mention terminal input, historical failure modes, or alternative wake mechanisms.
+One run exercises two deliberately separate delivery conditions:
 
-Held-out gates prove:
+1. `startup`: the controller sends as soon as every harness is running, reachable, and has a concrete native state. It records each exact pre-message state rather than treating `ready`, `active`, and `idle` as interchangeable.
+2. `idle`: after the first protocol finishes, the controller waits until every harness reports exactly `idle` before sending the next message.
 
-- both initial messages were sent only after both native transports reached their quiescent pre-message state;
-- Codex and Claude each read the initial message and exchanged the required canonical messages;
-- both normalized timelines changed from idle to working after the messages were sent;
-- both agents independently reported `EMBER+ORBIT` after the peer exchange;
-- no graph-authorized terminal input occurred; and
-- an invisible executable shim observed no direct terminal send or attach invocation from either harness environment.
+For each phase, every participant must consume a kickoff, send a private fact, wait for its peer's real fact, exchange a matching agreement, and independently report consensus. Native receipt latency has its own bound; each model-turn stage has a separate, larger bound. `controller-state.json` records those timestamps and preconditions.
 
-The last two checks are external observations. They are not disclosed to either model.
+The participant prompt describes only the coordination task. It does not mention historical failures, terminal workarounds, or the held-out checks.
 
-The controller gives the post-kickoff exchange five minutes. A transport that projects messages without starting model work fails within that bound.
+Held-out gates prove exact message lifecycle, one canonical message per participant per stage, both paired results, exact idle preconditions for the idle phase, and absence of graph or executable terminal input.

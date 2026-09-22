@@ -682,14 +682,11 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Seed the observed state with the idle proof's answer at open time, so the record does not
-    // wait for the first turn boundary to exist.
+    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
+    // idle frame would authorize the channel to inject mail before omp has created the transcript
+    // for that prompt. The post-`agent_end` idle proof is the first transcript-ready edge.
     if (opened) {
-      sendFrame({
-        type: "state",
-        state: idleProof(ctx) ? "idle" : "active",
-      });
-      // And seed the context record, so a resumed session publishes the window it resumed INTO
+      // Seed only the context record, so a resumed session publishes the window it resumed INTO
       // rather than waiting for its first turn boundary.
       sendContext(ctx);
     }

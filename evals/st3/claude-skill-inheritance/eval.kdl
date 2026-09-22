@@ -10,7 +10,6 @@ version 2
           harness "claude" {
             model "claude-sonnet-5"
             effort "medium"
-            dev-channels #true
             args "--permission-mode" "auto" "--plugin-dir" "../plugin/evalpkg"
           }
           restart "never"

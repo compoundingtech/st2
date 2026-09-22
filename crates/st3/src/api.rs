@@ -5032,9 +5032,6 @@ async fn quick_agent(
     if let Some(effort) = &request.effort {
         driver_body.push_str(&format!("effort {effort:?}\n"));
     }
-    if driver == "claude" {
-        driver_body.push_str("dev-channels #true\n");
-    }
     if !request.arguments.is_empty() {
         driver_body.push_str("args");
         for argument in &request.arguments {

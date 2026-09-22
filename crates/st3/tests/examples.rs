@@ -56,6 +56,10 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
                         counts.0 += 1;
                     }
                     "codex" => counts.1 += 1,
+                    // Pi and OMP use the configured account model and are asserted explicitly by
+                    // the one eval that owns those native transport seats. This historical tuple
+                    // remains the Claude/Codex inventory used by the paired corpus checks below.
+                    "pi" | "omp" => {}
                     provider => panic!("{source_name} uses unexpected harness {provider}"),
                 }
             }
@@ -325,7 +329,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_twenty_four_model_free_and_seventeen_model_backed_evals() {
+fn st3_eval_inventory_has_twenty_four_model_free_and_eighteen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -373,6 +377,7 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_seventeen_model_backed_eval
         "signal-rename",
         "test-writing",
         "weird-git-setup",
+        "work-wake-reliability",
     ];
     let mut actual = fs::read_dir(&root)
         .unwrap()
@@ -410,7 +415,7 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_seventeen_model_backed_eval
 }
 
 #[test]
-fn cross_harness_message_wake_is_black_box_and_uses_both_native_harnesses() {
+fn cross_harness_message_wake_is_black_box_and_uses_all_account_backed_harnesses() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/cross-harness-message-wake");
@@ -419,8 +424,10 @@ fn cross_harness_message_wake_is_black_box_and_uses_both_native_harnesses() {
         authored_harness_counts(&source, "cross-harness-message-wake/eval.kdl"),
         (1, 1)
     );
+    assert_eq!(source.matches("harness \"pi\"").count(), 1);
+    assert_eq!(source.matches("harness \"omp\"").count(), 1);
 
-    for name in ["codex.md", "claude.md"] {
+    for name in ["participant.md"] {
         let prompt = fs::read_to_string(root.join("prompts").join(name)).unwrap();
         let prompt = prompt.to_ascii_lowercase();
         for leaked_failure_mode in ["pty", "terminal", "workaround"] {
@@ -433,6 +440,42 @@ fn cross_harness_message_wake_is_black_box_and_uses_both_native_harnesses() {
 
     assert!(source.contains("judges/no-terminal-input.sh"));
     assert!(source.contains("cross-harness-message-wake/controller"));
+}
+
+#[test]
+fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worker() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/work-wake-reliability");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "work-wake-reliability/eval.kdl"),
+        (0, 1)
+    );
+    assert!(source.contains("restart \"always\""));
+
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    for required in [
+        "missions start",
+        "work revise",
+        "terminals signal",
+        "missions cancel",
+    ] {
+        assert!(
+            controller.contains(required),
+            "missing `{required}` scenario"
+        );
+    }
+
+    for entry in fs::read_dir(root.join("fixtures")).unwrap() {
+        let fixture = fs::read_to_string(entry.unwrap().path()).unwrap();
+        for leaked_failure_mode in ["pty", "terminal", "workaround"] {
+            assert!(
+                !fixture.to_ascii_lowercase().contains(leaked_failure_mode),
+                "worker fixture primes the agent with `{leaked_failure_mode}`"
+            );
+        }
+    }
 }
 
 #[test]

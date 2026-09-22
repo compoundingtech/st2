@@ -288,6 +288,12 @@ fn channel_loop(
     heartbeat_every: Duration,
 ) -> Result<()> {
     let mut delivered = HashSet::new();
+    // The extension opens its channel during `session_start`, before a positional boot prompt has
+    // necessarily begun. Holding mail until the first provider lifecycle state prevents an early
+    // `sendUserMessage` from racing the harness's creation of its session transcript. Pi's
+    // `agent_start` also precedes that write; the first `idle` lifecycle edge proves the boot turn
+    // and transcript have both completed. Startup mail then begins a clean provider turn.
+    let mut delivery_ready = false;
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -313,10 +319,14 @@ fn channel_loop(
                         "st2 {label} channel: recording harness timeline failed: {error:#}"
                     );
                 }
-                if let Some(observation) = frame
+                let state = frame.as_ref().and_then(state_observation);
+                if state
                     .as_ref()
-                    .and_then(state_observation)
-                    .or_else(|| turn.as_ref().and_then(turn_observation))
+                    .is_some_and(|observation| observation.state == harness_state::Activity::Idle)
+                {
+                    delivery_ready = true;
+                }
+                if let Some(observation) = state.or_else(|| turn.as_ref().and_then(turn_observation))
                     // A queued live frame must never overwrite the wrapper's terminal record:
                     // the channel and the wrapper are separate processes, so the flock alone
                     // serializes but does not order their writes.
@@ -377,9 +387,11 @@ fn channel_loop(
             }
             next_heartbeat = now + heartbeat_every;
         }
-        for msg in message::list_inbox(inbox)? {
-            if delivered.insert(msg.filename.clone()) {
-                write_json(out, &message_frame(msg, identity))?;
+        if delivery_ready {
+            for msg in message::list_inbox(inbox)? {
+                if delivered.insert(msg.filename.clone()) {
+                    write_json(out, &message_frame(msg, identity))?;
+                }
             }
         }
         out.flush()?;
@@ -758,6 +770,61 @@ mod tests {
         ] {
             assert_eq!(state_observation(&frame), None, "frame: {frame}");
         }
+    }
+
+    #[test]
+    fn startup_mail_waits_for_the_first_provider_lifecycle_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        let inbox = message::inbox_dir(agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(
+            inbox.join("1787042542238-xex2t4.md"),
+            "---\nfrom: h.supervisor\nsubject: startup work\n---\nBegin.\n",
+        )
+        .unwrap();
+
+        let run = |frames: &[&str]| {
+            let mut writer =
+                harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+            let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "pi", "test");
+            let (tx, rx) = mpsc::channel();
+            for frame in frames {
+                tx.send(Ok((*frame).to_string())).unwrap();
+            }
+            drop(tx);
+            let mut output = Vec::new();
+            channel_loop(
+                &rx,
+                &mut output,
+                &inbox,
+                agent_dir,
+                &mut writer,
+                None,
+                &mut timeline,
+                "h.worker",
+                &PI_KIND,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            String::from_utf8(output).unwrap()
+        };
+
+        assert!(
+            run(&[]).is_empty(),
+            "opening the extension channel is not proof that the boot turn exists"
+        );
+        assert!(
+            run(&[r#"{"type":"state","state":"active"}"#]).is_empty(),
+            "agent_start still precedes creation of pi's session transcript"
+        );
+        let after_idle = run(&[
+            r#"{"type":"state","state":"active"}"#,
+            r#"{"type":"state","state":"idle"}"#,
+        ]);
+        assert!(after_idle.contains("startup work"), "{after_idle}");
+        assert!(after_idle.contains("1787042542238-xex2t4.md"));
     }
 
     /// The omp extension's approval frames carry the blocked-on-human axis pi never emits. The

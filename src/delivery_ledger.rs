@@ -9,7 +9,9 @@
 //! release made and left behind. Such a phase holds exactly as far as a phase holds — no harness
 //! profile proves `Attempted`, so nothing is re-sent — and [`Attestation`] records that this
 //! build never watched it, which is what makes the leftover countable and therefore removable.
-//! The translation itself lives outside this module, behind the one seam in [`Ledger::open`].
+//! A transport with an explicit at-least-once contract may record
+//! [`NegativeReceipt::RetryAfterAbandonedIncarnation`] before retrying that stable identity. The
+//! translation itself lives outside this module, behind the one seam in [`Ledger::open`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +26,7 @@ pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
+    Claude,
     Codex,
     OpenCode,
 }
@@ -31,6 +34,7 @@ pub enum Harness {
 impl Harness {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
         }
@@ -38,6 +42,7 @@ impl Harness {
 
     fn parse(name: &str) -> Result<Self> {
         match name {
+            "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "opencode" => Ok(Self::OpenCode),
             other => anyhow::bail!("unknown native delivery harness '{other}'"),
@@ -73,23 +78,27 @@ impl Profile {
     /// Whether this harness has a concrete observation for `phase`.
     fn proves(self, phase: Phase) -> bool {
         match self.harness {
+            // Claude stream-json echoes each accepted user input through
+            // `--replay-user-messages`. The exact replay is a consumption receipt; there is no
+            // separate durable-storage phase in the public protocol.
+            Harness::Claude => matches!(phase, Phase::Attempted | Phase::Consumed),
             // Codex exposes transport acceptance and a typed completed user message, but no
             // storage receipt.
             Harness::Codex => matches!(
                 phase,
                 Phase::Attempted | Phase::TransportAccepted | Phase::Consumed
             ),
-            // OpenCode exposes transport acceptance and durable read-back, but no observation
-            // that the scheduler or model consumed the prompt.
+            // OpenCode exposes transport acceptance, durable read-back, and an assistant
+            // `message.updated` whose parentID is the exact correlated user message.
             Harness::OpenCode => matches!(
                 phase,
-                Phase::Attempted | Phase::TransportAccepted | Phase::Persisted
+                Phase::Attempted | Phase::TransportAccepted | Phase::Persisted | Phase::Consumed
             ),
         }
     }
 
     fn releases(self, phase: Phase) -> bool {
-        matches!(self.harness, Harness::Codex) && phase >= Phase::Consumed
+        phase >= Phase::Consumed
     }
 }
 
@@ -128,6 +137,10 @@ pub enum NegativeReceipt {
     Absent,
     /// The transport refused this attempt.
     Rejected,
+    /// The previous process incarnation ended before it could produce a consumption receipt.
+    /// A transport with an explicit at-least-once contract may retry the same stable identity;
+    /// duplicate consumption is allowed and must remain idempotent at the application boundary.
+    RetryAfterAbandonedIncarnation,
 }
 
 /// Positive evidence translated by a harness driver.
@@ -527,8 +540,8 @@ impl Ledger {
             return Ok(Retention::Hold(HoldReason::NegativeReceipt));
         }
         entry.negative = Some(receipt);
-        // An authoritative absence is itself an observation about this attempt, and it is the
-        // only receipt that may re-authorize a transport of a carried-forward one.
+        // An explicit retry receipt is itself an observation about this attempt and is the only
+        // authority that may re-open a carried-forward transport.
         entry.attestation = Attestation::Observed;
         self.persist()?;
         Ok(Retention::Hold(HoldReason::NegativeReceipt))
@@ -740,7 +753,12 @@ mod tests {
         let opencode = Harness::OpenCode.profile();
         assert!(opencode.graded(Evidence::TransportAccepted).is_ok());
         assert!(opencode.graded(Evidence::Persisted).is_ok());
-        assert!(opencode.graded(Evidence::Consumed).is_err());
+        assert!(opencode.graded(Evidence::Consumed).is_ok());
+
+        let claude = Harness::Claude.profile();
+        assert!(claude.graded(Evidence::TransportAccepted).is_err());
+        assert!(claude.graded(Evidence::Persisted).is_err());
+        assert!(claude.graded(Evidence::Consumed).is_ok());
     }
 
     #[test]
@@ -755,6 +773,41 @@ mod tests {
         assert_eq!(
             reopened.retry(FILE_A),
             RetryDecision::Hold(HoldReason::AmbiguousAttempt)
+        );
+    }
+
+    #[test]
+    fn claude_retries_an_abandoned_attempt_and_settles_only_on_exact_consumption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut first = open(tmp.path(), Harness::Claude);
+        begin(&mut first, "session-main", FILE_A);
+        assert_eq!(
+            first.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt)
+        );
+
+        let mut replacement = open(tmp.path(), Harness::Claude);
+        replacement
+            .negative(FILE_A, NegativeReceipt::RetryAfterAbandonedIncarnation)
+            .unwrap();
+        assert_eq!(replacement.retry(FILE_A), RetryDecision::Retry);
+        replacement
+            .begin(Begin {
+                filename: FILE_A.to_owned(),
+                binding: "session-main".to_owned(),
+                correlation: Correlation::native(correlation("session-main", FILE_A)),
+                incarnation: Some("incarnation-2".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            replacement.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt)
+        );
+        replacement.record(FILE_A, Evidence::Consumed).unwrap();
+        assert_eq!(replacement.retention(FILE_A), Retention::Release);
+        assert_eq!(
+            replacement.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::Settled)
         );
     }
 
@@ -930,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_persistence_holds_until_archive() {
+    fn opencode_persistence_holds_until_the_correlated_turn_starts() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = open(tmp.path(), Harness::OpenCode);
         begin(&mut ledger, "ses-main", FILE_A);
@@ -939,8 +992,8 @@ mod tests {
             ledger.retention(FILE_A),
             Retention::Hold(HoldReason::UnreadReceipt)
         );
-        ledger.prune(|_| false).unwrap();
-        assert!(ledger.entry(FILE_A).is_none());
+        ledger.record(FILE_A, Evidence::Consumed).unwrap();
+        assert_eq!(ledger.retention(FILE_A), Retention::Release);
     }
 
     #[test]
