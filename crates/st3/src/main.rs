@@ -2270,7 +2270,7 @@ async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<
         )
         .await?;
     let code = client
-        .proxy_terminal(&attachment.runtime_id, &attachment.websocket_path)
+        .proxy_terminal_resilient(subject, &attachment)
         .await?;
     if code == 0 {
         Ok(())

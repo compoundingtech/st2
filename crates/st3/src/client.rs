@@ -6,14 +6,17 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
 use pty_core::client::tty::{FdWriter, is_tty};
-use pty_core::client::{AttachParams, CURSOR_TO_BOTTOM, ClientIo, TERMINAL_SANITIZE, attach};
+use pty_core::client::{
+    AttachParams, CURSOR_TO_BOTTOM, ClientIo, Reconnect, RouteRefusedError, TERMINAL_SANITIZE,
+    attach,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-use crate::model::ApiErrorResponse;
 #[cfg(test)]
 use crate::model::ApiResponse;
+use crate::model::{ApiErrorResponse, AttachRequest, Attachment};
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
@@ -178,6 +181,67 @@ impl Client {
     }
 
     pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
+        let stream = self.open_terminal_bridge(path).await?;
+        proxy_stream_with_io(name, stream, None, ClientIo::default()).await
+    }
+
+    /// Keep one interactive terminal attachment alive while the local gateway restarts.
+    /// Every reconnect obtains a fresh one-use capability and remains fenced to the original
+    /// terminal incarnation.
+    pub async fn proxy_terminal_resilient(
+        &self,
+        subject: &str,
+        attachment: &Attachment,
+    ) -> Result<i32> {
+        self.proxy_terminal_resilient_with_io(subject, attachment, ClientIo::default())
+            .await
+    }
+
+    async fn proxy_terminal_resilient_with_io(
+        &self,
+        subject: &str,
+        attachment: &Attachment,
+        io: ClientIo,
+    ) -> Result<i32> {
+        let expected_incarnation = attachment
+            .incarnation_id
+            .clone()
+            .context("the terminal attachment has no incarnation fence")?;
+        let initial = self
+            .open_terminal_bridge(&attachment.websocket_path)
+            .await?;
+        let client = self.clone();
+        let subject = subject.to_owned();
+        let name = attachment.runtime_id.clone();
+        let handle = tokio::runtime::Handle::current();
+        let reconnect: Reconnect = Box::new(move || {
+            let next: Attachment = match handle.block_on(client.post(
+                &format!("/v1/sessions/attach/{}", urlencoding::encode(&subject)),
+                &AttachRequest::default(),
+            )) {
+                Ok(attachment) => attachment,
+                Err(error) if terminal_reconnect_is_refused(&error) => {
+                    return Err(RouteRefusedError(error.to_string()));
+                }
+                Err(_) => return Ok(None),
+            };
+            if next.incarnation_id.as_deref() != Some(expected_incarnation.as_str()) {
+                return Err(RouteRefusedError(format!(
+                    "terminal `{subject}` changed incarnation"
+                )));
+            }
+            match handle.block_on(client.open_terminal_bridge(&next.websocket_path)) {
+                Ok(stream) => Ok(Some(stream)),
+                Err(error) if terminal_reconnect_is_refused(&error) => {
+                    Err(RouteRefusedError(error.to_string()))
+                }
+                Err(_) => Ok(None),
+            }
+        });
+        proxy_stream_with_io(&name, initial, Some(reconnect), io).await
+    }
+
+    async fn open_terminal_bridge(&self, path: &str) -> Result<StdUnixStream> {
         match &self.endpoint {
             Endpoint::Unix(socket) => {
                 let endpoint = socket.display().to_string();
@@ -201,7 +265,7 @@ impl Client {
                         self.deadlines.terminal_handshake,
                     )
                 })??;
-                proxy_websocket(name, websocket).await
+                spawn_terminal_bridge(websocket)
             }
             Endpoint::Http(base) => {
                 let base = base
@@ -212,8 +276,8 @@ impl Client {
                             .map(|value| format!("wss://{value}"))
                     })
                     .context("a terminal endpoint must use http or https")?;
-                let request = terminal_request(&format!("{base}{path}"))?;
                 let endpoint = format!("{base}{path}");
+                let request = terminal_request(&endpoint)?;
                 let (websocket, _) = tokio::time::timeout(
                     self.deadlines.terminal_handshake,
                     tokio_tungstenite::connect_async(request),
@@ -226,10 +290,21 @@ impl Client {
                         self.deadlines.terminal_handshake,
                     )
                 })??;
-                proxy_websocket(name, websocket).await
+                spawn_terminal_bridge(websocket)
             }
         }
     }
+}
+
+fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .is_some_and(|error| {
+            matches!(
+                error.code.as_str(),
+                "not-found" | "stale-incarnation" | "runtime-not-local" | "unsupported-capability"
+            )
+        })
 }
 
 fn request_has_page_cursor(path: &str) -> bool {
@@ -271,16 +346,7 @@ fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::R
     Ok(request)
 }
 
-async fn proxy_websocket<S>(
-    name: &str,
-    websocket: tokio_tungstenite::WebSocketStream<S>,
-) -> Result<i32>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    proxy_websocket_with_io(name, websocket, ClientIo::default()).await
-}
-
+#[cfg(test)]
 async fn proxy_websocket_with_io<S>(
     name: &str,
     websocket: tokio_tungstenite::WebSocketStream<S>,
@@ -302,6 +368,40 @@ where
     .await
     .context("join the terminal client")?;
     bridge.abort();
+    Ok(outcome.exit_code())
+}
+
+fn spawn_terminal_bridge<S>(
+    websocket: tokio_tungstenite::WebSocketStream<S>,
+) -> Result<StdUnixStream>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (client_stream, bridge_stream) = StdUnixStream::pair()?;
+    bridge_stream.set_nonblocking(true)?;
+    let bridge_stream = tokio::net::UnixStream::from_std(bridge_stream)?;
+    tokio::spawn(async move {
+        let _ = bridge_terminal_protocol(websocket, bridge_stream).await;
+    });
+    Ok(client_stream)
+}
+
+async fn proxy_stream_with_io(
+    name: &str,
+    stream: StdUnixStream,
+    reconnect: Option<Reconnect>,
+    io: ClientIo,
+) -> Result<i32> {
+    let name = name.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut params = AttachParams::new(&name, stream);
+        params.reconnect = reconnect;
+        let outcome = attach(params, &io);
+        sanitize_interactive_terminal(io);
+        outcome
+    })
+    .await
+    .context("join the terminal client")?;
     Ok(outcome.exit_code())
 }
 
@@ -520,10 +620,13 @@ fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
-    use axum::routing::get;
+    use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse as _;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -864,6 +967,147 @@ mod tests {
                 Some("st3.terminal.v1".into())
             ))
         );
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_terminal_attachment_reconnects_across_a_temporary_gateway_restart() {
+        use std::fs::File;
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let attach_attempts = Arc::new(AtomicUsize::new(0));
+        let stream_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attach_attempts = attach_attempts.clone();
+        let route_stream_attempts = stream_attempts.clone();
+        let app = Router::new()
+            .route(
+                "/v1/sessions/attach/{*subject}",
+                post(move || {
+                    let attempt = route_attach_attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({
+                                    "code": "gateway-restarting",
+                                    "message": "the st3 gateway is restarting",
+                                    "details": {}
+                                })),
+                            )
+                                .into_response();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(test_envelope(json!({
+                                "subject": "agent/test",
+                                "runtime_id": "demo",
+                                "incarnation_id": "incarnation/one",
+                                "capability": "fresh-capability",
+                                "websocket_path": "/terminal",
+                                "expires_at_unix_ms": 9999999999999_u64
+                            }))),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/terminal",
+                get(move |websocket: WebSocketUpgrade| {
+                    let attempt = route_stream_attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        websocket.protocols(["st3.terminal.v1"]).on_upgrade(
+                            move |mut socket| async move {
+                                if attempt == 0 {
+                                    let _ = socket.close().await;
+                                    return;
+                                }
+                                let _ = socket
+                                    .send(AxumWsMessage::Binary(
+                                        pty_core::protocol::encode_screen(b"resumed after restart")
+                                            .into(),
+                                    ))
+                                    .await;
+                                let _ = socket
+                                    .send(AxumWsMessage::Binary(
+                                        pty_core::protocol::encode_exit(0).into(),
+                                    ))
+                                    .await;
+                            },
+                        )
+                    }
+                }),
+            );
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let attachment = Attachment {
+            subject: "agent/test".into(),
+            runtime_id: "demo".into(),
+            incarnation_id: Some("incarnation/one".into()),
+            capability: "initial-capability".into(),
+            websocket_path: "/terminal".into(),
+            expires_at_unix_ms: u128::MAX,
+        };
+        let io = ClientIo {
+            stdin: slave.as_raw_fd(),
+            stdout: slave.as_raw_fd(),
+            stderr: slave.as_raw_fd(),
+        };
+
+        let exit = Client::unix(&socket)
+            .proxy_terminal_resilient_with_io("agent/test", &attachment, io)
+            .await
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert_eq!(attach_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(stream_attempts.load(Ordering::SeqCst), 2);
+
+        drop(slave);
+        let mut output = Vec::new();
+        if let Err(error) = master.read_to_end(&mut output) {
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+        assert!(
+            output
+                .windows(b"resumed after restart".len())
+                .any(|window| window == b"resumed after restart"),
+            "the resumed terminal screen was not rendered: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"[reconnecting".len())
+                .any(|window| window == b"[reconnecting"),
+            "the reconnect state was not rendered: {output:?}"
+        );
+        server.abort();
     }
 
     #[allow(clippy::result_large_err)]
