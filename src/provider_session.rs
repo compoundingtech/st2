@@ -336,10 +336,8 @@ fn run_provider_observed_inner(
             return Err(error).with_context(|| format!("starting {provider} provider {program}"));
         }
     };
-    if report_ready {
-        if let Some(observed) = observed {
-            observed.ready();
-        }
+    if report_ready && let Some(observed) = observed {
+        observed.ready();
     }
     let mut next_refresh = Instant::now();
     loop {

@@ -213,42 +213,42 @@ pub fn run_controlled_paths(
                 .map(|item| item.filename.as_str())
                 .collect::<BTreeSet<_>>();
             ledger.prune(|filename| unread_names.contains(filename))?;
-            if pending.is_none() && boot_replay.is_none() && binding != "pending-session" {
-                if let Some(next) = unread
+            if pending.is_none()
+                && boot_replay.is_none()
+                && binding != "pending-session"
+                && let Some(next) = unread
                     .into_iter()
                     .find(|item| !ledger.settled(&item.filename))
-                {
-                    // A prior incarnation that died after its write but before the replay is
-                    // ambiguous. At-least-once delivery deliberately retries it; the stable DING
-                    // id and shared boot contract make duplicate application idempotent.
-                    if ledger.entry(&next.filename).is_some_and(|entry| {
-                        entry.phase == Phase::Attempted
-                            && entry.incarnation.as_deref() != Some(observer.session())
-                    }) {
-                        ledger.negative(
+            {
+                // A prior incarnation that died after its write but before the replay is
+                // ambiguous. At-least-once delivery deliberately retries it; the stable PING
+                // id and shared boot contract make duplicate application idempotent.
+                if ledger.entry(&next.filename).is_some_and(|entry| {
+                    entry.phase == Phase::Attempted
+                        && entry.incarnation.as_deref() != Some(observer.session())
+                }) {
+                    ledger.negative(
+                        &next.filename,
+                        NegativeReceipt::RetryAfterAbandonedIncarnation,
+                    )?;
+                }
+                if ledger.retry(&next.filename) == delivery_ledger::RetryDecision::Retry {
+                    let text = ding::poke_text(catalog_root, &run::detect_host(), &identity, &next);
+                    ledger.begin(Begin {
+                        filename: next.filename.clone(),
+                        binding: binding.clone(),
+                        correlation: Correlation::native(stable_correlation(
+                            &identity,
+                            &binding,
                             &next.filename,
-                            NegativeReceipt::RetryAfterAbandonedIncarnation,
-                        )?;
-                    }
-                    if ledger.retry(&next.filename) == delivery_ledger::RetryDecision::Retry {
-                        let text =
-                            ding::poke_text(catalog_root, &run::detect_host(), &identity, &next);
-                        ledger.begin(Begin {
-                            filename: next.filename.clone(),
-                            binding: binding.clone(),
-                            correlation: Correlation::native(stable_correlation(
-                                &identity,
-                                &binding,
-                                &next.filename,
-                            )),
-                            incarnation: Some(observer.session().to_string()),
-                        })?;
-                        write_user_turn(&mut stdin, &text)?;
-                        pending = Some(PendingDelivery {
-                            filename: next.filename,
-                            text,
-                        });
-                    }
+                        )),
+                        incarnation: Some(observer.session().to_string()),
+                    })?;
+                    write_user_turn(&mut stdin, &text)?;
+                    pending = Some(PendingDelivery {
+                        filename: next.filename,
+                        text,
+                    });
                 }
             }
             next_inbox_refresh = Instant::now() + INBOX_REFRESH;

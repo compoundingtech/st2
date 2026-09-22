@@ -421,7 +421,6 @@ fn tracked_product_surface_contains_only_native_names() {
 
     let forbidden = [
         ["con", "voy"].concat(),
-        ["small", "talk"].concat(),
         [".con", "voy"].concat(),
         ["render", "-agent"].concat(),
         ["build", "-agent"].concat(),

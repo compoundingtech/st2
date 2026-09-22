@@ -144,40 +144,99 @@ fn development_st3_channel_argv(
     identity: &str,
 ) -> Result<Vec<String>> {
     let subject = format!("agent/{identity}");
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            "st3": {
-                "type": "stdio",
-                "command": executable,
-                "args": ["driver", "claude-mcp", "--subject", subject]
-            }
-        }
+    let st3_server = serde_json::json!({
+        "type": "stdio",
+        "command": executable,
+        "args": ["driver", "claude-mcp", "--subject", subject]
     });
-    let mut output = Vec::with_capacity(argv.len() + 1);
+
+    // Claude accepts one effective MCP configuration. Preserve an authored configuration (for
+    // example Typecase's Xcode bridge) by adding st3 to it instead of appending a second flag,
+    // whose precedence differs across Claude releases and can make the provider reject startup.
+    let mut existing_mcp = None;
     let mut index = 0;
-    let mut replaced = false;
     while index < argv.len() {
-        if !replaced
-            && argv[index] == "--channels"
+        let (joined, raw) = if argv[index] == "--mcp-config" {
+            let raw = argv
+                .get(index + 1)
+                .context("the Claude --mcp-config option has no value")?
+                .clone();
+            (false, raw)
+        } else if let Some(raw) = argv[index].strip_prefix("--mcp-config=") {
+            (true, raw.to_string())
+        } else {
+            index += 1;
+            continue;
+        };
+        anyhow::ensure!(
+            existing_mcp.is_none(),
+            "the Claude arguments contain more than one --mcp-config option"
+        );
+        existing_mcp = Some((index, joined, raw));
+        index += if joined { 1 } else { 2 };
+    }
+
+    let mut mcp = match &existing_mcp {
+        Some((_, _, raw)) => serde_json::from_str::<serde_json::Value>(raw)
+            .context("parsing the authored Claude --mcp-config JSON")?,
+        None => serde_json::json!({"mcpServers": {}}),
+    };
+    let root = mcp
+        .as_object_mut()
+        .context("the authored Claude --mcp-config must be a JSON object")?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("the authored Claude --mcp-config mcpServers value must be a JSON object")?;
+    if let Some(authored) = servers.get("st3") {
+        anyhow::ensure!(
+            authored == &st3_server,
+            "the authored Claude --mcp-config already defines a different st3 server"
+        );
+    } else {
+        servers.insert("st3".to_string(), st3_server);
+    }
+    let mcp =
+        serde_json::to_string(&mcp).context("serializing the Claude st3 development channel")?;
+
+    let channel_count = argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::ST3_CHANNEL)
+        .count();
+    anyhow::ensure!(
+        channel_count == 1,
+        "the Claude arguments must contain exactly one st3 plugin channel selector"
+    );
+
+    let mut output = Vec::with_capacity(argv.len() + 1);
+    index = 0;
+    while index < argv.len() {
+        if argv[index] == "--channels"
             && argv.get(index + 1).map(String::as_str) == Some(crate::claude_channel::ST3_CHANNEL)
         {
-            output.extend([
-                "--mcp-config".to_string(),
-                serde_json::to_string(&mcp)
-                    .context("serializing the Claude st3 development channel")?,
-                "--dangerously-load-development-channels=server:st3".to_string(),
-            ]);
-            replaced = true;
+            if existing_mcp.is_none() {
+                output.extend(["--mcp-config".to_string(), mcp.clone()]);
+            }
+            output.push("--dangerously-load-development-channels=server:st3".to_string());
             index += 2;
+            continue;
+        }
+        if let Some((mcp_index, joined, _)) = &existing_mcp
+            && index == *mcp_index
+        {
+            if *joined {
+                output.push(format!("--mcp-config={mcp}"));
+                index += 1;
+            } else {
+                output.extend(["--mcp-config".to_string(), mcp.clone()]);
+                index += 2;
+            }
             continue;
         }
         output.push(argv[index].clone());
         index += 1;
     }
-    anyhow::ensure!(
-        replaced,
-        "the st3 Claude plugin channel selector is missing"
-    );
     Ok(output)
 }
 
@@ -770,6 +829,88 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+
+    #[test]
+    fn st3_development_channel_merges_an_authored_mcp_configuration() {
+        let xcode = serde_json::json!({
+            "mcpServers": {
+                "xcode": {
+                    "type": "stdio",
+                    "command": "xcrun",
+                    "args": ["mcpbridge"]
+                }
+            }
+        });
+        let argv = vec![
+            "claude".into(),
+            "--mcp-config".into(),
+            serde_json::to_string(&xcode).unwrap(),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+            "--remote-control".into(),
+            "prompt".into(),
+        ];
+
+        let output = development_st3_channel_argv(
+            argv,
+            Path::new("/opt/st3/bin/st3"),
+            Path::new("/var/lib/st3"),
+            "fleet/typecase/standing/typecase",
+        )
+        .unwrap();
+
+        let config_indexes = output
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (arg == "--mcp-config").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(config_indexes.len(), 1, "Claude receives one MCP config");
+        let mcp: serde_json::Value = serde_json::from_str(&output[config_indexes[0] + 1]).unwrap();
+        assert_eq!(mcp["mcpServers"]["xcode"], xcode["mcpServers"]["xcode"]);
+        assert_eq!(mcp["mcpServers"]["st3"]["command"], "/opt/st3/bin/st3");
+        assert_eq!(
+            mcp["mcpServers"]["st3"]["args"],
+            serde_json::json!([
+                "driver",
+                "claude-mcp",
+                "--subject",
+                "agent/fleet/typecase/standing/typecase"
+            ])
+        );
+        assert!(
+            output
+                .iter()
+                .any(|arg| arg == "--dangerously-load-development-channels=server:st3")
+        );
+        assert!(!output.iter().any(|arg| arg == "--channels"));
+        assert_eq!(output.last().map(String::as_str), Some("prompt"));
+    }
+
+    #[test]
+    fn st3_development_channel_rejects_conflicting_server_ownership() {
+        let argv = vec![
+            "claude".into(),
+            format!(
+                "--mcp-config={}",
+                serde_json::json!({"mcpServers": {"st3": {"command": "other"}}})
+            ),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+        ];
+
+        let error = development_st3_channel_argv(
+            argv,
+            Path::new("/opt/st3/bin/st3"),
+            Path::new("/var/lib/st3"),
+            "fleet/typecase/standing/typecase",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("already defines a different st3 server"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn only_the_packaged_channel_requests_the_installation_preflight() {
