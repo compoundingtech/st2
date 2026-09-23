@@ -99,6 +99,10 @@ directions correctly.
 - Restarting the daemon and replication services did not restart the standing
   st3 harness; it retained incarnation
   `3171390:2026-09-23T12:07:01.885Z`.
+- After two successful disposable runs, `mission/fleet/st3` was published at
+  store index 56002 with `gpt-6-sol` and `medium` effort for future Codex
+  harness incarnations. Publishing the definition left the current incarnation
+  unchanged.
 - Isolated parties
   `agent/e2e-conversations-20260923t1331z-postinstall/{a,b}` exercised KDL
   printing, tagged JSON send, explicit and `ST_AGENT`-scoped list/count,
