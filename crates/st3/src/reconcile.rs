@@ -4741,6 +4741,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         let variables = crate::store::mission_run_variables(run, &mission.revision);
         let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
+        let selected = self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .map(|subject| (subject.subject.clone(), subject))
+            .collect::<BTreeMap<_, _>>();
+        // A stop declared by a step is authoritative for the remainder of its generation.
+        // Re-materializing the mission-level agent on the next final-phase pass would otherwise
+        // replace that stop for one reconciliation cycle, launch a fresh incarnation, and then
+        // stop it again during terminal cleanup.
+        intent.subjects.retain(|subject, _| {
+            !selected.get(subject).is_some_and(|current| {
+                current.kind == "stop"
+                    && current.owner_run.as_deref() == Some(run.subject.as_str())
+                    && current.owner_generation.as_deref() == Some(run.generation.as_str())
+            })
+        });
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
             subject.owner_generation = Some(run.generation.clone());
@@ -12101,6 +12118,70 @@ version 2
             desired.subject == format!("agent/{}/worker", run.id)
                 && desired.kind == "stop"
                 && desired.owner_run.as_deref() == Some(run.subject.as_str())
+        }));
+    }
+
+    #[test]
+    fn a_finally_stop_does_not_relaunch_a_mission_agent() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+mission "final-stop-no-relaunch" state="ready" {
+  goal "Stop the mission agent exactly once."
+  completion { when "all-steps-exhausted" }
+
+  agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+
+  step "finish" { agentless }
+
+  finally {
+    step "stop-worker" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/worker"
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-final-stop-no-relaunch");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "final-stop-no-relaunch".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-final-stop-no-relaunch".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..12 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            runtime.started_members.lock().unwrap().len(),
+            1,
+            "the final stop must not be overwritten by a fresh mission-level declaration"
+        );
+        let worker = format!("agent/{}/worker", run.id);
+        assert!(store.desired_subjects().unwrap().iter().any(|desired| {
+            desired.subject == worker
+                && desired.kind == "stop"
+                && desired.owner_run.as_deref() == Some(run.subject.as_str())
+                && desired.owner_generation.as_deref() == Some(run.generation.as_str())
         }));
     }
 
