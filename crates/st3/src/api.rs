@@ -29,25 +29,25 @@ use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
-    AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck, DoctorReport,
-    DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
-    EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
+    AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
+    ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck,
+    DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStartRequest,
+    EvalStartResponse, EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
     LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
     LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest,
-    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
-    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
-    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
-    ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
-    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
-    WorkRequest, WorkWakeRequest,
+    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
+    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
+    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -343,7 +343,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/reviews/{*subject}", post(post_review))
         .route("/v1/attention", get(list_attention).post(request_attention))
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
+        .route(
+            "/v1/attention/withdraw/{*subject}",
+            post(withdraw_attention),
+        )
         .route("/v1/messages", get(list_messages).post(send_message))
+        .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/status", get(status))
@@ -1463,7 +1468,7 @@ fn client_attention_resources(
             let current = current_subjects.contains(request.subject.as_str());
             let mut reasons = Vec::new();
             if request.status != "pending" {
-                reasons.push("resolved");
+                reasons.push(request.status.as_str());
             } else if !current {
                 reasons.push("superseded");
             }
@@ -4848,6 +4853,19 @@ async fn resolve_attention(
     Ok(Json(response))
 }
 
+async fn withdraw_attention(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<AttentionWithdrawRequest>,
+) -> Result<Json<AttentionRequestView>, ApiError> {
+    let response = state
+        .store
+        .withdraw_attention(&subject, &request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
 async fn post_review(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -5049,6 +5067,90 @@ struct MessagesQuery {
     include_closed: bool,
 }
 
+#[derive(Deserialize)]
+struct MessagesPageQuery {
+    to: Option<String>,
+    #[serde(default)]
+    include_closed: bool,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MessagesPageCursor {
+    after: u64,
+    through: u64,
+    to: Option<String>,
+    include_closed: bool,
+    limit: usize,
+}
+
+async fn list_messages_page(
+    State(state): State<AppState>,
+    Query(query): Query<MessagesPageQuery>,
+) -> Result<Json<MessagePage>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let to = query.to.as_deref().map(normalize_message_party);
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|encoded| {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded.strip_prefix("messages/").unwrap_or(""))
+                .map_err(|_| {
+                    ApiError::bad(St3Error::new("validation-failed", "invalid message cursor"))
+                })?;
+            let cursor: MessagesPageCursor = serde_json::from_slice(&bytes).map_err(|_| {
+                ApiError::bad(St3Error::new("validation-failed", "invalid message cursor"))
+            })?;
+            if cursor.to != to
+                || cursor.include_closed != query.include_closed
+                || cursor.limit != limit
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "validation-failed",
+                    "message cursor filters changed",
+                )));
+            }
+            Ok(cursor)
+        })
+        .transpose()?;
+    let through = match &cursor {
+        Some(cursor) => cursor.through,
+        None => state.store.index().map_err(ApiError::internal)?,
+    };
+    let after = cursor.as_ref().map(|cursor| cursor.after);
+    let store = state.store.clone();
+    let (items, next_after) = blocking_store(move || {
+        store.messages_page(to.as_deref(), query.include_closed, after, through, limit)
+    })
+    .await?;
+    let next_cursor = next_after
+        .map(|after| {
+            let cursor = MessagesPageCursor {
+                after,
+                through,
+                to: query.to.as_deref().map(normalize_message_party),
+                include_closed: query.include_closed,
+                limit,
+            };
+            serde_json::to_vec(&cursor).map(|bytes| {
+                format!(
+                    "messages/{}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+                )
+            })
+        })
+        .transpose()
+        .map_err(ApiError::internal)?;
+    Ok(Json(MessagePage {
+        items,
+        has_more: next_cursor.is_some(),
+        next_cursor,
+        limit,
+    }))
+}
+
 async fn list_messages(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
@@ -5070,10 +5172,9 @@ async fn read_message(
         format!("message/{subject}")
     };
     let store = state.store.clone();
-    blocking_store(move || store.messages(None, true))
+    let lookup = subject.clone();
+    blocking_store(move || store.message(&lookup))
         .await?
-        .into_iter()
-        .find(|message| message.subject == subject)
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))
 }
@@ -10420,5 +10521,121 @@ version 2
         assert_eq!(resolved["status"], "resolved");
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
+    }
+
+    #[tokio::test]
+    async fn requester_can_withdraw_obsolete_attention_without_person_impersonation() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let request = serde_json::to_value(AttentionRequest {
+            reviewer: "person/nathan".into(),
+            title: "Old blocker".into(),
+            reason: "A logout might eventually help, but no action is needed now.".into(),
+            severity: "error".into(),
+            targets: vec![],
+            actor: "agent/typecase/worker".into(),
+            idempotency_key: "withdraw-old-blocker".into(),
+        })
+        .unwrap();
+        let (_, created) = json_request(app.clone(), "/v1/attention", request).await;
+        let subject = created["subject"].as_str().unwrap();
+        let path = format!("/v1/attention/withdraw/{}", urlencoding::encode(subject));
+        let wrong = serde_json::to_value(AttentionWithdrawRequest {
+            reason: "No action needed".into(),
+            actor: "agent/other".into(),
+            idempotency_key: "withdraw-wrong".into(),
+        })
+        .unwrap();
+        let (status, rejected) = json_request(app.clone(), &path, wrong).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        let request = serde_json::to_value(AttentionWithdrawRequest {
+            reason: "The milestone continued; no action is needed now.".into(),
+            actor: "agent/typecase/worker".into(),
+            idempotency_key: "withdraw-right".into(),
+        })
+        .unwrap();
+        let (status, withdrawn) = json_request(app.clone(), &path, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{withdrawn}");
+        assert_eq!(withdrawn["status"], "withdrawn");
+        let (status, repeated) = json_request(app.clone(), &path, request).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(
+            withdrawn["resolved_at_unix_ms"],
+            repeated["resolved_at_unix_ms"]
+        );
+        let (_, current) = get_request(app, "/v1/attention?person=person%2Fnathan").await;
+        assert_eq!(current, json!([]));
+    }
+
+    #[tokio::test]
+    async fn message_pages_are_bounded_and_stable_across_new_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for index in 0..205 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/page-{index:03}"),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/sender".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("agent/sender".into())),
+                        ("to".into(), Value::String("agent/receiver".into())),
+                        ("content".into(), Value::String(format!("body {index}"))),
+                        ("status".into(), Value::String("sent".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let app = router(state.clone());
+        let mut cursor: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let mut path = "/v1/messages/page?to=agent%2Freceiver&limit=100".to_owned();
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+            }
+            let (status, page) = get_request(app.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let items = page["items"].as_array().unwrap();
+            assert!(items.len() <= 100);
+            seen.extend(
+                items
+                    .iter()
+                    .map(|item| item["subject"].as_str().unwrap().to_owned()),
+            );
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+            if seen.len() == 100 {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: "message/new-after-page".into(),
+                        kind: "message.sent".into(),
+                        actor: Some("agent/sender".into()),
+                        fields: BTreeMap::from([
+                            ("from".into(), Value::String("agent/sender".into())),
+                            ("to".into(), Value::String("agent/receiver".into())),
+                            ("content".into(), Value::String("late".into())),
+                            ("status".into(), Value::String("sent".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 205);
+        assert_eq!(seen.first().unwrap(), "message/page-000");
+        assert_eq!(seen.last().unwrap(), "message/page-204");
+        let (status, exact) = get_request(app, "/v1/messages/read/message%2Fpage-204").await;
+        assert_eq!(status, StatusCode::OK, "{exact}");
+        assert_eq!(exact["content"], "body 204");
     }
 }

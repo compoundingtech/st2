@@ -17,20 +17,20 @@ use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
-    AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
-    CurrentHarnessView, DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion,
-    EvalStatus, EventRecord, IntentInput, LaunchApproveAndStartRequest, LaunchApproveAndStartView,
-    LaunchDecisionAnswerRequest, LaunchDecisionOption, LaunchDecisionRequest,
-    LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRevisionRequest, MissionRunView, MissionState,
-    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
-    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
-    PlanningSessionView, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
-    WorkRequest, WorkWakeRequest,
+    AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
+    ClaimRecord, ClaimsPage, CurrentHarnessView, DoctorReport, DocumentListResponse,
+    DocumentPutRequest, DocumentVersion, EvalStatus, EventRecord, IntentInput,
+    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
+    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
+    LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
+    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
+    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -941,6 +941,8 @@ enum AttentionCommand {
     Request(AttentionRequestArgs),
     /// Resolve or dismiss an explicit attention request.
     Resolve(AttentionResolveArgs),
+    /// Withdraw an obsolete attention request as its original requester.
+    Withdraw(AttentionWithdrawArgs),
     /// Approve one person-owned gate or launch review.
     Approve(ReviewArgs),
     /// Reject one person-owned gate or launch review.
@@ -973,6 +975,15 @@ struct AttentionResolveArgs {
     #[arg(long)]
     reason: Option<String>,
     #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+}
+
+#[derive(Args)]
+struct AttentionWithdrawArgs {
+    subject: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long = "as")]
     actor: String,
 }
 
@@ -3193,14 +3204,14 @@ async fn agent_wait_interruption(client: &Client, actor: &str) -> Result<Option<
         matches!(step.status.as_str(), "claimed" | "working")
             && step.claimant.as_deref() == Some(actor)
     });
-    let messages: Vec<MessageView> = client
-        .get(&format!("/v1/messages?to={}", urlencoding::encode(actor)))
-        .await?;
-    let unread = messages
-        .iter()
-        .filter(|message| matches!(message.status.as_str(), "sent" | "delivered"))
-        .map(|message| message.subject.clone())
-        .collect::<Vec<_>>();
+    let mut unread = Vec::new();
+    for_each_message(client, Some(actor), false, |message| {
+        if matches!(message.status.as_str(), "sent" | "delivered") {
+            unread.push(message.subject);
+        }
+        Ok(())
+    })
+    .await?;
     Ok(wait_interruption_reason(
         actor,
         has_claimed_work,
@@ -4614,6 +4625,28 @@ async fn run_attention(
                 Ok(())
             }
         }
+        AttentionCommand::Withdraw(args) => {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: AttentionRequestView = client
+                .post(
+                    &format!(
+                        "/v1/attention/withdraw/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &AttentionWithdrawRequest {
+                        reason: args.reason,
+                        actor: args.actor,
+                        idempotency_key: format!("attention-withdraw:{}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!("{}\t{}", response.status, response.subject);
+                Ok(())
+            }
+        }
         AttentionCommand::Approve(args) => {
             run_review_decision(client, "approved", args, json_output).await
         }
@@ -5073,6 +5106,41 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
     }
 }
 
+async fn message_page(
+    client: &Client,
+    recipient: Option<&str>,
+    include_closed: bool,
+    cursor: Option<&str>,
+) -> Result<MessagePage> {
+    let mut path = format!("/v1/messages/page?include_closed={include_closed}&limit=100");
+    if let Some(recipient) = recipient {
+        path.push_str(&format!("&to={}", urlencoding::encode(recipient)));
+    }
+    if let Some(cursor) = cursor {
+        path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+    }
+    client.get(&path).await
+}
+
+async fn for_each_message(
+    client: &Client,
+    recipient: Option<&str>,
+    include_closed: bool,
+    mut visit: impl FnMut(MessageView) -> Result<()>,
+) -> Result<()> {
+    let mut cursor = None;
+    loop {
+        let page = message_page(client, recipient, include_closed, cursor.as_deref()).await?;
+        for message in page.items {
+            visit(message)?;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(()),
+        }
+    }
+}
+
 async fn run_message(
     client: &Client,
     endpoint: &Endpoint,
@@ -5095,30 +5163,45 @@ async fn run_message(
         }
         MessageCommand::Ls(args) => {
             let identity = message_list_identity(args.identity, std::env::var("ST_AGENT").ok())?;
-            let mut path = format!("/v1/messages?to={}", urlencoding::encode(&identity));
-            if args.archive {
-                path.push_str("&include_closed=true");
+            let sender = args.sender.map(|sender| normalize_message_subject(&sender));
+            let mut count = 0_u64;
+            let mut first = true;
+            if json_output && !args.count {
+                print!("[");
             }
-            let mut messages: Vec<MessageView> = client.get(&path).await?;
-            if let Some(sender) = args.sender {
-                let sender = normalize_message_subject(&sender);
-                messages.retain(|message| message.from == sender);
-            }
+            for_each_message(client, Some(&identity), args.archive, |message| {
+                if sender
+                    .as_deref()
+                    .is_some_and(|sender| sender != message.from)
+                {
+                    return Ok(());
+                }
+                count += 1;
+                if args.count {
+                    return Ok(());
+                }
+                if json_output {
+                    if !first {
+                        print!(",");
+                    }
+                    print!("{}", serde_json::to_string(&message)?);
+                    first = false;
+                } else {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        message.subject,
+                        message.status,
+                        message.from,
+                        message.title.as_deref().unwrap_or("message")
+                    );
+                }
+                Ok(())
+            })
+            .await?;
             if args.count {
-                println!("{}", messages.len());
-                return Ok(());
-            }
-            if json_output {
-                return print_value(&messages, true);
-            }
-            for message in messages {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    message.subject,
-                    message.status,
-                    message.from,
-                    message.title.as_deref().unwrap_or("message")
-                );
+                println!("{count}");
+            } else if json_output {
+                println!("]");
             }
             Ok(())
         }
@@ -5214,13 +5297,21 @@ async fn run_message(
         }
         MessageCommand::Thread(args) => {
             let selected = read_message(client, &args.reference).await?;
-            let all: Vec<MessageView> = client.get("/v1/messages?include_closed=true").await?;
-            let root = thread_root(&selected, &all);
-            let mut thread = all
-                .iter()
-                .filter(|message| thread_root(message, &all).subject == root.subject)
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut links = BTreeMap::new();
+            for_each_message(client, None, true, |message| {
+                links.insert(message.subject, message.in_reply_to);
+                Ok(())
+            })
+            .await?;
+            let root = thread_root_from_links(&selected.subject, &links);
+            let mut thread = Vec::new();
+            for_each_message(client, None, true, |message| {
+                if thread_root_from_links(&message.subject, &links) == root {
+                    thread.push(message);
+                }
+                Ok(())
+            })
+            .await?;
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
         }
@@ -5255,19 +5346,19 @@ async fn run_message(
             print_timeline_page(&response, json_output)
         }
         MessageCommand::Export { directory } => {
-            let messages: Vec<MessageView> = client.get("/v1/messages?include_closed=true").await?;
-            st3::projection::export_messages(&directory, &messages)?;
+            let mut export = st3::projection::MessageExport::new(&directory)?;
+            let mut count = 0_u64;
+            for_each_message(client, None, true, |message| {
+                export.write(&message)?;
+                count += 1;
+                Ok(())
+            })
+            .await?;
+            export.finish()?;
             if json_output {
-                print_value(
-                    &json!({"directory": directory, "messages": messages.len()}),
-                    true,
-                )
+                print_value(&json!({"directory": directory, "messages": count}), true)
             } else {
-                println!(
-                    "exported {} messages to {}",
-                    messages.len(),
-                    directory.display()
-                );
+                println!("exported {} messages to {}", count, directory.display());
                 Ok(())
             }
         }
@@ -5555,15 +5646,16 @@ async fn sync_message_projection(client: &Client) -> Result<()> {
     let Some(root) = std::env::var_os("ST3_MESSAGE_ROOT") else {
         return Ok(());
     };
-    let messages: Vec<MessageView> = client.get("/v1/messages?include_closed=true").await?;
-    st3::projection::export_messages(Path::new(&root), &messages)
+    let mut export = st3::projection::MessageExport::new(Path::new(&root))?;
+    for_each_message(client, None, true, |message| export.write(&message)).await?;
+    export.finish()
 }
 
-fn thread_root<'a>(message: &'a MessageView, all: &'a [MessageView]) -> &'a MessageView {
-    let mut current = message;
+fn thread_root_from_links(subject: &str, links: &BTreeMap<String, Option<String>>) -> String {
+    let mut current = subject.to_owned();
     let mut seen = BTreeSet::new();
-    while let Some(parent) = current.in_reply_to.as_deref() {
-        if !seen.insert(parent) {
+    while let Some(parent) = links.get(&current).and_then(Option::as_deref) {
+        if !seen.insert(current.clone()) {
             break;
         }
         let normalized = if parent.starts_with("message/") {
@@ -5571,10 +5663,10 @@ fn thread_root<'a>(message: &'a MessageView, all: &'a [MessageView]) -> &'a Mess
         } else {
             format!("message/{parent}")
         };
-        let Some(next) = all.iter().find(|candidate| candidate.subject == normalized) else {
+        if !links.contains_key(&normalized) {
             break;
-        };
-        current = next;
+        }
+        current = normalized;
     }
     current
 }
@@ -6553,13 +6645,10 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                 }
             }
             _ = interval.tick() => {
-                let messages: Vec<MessageView> = client
-                    .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
-                    .await?;
-                for message in messages
-                    .into_iter()
-                    .filter(|message| matches!(message.status.as_str(), "sent" | "staged"))
-                {
+                let mut cursor = None;
+                loop {
+                    let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
+                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
                     if !delivered.insert(message.subject.clone()) {
                         continue;
                     }
@@ -6591,6 +6680,11 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                             format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
                         )
                         .await?;
+                    }
+                    }
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => break,
                     }
                 }
             }
@@ -7012,14 +7106,8 @@ async fn forward_projected_messages(
     receipts: NativeDeliveryReceipts<'_>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    let messages: Vec<MessageView> = client
-        .get(&format!(
-            "/v1/messages?to={}&include_closed=true",
-            urlencoding::encode(subject)
-        ))
-        .await?;
-    sync_closed_projected_messages(inbox, archive, &messages)?;
     let mut present = projected_message_files(inbox, archive)?;
+    let mut closed = BTreeSet::new();
     let stage_runtime_id = match receipts {
         NativeDeliveryReceipts::Codex { runtime_id, .. }
         | NativeDeliveryReceipts::OpenCode { runtime_id, .. } => Some(runtime_id),
@@ -7041,68 +7129,81 @@ async fn forward_projected_messages(
             runtime_id,
         } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
-    for message in messages
-        .into_iter()
-        .filter(|message| matches!(message.status.as_str(), "sent" | "staged"))
-    {
-        let filename = if let Some(filename) = present.get(&message.subject) {
-            filename.clone()
-        } else {
-            let content = if message.content.starts_with("doc/") {
-                let value: Value = client
-                    .get(&format!(
-                        "/v1/documents/content?reference={}",
-                        urlencoding::encode(&message.content)
-                    ))
-                    .await?;
-                let bytes = serde_json::from_value::<Vec<u8>>(
-                    value
-                        .get("bytes")
-                        .cloned()
-                        .context("document response lacks bytes")?,
-                )?;
-                String::from_utf8(bytes).context("message document is not UTF-8")?
+    let mut cursor = None;
+    loop {
+        let page = message_page(client, Some(subject), true, cursor.as_deref()).await?;
+        for message in page.items {
+            if message.status == "closed" {
+                closed.insert(message.subject);
+                continue;
+            }
+            if !matches!(message.status.as_str(), "sent" | "staged") {
+                continue;
+            }
+            let filename = if let Some(filename) = present.get(&message.subject) {
+                filename.clone()
             } else {
-                message.content.clone()
+                let content = if message.content.starts_with("doc/") {
+                    let value: Value = client
+                        .get(&format!(
+                            "/v1/documents/content?reference={}",
+                            urlencoding::encode(&message.content)
+                        ))
+                        .await?;
+                    let bytes = serde_json::from_value::<Vec<u8>>(
+                        value
+                            .get("bytes")
+                            .cloned()
+                            .context("document response lacks bytes")?,
+                    )?;
+                    String::from_utf8(bytes).context("message document is not UTF-8")?
+                } else {
+                    message.content.clone()
+                };
+                let mut tags = message.tags.clone();
+                tags.push(format!("{TAG_PREFIX}{}", message.subject));
+                let filename = st2::message::send_to_inbox(
+                    inbox,
+                    &message.from,
+                    message.title.as_deref(),
+                    message.in_reply_to.as_deref(),
+                    &tags,
+                    &content,
+                )?;
+                present.insert(message.subject.clone(), filename.clone());
+                filename
             };
-            let mut tags = message.tags.clone();
-            tags.push(format!("{TAG_PREFIX}{}", message.subject));
-            let filename = st2::message::send_to_inbox(
-                inbox,
-                &message.from,
-                message.title.as_deref(),
-                message.in_reply_to.as_deref(),
-                &tags,
-                &content,
-            )?;
-            present.insert(message.subject.clone(), filename.clone());
-            filename
-        };
-        if message.status == "sent" {
-            stage_message(
+            if message.status == "sent" {
+                stage_message(
+                    client,
+                    &message.subject,
+                    subject,
+                    transport,
+                    stage_runtime_id,
+                    format!("native-staged:{transport}:{subject}:{}", message.subject),
+                )
+                .await?;
+            }
+            // Receipt-backed transports advance graph delivery only after their durable ledger proves
+            // that the exact inbox file was consumed by a provider turn. Materialization alone is
+            // merely queued native delivery.
+            if !native_delivery_receipted(&consumed, &filename) {
+                continue;
+            }
+            deliver_message(
                 client,
                 &message.subject,
                 subject,
-                transport,
-                stage_runtime_id,
-                format!("native-staged:{transport}:{subject}:{}", message.subject),
+                format!("native-delivered:{transport}:{subject}:{}", message.subject),
             )
             .await?;
         }
-        // Receipt-backed transports advance graph delivery only after their durable ledger proves
-        // that the exact inbox file was consumed by a provider turn. Materialization alone is
-        // merely queued native delivery.
-        if !native_delivery_receipted(&consumed, &filename) {
-            continue;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
         }
-        deliver_message(
-            client,
-            &message.subject,
-            subject,
-            format!("native-delivered:{transport}:{subject}:{}", message.subject),
-        )
-        .await?;
     }
+    sync_closed_projected_messages(inbox, archive, &closed)?;
     Ok(())
 }
 
@@ -7158,14 +7259,9 @@ fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> boo
 fn sync_closed_projected_messages(
     inbox: &Path,
     archive: &Path,
-    messages: &[MessageView],
+    closed: &BTreeSet<String>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    let closed = messages
-        .iter()
-        .filter(|message| message.status == "closed")
-        .map(|message| message.subject.as_str())
-        .collect::<BTreeSet<_>>();
     for message in st2::message::list_dir(inbox)? {
         let is_closed = message
             .tags
@@ -8734,19 +8830,8 @@ mission "review" state="ready" {
             "Do the work.",
         )
         .unwrap();
-        let messages = vec![MessageView {
-            subject: "message/kickoff/run-1".into(),
-            from: "agent/requester".into(),
-            to: "agent/worker".into(),
-            content: "Do the work.".into(),
-            status: "closed".into(),
-            title: Some("Start".into()),
-            in_reply_to: None,
-            tags: Vec::new(),
-            created_index: 1,
-        }];
-
-        sync_closed_projected_messages(&inbox, &archive, &messages).unwrap();
+        let closed = BTreeSet::from(["message/kickoff/run-1".into()]);
+        sync_closed_projected_messages(&inbox, &archive, &closed).unwrap();
 
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());

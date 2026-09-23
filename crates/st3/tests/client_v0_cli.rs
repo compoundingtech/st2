@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use st3::api::AppState;
-use st3::model::{ClaimInput, IntentInput, MissionRunRequest};
+use st3::model::{AttentionRequest, ClaimInput, IntentInput, MissionRunRequest};
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -139,6 +139,143 @@ async fn import_list_does_not_return_an_empty_page_with_more_managed_sessions() 
     assert!(page["value"]["items"].as_array().unwrap().is_empty());
     assert_eq!(page["value"]["page"]["has_more"], false);
     assert!(page["value"]["page"]["next_cursor"].is_null());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversations_cli_handles_multiple_message_pages_and_exact_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    for index in 0..205 {
+        let mut fields = BTreeMap::from([
+            ("from".into(), Value::String("agent/sender".into())),
+            ("to".into(), Value::String("agent/receiver".into())),
+            ("content".into(), Value::String(format!("body {index}"))),
+            ("status".into(), Value::String("sent".into())),
+        ]);
+        if index == 204 {
+            fields.insert(
+                "in_reply_to".into(),
+                Value::String("message/page-000".into()),
+            );
+        }
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("message/page-{index:03}"),
+                kind: "message.sent".into(),
+                actor: Some("agent/sender".into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+
+    let listed = value(&run_cli(&socket, &["conversations", "ls", "agent/receiver"]).await);
+    assert_eq!(listed.as_array().unwrap().len(), 205);
+    let thread = value(&run_cli(&socket, &["conversations", "thread", "message/page-204"]).await);
+    assert_eq!(thread.as_array().unwrap().len(), 2);
+    let read = value(
+        &run_cli(
+            &socket,
+            &[
+                "conversations",
+                "read",
+                "message/page-204",
+                "--as",
+                "agent/receiver",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(read["subject"], "message/page-204");
+    let export_dir = root.path().join("export");
+    std::fs::create_dir_all(export_dir.join("receiver/inbox")).unwrap();
+    let stale = export_dir.join("receiver/inbox/stale.md");
+    std::fs::write(&stale, "old projection").unwrap();
+    let exported = value(
+        &run_cli(
+            &socket,
+            &["conversations", "export", export_dir.to_str().unwrap()],
+        )
+        .await,
+    );
+    assert_eq!(exported["messages"], 205);
+    assert!(!stale.exists());
+    assert_eq!(
+        std::fs::read_dir(export_dir.join("receiver/inbox"))
+            .unwrap()
+            .count(),
+        205
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attention_withdraw_removes_an_obsolete_request_from_now() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let request = state
+        .store
+        .request_attention(
+            "attention/obsolete",
+            &AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: "No action needed".into(),
+                reason: "The original blocker has cleared.".into(),
+                severity: "warning".into(),
+                targets: Vec::new(),
+                actor: "agent/typecase/worker".into(),
+                idempotency_key: "obsolete-request".into(),
+            },
+        )
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    let withdrawn = value(
+        &run_cli(
+            &socket,
+            &[
+                "attention",
+                "withdraw",
+                &request.subject,
+                "--reason",
+                "No action needed now",
+                "--as",
+                "agent/typecase/worker",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(withdrawn["status"], "withdrawn");
+    let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    assert!(current["value"]["items"].as_array().unwrap().is_empty());
     server.abort();
 }
 

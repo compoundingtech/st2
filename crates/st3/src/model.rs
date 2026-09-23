@@ -1421,6 +1421,13 @@ pub struct AttentionResolveRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionWithdrawRequest {
+    pub reason: String,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionRequestView {
     pub subject: String,
     pub request: String,
@@ -1482,6 +1489,14 @@ pub struct MessageView {
     pub in_reply_to: Option<String>,
     pub tags: Vec<String>,
     pub created_index: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MessagePage {
+    pub items: Vec<MessageView>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub limit: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

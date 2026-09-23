@@ -16,20 +16,21 @@ use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
-    AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, ContextUsage,
-    DependencySpec, DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput,
-    LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView, MissionDefinitionView,
-    MissionInputKind, MissionOutputView, MissionResponse, MissionRevisionOperation,
-    MissionRunDeclaration, MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec,
-    MissionState, NormalizedIntent, OperationalAnnotation, OperationalRepairItem,
-    OperationalRepairPlan, OperationalRepairResult, PlannedAction, PlanningCandidateView,
-    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
-    ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
-    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
-    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
+    AttentionResolveRequest, AttentionWithdrawRequest, Capability, ClaimInput, ClaimRecord,
+    ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, DocumentVersion, EventRecord,
+    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
+    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
+    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunRequest,
+    MissionRunView, MissionSpec, MissionState, NormalizedIntent, OperationalAnnotation,
+    OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult, PlannedAction,
+    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
+    PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView,
+    ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory, ReplicationPeerStatus,
+    ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionConditionSpec, SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector,
+    WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -5995,12 +5996,52 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        let through = self.index()?;
+        let mut after = None;
+        let mut all = Vec::new();
+        loop {
+            let (items, next) =
+                self.messages_page(recipient, include_closed, after, through, 200)?;
+            all.extend(items);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => return Ok(all),
+            }
+        }
+    }
+
+    pub fn message(&self, subject: &str) -> Result<Option<MessageView>> {
+        let connection = self.readers.get();
+        let created_index = connection.query_row(
+            "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
+            [subject],
+            |row| row.get::<_, Option<u64>>(0),
+        )?;
+        created_index
+            .map(|index| message_view_tx(&connection, subject, index))
+            .transpose()
+    }
+
+    pub fn messages_page(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
         let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
         let mut statement = connection.prepare(
-            "SELECT DISTINCT subject
+            "SELECT claims.subject, claims.store_index
              FROM claims
-             WHERE subject LIKE 'message/%'
+             WHERE claims.subject LIKE 'message/%'
+               AND claims.store_index>?3 AND claims.store_index<=?4
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims earlier
+                   WHERE earlier.subject=claims.subject
+                     AND earlier.store_index<claims.store_index
+               )
                AND (?1 OR NOT EXISTS (
                    SELECT 1 FROM claims closed
                    WHERE closed.subject=claims.subject AND closed.kind='message.closed'
@@ -6026,112 +6067,37 @@ impl Store {
                          ELSE 'agent/' || json_extract(child.value, '$.arguments[0]')
                      END=?2
                ))
-             ORDER BY subject",
+             ORDER BY claims.store_index, claims.subject LIMIT ?5",
         )?;
-        let subjects = statement
-            .query_map(params![include_closed, recipient.as_deref()], |row| {
-                row.get::<_, String>(0)
-            })?
+        let mut subjects = statement
+            .query_map(
+                params![
+                    include_closed,
+                    recipient.as_deref(),
+                    after.unwrap_or(0),
+                    through,
+                    limit.saturating_add(1)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
+        let has_more = subjects.len() > limit;
+        subjects.truncate(limit);
+        let next_after = has_more
+            .then(|| subjects.last().map(|(_, index)| *index))
+            .flatten();
         let mut output = Vec::new();
-        for subject in subjects {
-            let actual = latest_actual(&connection, &subject)?.unwrap_or(Value::Null);
-            let desired = current_desired_row(&connection, &subject)?
-                .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
-            let from = actual
-                .get("from")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    desired
-                        .as_ref()
-                        .and_then(|value| canonical_child_string(value, "from"))
-                })
-                .unwrap_or_else(|| "requester".into());
-            let from = normalize_message_party(&from);
-            let to = actual
-                .get("to")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    desired
-                        .as_ref()
-                        .and_then(|value| canonical_child_string(value, "to"))
-                })
-                .unwrap_or_default();
-            let to = normalize_message_party(&to);
-            let content = actual
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    desired
-                        .as_ref()
-                        .and_then(|value| canonical_child_string(value, "content"))
-                })
-                .unwrap_or_default();
-            let status = actual
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("sent")
-                .to_owned();
+        for (subject, created_index) in subjects {
+            let message = message_view_tx(&connection, &subject, created_index)?;
             if recipient
                 .as_deref()
-                .is_some_and(|recipient| recipient != to)
-                || (!include_closed && status == "closed")
+                .is_none_or(|recipient| recipient == message.to)
+                && (include_closed || message.status != "closed")
             {
-                continue;
+                output.push(message);
             }
-            let created_index = connection.query_row(
-                "SELECT MIN(store_index) FROM claims WHERE subject=?1",
-                [&subject],
-                |row| row.get(0),
-            )?;
-            output.push(MessageView {
-                subject,
-                from,
-                to,
-                content,
-                status,
-                title: actual
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        desired
-                            .as_ref()
-                            .and_then(|value| canonical_child_string(value, "title"))
-                    }),
-                in_reply_to: actual
-                    .get("in_reply_to")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        desired
-                            .as_ref()
-                            .and_then(|value| canonical_child_string(value, "in-reply-to"))
-                    }),
-                tags: actual
-                    .get("tags")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_else(|| {
-                        desired
-                            .as_ref()
-                            .map(|value| canonical_child_strings(value, "tag"))
-                            .unwrap_or_default()
-                    }),
-                created_index,
-            });
         }
-        output.sort_by_key(|message| message.created_index);
-        Ok(output)
+        Ok((output, next_after))
     }
 
     pub fn operational_messages(
@@ -6312,6 +6278,59 @@ impl Store {
         self.attention_request(&subject)
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("internal", "the attention resolution was not stored"))
+    }
+
+    pub fn withdraw_attention(
+        &self,
+        subject: &str,
+        request: &AttentionWithdrawRequest,
+    ) -> Result<AttentionRequestView, St3Error> {
+        if request.reason.trim().is_empty() {
+            return Err(St3Error::new(
+                "invalid-attention-withdrawal",
+                "an attention withdrawal needs a reason",
+            ));
+        }
+        let subject = if subject.starts_with("attention/") {
+            subject.to_owned()
+        } else {
+            format!("attention/{subject}")
+        };
+        let current = self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-attention-request",
+                    format!("attention request `{subject}` does not exist"),
+                )
+            })?;
+        let actor = normalize_actor(&request.actor, "agent");
+        if actor != current.actor {
+            return Err(St3Error::new(
+                "wrong-attention-requester",
+                format!(
+                    "attention request `{subject}` belongs to `{}`",
+                    current.actor
+                ),
+            ));
+        }
+        self.append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "attention.resolved".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(current.request)),
+                ("outcome".into(), Value::String("withdrawn".into())),
+                ("reason".into(), Value::String(request.reason.clone())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        })?;
+        self.attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("internal", "the attention withdrawal was not stored"))
     }
 
     pub(crate) fn resolve_attention_automatically(
@@ -11175,6 +11194,56 @@ fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Error>
         Some(requested) => Ok(requested),
         None => Ok(current),
     }
+}
+
+fn message_view_tx(
+    connection: &Connection,
+    subject: &str,
+    created_index: u64,
+) -> Result<MessageView> {
+    let actual = latest_actual(connection, subject)?.unwrap_or(Value::Null);
+    let desired = current_desired_row(connection, subject)?
+        .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
+    let field = |name: &str| actual.get(name).and_then(Value::as_str).map(str::to_owned);
+    let child = |name: &str| {
+        desired
+            .as_ref()
+            .and_then(|value| canonical_child_string(value, name))
+    };
+    let from = normalize_message_party(
+        &field("from")
+            .or_else(|| child("from"))
+            .unwrap_or_else(|| "requester".into()),
+    );
+    let to = normalize_message_party(&field("to").or_else(|| child("to")).unwrap_or_default());
+    Ok(MessageView {
+        subject: subject.into(),
+        from,
+        to,
+        content: field("content")
+            .or_else(|| child("content"))
+            .unwrap_or_default(),
+        status: field("status").unwrap_or_else(|| "sent".into()),
+        title: field("title").or_else(|| child("title")),
+        in_reply_to: field("in_reply_to").or_else(|| child("in-reply-to")),
+        tags: actual
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                desired
+                    .as_ref()
+                    .map(|value| canonical_child_strings(value, "tag"))
+                    .unwrap_or_default()
+            }),
+        created_index,
+    })
 }
 
 fn latest_actual(connection: &Connection, subject: &str) -> Result<Option<Value>> {

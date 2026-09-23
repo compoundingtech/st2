@@ -10,10 +10,29 @@ use crate::model::MessageView;
 ///
 /// The claims store remains authoritative. This tree is a disposable read projection.
 pub fn export_messages(root: &Path, messages: &[MessageView]) -> Result<()> {
-    fs::create_dir_all(root)
-        .with_context(|| format!("create message projection {}", root.display()))?;
-    let mut expected = BTreeSet::new();
+    let mut export = MessageExport::new(root)?;
     for message in messages {
+        export.write(message)?;
+    }
+    export.finish()
+}
+
+pub struct MessageExport<'a> {
+    root: &'a Path,
+    expected: BTreeSet<PathBuf>,
+}
+
+impl<'a> MessageExport<'a> {
+    pub fn new(root: &'a Path) -> Result<Self> {
+        fs::create_dir_all(root)
+            .with_context(|| format!("create message projection {}", root.display()))?;
+        Ok(Self {
+            root,
+            expected: BTreeSet::new(),
+        })
+    }
+
+    pub fn write(&mut self, message: &MessageView) -> Result<()> {
         let recipient = message.to.strip_prefix("agent/").unwrap_or(&message.to);
         let folder = if message.status == "closed" {
             "archive"
@@ -29,18 +48,22 @@ pub fn export_messages(root: &Path, messages: &[MessageView]) -> Result<()> {
             message.created_index,
             urlencoding::encode(id)
         );
-        let path = root.join(recipient).join(folder).join(filename);
-        expected.insert(path.clone());
+        let path = self.root.join(recipient).join(folder).join(filename);
+        self.expected.insert(path.clone());
         write_message(&path, message)?;
+        Ok(())
     }
 
-    for path in projected_files(root)? {
-        if !expected.contains(&path) {
-            fs::remove_file(&path)
-                .with_context(|| format!("remove stale message projection {}", path.display()))?;
+    pub fn finish(self) -> Result<()> {
+        for path in projected_files(self.root)? {
+            if !self.expected.contains(&path) {
+                fs::remove_file(&path).with_context(|| {
+                    format!("remove stale message projection {}", path.display())
+                })?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn write_message(path: &Path, message: &MessageView) -> Result<()> {
