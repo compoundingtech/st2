@@ -318,7 +318,13 @@ pub fn apply_all(
             anyhow::bail!("workspace {} does not exist", workspace.display());
         }
         let (mut writes, warnings) = match render {
-            Some(render) => prepare_render(store, render, workspace)?,
+            Some(render) => prepare_render(store, render, workspace).with_context(|| {
+                format!(
+                    "prepare render for {} in {}",
+                    subject.subject,
+                    workspace.display()
+                )
+            })?,
             None => (Vec::new(), Vec::new()),
         };
         if native_harness {
@@ -495,7 +501,9 @@ fn commit_transaction(writes: &[PlannedWrite]) -> Result<()> {
         originals.push((write.destination.clone(), bytes, mode));
     }
     for (committed, write) in changes.into_iter().enumerate() {
-        if let Err(error) = atomic_write_mode(&write.destination, &write.bytes, write.mode) {
+        if let Err(error) = atomic_write_mode(&write.destination, &write.bytes, write.mode)
+            .with_context(|| format!("write rendered destination {}", write.destination.display()))
+        {
             let mut rollback_errors = Vec::new();
             for (path, bytes, mode) in originals[..committed].iter().rev() {
                 let rollback = if let Some(bytes) = bytes {
