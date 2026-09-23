@@ -192,28 +192,38 @@ pub fn status() -> Result<ServiceStatusReport> {
 }
 
 pub fn permissions(open: bool) -> Result<()> {
+    print!("{}", permissions_guidance()?);
+    if open {
+        open_permissions_settings()?;
+    }
+    Ok(())
+}
+
+pub fn permissions_guidance() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         let executable = env::current_exe().context("resolve the current st3 executable")?;
-        print!("{}", macos_permission_guidance(&executable));
-        if open {
-            run_command(
-                "open",
-                &["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
-            )?;
-            run_command(
-                "open",
-                &["x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTools"],
-            )?;
-        }
-        return Ok(());
+        Ok(macos_permission_guidance(&executable))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = open;
-        println!("st3 does not need a macOS privacy approval on this host.");
-        Ok(())
+        Ok("st3 does not need a macOS privacy approval on this host.\n".into())
     }
+}
+
+pub fn open_permissions_settings() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        run_command(
+            "open",
+            &["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+        )?;
+        run_command(
+            "open",
+            &["x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTools"],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]

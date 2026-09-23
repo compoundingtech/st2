@@ -758,6 +758,9 @@ enum DocCommand {
         all: bool,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Continue from a previous page's next_cursor.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 
@@ -2848,6 +2851,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 );
                 let _ = writeln!(output, "  runtime: {}", item.runtime_id);
                 if item.terminal_id.is_some() && item.state == "running" {
+                    let _ = writeln!(output, "  peek: st3 terminals peek {}", item.owner_id);
                     let _ = writeln!(output, "  attach: st3 terminals attach {}", item.owner_id);
                 }
                 if let Some(owner) = &item.owner_run_id {
@@ -3578,7 +3582,24 @@ fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
                 Ok(())
             }
         }
-        ServiceCommand::Permissions { open } => st3::service::permissions(open),
+        ServiceCommand::Permissions { open } => {
+            if json_output {
+                let guidance = st3::service::permissions_guidance()?;
+                if open {
+                    st3::service::open_permissions_settings()?;
+                }
+                print_value(
+                    &serde_json::json!({
+                        "platform": std::env::consts::OS,
+                        "guidance": guidance,
+                        "settings_opened": open && cfg!(target_os = "macos"),
+                    }),
+                    true,
+                )
+            } else {
+                st3::service::permissions(open)
+            }
+        }
         ServiceCommand::Restart { config } => {
             st3::service::restart(Config::load(config.as_deref())?)
         }
@@ -3728,16 +3749,24 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             }
             Ok(())
         }
-        DocCommand::Ls { name, all, limit } => {
+        DocCommand::Ls {
+            name,
+            all,
+            limit,
+            cursor,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the document limit must be 1 through 200"
             );
-            let mut path = name.map_or_else(
+            let mut path = name.as_deref().map_or_else(
                 || "/v1/documents?".to_owned(),
-                |name| format!("/v1/documents?prefix={}&", urlencoding::encode(&name)),
+                |name| format!("/v1/documents?prefix={}&", urlencoding::encode(name)),
             );
             path.push_str(&format!("history={all}&limit={limit}"));
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+            }
             let response: DocumentListResponse = client.get(&path).await?;
             if json_output {
                 print_value(&response, true)
@@ -3766,15 +3795,34 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                         version.owner.as_deref().unwrap_or("unknown-owner")
                     );
                 }
-                if response.has_more {
+                if response.has_more
+                    && let Some(cursor) = response.next_cursor
+                {
                     println!(
-                        "More document versions are available; narrow the name or raise --limit."
+                        "More document versions are available. Continue with: {}",
+                        document_continuation_command(name.as_deref(), all, limit, &cursor)
                     );
                 }
                 Ok(())
             }
         }
     }
+}
+
+fn document_continuation_command(
+    name: Option<&str>,
+    all: bool,
+    limit: usize,
+    cursor: &str,
+) -> String {
+    let name = name
+        .map(|name| format!(" {}", shell_argument(name)))
+        .unwrap_or_default();
+    format!(
+        "st3 documents ls{name} --limit {limit}{} --cursor {}",
+        if all { " --all" } else { "" },
+        shell_argument(cursor)
+    )
 }
 
 async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bool) -> Result<()> {
@@ -3785,12 +3833,9 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
                 "the import limit must be 1 through 200"
             );
             let client = generated_client(endpoint, None)?;
-            let mut response = client
-                .sessions_list(cursor.as_deref(), Some(limit), all)
+            let response = client
+                .sessions_list_native(cursor.as_deref(), Some(limit), all)
                 .await?;
-            response.value.items.retain(|item| {
-                matches!(item, ClientResource::Session(session) if session.extra.get("managed") == Some(&Value::Bool(false)))
-            });
             if json_output {
                 return print_value(&response, true);
             }
@@ -7442,6 +7487,29 @@ mod tests {
                 cursor_expires_at: None,
             },
         }
+    }
+
+    #[test]
+    fn terminal_list_shows_a_working_peek_target() {
+        let mut page = fixture_product_page(&["runtime"], false);
+        if let ClientResource::Runtime(runtime) = &mut page.items[0] {
+            runtime.terminal_id = Some("terminal/agent/release".into());
+        } else {
+            panic!("expected runtime fixture");
+        }
+        let rendered = render_product_page("TERMINALS", &page, "st3 terminals");
+        assert!(
+            rendered.contains("peek: st3 terminals peek agent/release"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn document_continuation_preserves_prefix_and_history() {
+        assert_eq!(
+            document_continuation_command(Some("doc/type case"), true, 1, "document/abc"),
+            "st3 documents ls 'doc/type case' --limit 1 --all --cursor document/abc"
+        );
     }
 
     #[test]

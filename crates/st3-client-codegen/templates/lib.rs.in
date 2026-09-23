@@ -284,6 +284,22 @@ impl Client {
         )
         .await
     }
+    /// List only native sessions that are not already managed by st3.
+    pub async fn sessions_list_native(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(
+            "sessions",
+            cursor,
+            limit,
+            history,
+            &[("native_only", "true")],
+        )
+        .await
+    }
     async fn resource_internal(
         &self,
         collection: &str,

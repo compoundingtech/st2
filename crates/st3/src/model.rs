@@ -1106,6 +1106,8 @@ pub struct DocumentListResponse {
     pub has_more: bool,
     pub limit: usize,
     pub history: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

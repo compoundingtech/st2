@@ -84,6 +84,64 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[test]
+fn service_permissions_honors_global_json_flag() {
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        .args(["--json", "service", "permissions"])
+        .output()
+        .unwrap();
+    let response = value(&output);
+    assert!(response["platform"].is_string(), "{response}");
+    assert!(response["guidance"].is_string(), "{response}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_list_does_not_return_an_empty_page_with_more_managed_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    for name in ["first", "second"] {
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("agent/import-{name}"),
+                kind: "runtime.observed".into(),
+                actor: Some(format!("agent/import-{name}")),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String(format!("import-{name}"))),
+                    (
+                        "incarnation_id".into(),
+                        Value::String(format!("import-{name}:i1")),
+                    ),
+                    ("status".into(), Value::String("running".into())),
+                    ("reachability".into(), Value::String("local".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+
+    let page = value(&run_cli(&socket, &["import", "ls", "--limit", "1"]).await);
+    assert!(page["value"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(page["value"]["page"]["has_more"], false);
+    assert!(page["value"]["page"]["next_cursor"].is_null());
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();

@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
@@ -72,10 +72,24 @@ const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
 const CLIENT_MAX_PAGE_ITEMS: usize = 200;
 const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
-// Page cursors are invalidated by a changed store index. A fixed far-future descriptor keeps the
-// same `(node, index, projection)` byte-identical instead of smuggling request wall-clock time into
-// an otherwise stable snapshot payload.
-const CLIENT_PAGE_EXPIRES_UNIX_MS: u128 = 253_402_300_799_000;
+// Keep complete result sets briefly so fleet writes cannot reorder or invalidate a traversal.
+// Cursors expire after this bounded window or if the daemon restarts/evicts their snapshot.
+const CLIENT_PAGE_TTL_MS: u128 = 300_000;
+const CLIENT_PAGE_CACHE_CAPACITY: usize = 32;
+
+struct CachedClientPage {
+    snapshot_id: String,
+    collection: String,
+    items_digest: String,
+    items: Arc<Vec<Value>>,
+    expires_at_unix_ms: u128,
+}
+
+static CLIENT_PAGE_CACHE: OnceLock<Mutex<VecDeque<CachedClientPage>>> = OnceLock::new();
+
+fn client_page_cache() -> &'static Mutex<VecDeque<CachedClientPage>> {
+    CLIENT_PAGE_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
 
 #[derive(Clone, Copy)]
 enum ClientTransportBoundary {
@@ -111,6 +125,8 @@ struct ClientListQuery {
     actor: Option<String>,
     owner_run: Option<String>,
     status: Option<String>,
+    #[serde(default)]
+    native_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -124,6 +140,8 @@ struct ClientPageCursor {
     actor: Option<String>,
     owner_run: Option<String>,
     status: Option<String>,
+    #[serde(default)]
+    native_only: bool,
     items_digest: String,
     expires_at_unix_ms: u128,
 }
@@ -669,14 +687,13 @@ fn client_page(
     items: Vec<Value>,
     query: &ClientListQuery,
 ) -> Result<ClientResourcePage, ApiError> {
-    let items_digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&items).map_err(ApiError::internal)?,
-    ));
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
         .clamp(1, CLIENT_MAX_PAGE_ITEMS);
-    let (offset, limit, expires_at_unix_ms) = if let Some(cursor) = &query.cursor {
+    let (items, items_digest, offset, limit, expires_at_unix_ms) = if let Some(cursor) =
+        &query.cursor
+    {
         let cursor = decode_client_cursor(cursor)?;
         if cursor.collection != collection
             || cursor.history != query.history
@@ -684,7 +701,7 @@ fn client_page(
             || cursor.actor != query.actor
             || cursor.owner_run != query.owner_run
             || cursor.status != query.status
-            || cursor.items_digest != items_digest
+            || cursor.native_only != query.native_only
             || query
                 .limit
                 .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
@@ -698,18 +715,81 @@ fn client_page(
         if client_now_ms() > cursor.expires_at_unix_ms {
             return Err(client_page_expired("the page cursor expired"));
         }
-        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+        let cache = client_page_cache()
+            .lock()
+            .expect("client page cache poisoned");
+        let cached = cache
+            .iter()
+            .find(|entry| {
+                entry.snapshot_id == cursor.snapshot.id
+                    && entry.collection == collection
+                    && entry.items_digest == cursor.items_digest
+                    && entry.expires_at_unix_ms == cursor.expires_at_unix_ms
+            })
+            .ok_or_else(|| {
+                client_page_expired("the page snapshot is no longer available; restart pagination")
+            })?;
+        (
+            cached.items.clone(),
+            cursor.items_digest,
+            cursor.offset,
+            cursor.limit,
+            cursor.expires_at_unix_ms,
+        )
     } else {
-        (0, requested_limit, CLIENT_PAGE_EXPIRES_UNIX_MS)
-    };
-    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-        return Err(client_page_expired(
-            "the snapshot changed; restart pagination from the first page",
+        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+            return Err(client_page_expired(
+                "the snapshot changed; restart pagination from the first page",
+            ));
+        }
+        let items_digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(&items).map_err(ApiError::internal)?,
         ));
-    }
+        let cached = client_page_cache()
+            .lock()
+            .expect("client page cache poisoned")
+            .iter()
+            .find(|entry| {
+                entry.snapshot_id == snapshot.id
+                    && entry.collection == collection
+                    && entry.items_digest == items_digest
+                    && entry.expires_at_unix_ms > client_now_ms()
+            })
+            .map(|entry| (entry.items.clone(), entry.expires_at_unix_ms));
+        let (items, expires_at_unix_ms) = cached.unwrap_or_else(|| {
+            (
+                Arc::new(items),
+                client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+            )
+        });
+        (items, items_digest, 0, requested_limit, expires_at_unix_ms)
+    };
     let end = offset.saturating_add(limit).min(items.len());
     let page_items = items.get(offset..end).unwrap_or_default().to_vec();
     let has_more = end < items.len();
+    if query.cursor.is_none() && has_more {
+        let mut cache = client_page_cache()
+            .lock()
+            .expect("client page cache poisoned");
+        cache.retain(|entry| entry.expires_at_unix_ms > client_now_ms());
+        if !cache.iter().any(|entry| {
+            entry.snapshot_id == snapshot.id
+                && entry.collection == collection
+                && entry.items_digest == items_digest
+                && entry.expires_at_unix_ms == expires_at_unix_ms
+        }) {
+            while cache.len() >= CLIENT_PAGE_CACHE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back(CachedClientPage {
+                snapshot_id: snapshot.id.clone(),
+                collection: collection.into(),
+                items_digest: items_digest.clone(),
+                items: items.clone(),
+                expires_at_unix_ms,
+            });
+        }
+    }
     let next_cursor = if has_more {
         Some(encode_client_cursor(&ClientPageCursor {
             snapshot: snapshot.clone(),
@@ -721,6 +801,7 @@ fn client_page(
             actor: query.actor.clone(),
             owner_run: query.owner_run.clone(),
             status: query.status.clone(),
+            native_only: query.native_only,
             items_digest,
             expires_at_unix_ms,
         })?)
@@ -741,6 +822,9 @@ fn client_page(
             filters.insert(name.into(), value.clone());
         }
     }
+    if query.native_only {
+        filters.insert("native_only".into(), "true".into());
+    }
     Ok(ClientResourcePage {
         kind: "page".into(),
         collection: collection.into(),
@@ -750,7 +834,7 @@ fn client_page(
             limit,
             has_more,
             next_cursor,
-            cursor_expires_at: Some(client_timestamp(expires_at_unix_ms)),
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
     })
 }
@@ -2031,7 +2115,10 @@ async fn client_sessions(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_session_resources(
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "sessions", Vec::new(), &query).map(Json);
+    }
+    let mut items = client_session_resources(
         &state.store,
         query.history,
         &snapshot.created_at,
@@ -2039,6 +2126,9 @@ async fn client_sessions(
         state.native_session_home.as_deref(),
     )
     .map_err(ApiError::internal)?;
+    if query.native_only {
+        items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
+    }
     client_page(&state, &snapshot, "sessions", items, &query).map(Json)
 }
 
@@ -4415,9 +4505,19 @@ async fn put_document(
 struct DocumentQuery {
     name: Option<String>,
     prefix: Option<String>,
+    cursor: Option<String>,
     #[serde(default)]
     history: bool,
     limit: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DocumentCursor {
+    name: String,
+    created_index: u64,
+    exact_name: Option<String>,
+    prefix: Option<String>,
+    history: bool,
 }
 
 async fn list_documents(
@@ -4426,30 +4526,76 @@ async fn list_documents(
 ) -> Result<Json<DocumentListResponse>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let history = query.history;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|encoded| {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded.strip_prefix("document/").unwrap_or(""))
+                .map_err(|_| {
+                    ApiError::bad(St3Error::new(
+                        "validation-failed",
+                        "invalid document cursor",
+                    ))
+                })?;
+            let cursor: DocumentCursor = serde_json::from_slice(&bytes).map_err(|_| {
+                ApiError::bad(St3Error::new(
+                    "validation-failed",
+                    "invalid document cursor",
+                ))
+            })?;
+            if cursor.exact_name != query.name
+                || cursor.prefix != query.prefix
+                || cursor.history != history
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "validation-failed",
+                    "document cursor filters changed",
+                )));
+            }
+            Ok(cursor)
+        })
+        .transpose()?;
     let store = state.store.clone();
+    let name = query.name.clone();
+    let prefix = query.prefix.clone();
     let mut items = blocking_store(move || {
-        let mut items = store.list_documents(
-            query.name.as_deref(),
+        store.list_documents_page(
+            name.as_deref(),
+            prefix.as_deref(),
             history,
-            if query.prefix.is_some() {
-                201
-            } else {
-                limit.saturating_add(1)
-            },
-        )?;
-        if let Some(prefix) = query.prefix {
-            items.retain(|item| item.name.starts_with(&prefix));
-        }
-        Ok(items)
+            cursor
+                .as_ref()
+                .map(|cursor| (cursor.name.as_str(), cursor.created_index)),
+            limit.saturating_add(1),
+        )
     })
     .await?;
     let has_more = items.len() > limit;
     items.truncate(limit);
+    let next_cursor = if has_more {
+        let last = items.last().expect("nonempty page with more items");
+        let cursor = DocumentCursor {
+            name: last.name.clone(),
+            created_index: last.created_index,
+            exact_name: query.name,
+            prefix: query.prefix,
+            history,
+        };
+        Some(format!(
+            "document/{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&cursor).map_err(ApiError::internal)?)
+        ))
+    } else {
+        None
+    };
     Ok(Json(DocumentListResponse {
         items,
         has_more,
         limit,
         history,
+        next_cursor,
     }))
 }
 
@@ -7068,6 +7214,55 @@ mod tests {
             configured_peers: Vec::new(),
             native_session_home: None,
         }
+    }
+
+    #[tokio::test]
+    async fn document_history_prefix_filters_before_limit_and_has_a_next_page() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for index in 0..202 {
+            let name = format!("doc/early/{index:03}");
+            state
+                .store
+                .put_document(&name, b"early", &None, &format!("early-{index}"))
+                .unwrap();
+        }
+        let mut head = None;
+        for index in 0..2 {
+            let version = state
+                .store
+                .put_document(
+                    "doc/late/target",
+                    format!("version-{index}").as_bytes(),
+                    &head,
+                    &format!("late-{index}"),
+                )
+                .unwrap();
+            head = Some(version.binding_claim_id);
+        }
+        let app = router(state);
+        let (status, first) = get_request(
+            app.clone(),
+            "/v1/documents?prefix=doc%2Flate&history=true&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["items"][0]["name"], "doc/late/target");
+        assert_eq!(first["has_more"], true);
+        assert!(first["next_cursor"].is_string(), "{first}");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let (status, second) = get_request(
+            app,
+            &format!(
+                "/v1/documents?prefix=doc%2Flate&history=true&limit=1&cursor={}",
+                urlencoding::encode(cursor)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["items"][0]["name"], "doc/late/target");
+        assert_ne!(first["items"][0]["hash"], second["items"][0]["hash"]);
+        assert_eq!(second["has_more"], false);
     }
 
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {

@@ -1209,6 +1209,22 @@ pub(super) fn timeline_value(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
+    if query.cursor.is_some() {
+        let mut page = client_page(
+            state,
+            snapshot,
+            &format!("timeline/{session_id}"),
+            Vec::new(),
+            query,
+        )?;
+        page.items.reverse();
+        return Ok(Json(json!({
+            "kind": "timeline-page",
+            "session_id": session_id,
+            "items": page.items,
+            "page": page.page
+        })));
+    }
     if let Some(external) =
         crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
             .map_err(ApiError::internal)?
@@ -1219,7 +1235,7 @@ pub(super) fn timeline_value(
         let mut page = client_page(
             state,
             snapshot,
-            &format!("timeline/{session_id}/{}", external.revision),
+            &format!("timeline/{session_id}"),
             items,
             query,
         )?;
@@ -4288,6 +4304,7 @@ mission "example/zero-run" state="ready" {
         let client_session = ClientSession::local(None).unwrap();
         let mut cursor = None;
         let mut entries = Vec::new();
+        let mut wrote_during_pagination = false;
         loop {
             let query = ClientListQuery {
                 limit: Some(3),
@@ -4306,6 +4323,31 @@ mission "example/zero-run" state="ready" {
             let page_items = page["items"].as_array().unwrap().iter().cloned();
             entries.splice(0..0, page_items);
             cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_some() && !wrote_during_pagination {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: "agent/unrelated-timeline-writer".into(),
+                        kind: "runtime.observed".into(),
+                        actor: Some("agent/unrelated-timeline-writer".into()),
+                        fields: BTreeMap::from([
+                            (
+                                "runtime_id".into(),
+                                Value::String("unrelated-runtime".into()),
+                            ),
+                            (
+                                "incarnation_id".into(),
+                                Value::String("unrelated-runtime:i1".into()),
+                            ),
+                            ("status".into(), Value::String("running".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                wrote_during_pagination = true;
+            }
             if cursor.is_none() {
                 break;
             }

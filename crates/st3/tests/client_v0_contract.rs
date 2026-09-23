@@ -1432,10 +1432,10 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
             idempotency_key: None,
         })
         .unwrap();
-    let (status, expired) = client_json(app, &uri).await;
-    assert_eq!(status, StatusCode::GONE);
-    assert_eq!(expired["code"], "page-cursor-expired");
-    assert_eq!(expired["error_version"], "st3.client.error.v0");
+    let (status, continued) = client_json(app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{continued}");
+    assert_eq!(first["snapshot"]["id"], continued["snapshot"]["id"]);
+    assert_eq!(second["value"]["items"], continued["value"]["items"]);
 }
 
 #[tokio::test]

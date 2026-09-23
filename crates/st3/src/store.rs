@@ -4894,6 +4894,17 @@ impl Store {
         history: bool,
         limit: usize,
     ) -> Result<Vec<DocumentVersion>> {
+        self.list_documents_page(name, None, history, None, limit)
+    }
+
+    pub fn list_documents_page(
+        &self,
+        name: Option<&str>,
+        prefix: Option<&str>,
+        history: bool,
+        after: Option<(&str, u64)>,
+        limit: usize,
+    ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
@@ -4902,26 +4913,38 @@ impl Store {
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
                        AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
-                     ORDER BY d.name, d.created_index DESC LIMIT ?3";
+                       AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
+                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND d.created_index<?5))
+                     ORDER BY d.name, d.created_index DESC LIMIT ?6";
         let mut statement = connection.prepare(query)?;
-        let rows = statement.query_map(params![name, history, limit], |row| {
-            Ok(DocumentVersion {
-                name: row.get(0)?,
-                hash: row.get(1)?,
-                size: row.get(2)?,
-                created_index: row.get(3)?,
-                latest: row.get::<_, i64>(4)? != 0,
-                binding_claim_id: row.get(5)?,
-                created_at_unix_ms: row.get::<_, String>(6)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                owner: row.get::<_, Option<String>>(7)?.or(row.get(8)?),
-            })
-        })?;
+        let rows = statement.query_map(
+            params![
+                name,
+                history,
+                prefix,
+                after.map(|v| v.0),
+                after.map(|v| v.1),
+                limit
+            ],
+            |row| {
+                Ok(DocumentVersion {
+                    name: row.get(0)?,
+                    hash: row.get(1)?,
+                    size: row.get(2)?,
+                    created_index: row.get(3)?,
+                    latest: row.get::<_, i64>(4)? != 0,
+                    binding_claim_id: row.get(5)?,
+                    created_at_unix_ms: row.get::<_, String>(6)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    owner: row.get::<_, Option<String>>(7)?.or(row.get(8)?),
+                })
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
