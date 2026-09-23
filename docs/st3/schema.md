@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `06e51dc8fdbda3f550cde97fcc4a85815b17f85ae256dc02236a2c62ed340e5f`
+Digest: `d49966b40954fabd7d348e51e8ba50c93242743f7ce40e683abca7e84dc07def`
 
 ## Subject families
 
@@ -81,7 +81,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `message.closed` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `message.read` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
-| `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
+| `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `session_id:string`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
 | `message.staged` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `mission-run.created` | `mission-run` | `system-only` | `once` | `current_generation:subject-reference`, `deadline_at_unix_ms:integer`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `timeout_ms:integer`, `workspace:string` | `mission-run` |
 | `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
@@ -97,7 +97,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `planning-session.question-answered` | `planning-session` | `authorized-requester` | `append` | `decision_id:string`, `expected_revision:integer`, `explanation:string`, `requester:subject-reference`, `response:object` |  |
 | `planning-session.question-requested` | `planning-session` | `authorized-participant` | `append` | `decision_id:string`, `decision_type!:string`, `options:array`, `planner:subject-reference`, `question:string`, `requester:subject-reference`, `revision:integer` |  |
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
-| `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
+| `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `planner_config:object`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |

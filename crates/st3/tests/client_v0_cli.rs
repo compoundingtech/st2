@@ -24,6 +24,7 @@ fn test_state(root: &Path) -> AppState {
         fleet_id: None,
         configured_peers: vec!["offline-peer".into()],
         native_session_home: None,
+        planner_default: st3::model::PlannerSpec::default(),
     }
 }
 

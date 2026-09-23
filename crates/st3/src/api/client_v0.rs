@@ -1543,6 +1543,9 @@ pub(super) fn timeline_value(
             continue;
         }
         if claim.kind == "message.sent" {
+            if fields.get("session_id").and_then(Value::as_str) != Some(session_id.as_str()) {
+                continue;
+            }
             let from = fields.get("from").and_then(Value::as_str);
             let to = fields.get("to").and_then(Value::as_str);
             if from != Some(owner) && to != Some(owner) {
@@ -1719,6 +1722,11 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
             "launch/{}",
             record.subject.trim_start_matches("planning-session/")
         ));
+    }
+    if record.kind == "message.sent"
+        && let Some(session_id) = fields.get("session_id").and_then(Value::as_str)
+    {
+        resource_ids.push(session_id.to_owned());
     }
     let event_type = if record.kind == "runtime.observed"
         && fields.get("status").and_then(Value::as_str) == Some("running")
@@ -2751,6 +2759,36 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
 }
 
+fn validate_message_session(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    recipient: &str,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let recipient = normalize_message_party(recipient);
+    let current_session = client_agent_resources(
+        &state.store,
+        false,
+        &snapshot.created_at,
+        snapshot.store_index,
+    )
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .find(|agent| agent["id"] == recipient)
+    .and_then(|agent| agent["current_session_id"].as_str().map(str::to_owned))
+    .ok_or_else(|| {
+        validation(format!(
+            "message recipient `{recipient}` has no current normalized session"
+        ))
+    })?;
+    if current_session != session_id {
+        return Err(stale(format!(
+            "session `{session_id}` is not the current session for `{recipient}`"
+        )));
+    }
+    Ok(())
+}
+
 async fn import_external_session_action(
     state: &AppState,
     session: &ClientSession,
@@ -2970,6 +3008,7 @@ fn validate_fence(
 
 async fn dispatch_action(
     state: &AppState,
+    snapshot: &ClientSnapshot,
     session: &ClientSession,
     request: &ActionRequest,
 ) -> Result<Vec<String>, ApiError> {
@@ -3025,12 +3064,20 @@ async fn dispatch_action(
             Ok(vec![result.subject])
         }
         "message.send" => {
-            let result = send_message(
-                State(state.clone()),
-                Json(MessageSendRequest {
+            let to = parameter_string(p, "to")?;
+            let session_id = p
+                .get("session_id")
+                .map(|_| parameter_string(p, "session_id"))
+                .transpose()?;
+            if let Some(session_id) = session_id.as_deref() {
+                validate_message_session(state, snapshot, &to, session_id)?;
+            }
+            let result = accept_message(
+                state,
+                MessageSendRequest {
                     idempotency_key: request.idempotency_key.clone(),
                     from: authority_actor.clone(),
-                    to: parameter_string(p, "to")?,
+                    to,
                     content: parameter_string(p, "content")?,
                     title: p.get("title").and_then(Value::as_str).map(str::to_owned),
                     in_reply_to: p
@@ -3045,9 +3092,9 @@ async fn dispatch_action(
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
                         .collect(),
-                }),
-            )
-            .await?
+                },
+                session_id,
+            )?
             .0;
             Ok(vec![result.subject])
         }
@@ -3145,8 +3192,9 @@ async fn dispatch_action(
                     request: parameter_string(p, "request")?.into_bytes(),
                     workspace,
                     requester: Some(authority_actor.clone()),
-                    model: None,
-                    effort: None,
+                    provider: p.get("provider").and_then(Value::as_str).map(str::to_owned),
+                    model: p.get("model").and_then(Value::as_str).map(str::to_owned),
+                    effort: p.get("effort").and_then(Value::as_str).map(str::to_owned),
                     idempotency_key: request.idempotency_key.clone(),
                 }),
             )
@@ -3622,7 +3670,7 @@ pub(super) async fn action(
                 .to_owned(),
         ]
     } else {
-        dispatch_action(&state, &session, &request).await?
+        dispatch_action(&state, &snapshot, &session, &request).await?
     };
     let operation_id = format!("operation/client-{}", &request_digest[..24]);
     let mut result = json!({ "kind": "action-result", "action_id": request.id, "operation_id": operation_id, "status": "completed", "affected_ids": affected });
@@ -3721,6 +3769,7 @@ mod tests {
             fleet_id: None,
             configured_peers: Vec::new(),
             native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
         }
     }
 
@@ -3880,7 +3929,7 @@ mission "example/zero-run" state="ready" {
                 store_index: 9,
                 kind: "message.sent".into(),
                 subject: "message/safe-id".into(),
-                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/nathan", "to": "agent/worker"}}),
+                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/nathan", "to": "agent/worker", "session_id": "session/current"}}),
             },
         ] {
             let projected = safe_event_projection(&state, &record);
@@ -3890,6 +3939,16 @@ mission "example/zero-run" state="ready" {
             assert!(!encoded.contains("stream_url"));
             assert!(!encoded.contains("credential"));
         }
+        let message = safe_event_projection(
+            &state,
+            &EventRecord {
+                store_index: 9,
+                kind: "message.sent".into(),
+                subject: "message/safe-id".into(),
+                body: json!({"fields": {"session_id": "session/current"}}),
+            },
+        );
+        assert_eq!(message.1, ["message/safe-id", "session/current"]);
         let pairing = safe_event_projection(
             &state,
             &EventRecord {
@@ -4077,6 +4136,167 @@ mission "example/zero-run" state="ready" {
         assert_eq!(page["has_more"], false);
     }
 
+    #[tokio::test]
+    async fn current_agent_session_fences_composer_messages_and_timeline_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "session-message-node");
+        let subject = "agent/session-message-owner";
+        let incarnation = "session-message-runtime:i2";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("session-message-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("session-message-runtime".into()),
+            })
+            .unwrap();
+
+        let snapshot = new_client_snapshot(&state);
+        let agents = client_agent_resources(
+            &state.store,
+            false,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .unwrap();
+        let sessions = client_session_resources(
+            &state.store,
+            false,
+            &snapshot.created_at,
+            snapshot.store_index,
+            state.native_session_home.as_deref(),
+        )
+        .unwrap();
+        let agent = agents.iter().find(|agent| agent["id"] == subject).unwrap();
+        let owned_sessions = sessions
+            .iter()
+            .filter(|session| session["owner_id"] == subject)
+            .collect::<Vec<_>>();
+        assert_eq!(owned_sessions.len(), 1);
+        let session_id = owned_sessions[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(agent["current_session_id"], session_id);
+
+        let client_session = ClientSession::local(Some("person/nathan")).unwrap();
+        let action = |key: &str, parameters: Value| ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: format!("action/{key}"),
+            action_type: "message.send".into(),
+            idempotency_key: format!("session-message-{key}"),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                subject_revisions: BTreeMap::new(),
+                mission_generation: None,
+                step_definition: None,
+                attempt: None,
+                readiness_epoch: None,
+                runtime_incarnation: None,
+                terminal_sequence: None,
+                preview_token: None,
+            },
+            parameters,
+        };
+
+        let generic = action(
+            "generic",
+            json!({"to": subject, "content": "generic legacy message"}),
+        );
+        dispatch_action(&state, &snapshot, &client_session, &generic)
+            .await
+            .expect("generic messaging remains backward compatible");
+
+        let current_snapshot = new_client_snapshot(&state);
+        let composer = action(
+            "composer",
+            json!({
+                "to": subject,
+                "session_id": session_id,
+                "content": "current composer message"
+            }),
+        );
+        let affected = dispatch_action(&state, &current_snapshot, &client_session, &composer)
+            .await
+            .unwrap();
+        let composer_claim = state
+            .store
+            .claims_for(&affected[0], Some("message.sent"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            composer_claim.body["fields"]["session_id"],
+            Value::String(session_id.clone())
+        );
+        let composer_resource = client_message_resources(&state.store, None, true)
+            .unwrap()
+            .into_iter()
+            .find(|message| message["id"] == affected[0])
+            .unwrap();
+        assert_eq!(composer_resource["session_id"], session_id);
+
+        let _ = accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "session-message-older".into(),
+                from: client_session.authority_actor.clone(),
+                to: subject.into(),
+                content: "older session message".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+            },
+            Some("session/older-incarnation".into()),
+        )
+        .unwrap();
+
+        let rejected = action(
+            "stale",
+            json!({
+                "to": subject,
+                "session_id": "session/older-incarnation",
+                "content": "must not be accepted"
+            }),
+        );
+        let error = dispatch_action(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            &rejected,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "stale-fence");
+
+        let timeline = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            session_id.trim_start_matches("session/"),
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        let text = timeline["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["body"]["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["current composer message"]);
+    }
+
     #[test]
     fn durable_timeline_is_cursor_paged_and_enforces_replace_finalize_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -4121,6 +4341,10 @@ mission "example/zero-run" state="ready" {
                     ("to".into(), Value::String(subject.into())),
                     ("content".into(), Value::String("do the work".into())),
                     ("status".into(), Value::String("sent".into())),
+                    (
+                        "session_id".into(),
+                        Value::String(managed_session_id(subject, incarnation)),
+                    ),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,

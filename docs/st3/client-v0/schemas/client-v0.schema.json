@@ -145,6 +145,7 @@
             "content": { "type": "string" },
             "state": { "enum": ["sent", "delivered", "read", "closed"] },
             "sent_at": { "$ref": "#/$defs/Timestamp" },
+            "session_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "in_reply_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
           }
@@ -156,12 +157,14 @@
         { "$ref": "#/$defs/ResourceHeader" },
         {
           "type": "object",
-          "required": ["kind", "title", "phase", "request", "target", "variants", "decisions", "approvals"],
+          "required": ["kind", "title", "phase", "request", "target", "variants", "decisions", "approvals", "planner", "planner_config"],
           "properties": {
             "kind": { "const": "launch" },
             "title": { "type": "string" },
             "phase": { "enum": ["authoring", "review", "approved", "cancelled", "failed"] },
             "request": { "type": "string" },
+            "planner": { "$ref": "#/$defs/Id" },
+            "planner_config": { "$ref": "#/$defs/PlannerConfig" },
             "target": {
               "type": "object",
               "required": ["type"],
@@ -181,6 +184,14 @@
           }
         }
       ]
+    },
+    "PlannerConfig": {
+      "type": "object", "additionalProperties": false, "required": ["provider"],
+      "properties": {
+        "provider": { "enum": ["codex", "claude", "pi", "omp", "opencode"] },
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "type": "string", "minLength": 1 }
+      }
     },
     "LaunchVariant": {
       "allOf": [
@@ -450,6 +461,7 @@
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
             "incarnation_id": { "type": ["string", "null"] },
+            "current_session_id": { "type": ["string", "null"] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }
@@ -850,7 +862,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }
             }
           }
         },
@@ -863,6 +875,9 @@
               "properties": {
                 "title": { "type": "string" },
                 "request": { "type": "string" },
+                "provider": { "enum": ["codex", "claude", "pi", "omp", "opencode"] },
+                "model": { "type": "string", "minLength": 1 },
+                "effort": { "type": "string", "minLength": 1 },
                 "target": {
                   "oneOf": [
                     {

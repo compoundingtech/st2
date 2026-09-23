@@ -11,7 +11,7 @@
   },
   {
     "id": "launch/release", "kind": "launch", "revision": "l2", "updated_at": "2026-09-20T11:02:00Z",
-    "title": "Release", "phase": "review", "request": "Prepare the release mission.", "target": { "type": "new-mission" },
+    "title": "Release", "phase": "review", "request": "Prepare the release mission.", "planner": "agent/planner", "planner_config": { "provider": "codex", "model": "gpt-6-sol", "effort": "medium" }, "target": { "type": "new-mission" },
     "variants": ["launch-variant/release/default"], "decisions": ["launch-decision/release/region"], "approvals": ["launch-approval/release/alex"],
     "visualization": {
       "version": "st3.visualization.v0", "views": ["graph", "timeline"], "mission": "mission/release",

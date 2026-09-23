@@ -184,6 +184,8 @@ pub struct Message {
     pub sent_at: String,
     pub in_reply_to: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -279,6 +281,25 @@ pub struct Visualization {
     pub live_progress: Option<Value>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PlannerProvider {
+    Codex,
+    Claude,
+    Pi,
+    Omp,
+    Opencode,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PlannerConfig {
+    pub provider: PlannerProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Launch {
     #[serde(flatten)]
     pub header: ResourceHeader,
@@ -287,6 +308,8 @@ pub struct Launch {
     pub title: String,
     pub phase: String,
     pub request: String,
+    pub planner: String,
+    pub planner_config: PlannerConfig,
     pub target: Value,
     #[serde(default)]
     pub variants: Vec<String>,
@@ -459,6 +482,8 @@ pub struct Agent {
     pub harness_state: Option<String>,
     #[serde(default)]
     pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub current_session_id: Option<String>,
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
@@ -1125,6 +1150,8 @@ pub struct MessageSendParameters {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -1147,6 +1174,12 @@ pub struct LaunchCreateParameters {
     pub title: String,
     pub request: String,
     pub target: LaunchTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<PlannerProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

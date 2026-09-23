@@ -726,6 +726,16 @@ pub struct PlannerSpec {
     pub effort: Option<String>,
 }
 
+impl Default for PlannerSpec {
+    fn default() -> Self {
+        Self {
+            provider: "codex".into(),
+            model: Some("gpt-6-sol".into()),
+            effort: Some("medium".into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanningSessionCreation {
     pub mission: String,
@@ -883,6 +893,8 @@ pub struct PlanningSessionStartRequest {
     #[serde(default)]
     pub requester: Option<String>,
     #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
@@ -1022,6 +1034,9 @@ pub struct PlanningSessionView {
     pub workspace: String,
     pub requester: String,
     pub planner: String,
+    /// Immutable harness choice made when this launch was created.
+    #[serde(default)]
+    pub planner_config: PlannerSpec,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_mission_run: Option<String>,

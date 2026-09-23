@@ -23,14 +23,14 @@ use crate::model::{
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunRequest,
     MissionRunView, MissionSpec, MissionState, NormalizedIntent, OperationalAnnotation,
     OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult, PlannedAction,
-    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
-    PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView,
-    ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory, ReplicationPeerStatus,
-    ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
-    SubscriptionConditionSpec, SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector,
-    WorkWakeView,
+    PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
+    PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
+    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
+    ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome,
+    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
+    SubjectStatus, SubscriptionConditionSpec, SubscriptionSpec, UsageSummary, WorkRequest,
+    WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -325,6 +325,7 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     workspace TEXT NOT NULL,
     requester TEXT NOT NULL,
     planner TEXT NOT NULL,
+    planner_spec_json TEXT NOT NULL DEFAULT '{"provider":"codex"}',
     status TEXT NOT NULL,
     target_run_id TEXT,
     source_generation_id TEXT,
@@ -354,7 +355,7 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 12;
+PRAGMA user_version = 13;
 "#;
 
 const READ_CONNECTIONS: usize = 4;
@@ -526,11 +527,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=12),
+        table_count == 0 || matches!(version, 10..=13),
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12),
+        matches!(version, 0 | 10 | 11 | 12 | 13),
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -538,7 +539,21 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 12 {
+    if version == 0 || version == 13 {
+        return Ok(());
+    }
+    if version == 12 {
+        let has_planner_spec: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('planning_sessions') WHERE name='planner_spec_json')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_planner_spec {
+            connection.execute_batch(
+                "ALTER TABLE planning_sessions ADD COLUMN planner_spec_json TEXT NOT NULL DEFAULT '{\"provider\":\"codex\"}';",
+            )?;
+        }
+        connection.execute_batch("PRAGMA user_version = 13;")?;
         return Ok(());
     }
     if version == 10 {
@@ -581,6 +596,21 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         failures == 0,
         "the schema migration broke {failures} foreign keys"
     );
+    let planning_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='planning_sessions')",
+        [],
+        |row| row.get(0),
+    )?;
+    let has_planner_spec: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('planning_sessions') WHERE name='planner_spec_json')",
+        [],
+        |row| row.get(0),
+    )?;
+    if planning_table_exists && !has_planner_spec {
+        connection.execute_batch(
+            "ALTER TABLE planning_sessions ADD COLUMN planner_spec_json TEXT NOT NULL DEFAULT '{\"provider\":\"codex\"}';",
+        )?;
+    }
     Ok(())
 }
 
@@ -866,6 +896,7 @@ impl Store {
         workspace: &str,
         requester: &str,
         planner: &str,
+        planner_config: &PlannerSpec,
         target_run: Option<&str>,
         source_generation: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
@@ -873,9 +904,9 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT OR IGNORE INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
-                params![id, mission, request_ref, workspace, requester, planner, target_run.map(|run| run.strip_prefix("mission-run/").unwrap_or(run)), source_generation.map(generation_id_from_subject), now],
+                "INSERT OR IGNORE INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning', ?8, ?9, ?10, ?10)",
+                params![id, mission, request_ref, workspace, requester, planner, serde_json::to_string(planner_config).map_err(internal)?, target_run.map(|run| run.strip_prefix("mission-run/").unwrap_or(run)), source_generation.map(generation_id_from_subject), now],
             )
             .map_err(internal)?;
         planning_session_view_tx(&connection, id)
@@ -9581,8 +9612,8 @@ fn apply_planning_session_declaration_tx(
         let planner = crate::graph::planning_planner_subject(&declaration.subject);
         transaction
             .execute(
-                "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
+                "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning', ?8, ?9, ?10, ?10)",
                 params![
                     id,
                     creation.mission,
@@ -9590,6 +9621,7 @@ fn apply_planning_session_declaration_tx(
                     creation.workspace,
                     creation.requester,
                     planner,
+                    serde_json::to_string(&creation.planner).map_err(internal)?,
                     creation.target_run.as_deref().map(|value| value.strip_prefix("mission-run/").unwrap_or(value)),
                     creation.target_generation.as_deref().map(|value| value.strip_prefix("run-generation/").unwrap_or(value)),
                     now_ms().to_string(),
@@ -9603,6 +9635,10 @@ fn apply_planning_session_declaration_tx(
             ),
             ("request".into(), Value::String(creation.request.clone())),
             ("planner".into(), Value::String(planner.clone())),
+            (
+                "planner_config".into(),
+                serde_json::to_value(&creation.planner).map_err(internal)?,
+            ),
             (
                 "workspace".into(),
                 Value::String(creation.workspace.clone()),
@@ -10702,8 +10738,8 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                 let target_generation = text("target_generation")
                     .map(|value| value.strip_prefix("run-generation/").unwrap_or(value));
                 transaction.execute(
-                    "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
+                    "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning', ?8, ?9, ?10, ?10)",
                     params![
                         id,
                         mission,
@@ -10711,6 +10747,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                         text("workspace").context("planning-session.started has no workspace")?,
                         text("requester").or(claim.actor.as_deref()).context("planning-session.started has no requester")?,
                         text("planner").context("planning-session.started has no planner")?,
+                        fields.get("planner_config").map(serde_json::to_string).transpose()?.unwrap_or_else(|| "{\"provider\":\"codex\"}".into()),
                         target_run,
                         target_generation,
                         accepted,
@@ -16055,7 +16092,7 @@ fn planning_session_view_tx(
     let row = connection
         .query_row(
             "SELECT mission_id, request_ref, workspace, requester, planner, status, published_revision,
-                    target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms
+                    target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms, planner_spec_json
              FROM planning_sessions WHERE id=?1",
             [id],
             |row| {
@@ -16071,6 +16108,7 @@ fn planning_session_view_tx(
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             },
         )
@@ -16087,6 +16125,7 @@ fn planning_session_view_tx(
         source_generation_id,
         created,
         updated,
+        planner_spec_json,
     )) = row
     else {
         return Ok(None);
@@ -16158,6 +16197,7 @@ fn planning_session_view_tx(
         workspace,
         requester,
         planner,
+        planner_config: serde_json::from_str(&planner_spec_json)?,
         status,
         target_mission_run: target_run_id.map(|id| format!("mission-run/{id}")),
         source_generation: source_generation_id.map(|id| format!("run-generation/{id}")),
@@ -20898,7 +20938,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            12
+            13
         );
         assert_eq!(
             connection
@@ -20972,8 +21012,38 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            12
+            13
         );
+    }
+
+    #[test]
+    fn schema_version_twelve_adds_durable_planner_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        drop(Store::open(&path, "node").unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, "node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let planner_column: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('planning_sessions') WHERE name='planner_spec_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 13);
+        assert_eq!(planner_column, 1);
     }
 
     #[test]

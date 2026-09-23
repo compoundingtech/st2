@@ -38,7 +38,7 @@ use crate::model::{
     LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
-    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
     PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
     PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
     PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
@@ -65,6 +65,7 @@ pub struct AppState {
     pub fleet_id: Option<String>,
     pub configured_peers: Vec<String>,
     pub native_session_home: Option<std::path::PathBuf>,
+    pub planner_default: PlannerSpec,
 }
 
 const CLIENT_API_VERSION: &str = "st3.client.v0";
@@ -1115,15 +1116,20 @@ fn client_agent_resources(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
-            let runtime_ids = fields
+            let runtime_id = fields
                 .and_then(|fields| fields.get("runtime_id"))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
+            let runtime_ids = runtime_id
                 .map(|runtime| vec![format!("runtime/{runtime}")])
                 .unwrap_or_default();
             let incarnation_id = fields
                 .and_then(|fields| fields.get("incarnation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let current_session_id = incarnation_id
+                .as_deref()
+                .or(runtime_id)
+                .map(|identity| managed_session_id(&subject.subject, identity));
             let updated_at = subject
                 .harness
                 .as_ref()
@@ -1168,6 +1174,7 @@ fn client_agent_resources(
                 "driver": driver,
                 "harness_state": harness_state,
                 "incarnation_id": incarnation_id,
+                "current_session_id": current_session_id,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
@@ -1196,6 +1203,11 @@ fn desired_harness_driver(desired: &Value) -> Option<String> {
         .first()?
         .as_str()
         .map(str::to_owned)
+}
+
+fn managed_session_id(owner: &str, identity: &str) -> String {
+    let digest = hex::encode(Sha256::digest(format!("{owner}:{identity}").as_bytes()));
+    format!("session/{}", &digest[..24])
 }
 
 fn client_session_resources(
@@ -1229,9 +1241,11 @@ fn client_session_resources(
         let Some(identity) = incarnation.or(runtime) else {
             continue;
         };
-        let digest = hex::encode(Sha256::digest(
-            format!("{}:{identity}", subject.subject).as_bytes(),
-        ));
+        let session_id = managed_session_id(&subject.subject, identity);
+        let timeline_cursor = format!(
+            "timeline-cursor/{}/0",
+            session_id.trim_start_matches("session/")
+        );
         let observed = fields
             .and_then(|fields| fields.get("status"))
             .and_then(Value::as_str)
@@ -1281,7 +1295,7 @@ fn client_session_resources(
             .unwrap_or_else(|| at.to_owned());
         let usage = store.usage_summary_at(&subject.subject, incarnation, Some(snapshot_index))?;
         sessions.push(json!({
-            "id": format!("session/{}", &digest[..24]),
+            "id": session_id,
             "kind": "session",
             "revision": identity,
             "updated_at": updated.clone(),
@@ -1289,7 +1303,7 @@ fn client_session_resources(
             "state": state,
             "started_at": started,
             "ended_at": if state == "completed" || state == "failed" || state == "cancelled" { Some(updated) } else { None },
-            "timeline_cursor": format!("timeline-cursor/{}/0", &digest[..24]),
+            "timeline_cursor": timeline_cursor,
             "runtime_incarnation": incarnation,
             "usage": usage,
             "operational": subject.projection
@@ -1537,6 +1551,16 @@ fn client_message_resources(
         let updated_at = last
             .map(|claim| claim.accepted_at_unix_ms)
             .unwrap_or(sent_at);
+        let session_id = first
+            .and_then(|claim| {
+                claim
+                    .body
+                    .get("fields")
+                    .unwrap_or(&claim.body)
+                    .get("session_id")
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut reasons = Vec::new();
         if message.status == "closed" {
             reasons.push("closed");
@@ -1555,6 +1579,7 @@ fn client_message_resources(
             "content": message.content,
             "state": message.status,
             "sent_at": client_timestamp(sent_at),
+            "session_id": session_id,
             "in_reply_to": message.in_reply_to,
             "tags": message.tags,
             "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
@@ -1988,6 +2013,8 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
                 "title": session.mission,
                 "phase": phase,
                 "request": session.request,
+                "planner": session.planner,
+                "planner_config": session.planner_config,
                 "target": target,
                 "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
                 "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
@@ -3040,6 +3067,40 @@ async fn start_planning_session(
         .map_err(ApiError::bad)?;
     let requester =
         normalize_planning_reviewer(request.requester.as_deref().unwrap_or("person/requester"));
+    let provider = request
+        .provider
+        .as_deref()
+        .unwrap_or(&state.planner_default.provider)
+        .to_owned();
+    if !matches!(
+        provider.as_str(),
+        "codex" | "claude" | "pi" | "omp" | "opencode"
+    ) {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-planner",
+            "the planner must use an eligible typed harness driver",
+        )));
+    }
+    let inherit_default = provider == state.planner_default.provider;
+    let planner_config = PlannerSpec {
+        provider,
+        model: request.model.clone().or_else(|| {
+            inherit_default
+                .then(|| state.planner_default.model.clone())
+                .flatten()
+        }),
+        effort: request.effort.clone().or_else(|| {
+            inherit_default
+                .then(|| state.planner_default.effort.clone())
+                .flatten()
+        }),
+    };
+    if planner_config.provider == "opencode" && planner_config.effort.is_some() {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-planner-effort",
+            "the OpenCode harness does not accept an effort override",
+        )));
+    }
     let planner_alias = format!("agent/planner.{}", &id[..10]);
     let request_reference = format!("{}@{}", request_document.name, request_document.hash);
     let context_reference = if let Some(run) = &target_run {
@@ -3070,24 +3131,30 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for launch {id}. Use `st3 conversations ls`, read and archive the native Small Talk request, and use `st3 documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
+        "You are the durable {} planner for launch {id}. Use `st3 conversations ls`, read and archive the native Small Talk request, and use `st3 documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
+        planner_config.provider
     );
+    let arguments = match planner_config.provider.as_str() {
+        "codex" => vec![
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--dangerously-bypass-hook-trust".into(),
+        ],
+        "claude" => vec!["--permission-mode".into(), "bypassPermissions".into()],
+        _ => Vec::new(),
+    };
     let planner = quick_agent(
         &state,
         QuickAgentRequest {
             subject: planner_alias,
             worktree: request.workspace.clone(),
-            model: request.model,
-            effort: request.effort,
+            model: planner_config.model.clone(),
+            effort: planner_config.effort.clone(),
             prompt: Some(prompt),
-            arguments: vec![
-                "--dangerously-bypass-approvals-and-sandbox".into(),
-                "--dangerously-bypass-hook-trust".into(),
-            ],
+            arguments,
             expected_subject,
             idempotency_key: format!("{}:planner", request.idempotency_key),
         },
-        "codex",
+        &planner_config.provider,
     )
     .await?;
     let session = state
@@ -3099,6 +3166,7 @@ async fn start_planning_session(
             &request.workspace,
             &requester,
             &planner.subject,
+            &planner_config,
             target_run.as_ref().map(|run| run.subject.as_str()),
             target_run.as_ref().map(|run| run.generation.as_str()),
         )
@@ -3121,6 +3189,10 @@ async fn start_planning_session(
         ),
         ("request".into(), Value::String(request_reference)),
         ("planner".into(), Value::String(session.planner.clone())),
+        (
+            "planner_config".into(),
+            serde_json::to_value(&planner_config).map_err(ApiError::internal)?,
+        ),
         ("workspace".into(), Value::String(session.workspace.clone())),
         ("requester".into(), Value::String(session.requester.clone())),
     ]);
@@ -4967,6 +5039,14 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
+    accept_message(&state, request, None)
+}
+
+fn accept_message(
+    state: &AppState,
+    request: MessageSendRequest,
+    session_id: Option<String>,
+) -> Result<Json<MessageView>, ApiError> {
     if request.content.trim().is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -5008,7 +5088,7 @@ async fn send_message(
     let to = normalize_message_party(&request.to);
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
-    let fields = BTreeMap::from([
+    let mut fields = BTreeMap::from([
         ("from".into(), Value::String(from.clone())),
         ("to".into(), Value::String(to.clone())),
         ("content".into(), Value::String(request.content.clone())),
@@ -5034,6 +5114,9 @@ async fn send_message(
             Value::Array(request.tags.iter().cloned().map(Value::String).collect()),
         ),
     ]);
+    if let Some(session_id) = session_id {
+        fields.insert("session_id".into(), Value::String(session_id));
+    }
     let record = state
         .store
         .append_claim(&ClaimInput {
@@ -5046,7 +5129,7 @@ async fn send_message(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
-    signal_changed(&state);
+    signal_changed(state);
     Ok(Json(MessageView {
         subject,
         from,
@@ -7314,6 +7397,7 @@ mod tests {
             fleet_id: None,
             configured_peers: Vec::new(),
             native_session_home: None,
+            planner_default: PlannerSpec::default(),
         }
     }
 
@@ -7872,6 +7956,86 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
     }
 
     #[tokio::test]
+    async fn planner_choice_is_frozen_per_launch_and_survives_projection_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let database = root.path().join("graph.sqlite3");
+        let mut first = state(root.path());
+        first.store = Arc::new(Store::open(&database, "node").unwrap());
+        let first_app = router(first.clone());
+        let (status, first_launch) = json_request(
+            first_app,
+            "/v1/launches",
+            serde_json::to_value(PlanningSessionStartRequest {
+                mission: "first-planner".into(),
+                run: None,
+                request: b"Plan the first mission.".to_vec(),
+                workspace: workspace.display().to_string(),
+                requester: Some("person/nathan".into()),
+                provider: None,
+                model: None,
+                effort: None,
+                idempotency_key: "first-planner-session".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first_launch}");
+        assert_eq!(first_launch["planner_config"]["provider"], "codex");
+        assert_eq!(first_launch["planner_config"]["model"], "gpt-6-sol");
+        assert_eq!(first_launch["planner_config"]["effort"], "medium");
+
+        let mut second = first.clone();
+        second.planner_default = PlannerSpec {
+            provider: "claude".into(),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+        };
+        let (status, second_launch) = json_request(
+            router(second),
+            "/v1/launches",
+            serde_json::to_value(PlanningSessionStartRequest {
+                mission: "second-planner".into(),
+                run: None,
+                request: b"Plan the second mission.".to_vec(),
+                workspace: workspace.display().to_string(),
+                requester: Some("person/nathan".into()),
+                provider: None,
+                model: None,
+                effort: None,
+                idempotency_key: "second-planner-session".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second_launch}");
+        assert_eq!(second_launch["planner_config"]["provider"], "claude");
+        assert_eq!(second_launch["planner_config"]["model"], "opus");
+        let first_id = first_launch["id"].as_str().unwrap();
+        let second_id = second_launch["id"].as_str().unwrap();
+        drop(first);
+        let rebuilt = Store::open(&database, "node").unwrap();
+        assert_eq!(
+            rebuilt
+                .planning_session(first_id)
+                .unwrap()
+                .unwrap()
+                .planner_config,
+            PlannerSpec::default()
+        );
+        assert_eq!(
+            rebuilt
+                .planning_session(second_id)
+                .unwrap()
+                .unwrap()
+                .planner_config
+                .provider,
+            "claude"
+        );
+    }
+
+    #[tokio::test]
     async fn planning_requires_an_exact_preview_and_publishes_without_a_run() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -7891,6 +8055,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 request: b"Mission a two-step release without changing this workspace.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("nathan".into()),
+                provider: None,
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("medium".into()),
                 idempotency_key: "planning-session-test".into(),
@@ -8553,6 +8718,7 @@ mission "targeted" state="ready" revisions="human-only" {
                 request: b"Add the final verification.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("person/operator".into()),
+                provider: None,
                 model: None,
                 effort: None,
                 idempotency_key: "targeted-session".into(),
@@ -8662,6 +8828,7 @@ version 2
                 request: b"Compare a compact mission with an extended mission.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("person/nathan".into()),
+                provider: None,
                 model: None,
                 effort: None,
                 idempotency_key: "variant-session".into(),

@@ -942,6 +942,7 @@ mod tests {
             fleet_id: Some(fleet.into()),
             configured_peers: vec!["source".into()],
             native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
         });
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {

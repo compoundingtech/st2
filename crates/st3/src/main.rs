@@ -25,7 +25,7 @@ use st3::model::{
     LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
-    OperationalRepairPlan, OperationalRepairResult, PlanningApprovalRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
     ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
@@ -342,6 +342,8 @@ struct PlanningStartArgs {
     workspace: PathBuf,
     #[arg(long = "as", value_parser = parse_person_subject)]
     requester: String,
+    #[arg(long, value_parser = ["codex", "claude", "pi", "omp", "opencode"])]
+    provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
@@ -1320,7 +1322,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
-        Command::Launch { command } => run_launch(&client, &endpoint, command, cli.json).await,
+        Command::Launch { command } => {
+            run_launch(&client, &endpoint, command, &config.planner, cli.json).await
+        }
         Command::Missions { command } => {
             run_mission_view(&client, &endpoint, command, cli.json).await
         }
@@ -1488,6 +1492,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
+        planner_default: config.planner.clone(),
     };
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
@@ -1518,6 +1523,7 @@ async fn run_launch(
     client: &Client,
     endpoint: &Endpoint,
     command: LaunchCommand,
+    default_planner: &PlannerSpec,
     json_output: bool,
 ) -> Result<()> {
     if let LaunchCommand::Ls { all, cursor, limit } = &command {
@@ -1540,6 +1546,25 @@ async fn run_launch(
     let response = match command {
         LaunchCommand::Ls { .. } => unreachable!(),
         LaunchCommand::Start(args) => {
+            let provider = args
+                .provider
+                .as_deref()
+                .unwrap_or(&default_planner.provider)
+                .to_owned();
+            let inherit_default = provider == default_planner.provider;
+            let planner = PlannerSpec {
+                provider,
+                model: args.model.or_else(|| {
+                    inherit_default
+                        .then(|| default_planner.model.clone())
+                        .flatten()
+                }),
+                effort: args.effort.or_else(|| {
+                    inherit_default
+                        .then(|| default_planner.effort.clone())
+                        .flatten()
+                }),
+            };
             let (request, _) = read_intent(args.request.as_deref())?;
             anyhow::ensure!(
                 !request.trim().is_empty(),
@@ -1575,8 +1600,7 @@ async fn run_launch(
                 &request_reference,
                 &workspace,
                 &requester,
-                args.model.as_deref(),
-                args.effort.as_deref(),
+                &planner,
                 target.as_ref(),
             );
             if args.print_kdl {
@@ -5709,8 +5733,7 @@ fn planning_session_intent(
     request: &str,
     workspace: &Path,
     requester: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
+    planner_spec: &PlannerSpec,
     target: Option<&MissionRunView>,
 ) -> String {
     let mut session = KdlNode::new("planning-session");
@@ -5724,12 +5747,14 @@ fn planning_session_intent(
     ));
     body.nodes_mut().push(kdl_node("requester", [requester]));
     let mut planner = KdlNode::new("planner");
-    planner.entries_mut().push(KdlEntry::new("codex"));
+    planner
+        .entries_mut()
+        .push(KdlEntry::new(planner_spec.provider.as_str()));
     let mut planner_body = KdlDocument::new();
-    if let Some(model) = model {
+    if let Some(model) = planner_spec.model.as_deref() {
         planner_body.nodes_mut().push(kdl_node("model", [model]));
     }
-    if let Some(effort) = effort {
+    if let Some(effort) = planner_spec.effort.as_deref() {
         planner_body.nodes_mut().push(kdl_node("effort", [effort]));
     }
     planner.set_children(planner_body);
@@ -8360,6 +8385,7 @@ mod tests {
             fleet_id: None,
             configured_peers: Vec::new(),
             native_session_home: None,
+            planner_default: PlannerSpec::default(),
         };
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
@@ -8595,8 +8621,7 @@ mod tests {
             &format!("doc/planning/example/request@{}", "a".repeat(64)),
             Path::new("/work/example"),
             "person/operator",
-            None,
-            None,
+            &PlannerSpec::default(),
             None,
         );
         let planning = st3::parse_intent(&planning, "node").unwrap();

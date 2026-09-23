@@ -42,11 +42,11 @@ The foundation is materially ready for UI work:
 - Saved/running Codex, Claude, Pi, OMP, and OpenCode sessions have a harness-neutral normalized timeline and a
   fenced import action.
 
-The Expo choice exposes one foundation gap we should address in the first app mission: generate a
-TypeScript client and models from the same normative schema/operation manifest. Bridging the Swift
-package merely to perform JSON HTTP calls would add complexity and create an unnatural React Native
-boundary. The Fabric transport itself can remain a small native Expo module that presents a local
-or virtual loopback URL to the TypeScript client.
+The Expo choice uses a generated TypeScript client and models from the same normative
+schema/operation manifest as Rust and Swift. Bridging the Swift package merely to perform JSON HTTP
+calls would add complexity and create an unnatural React Native boundary. The Fabric transport
+itself can remain a future native Expo module that presents a local or virtual loopback URL to the
+TypeScript client.
 
 ## Delivery gate 1: installable shells immediately
 

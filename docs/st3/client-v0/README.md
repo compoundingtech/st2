@@ -3,13 +3,14 @@
 Status: implemented client boundary with operational projections, resumable events, authenticated
 pairing, fenced actions, terminal snapshots/frames, and generated Rust and Swift clients. The files in
 [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire examples. Rust and Swift
-clients consume the same JSON; neither client parses CLI output, Markdown, KDL, claim envelopes, or
+clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
 local Unix socket and authenticated Fabric-loopback HTTP. The Swift package is
-[`clients/swift/St3Client`](../../../clients/swift/St3Client) and uses the authenticated
-Fabric-loopback transport. Regenerate their contract tables with `cargo run -p st3-client-codegen`;
+[`clients/swift/St3Client`](../../../clients/swift/St3Client). The Expo TypeScript client is
+[`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
+clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
 
 ## Boundary and transport
@@ -165,6 +166,11 @@ A launch owns its request, target (new mission or an exact mission run generatio
 decisions, approvals, and terminal outcome. Variant content is typed projected mission data; clients
 do not submit or receive KDL or Markdown. A preview returns its normalized graph, validation
 diagnostics, and a deterministic token:
+
+Launch creation may select an eligible planner provider, model, and effort. The server applies its
+configured default only to new launches and records the effective immutable `planner_config` with
+the launch and its planner agent. Selecting a different provider without model or effort overrides
+does not carry the old provider's defaults into that new session.
 
 ```
 lpv0:<lowercase SHA-256 of RFC 8785 canonical JSON {

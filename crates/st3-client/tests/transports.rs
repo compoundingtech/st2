@@ -40,6 +40,7 @@ fn state(root: &Path, name: &str) -> AppState {
         fleet_id: None,
         configured_peers: Vec::new(),
         native_session_home: None,
+        planner_default: st3::model::PlannerSpec::default(),
     }
 }
 

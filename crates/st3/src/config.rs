@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::model::PlannerSpec;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
@@ -27,6 +29,8 @@ pub struct Config {
     pub client_gateway_socket: PathBuf,
     pub peer_listen: Option<String>,
     pub peers: Vec<PeerConfig>,
+    /// Default harness configuration for new planning sessions only.
+    pub planner: PlannerSpec,
 }
 
 impl Default for Config {
@@ -48,6 +52,7 @@ impl Default for Config {
             client_gateway_socket,
             peer_listen: None,
             peers: Vec::new(),
+            planner: PlannerSpec::default(),
         }
     }
 }
@@ -98,6 +103,29 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.planner.provider.as_str(),
+                "codex" | "claude" | "pi" | "omp" | "opencode"
+            ),
+            "planner.provider must be an eligible harness driver"
+        );
+        anyhow::ensure!(
+            self.planner
+                .model
+                .as_deref()
+                .is_none_or(|value| !value.trim().is_empty())
+                && self
+                    .planner
+                    .effort
+                    .as_deref()
+                    .is_none_or(|value| !value.trim().is_empty()),
+            "planner model and effort must be nonempty when set"
+        );
+        anyhow::ensure!(
+            self.planner.provider != "opencode" || self.planner.effort.is_none(),
+            "the OpenCode planner does not accept an effort override"
+        );
         anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
@@ -203,6 +231,7 @@ mod tests {
     #[test]
     fn defaults_to_a_local_only_daemon() {
         let config = Config::default();
+        assert_eq!(config.planner, PlannerSpec::default());
         assert!(config.peer_listen.is_none());
         assert!(config.peers.is_empty());
         assert!(config.socket.ends_with("st3.sock"));

@@ -347,6 +347,7 @@ fn test_state(root: &Path) -> AppState {
         fleet_id: None,
         configured_peers: Vec::new(),
         native_session_home: None,
+        planner_default: st3::model::PlannerSpec::default(),
     }
 }
 
@@ -1014,6 +1015,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             request: b"Draft Alex's mission.".to_vec(),
             workspace: workspace.display().to_string(),
             requester: Some("person/alex".into()),
+            provider: None,
             model: None,
             effort: None,
             idempotency_key: "paired-alex-launch-0001".into(),

@@ -1,8 +1,8 @@
 # st3 data authority
 
-This document classifies each SQLite table in schema version 12.
+This document classifies each SQLite table in schema version 13.
 
-Schema version 12 upgrades schema versions 10 and 11 in place.
+Schema version 13 upgrades schema versions 10, 11, and 12 in place.
 
 The claim log and immutable blobs are the durable graph authority.
 

@@ -884,10 +884,13 @@ fn parse_planning_session_declaration(
         })?;
         ensure_no_properties(planner_node)?;
         let provider = one_string_with_children(planner_node)?;
-        if provider != "codex" {
+        if !matches!(
+            provider.as_str(),
+            "codex" | "claude" | "pi" | "omp" | "opencode"
+        ) {
             return Err(St3Error::new(
                 "unsupported-planner",
-                "the planning MVP supports only the Codex planner",
+                "the planner must use an eligible typed harness driver",
             ));
         }
         let planner_body = planner_node
@@ -916,9 +919,11 @@ fn parse_planning_session_declaration(
             workspace,
             requester,
             planner: PlannerSpec {
+                model: child_string(planner_body, "model")?
+                    .or_else(|| (provider == "codex").then(|| "gpt-6-sol".to_owned())),
+                effort: child_string(planner_body, "effort")?
+                    .or_else(|| (provider == "codex").then(|| "medium".to_owned())),
                 provider,
-                model: child_string(planner_body, "model")?,
-                effort: child_string(planner_body, "effort")?,
             },
             target_run,
             target_generation,
@@ -1018,7 +1023,9 @@ fn parse_planning_session_declaration(
                 .nodes_mut()
                 .push(string_node("workspace", &creation.workspace));
             let mut harness = KdlNode::new("harness");
-            harness.entries_mut().push(kdl::KdlEntry::new("codex"));
+            harness
+                .entries_mut()
+                .push(kdl::KdlEntry::new(creation.planner.provider.as_str()));
             let mut harness_body = KdlDocument::new();
             if let Some(model) = &creation.planner.model {
                 harness_body.nodes_mut().push(string_node("model", model));
@@ -1035,17 +1042,26 @@ fn parse_planning_session_declaration(
             harness_body.nodes_mut().push(string_node(
                 "prompt",
                 &format!(
-                    "You are the durable Codex planner for launch `{id}`. Read `{}` with `st3 documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+                    "You are the durable {} planner for launch `{id}`. Read `{}` with `st3 documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+                    creation.planner.provider,
                     creation.request, creation.mission
                 ),
             ));
-            let mut args = KdlNode::new("args");
-            args.entries_mut().push(kdl::KdlEntry::new(
-                "--dangerously-bypass-approvals-and-sandbox",
-            ));
-            args.entries_mut()
-                .push(kdl::KdlEntry::new("--dangerously-bypass-hook-trust"));
-            harness_body.nodes_mut().push(args);
+            let arguments: &[&str] = match creation.planner.provider.as_str() {
+                "codex" => &[
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--dangerously-bypass-hook-trust",
+                ],
+                "claude" => &["--permission-mode", "bypassPermissions"],
+                _ => &[],
+            };
+            if !arguments.is_empty() {
+                let mut args = KdlNode::new("args");
+                for argument in arguments {
+                    args.entries_mut().push(kdl::KdlEntry::new(*argument));
+                }
+                harness_body.nodes_mut().push(args);
+            }
             harness.set_children(harness_body);
             agent_body.nodes_mut().push(harness);
             agent.set_children(agent_body);

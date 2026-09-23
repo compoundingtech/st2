@@ -278,7 +278,13 @@ planning-session "planning/release/01990000000070008000000000000000" {
 }
 ```
 
-The session creates a session-scoped Codex planner with a bounded runtime ID. Candidate submission is an observed result, so it is not authored in KDL. Candidate submission creates an exact preview automatically. A blocked preview stays durable for review.
+The session creates a session-scoped planner with a bounded runtime ID. Codex with no explicit model
+or effort uses `gpt-6-sol` and `medium`; `st3 launch start --provider`, `--model`, and `--effort`
+can select another eligible harness configuration. The daemon's `[planner]` configuration supplies
+defaults for API-created launches. Each launch stores its effective planner configuration; changing
+the default affects only later launches. Candidate submission is an observed result, so it is not
+authored in KDL. Candidate submission creates an exact preview automatically. A blocked preview
+stays durable for review.
 
 Human approval is also observed input. It publishes the approved mission revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new mission separately with `st3 missions start`.
 

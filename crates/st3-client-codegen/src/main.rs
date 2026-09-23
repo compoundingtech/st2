@@ -10,6 +10,7 @@ const RUST_MODELS_TEMPLATE: &str = include_str!("../templates/generated.rs.in");
 const RUST_CLIENT_TEMPLATE: &str = include_str!("../templates/lib.rs.in");
 const SWIFT_MODELS_TEMPLATE: &str = include_str!("../templates/Models.swift.in");
 const SWIFT_CLIENT_TEMPLATE: &str = include_str!("../templates/Client.swift.in");
+const TYPESCRIPT_CLIENT_TEMPLATE: &str = include_str!("../templates/Client.ts.in");
 
 fn main() -> Result<()> {
     let check = std::env::args()
@@ -53,6 +54,12 @@ fn main() -> Result<()> {
         "    // @st3-codegen:swift-operation-methods",
         &swift_operation_methods(reads, actions)?,
     )?;
+    let typescript_models = typescript_models(&schema, &operations, &digest)?;
+    let typescript_client = render_marker(
+        TYPESCRIPT_CLIENT_TEMPLATE,
+        "    // @st3-codegen:typescript-operation-methods",
+        &typescript_operation_methods(reads, actions)?,
+    )?;
     validate_surfaces(
         &schema,
         &operations,
@@ -89,6 +96,16 @@ fn main() -> Result<()> {
     output(
         &root.join("clients/swift/St3Client/Sources/St3Client/Client.swift"),
         &swift_client,
+        check,
+    )?;
+    output(
+        &root.join("clients/typescript/st3-client/Models.generated.ts"),
+        &typescript_models,
+        check,
+    )?;
+    output(
+        &root.join("clients/typescript/st3-client/Client.generated.ts"),
+        &typescript_client,
         check,
     )?;
     Ok(())
@@ -666,6 +683,261 @@ fn lower_camel(value: &str) -> String {
         .unwrap_or_default()
 }
 
+fn ts_type(value: &Value) -> Result<String> {
+    if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+        return Ok(reference
+            .rsplit('/')
+            .next()
+            .context("TypeScript reference")?
+            .into());
+    }
+    if let Some(constant) = value.get("const") {
+        return Ok(constant.to_string());
+    }
+    if let Some(items) = value.get("enum").and_then(Value::as_array) {
+        return Ok(items
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(" | "));
+    }
+    for union in ["oneOf", "anyOf"] {
+        if let Some(items) = value.get(union).and_then(Value::as_array) {
+            return Ok(format!(
+                "({})",
+                items
+                    .iter()
+                    .map(ts_type)
+                    .collect::<Result<Vec<_>>>()?
+                    .join(" | ")
+            ));
+        }
+    }
+    if let Some(types) = value.get("type").and_then(Value::as_array) {
+        return Ok(types
+            .iter()
+            .map(|kind| ts_type(&serde_json::json!({"type": kind})))
+            .collect::<Result<Vec<_>>>()?
+            .join(" | "));
+    }
+    let base = match value.get("type").and_then(Value::as_str) {
+        Some("string") => "string".into(),
+        Some("integer" | "number") => "number".into(),
+        Some("boolean") => "boolean".into(),
+        Some("null") => "null".into(),
+        Some("array") => format!("Array<{}>", ts_type(&value["items"])?),
+        Some("object") => ts_object(value)?,
+        Some(other) => bail!("unsupported TypeScript schema type `{other}`"),
+        None if value.get("properties").is_some() => ts_object(value)?,
+        None => "unknown".into(),
+    };
+    if let Some(parts) = value.get("allOf").and_then(Value::as_array) {
+        let mut members = vec![base];
+        for part in parts {
+            if part.get("if").is_none() {
+                members.push(ts_type(part)?);
+            }
+        }
+        return Ok(members
+            .into_iter()
+            .filter(|member| member != "unknown")
+            .collect::<Vec<_>>()
+            .join(" & "));
+    }
+    Ok(base)
+}
+
+fn ts_object(value: &Value) -> Result<String> {
+    let required = value["required"].as_array();
+    let mut fields = Vec::new();
+    if let Some(properties) = value["properties"].as_object() {
+        for (name, definition) in properties {
+            let optional = if required
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(name)))
+            {
+                ""
+            } else {
+                "?"
+            };
+            fields.push(format!("  {name}{optional}: {};", ts_type(definition)?));
+        }
+    }
+    if let Some(extra) = value.get("additionalProperties")
+        && extra.is_object()
+    {
+        if fields.is_empty() {
+            fields.push(format!("  [key: string]: {};", ts_type(extra)?));
+        } else {
+            // TypeScript requires an index value to accept every named field.
+            fields.push("  [key: string]: unknown;".into());
+        }
+    }
+    Ok(format!("{{\n{}\n}}", fields.join("\n")))
+}
+
+fn ts_conditional_body(value: &Value) -> Result<Option<String>> {
+    let Some(parts) = value.get("allOf").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut variants = Vec::new();
+    for part in parts {
+        let Some(discriminator) = part["if"]["properties"]["type"]
+            .get("const")
+            .or_else(|| part["if"]["properties"]["type"].get("enum"))
+        else {
+            continue;
+        };
+        let Some(body) = part["then"]["properties"].get("body") else {
+            continue;
+        };
+        let types = if let Some(items) = discriminator.as_array() {
+            items.clone()
+        } else {
+            vec![discriminator.clone()]
+        };
+        for kind in types {
+            variants.push(format!("{{ type: {}; body: {} }}", kind, ts_type(body)?));
+        }
+    }
+    if variants.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "Omit<{}, 'type' | 'body'> & ({})",
+            ts_object(value)?,
+            variants.join(" | ")
+        )))
+    }
+}
+
+fn typescript_models(schema: &Value, operations: &Value, digest: &str) -> Result<String> {
+    let defs = schema["$defs"].as_object().context("schema definitions")?;
+    let mut out = format!(
+        "// @generated by st3-client-codegen; contract sha256 {digest}\n// Source: docs/st3/client-v0/schemas/client-v0.schema.json\n\nexport const CONTRACT_SHA256 = '{digest}' as const;\nexport const API_VERSION = 'st3.client.v0' as const;\n\n"
+    );
+    for (name, definition) in defs {
+        if name == "ActionRequest" {
+            continue;
+        }
+        let shape = ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?);
+        writeln!(out, "export type {name} = {shape};\n")?;
+    }
+    let actions = operations["actions"]
+        .as_object()
+        .context("actions object")?;
+    let branches = schema["$defs"]["ActionRequest"]["oneOf"]
+        .as_array()
+        .context("ActionRequest.oneOf")?;
+    let mut variants = Vec::new();
+    for (action, definition) in actions {
+        let branch = branches
+            .iter()
+            .find(|branch| {
+                let kind = &branch["properties"]["type"];
+                kind["const"].as_str() == Some(action)
+                    || kind["enum"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(action)))
+            })
+            .with_context(|| format!("ActionRequest branch for `{action}`"))?;
+        let parameter_name = action_parameter(action, definition)?;
+        let parameter = if defs.contains_key(parameter_name) {
+            parameter_name.to_owned()
+        } else {
+            ts_type(&branch["properties"]["parameters"])?
+        };
+        let mut fence = "Fence".to_owned();
+        if let Some(required) = branch["properties"]["fence"]["allOf"]
+            .as_array()
+            .and_then(|parts| parts.iter().find_map(|part| part["required"].as_array()))
+        {
+            let keys = required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>();
+            if !keys.is_empty() {
+                fence = format!("Fence & Required<Pick<Fence, {}>>", keys.join(" | "));
+            }
+        }
+        variants.push(format!("  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & {{ type: '{action}'; parameters: {parameter}; fence: {fence} }})"));
+    }
+    writeln!(
+        out,
+        "export type ActionRequest =\n{};",
+        variants.join(" |\n")
+    )?;
+    writeln!(
+        out,
+        "export type ActionOf<T extends ActionRequest['type']> = Extract<ActionRequest, {{ type: T }}>;"
+    )?;
+    writeln!(
+        out,
+        "export type EnvelopeOf<T> = Omit<Envelope, 'value'> & {{ value: T }};"
+    )?;
+    Ok(out)
+}
+
+fn typescript_operation_methods(
+    reads: &[Value],
+    actions: &serde_json::Map<String, Value>,
+) -> Result<String> {
+    let mut out = String::new();
+    for read in reads {
+        let id = read["id"].as_str().context("read id")?;
+        let path = read["path"].as_str().context("read path")?;
+        let response = read["response"].as_str().context("read response")?;
+        let method = lower_camel(&pascal(id));
+        if id == "capabilities.get" {
+            continue;
+        }
+        let route = if path.contains("{id}") {
+            path.replace("{id}", "${encodeURIComponent(routedId(id))}")
+        } else {
+            path.to_owned()
+        };
+        if id == "events.list" {
+            writeln!(
+                out,
+                "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
+            )?;
+        } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
+            let query_suffix = if id == "timeline.list" {
+                " + query(options)"
+            } else {
+                ""
+            };
+            let option_arg = if id == "timeline.list" {
+                ", options: PageOptions = {}"
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "    async {method}(id: string{option_arg}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}`{query_suffix}); }}"
+            )?;
+        } else if id.starts_with("launch-") {
+            writeln!(
+                out,
+                "    async {method}(id: string, options: PageOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "    async {method}(options: ListOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options)); }}"
+            )?;
+        }
+    }
+    for action in actions.keys() {
+        let method = lower_camel(&pascal(action));
+        writeln!(
+            out,
+            "    async {method}(input: Omit<ActionOf<'{action}'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> {{ return this.submitAction({{ ...input, api_version: API_VERSION, type: '{action}' }} as ActionOf<'{action}'>); }}"
+        )?;
+    }
+    Ok(out.trim_end().into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +961,19 @@ mod tests {
         ))?;
         let actions = operations["actions"].as_object().context("actions")?;
         let reads = operations["reads"].as_array().context("reads")?;
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))?;
+        let digest = hex_digest(&[
+            include_bytes!("../../../docs/st3/client-v0/schemas/client-v0.schema.json"),
+            include_bytes!("../../../docs/st3/client-v0/schemas/operations.json"),
+        ]);
+        let ts_models = typescript_models(&schema, &operations, &digest)?;
+        let ts_client = render_marker(
+            TYPESCRIPT_CLIENT_TEMPLATE,
+            "    // @st3-codegen:typescript-operation-methods",
+            &typescript_operation_methods(reads, actions)?,
+        )?;
         let models = format_rust(&render_marker(
             RUST_MODELS_TEMPLATE,
             "    // @st3-codegen:rust-action-constructors",
@@ -713,6 +998,20 @@ mod tests {
                     "async fn removed_attention_list(",
                     1,
                 ),
+            ),
+            (
+                "Models.generated.ts",
+                ts_models.as_str(),
+                ts_models.replacen(
+                    "export type ActionRequest =",
+                    "export type MissingActionRequest =",
+                    1,
+                ),
+            ),
+            (
+                "Client.generated.ts",
+                ts_client.as_str(),
+                ts_client.replacen("async eventsList(", "async removedEventsList(", 1),
             ),
         ];
         for (name, expected, drifted) in cases {
