@@ -7989,6 +7989,20 @@ impl Store {
         }
     }
 
+    /// A quiet peer wake does not need to replay the entire graph. A stale or
+    /// missing projection still gets a retry, including after a failed wake.
+    pub fn replication_projection_needs_recovery(&self) -> Result<bool> {
+        let connection = self.readers.get();
+        let status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status.as_deref() != Some("healthy"))
+    }
+
     pub fn apply_replication_repairs(&self) -> Result<usize> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
@@ -17165,6 +17179,24 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn replication_projection_retries_missing_and_stale_health_only() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.replication_projection_needs_recovery().unwrap());
+        assert!(store.project_replication_backlog().unwrap());
+        assert!(!store.replication_projection_needs_recovery().unwrap());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                [],
+            )
+            .unwrap();
+        assert!(store.replication_projection_needs_recovery().unwrap());
+    }
 
     fn rewrite_envelope(
         envelope: &ReplicaEnvelope,

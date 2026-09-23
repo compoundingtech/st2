@@ -2991,10 +2991,20 @@ async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, 
         .store
         .apply_replication_repairs()
         .map_err(ApiError::internal)?;
-    let projected = state
-        .store
-        .project_replication_backlog()
-        .map_err(ApiError::internal)?;
+    let projection_attempted = admission.changed
+        || repairs != 0
+        || state
+            .store
+            .replication_projection_needs_recovery()
+            .map_err(ApiError::internal)?;
+    let projected = if projection_attempted {
+        state
+            .store
+            .project_replication_backlog()
+            .map_err(ApiError::internal)?
+    } else {
+        true
+    };
     if projected && (admission.changed || repairs != 0) {
         signal_changed(&state);
     }
@@ -3004,6 +3014,7 @@ async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, 
         "invalid": admission.invalid,
         "repairs": repairs,
         "projected": projected,
+        "projection_attempted": projection_attempted,
     })))
 }
 
@@ -7572,6 +7583,20 @@ mod tests {
     fn replication_heartbeats_do_not_process_the_backlog() {
         assert!(!replication_receive_has_new_data(0));
         assert!(replication_receive_has_new_data(1));
+    }
+
+    #[tokio::test]
+    async fn quiet_replication_wakes_skip_full_graph_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let Json(first) = replication_wake(State(state.clone())).await.unwrap();
+        assert_eq!(first["projection_attempted"], true);
+        assert_eq!(first["projected"], true);
+        let Json(second) = replication_wake(State(state)).await.unwrap();
+        assert_eq!(second["projection_attempted"], false);
+        assert_eq!(second["projected"], true);
+        assert_eq!(second["admitted"], 0);
+        assert_eq!(second["repairs"], 0);
     }
 
     fn materialize_run_agents(state: &AppState, run: &MissionRunView) {
