@@ -7426,10 +7426,22 @@ impl Store {
         let value = latest_actual(&connection, subject)?;
         let after = self.committed_index.load(Ordering::Acquire);
         if before == after {
-            self.actual_cache
+            let mut cache = self
+                .actual_cache
                 .lock()
-                .expect("actual cache mutex poisoned")
-                .insert(subject.to_owned(), (after, value.clone()));
+                .expect("actual cache mutex poisoned");
+            if self.committed_index.load(Ordering::Acquire) == after {
+                // Entries from an earlier store index can never be hit again.
+                // Keeping them would retain historical subjects indefinitely.
+                if cache
+                    .values()
+                    .next()
+                    .is_some_and(|(index, _)| *index != after)
+                {
+                    cache.clear();
+                }
+                cache.insert(subject.to_owned(), (after, value.clone()));
+            }
         }
         Ok(value)
     }
@@ -18119,6 +18131,8 @@ observer "ordered/file" {
             .unwrap();
         let first = store.latest_actual_value(subject).unwrap().unwrap();
         assert_eq!(first["status"], "running");
+        store.latest_actual_value("agent/old").unwrap();
+        assert!(store.actual_cache.lock().unwrap().contains_key("agent/old"));
         let first_index = store.actual_cache.lock().unwrap().get(subject).unwrap().0;
 
         store
@@ -18134,7 +18148,9 @@ observer "ordered/file" {
             .unwrap();
         let second = store.latest_actual_value(subject).unwrap().unwrap();
         assert_eq!(second["status"], "stopped");
-        assert!(store.actual_cache.lock().unwrap().get(subject).unwrap().0 > first_index);
+        let cache = store.actual_cache.lock().unwrap();
+        assert!(cache.get(subject).unwrap().0 > first_index);
+        assert!(!cache.contains_key("agent/old"));
     }
 
     #[test]

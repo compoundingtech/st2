@@ -400,6 +400,8 @@ fn start_outbound(
     notify: watch::Sender<u64>,
 ) {
     for peer in peers {
+        // Retain the connection pool across both phases and later wakeups for this peer.
+        let http = replication_http_client();
         let backend = backend.clone();
         let node = node.clone();
         let auth = auth.clone();
@@ -408,7 +410,7 @@ fn start_outbound(
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match exchange(&backend, &node, &peer, &auth, &main_socket).await {
+                match exchange(&http, &backend, &node, &peer, &auth, &main_socket).await {
                     Ok(_) => {
                         backoff = Duration::from_secs(1);
                         tokio::select! {
@@ -434,6 +436,14 @@ fn start_outbound(
             }
         });
     }
+}
+
+fn replication_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("the replication HTTP client configuration is valid")
 }
 
 async fn receive_exchange(
@@ -555,6 +565,7 @@ fn signed_error_response(
 }
 
 async fn exchange(
+    http: &reqwest::Client,
     backend: &PeerBackend,
     node: &str,
     peer: &PeerConfig,
@@ -570,7 +581,7 @@ async fn exchange(
         envelopes: Vec::new(),
         ..first
     };
-    let remote = post_signed(peer, node, auth, &query).await?;
+    let remote = post_signed(http, peer, node, auth, &query).await?;
     let different = remote.inventory.digest != local_digest;
     let pulled = !remote.envelopes.is_empty();
     let received = backend
@@ -587,7 +598,7 @@ async fn exchange(
             .await?
             .exchange;
         pushed = !push.envelopes.is_empty();
-        let response = post_signed(peer, node, auth, &push).await?;
+        let response = post_signed(http, peer, node, auth, &push).await?;
         pulled_follow_up = !response.envelopes.is_empty();
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &response)
@@ -600,6 +611,7 @@ async fn exchange(
 }
 
 async fn post_signed(
+    http: &reqwest::Client,
     peer: &PeerConfig,
     node: &str,
     auth: &FleetAuth,
@@ -609,10 +621,7 @@ async fn post_signed(
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
-    let response = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(120))
-        .build()?
+    let response = http
         .post(&endpoint)
         .headers(headers)
         .header("content-type", "application/json")
@@ -669,6 +678,8 @@ mod tests {
     use axum::http::Request;
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
     use tower::ServiceExt as _;
 
     #[test]
@@ -852,12 +863,29 @@ mod tests {
             main_socket: PathBuf::from("/no/such/socket"),
             outbound_notify: watch::channel(0_u64).0,
         };
+        let connection_ports = Arc::new(Mutex::new(BTreeSet::new()));
+        let observed_ports = connection_ports.clone();
         let server = tokio::spawn(
             axum::serve(
                 listener,
                 Router::new()
                     .route(EXCHANGE_PATH, post(receive_exchange))
-                    .with_state(state),
+                    .layer(axum::middleware::from_fn(
+                        move |request: Request<Body>, next: axum::middleware::Next| {
+                            let observed_ports = observed_ports.clone();
+                            async move {
+                                if let Some(axum::extract::ConnectInfo(address)) = request
+                                    .extensions()
+                                    .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                                {
+                                    observed_ports.lock().unwrap().insert(address.port());
+                                }
+                                next.run(request).await
+                            }
+                        },
+                    ))
+                    .with_state(state)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .into_future(),
         );
@@ -865,7 +893,9 @@ mod tests {
             name: "target".into(),
             url: format!("http://{address}"),
         };
+        let http = replication_http_client();
         exchange(
+            &http,
             &PeerBackend::Local(source.clone()),
             "source",
             &peer,
@@ -893,6 +923,7 @@ mod tests {
             })
             .unwrap();
         exchange(
+            &http,
             &PeerBackend::Local(source.clone()),
             "source",
             &peer,
@@ -912,6 +943,26 @@ mod tests {
         assert_eq!(
             source_status.authority_digest,
             target_status.authority_digest
+        );
+        assert_eq!(
+            connection_ports.lock().unwrap().len(),
+            1,
+            "the two-phase exchanges and later wakeup should reuse one TCP connection"
+        );
+        exchange(
+            &replication_http_client(),
+            &PeerBackend::Local(source.clone()),
+            "source",
+            &peer,
+            &auth,
+            Path::new("/no/such/socket"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection_ports.lock().unwrap().len(),
+            2,
+            "a fresh client should demonstrate the former extra dial"
         );
         let summary = source.export_replication_summary(fleet).unwrap();
         assert!(summary.inventory.envelopes.is_empty());
