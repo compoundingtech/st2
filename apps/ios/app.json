@@ -5,6 +5,16 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "enableSceneSupport": true
+          }
+        }
+      ]
+    ],
     "ios": {
       "bundleIdentifier": "com.compoundingtech.smalltalk.starter",
       "supportsTablet": true
