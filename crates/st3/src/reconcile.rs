@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -522,7 +523,49 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
 
         let active = desired.iter().collect::<Vec<_>>();
-        let rendered = crate::render::apply_all(&self.store, &active, &self.host)?;
+        let mut unavailable_workspaces = BTreeSet::new();
+        for subject in &active {
+            let Some(member) = subject
+                .member
+                .as_ref()
+                .filter(|member| member.host == self.host)
+            else {
+                continue;
+            };
+            let workspace = Path::new(&member.workspace);
+            if workspace.is_dir() {
+                continue;
+            }
+            let failure = if member.workspace_create {
+                fs::create_dir_all(workspace)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                Some("the workspace does not exist and create was not requested".into())
+            };
+            if let Some(failure) = failure {
+                unavailable_workspaces.insert(subject.subject.clone());
+                self.record_once(
+                    &subject.subject,
+                    "harness.diagnostic",
+                    BTreeMap::from([
+                        ("severity".into(), Value::String("error".into())),
+                        ("status".into(), Value::String("unavailable".into())),
+                        ("code".into(), Value::String("workspace-unavailable".into())),
+                        (
+                            "reason".into(),
+                            Value::String(format!("workspace {}: {failure}", workspace.display())),
+                        ),
+                    ]),
+                )?;
+            }
+        }
+        let renderable = active
+            .iter()
+            .copied()
+            .filter(|subject| !unavailable_workspaces.contains(&subject.subject))
+            .collect::<Vec<_>>();
+        let rendered = crate::render::apply_all(&self.store, &renderable, &self.host)?;
         for (subject, result) in rendered {
             for warning in result.warnings {
                 self.record_once(
@@ -544,6 +587,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let mut work_message_agents = Vec::new();
         for subject in &active {
+            if unavailable_workspaces.contains(&subject.subject) {
+                continue;
+            }
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
                 continue;
@@ -9216,6 +9262,43 @@ version 2
         assert_eq!(
             argv.first().map(Path::new),
             Some(std::env::current_exe().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn one_uncreatable_workspace_does_not_starve_other_agent_launches() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), "not a directory").unwrap();
+        let source = format!(
+            "version 2\nagent \"bad\" {{ workspace {:?} create=#true; harness \"codex\" {{}} }}\nagent \"good\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
+            root.path().join("file/child").display().to_string(),
+            root.path().display().to_string(),
+        );
+        apply_source(&store, &source, "unavailable-workspace");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let started = runtime.started_members.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].runtime_id, "node.good");
+        let diagnostic = store
+            .claims_for("agent/node.bad", Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostic.len(), 1);
+        assert_eq!(
+            diagnostic[0]
+                .body
+                .pointer("/fields/code")
+                .and_then(Value::as_str),
+            Some("workspace-unavailable")
         );
     }
 
