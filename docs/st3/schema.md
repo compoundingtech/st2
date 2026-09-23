@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `bb7f7e6ec1b1cef8f85d3f2ac73b17da01910c2603b503827475ab518026c505`
+Digest: `ac17fe44abc4dc4e14458e0151eff3070ac4fed5d9f18e9312233ff153438ec1`
 
 ## Subject families
 
@@ -70,9 +70,10 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
 | `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `observed_since_ms:integer`, `reason:string`, `retry_after_unix_ms:integer`, `retry_attempt:integer`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
-| `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
+| `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `evidence_incarnation:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `observed_at_ms:integer`, `observed_since_ms:integer`, `ownership_sequence:integer`, `reason:string`, `state!:string`, `transition_sequence:integer`, `transport:string` |  |
+| `harness.session-file` | `agent` | `authorized-requester` | `append` | `agent:subject-reference(agent)`, `discovery_revision:string`, `harness!:string`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id!:string`, `source_session:string`, `status:string` |  |
 | `harness.timeline` | `agent` | `same-subject-actor` | `append` | `body!:object`, `driver!:string`, `entry_id!:string`, `entry_type!:string`, `final!:boolean`, `incarnation_id!:string`, `observed_at_unix_ms:integer`, `operation!:string`, `revision!:integer`, `role!:string`, `sequence:integer` |  |
-| `harness.usage` | `agent` | `same-subject-actor` | `append` | `cached_tokens:integer`, `context_used_percent:number`, `context_used_tokens:integer`, `context_window_tokens:integer`, `cost:number`, `currency:string`, `driver!:string`, `incarnation_id!:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `semantics!:string`, `total_tokens:integer` |  |
+| `harness.usage` | `agent` | `same-subject-actor` | `append` | `cached_tokens:integer`, `compactions:integer`, `context_used_percent:number`, `context_used_tokens:integer`, `context_window_tokens:integer`, `cost:number`, `currency:string`, `driver!:string`, `incarnation_id!:string`, `input_tokens:integer`, `last_compaction_ms:integer`, `last_compaction_trigger:string`, `model:string`, `output_tokens:integer`, `semantics!:string`, `total_tokens:integer` |  |
 | `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
 | `loop.round-dispatch` | `loop-run` | `system-only` | `append` | `candidate:integer`, `dispatch!:integer`, `item_id:string`, `mission_run!:subject-reference(mission-run)`, `reason!:string`, `round!:integer`, `status!:string` | `loop`, `round` |
 | `loop.round-result` | `loop-run` | `system-only` | `append` | `candidate:integer`, `feedback:subject-reference(doc)`, `item:any`, `metrics:object`, `mission_run!:subject-reference(mission-run)`, `reason:string`, `round!:integer`, `status!:string`, `token_usage:integer` | `loop`, `round` |
@@ -81,6 +82,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `message.read` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
+| `message.staged` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `mission-run.created` | `mission-run` | `system-only` | `once` | `current_generation:subject-reference`, `deadline_at_unix_ms:integer`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `timeout_ms:integer`, `workspace:string` | `mission-run` |
 | `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
 | `mission.produced` | `mission`, `step-run` | `capability-holder` | `append` | `attempt:integer`, `mission:subject-reference`, `name:string`, `revision:string`, `step_definition:string` | `produces` |
@@ -127,7 +129,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `subscription.mission-requested` | `subscription` | `system-only` | `append` | `discovery!:string`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
-| `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `byte_count:integer`, `incarnation_id:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
+| `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `byte_count:integer`, `incarnation_id:string`, `intent:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
 | `terminal.input.result` | `agent`, `pty` | `system-only` | `append` | `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string`, `sequence:integer` |  |
 | `transport.observed` | `host` | `system-only` | `append` | `last_success_at:integer`, `protocol:string`, `reason:string`, `remote_heads:object`, `status!:string` |  |
 | `work.claimed` | `step-run` | `authorized-participant` | `state-transition` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |

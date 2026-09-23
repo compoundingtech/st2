@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result};
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -33,7 +34,9 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 pub(crate) enum ExternalDriver {
     Codex,
     Claude,
+    Pi,
     Omp,
+    OpenCode,
 }
 
 impl ExternalDriver {
@@ -41,7 +44,9 @@ impl ExternalDriver {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Pi => "pi",
             Self::Omp => "omp",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -222,6 +227,9 @@ pub(crate) fn timestamp(unix_ms: u128) -> String {
 }
 
 pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    if session.driver == ExternalDriver::OpenCode {
+        return normalized_opencode_timeline(session);
+    }
     let metadata = fs::metadata(&session.transcript)
         .with_context(|| format!("inspect transcript {}", session.transcript.display()))?;
     let mut file = File::open(&session.transcript)
@@ -262,20 +270,22 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
         match session.driver {
             ExternalDriver::Codex => normalize_codex(&value, sequence, session, &mut items),
             ExternalDriver::Claude => normalize_claude(&value, sequence, session, &mut items),
-            ExternalDriver::Omp => normalize_omp(&value, sequence, session, &mut items),
+            ExternalDriver::Pi | ExternalDriver::Omp => {
+                normalize_omp(&value, sequence, session, &mut items)
+            }
+            ExternalDriver::OpenCode => unreachable!("OpenCode history is stored in SQLite"),
         }
     }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     Ok(items)
 }
 
-pub(crate) struct ImportMission {
-    pub(crate) id: String,
-    pub(crate) workspace: PathBuf,
+pub(crate) struct ImportSeat {
+    pub(crate) subject: String,
     pub(crate) kdl: String,
 }
 
-pub(crate) fn import_mission(session: &ExternalSession) -> Result<ImportMission> {
+pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
     let workspace = session
         .cwd
         .clone()
@@ -291,27 +301,9 @@ pub(crate) fn import_mission(session: &ExternalSession) -> Result<ImportMission>
         session.native_id
     ))[..24];
     let id = format!("import/{}/{suffix}", session.driver.as_str());
-    let mut mission = KdlNode::new("mission");
-    mission.entries_mut().push(KdlEntry::new(id.clone()));
-    mission
-        .entries_mut()
-        .push(KdlEntry::new_prop("state", "ready"));
-    let mut mission_body = KdlDocument::new();
-    mission_body.nodes_mut().push(string_node(
-        "goal",
-        &format!(
-            "Continue the imported {} session {} under durable st3 ownership.",
-            session.driver.as_str(),
-            session.native_id
-        ),
-    ));
-
     let mut agent = KdlNode::new("agent");
-    agent.entries_mut().push(KdlEntry::new("session"));
+    agent.entries_mut().push(KdlEntry::new(id.clone()));
     let mut agent_body = KdlDocument::new();
-    agent_body
-        .nodes_mut()
-        .push(string_node("identity", "session"));
     agent_body.nodes_mut().push(string_node(
         "workspace",
         workspace.to_string_lossy().as_ref(),
@@ -328,8 +320,23 @@ pub(crate) fn import_mission(session: &ExternalSession) -> Result<ImportMission>
             args.entries_mut()
                 .push(KdlEntry::new(session.native_id.clone()));
         }
-        ExternalDriver::Claude | ExternalDriver::Omp => {
+        ExternalDriver::Claude => {
             args.entries_mut().push(KdlEntry::new("--resume"));
+            args.entries_mut()
+                .push(KdlEntry::new(session.native_id.clone()));
+        }
+        ExternalDriver::Omp => {
+            args.entries_mut()
+                .push(KdlEntry::new(format!("--resume={}", session.native_id)));
+        }
+        ExternalDriver::Pi => {
+            args.entries_mut().push(KdlEntry::new("--session"));
+            args.entries_mut().push(KdlEntry::new(
+                session.transcript.to_string_lossy().to_string(),
+            ));
+        }
+        ExternalDriver::OpenCode => {
+            args.entries_mut().push(KdlEntry::new("--session"));
             args.entries_mut()
                 .push(KdlEntry::new(session.native_id.clone()));
         }
@@ -341,18 +348,15 @@ pub(crate) fn import_mission(session: &ExternalSession) -> Result<ImportMission>
         .nodes_mut()
         .push(string_node("restart", "always"));
     agent.set_children(agent_body);
-    mission_body.nodes_mut().push(agent);
-    mission.set_children(mission_body);
 
     let mut document = KdlDocument::new();
     let mut version = KdlNode::new("version");
     version.entries_mut().push(KdlEntry::new(2));
     document.nodes_mut().push(version);
-    document.nodes_mut().push(mission);
+    document.nodes_mut().push(agent);
     document.autoformat();
-    Ok(ImportMission {
-        id,
-        workspace,
+    Ok(ImportSeat {
+        subject: format!("agent/{id}"),
         kdl: document.to_string(),
     })
 }
@@ -430,10 +434,11 @@ fn discover_files(home: &Path) -> Result<Vec<SessionMetadata>> {
     let roots = [
         (ExternalDriver::Codex, home.join(".codex/sessions")),
         (ExternalDriver::Claude, home.join(".claude/projects")),
+        (ExternalDriver::Pi, home.join(".pi/agent/sessions")),
         (ExternalDriver::Omp, home.join(".oh-omp/agent/sessions")),
         (ExternalDriver::Omp, home.join(".omp/agent/sessions")),
     ];
-    let mut found = Vec::new();
+    let mut found = discover_opencode_sessions(home)?;
     for (driver, root) in roots {
         if !root.is_dir() {
             continue;
@@ -457,6 +462,80 @@ fn discover_files(home: &Path) -> Result<Vec<SessionMetadata>> {
                 found.push(metadata);
             }
         }
+    }
+    Ok(found)
+}
+
+fn open_opencode_database(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open OpenCode session database {}", path.display()))
+}
+
+fn discover_opencode_sessions(home: &Path) -> Result<Vec<SessionMetadata>> {
+    let database = home.join(".local/share/opencode/opencode.db");
+    if !database.is_file() {
+        return Ok(Vec::new());
+    }
+    let file_metadata = fs::metadata(&database)?;
+    let database_updated_at = system_time_ms(file_metadata.modified().unwrap_or(UNIX_EPOCH));
+    let connection = open_opencode_database(&database)?;
+    let mut statement = connection.prepare(
+        "SELECT s.id, s.directory, s.title, s.time_created, s.time_updated, \
+                COALESCE(MAX(m.time_updated), 0), COUNT(m.id) \
+         FROM session s LEFT JOIN message m ON m.session_id = s.id \
+         GROUP BY s.id \
+         ORDER BY s.time_updated DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![MAX_EXPOSED_HISTORY as i64], |row| {
+        let native_id: String = row.get(0)?;
+        let directory: Option<String> = row.get(1)?;
+        let title: Option<String> = row.get(2)?;
+        let created: i64 = row.get(3)?;
+        let updated: i64 = row.get(4)?;
+        let message_updated: i64 = row.get(5)?;
+        let message_count: i64 = row.get(6)?;
+        Ok((
+            native_id,
+            directory,
+            title,
+            created,
+            updated,
+            message_updated,
+            message_count,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (native_id, directory, title, created, updated, message_updated, message_count) = row?;
+        if native_id.trim().is_empty() {
+            continue;
+        }
+        let started_at_unix_ms = created.max(0) as u128;
+        let updated_at_unix_ms = updated.max(message_updated).max(0) as u128;
+        let revision = digest(&format!(
+            "opencode:{}:{}:{}:{}:{}:{}",
+            database.display(),
+            native_id,
+            updated_at_unix_ms,
+            message_count,
+            file_metadata.len(),
+            database_updated_at,
+        ));
+        found.push(SessionMetadata {
+            driver: ExternalDriver::OpenCode,
+            native_id,
+            transcript: database.clone(),
+            cwd: directory
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from),
+            title: title.filter(|value| !value.trim().is_empty()),
+            started_at_unix_ms,
+            updated_at_unix_ms,
+            revision,
+        });
     }
     Ok(found)
 }
@@ -503,7 +582,7 @@ fn read_metadata(driver: ExternalDriver, path: &Path) -> Result<Option<SessionMe
                 title =
                     title.or_else(|| value.get("slug").and_then(Value::as_str).map(str::to_owned));
             }
-            ExternalDriver::Omp if value["type"] == "session" => {
+            ExternalDriver::Pi | ExternalDriver::Omp if value["type"] == "session" => {
                 native_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
                 cwd = value.get("cwd").and_then(Value::as_str).map(PathBuf::from);
                 started_at_unix_ms = parse_timestamp(value.get("timestamp"));
@@ -513,6 +592,7 @@ fn read_metadata(driver: ExternalDriver, path: &Path) -> Result<Option<SessionMe
                     .map(str::to_owned);
                 break;
             }
+            ExternalDriver::OpenCode => unreachable!("OpenCode metadata is stored in SQLite"),
             _ => {}
         }
     }
@@ -728,7 +808,9 @@ fn driver_for_command(command: &str) -> Option<ExternalDriver> {
     for driver in [
         ExternalDriver::Codex,
         ExternalDriver::Claude,
+        ExternalDriver::Pi,
         ExternalDriver::Omp,
+        ExternalDriver::OpenCode,
     ] {
         let name = driver.as_str();
         if tokens.first().and_then(|value| command_basename(value)) == Some(name)
@@ -768,6 +850,110 @@ fn external_session_id(driver: ExternalDriver, native_id: &str) -> String {
         "session/external-{}",
         &digest(&format!("{}:{native_id}", driver.as_str()))[..24]
     )
+}
+
+fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    let connection = open_opencode_database(&session.transcript)?;
+    let mut message_statement = connection.prepare(
+        "SELECT id, time_created, data FROM (\
+             SELECT id, time_created, data FROM message \
+             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2\
+         ) ORDER BY time_created, id",
+    )?;
+    let messages = message_statement
+        .query_map(
+            params![session.native_id, MAX_TIMELINE_LINES as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut part_statement = connection.prepare(
+        "SELECT data FROM part WHERE session_id = ?1 AND message_id = ?2 \
+         ORDER BY time_created, id",
+    )?;
+    let mut items = Vec::new();
+    let truncated = messages.len() == MAX_TIMELINE_LINES;
+    if truncated {
+        items.push(timeline_item(
+            0,
+            &timestamp(session.updated_at_unix_ms),
+            "system",
+            "truncation",
+            json!({
+                "reason": "the native OpenCode history prefix is outside the bounded read window",
+                "omitted_from_sequence": 0,
+                "omitted_to_sequence": 0
+            }),
+        ));
+    }
+    for (message_offset, (message_id, created, encoded)) in messages.into_iter().enumerate() {
+        let message = serde_json::from_str::<Value>(&encoded).unwrap_or(Value::Null);
+        let role = normalized_role(message.get("role").and_then(Value::as_str));
+        let at = timestamp(created.max(0) as u128);
+        let base = ((message_offset as u64).saturating_add(1)).saturating_mul(32);
+        push_message(&mut items, base, &at, role, &message_id);
+        let parts = part_statement
+            .query_map(params![session.native_id, message_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut sequence = base.saturating_add(1);
+        for encoded_part in parts {
+            let Ok(part) = serde_json::from_str::<Value>(&encoded_part) else {
+                continue;
+            };
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        push_content(&mut items, sequence, &at, role, text);
+                    }
+                }
+                Some("tool") => {
+                    let call_id = part
+                        .get("callID")
+                        .or_else(|| part.get("callId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("native-call");
+                    let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                    let state = part.get("state").unwrap_or(&Value::Null);
+                    push_tool_call(
+                        &mut items,
+                        sequence,
+                        &at,
+                        call_id,
+                        name,
+                        state.get("input").cloned().unwrap_or_else(|| json!({})),
+                    );
+                    sequence = sequence.saturating_add(1);
+                    if matches!(
+                        state.get("status").and_then(Value::as_str),
+                        Some("completed" | "error")
+                    ) {
+                        push_tool_result(
+                            &mut items,
+                            sequence,
+                            &at,
+                            call_id,
+                            state
+                                .get("output")
+                                .or_else(|| state.get("error"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            sequence = sequence.saturating_add(1);
+        }
+    }
+    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+    Ok(items)
 }
 
 fn normalize_codex(
@@ -1070,7 +1256,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_claude_and_omp_transcripts_normalize_to_one_timeline_shape() {
+    fn codex_claude_pi_and_omp_transcripts_normalize_to_one_timeline_shape() {
         let session = |driver| ExternalSession {
             id: "session/external-test".into(),
             revision: "revision".into(),
@@ -1120,27 +1306,34 @@ mod tests {
     }
 
     #[test]
-    fn imported_sessions_render_as_valid_resuming_missions() {
+    fn imported_sessions_render_as_valid_durable_seats() {
         let workspace = tempfile::tempdir().unwrap();
         for (driver, expected) in [
             (ExternalDriver::Codex, vec!["resume", "native-session"]),
             (ExternalDriver::Claude, vec!["--resume", "native-session"]),
-            (ExternalDriver::Omp, vec!["--resume", "native-session"]),
+            (ExternalDriver::Pi, vec!["--session"]),
+            (ExternalDriver::Omp, vec!["--resume=native-session"]),
+            (
+                ExternalDriver::OpenCode,
+                vec!["--session", "native-session"],
+            ),
         ] {
             let session = ExternalSession {
                 id: "session/external-test".into(),
                 revision: "revision".into(),
                 driver,
                 native_id: "native-session".into(),
-                transcript: PathBuf::new(),
+                transcript: workspace.path().join("session.jsonl"),
                 cwd: Some(workspace.path().to_owned()),
                 title: None,
                 started_at_unix_ms: 0,
                 updated_at_unix_ms: 0,
                 process: None,
             };
-            let import = import_mission(&session).unwrap();
+            let import = import_seat(&session).unwrap();
             crate::graph::parse_intent(&import.kdl, "host/test").unwrap();
+            assert!(import.subject.starts_with("agent/import/"));
+            assert!(!import.kdl.contains("mission \""));
             for argument in expected {
                 assert!(
                     import.kdl.contains(argument),
@@ -1162,11 +1355,106 @@ mod tests {
             Some(ExternalDriver::Claude)
         );
         assert_eq!(
+            driver_for_command("/opt/bin/pi --session abc"),
+            Some(ExternalDriver::Pi)
+        );
+        assert_eq!(
             driver_for_command("/opt/st3 driver omp --subject agent/x -- omp"),
             Some(ExternalDriver::Omp)
         );
+        assert_eq!(
+            driver_for_command("/Users/test/.opencode/bin/opencode --session ses_123"),
+            Some(ExternalDriver::OpenCode)
+        );
         assert_eq!(driver_for_command("rg codex crates/st3"), None);
         assert_eq!(driver_for_command("bash -c echo claude"), None);
+    }
+
+    #[test]
+    fn opencode_sqlite_sessions_are_discovered_and_normalized() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".local/share/opencode");
+        fs::create_dir_all(&parent).unwrap();
+        let database = parent.join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (\
+                    id TEXT PRIMARY KEY, directory TEXT, title TEXT, \
+                    time_created INTEGER, time_updated INTEGER\
+                 );\
+                 CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "ses_native",
+                    workspace.path().to_string_lossy(),
+                    "Imported session",
+                    1_700_000_000_000_i64,
+                    1_700_000_000_100_i64,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "msg_1",
+                    "ses_native",
+                    1_700_000_000_010_i64,
+                    1_700_000_000_020_i64,
+                    r#"{"role":"assistant"}"#,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "part_1",
+                    "msg_1",
+                    "ses_native",
+                    1_700_000_000_011_i64,
+                    1_700_000_000_011_i64,
+                    r#"{"type":"text","text":"opencode"}"#,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let sessions = discover_opencode_sessions(home.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_id, "ses_native");
+        assert_eq!(sessions[0].cwd.as_deref(), Some(workspace.path()));
+        let external = ExternalSession {
+            id: external_session_id(ExternalDriver::OpenCode, &sessions[0].native_id),
+            revision: sessions[0].revision.clone(),
+            driver: ExternalDriver::OpenCode,
+            native_id: sessions[0].native_id.clone(),
+            transcript: sessions[0].transcript.clone(),
+            cwd: sessions[0].cwd.clone(),
+            title: sessions[0].title.clone(),
+            started_at_unix_ms: sessions[0].started_at_unix_ms,
+            updated_at_unix_ms: sessions[0].updated_at_unix_ms,
+            process: None,
+        };
+        let timeline = normalized_timeline(&external).unwrap();
+        assert!(
+            timeline
+                .iter()
+                .any(|item| { item["type"] == "content" && item["body"]["text"] == "opencode" })
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -179,6 +179,12 @@ pub struct ContextUsage {
     pub used_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default)]
+    pub compactions: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_trigger: Option<String>,
     pub observed_at_unix_ms: u128,
 }
 
@@ -1424,6 +1430,10 @@ pub struct MessageLifecycleRequest {
     pub lifecycle: String,
     #[serde(default)]
     pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
     #[serde(default)]

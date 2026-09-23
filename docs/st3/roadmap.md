@@ -9,7 +9,7 @@ This file records accepted future work. Active fleet work belongs in st3 mission
 - [ ] Define safe suspension points, stored state, timing, and recovery failure behavior.
 - [x] Add a harness-neutral session view for SwiftUI, React, and other native clients.
 - [x] Include ordered messages, roles, tool activity, status, errors, usage, and incremental updates.
-- [x] Discover saved and running Codex, Claude, and OMP sessions, render their normalized
+- [x] Discover saved and running Codex, Claude, Pi, OMP, and OpenCode sessions, render their normalized
   conversations read-only, and import an exact session through a fenced `session.import` action.
 
 ## User interfaces

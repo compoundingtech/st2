@@ -2766,36 +2766,30 @@ async fn import_external_session_action(
         }
     }
 
-    let import = crate::external_sessions::import_mission(&external).map_err(|error| {
+    let import = crate::external_sessions::import_seat(&external).map_err(|error| {
         ApiError::bad(St3Error::new("invalid-import-session", error.to_string()))
     })?;
-    let mission_intent = parse_intent(&import.kdl, &state.node).map_err(ApiError::bad)?;
-    let mission_preview = state
+    let seat_intent = parse_intent(&import.kdl, &state.node).map_err(ApiError::bad)?;
+    let seat_preview = state
         .store
         .mission(
-            &mission_intent,
+            &seat_intent,
             IntentInput {
                 kdl: import.kdl.clone(),
-                source_name: Some(format!("session import {target}")),
+                source_name: Some(format!("session import seat {target}")),
             },
         )
         .map_err(ApiError::bad)?;
-    if !mission_preview.blockers.is_empty() {
+    if !seat_preview.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-import-mission",
-            mission_preview.blockers.join("; "),
+            "invalid-import-seat",
+            seat_preview.blockers.join("; "),
         )));
     }
-    state
-        .store
-        .apply_as(
-            &mission_intent,
-            &mission_preview.subject_tokens,
-            &format!("{}:mission", request.idempotency_key),
-            Some(&session.authority_actor),
-        )
-        .map_err(ApiError::bad)?;
 
+    // Fenced takeover is deliberately stop -> declare -> start. The graph intent is fully parsed
+    // and authorized before the predecessor is touched, but the durable seat is not made desired
+    // until the exact native process has stopped, so two harnesses never own one native session.
     if let Some(process) = external.process.clone() {
         let driver = external.driver;
         tokio::task::spawn_blocking(move || {
@@ -2805,69 +2799,55 @@ async fn import_external_session_action(
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
     }
-
-    let published = state
-        .store
-        .mission_spec(&import.id, None)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::internal("the import mission was not published"))?;
-    let operation = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
-    let run_id = format!("{}/{}/{}", import.id, &operation[..12], "run");
-    let mut run = kdl::KdlNode::new("mission-run");
-    run.entries_mut().push(kdl::KdlEntry::new(run_id.clone()));
-    let mut run_body = kdl::KdlDocument::new();
-    for (name, value) in [
-        (
-            "mission",
-            format!("mission/{}@{}", import.id, published.revision),
-        ),
-        ("workspace", import.workspace.display().to_string()),
-        ("requester", session.authority_actor.clone()),
-    ] {
-        let mut node = kdl::KdlNode::new(name);
-        node.entries_mut().push(kdl::KdlEntry::new(value));
-        run_body.nodes_mut().push(node);
-    }
-    run.set_children(run_body);
-    let mut run_document = kdl::KdlDocument::new();
-    let mut version = kdl::KdlNode::new("version");
-    version.entries_mut().push(kdl::KdlEntry::new(2));
-    run_document.nodes_mut().push(version);
-    run_document.nodes_mut().push(run);
-    run_document.autoformat();
-    let run_kdl = run_document.to_string();
-    let run_intent = parse_intent(&run_kdl, &state.node).map_err(ApiError::bad)?;
-    let run_preview = state
-        .store
-        .mission(
-            &run_intent,
-            IntentInput {
-                kdl: run_kdl,
-                source_name: Some(format!("session import run {target}")),
-            },
-        )
-        .map_err(ApiError::bad)?;
-    if !run_preview.blockers.is_empty() {
-        return Err(ApiError::bad(St3Error::new(
-            "invalid-import-run",
-            run_preview.blockers.join("; "),
-        )));
-    }
     state
         .store
         .apply_as(
-            &run_intent,
-            &run_preview.subject_tokens,
-            &format!("{}:run", request.idempotency_key),
+            &seat_intent,
+            &seat_preview.subject_tokens,
+            &format!("{}:seat", request.idempotency_key),
             Some(&session.authority_actor),
         )
         .map_err(ApiError::bad)?;
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: import.subject.clone(),
+            kind: "harness.session-file".into(),
+            actor: Some(session_claim_actor(session)),
+            fields: BTreeMap::from([
+                (
+                    "harness".into(),
+                    Value::String(external.driver.as_str().into()),
+                ),
+                (
+                    "path".into(),
+                    Value::String(external.transcript.to_string_lossy().into_owned()),
+                ),
+                (
+                    "session_id".into(),
+                    Value::String(external.native_id.clone()),
+                ),
+                ("source_session".into(), Value::String(external.id.clone())),
+                (
+                    "discovery_revision".into(),
+                    Value::String(external.revision.clone()),
+                ),
+                ("agent".into(), Value::String(import.subject.clone())),
+                ("status".into(), Value::String("unknown".into())),
+                (
+                    "modified_at".into(),
+                    Value::String(crate::external_sessions::timestamp(
+                        external.updated_at_unix_ms,
+                    )),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("{}:native-session", request.idempotency_key)),
+        })
+        .map_err(ApiError::bad)?;
     signal_changed(state);
-    Ok(vec![
-        external.id,
-        format!("mission/{}", import.id),
-        format!("mission-run/{run_id}"),
-    ])
+    Ok(vec![external.id, import.subject])
 }
 
 fn contains_identity_selector(value: &Value) -> bool {
@@ -3064,6 +3044,8 @@ async fn dispatch_action(
                 Json(MessageLifecycleRequest {
                     lifecycle: lifecycle.into(),
                     actor: Some(authority_actor.clone()),
+                    transport: None,
+                    runtime_id: None,
                     evidence: Vec::new(),
                     expected_subject: None,
                     idempotency_key: request.idempotency_key.clone(),
@@ -3768,7 +3750,7 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
-    async fn a_saved_native_session_import_publishes_and_starts_one_resuming_mission() {
+    async fn a_saved_native_session_import_declares_one_durable_resuming_seat() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let workspace = root.path().join("workspace");
@@ -3827,12 +3809,34 @@ mission "example/zero-run" state="ready" {
         let affected = import_external_session_action(&state, &session, &request)
             .await
             .unwrap();
-        assert_eq!(affected.len(), 3);
-        assert!(affected[1].starts_with("mission/import/codex/"));
-        assert!(affected[2].starts_with("mission-run/import/codex/"));
-        let runs = state.store.active_mission_runs().unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].requester, "person/tester");
+        assert_eq!(affected.len(), 2);
+        assert!(affected[1].starts_with("agent/import/codex/"));
+        assert!(state.store.active_mission_runs().unwrap().is_empty());
+        let imported = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == affected[1])
+            .expect("the imported durable seat is declared");
+        assert_eq!(imported.kind, "agent");
+        assert!(imported.owner_run.is_none());
+        let session_file = state
+            .store
+            .latest_claim(&affected[1], Some("harness.session-file"))
+            .unwrap()
+            .expect("the native session identity is durable graph state");
+        assert_eq!(
+            session_file.body["fields"]["session_id"],
+            "native-import-test"
+        );
+        assert_eq!(session_file.body["fields"]["harness"], "codex");
+        assert_eq!(session_file.body["fields"]["agent"], affected[1]);
+        assert_eq!(session_file.body["fields"]["source_session"], external.id);
+        assert_eq!(
+            session_file.body["fields"]["discovery_revision"],
+            external.revision
+        );
     }
 
     #[test]

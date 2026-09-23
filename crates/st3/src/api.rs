@@ -4939,6 +4939,7 @@ async fn post_message_claim(
 ) -> Result<Json<ClaimRecord>, ApiError> {
     let subject = message_subject(&message_id);
     let kind = match request.lifecycle.as_str() {
+        "staged" => "message.staged",
         "delivered" => "message.delivered",
         "read" => "message.read",
         "closed" => "message.closed",
@@ -4972,13 +4973,23 @@ async fn post_message_claim(
             ),
         )));
     }
+    let mut fields = BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
+    if kind == "message.staged" {
+        fields.insert("recipient".into(), Value::String(actor.clone()));
+        if let Some(transport) = request.transport {
+            fields.insert("transport".into(), Value::String(transport));
+        }
+        if let Some(runtime_id) = request.runtime_id {
+            fields.insert("runtime_id".into(), Value::String(runtime_id));
+        }
+    }
     let record = state
         .store
         .append_claim(&ClaimInput {
             subject,
             kind: kind.into(),
             actor: Some(actor),
-            fields: BTreeMap::from([("status".into(), Value::String(request.lifecycle))]),
+            fields,
             evidence: request.evidence,
             expected_subject: request.expected_subject,
             idempotency_key: Some(request.idempotency_key),
@@ -6464,6 +6475,9 @@ async fn input_session_as(
         SessionInputMode::Raw => "raw",
         SessionInputMode::Key => "key",
     };
+    let compaction_intent = matches!(request.mode, SessionInputMode::Line)
+        && request.value == "/compact"
+        && session.driver.as_deref() == Some("codex");
     let request_key = format!(
         "session-control-request:input:{subject}:{}",
         request.idempotency_key
@@ -6485,28 +6499,32 @@ async fn input_session_as(
             )),
         );
     }
+    let mut request_fields = BTreeMap::from([
+        ("mode".into(), Value::String(mode.into())),
+        (
+            "sha256".into(),
+            Value::String(hex::encode(Sha256::digest(&bytes))),
+        ),
+        ("byte_count".into(), Value::from(bytes.len() as u64)),
+        (
+            "runtime_id".into(),
+            Value::String(session.runtime_id.clone()),
+        ),
+        (
+            "incarnation_id".into(),
+            Value::String(session.incarnation_id.clone()),
+        ),
+    ]);
+    if compaction_intent {
+        request_fields.insert("intent".into(), Value::String("context-compaction".into()));
+    }
     let request_claim = state
         .store
         .append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "terminal.input.requested".into(),
             actor: Some(authority_actor.into()),
-            fields: BTreeMap::from([
-                ("mode".into(), Value::String(mode.into())),
-                (
-                    "sha256".into(),
-                    Value::String(hex::encode(Sha256::digest(&bytes))),
-                ),
-                ("byte_count".into(), Value::from(bytes.len() as u64)),
-                (
-                    "runtime_id".into(),
-                    Value::String(session.runtime_id.clone()),
-                ),
-                (
-                    "incarnation_id".into(),
-                    Value::String(session.incarnation_id.clone()),
-                ),
-            ]),
+            fields: request_fields,
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(request_key),
@@ -8587,6 +8605,8 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 lifecycle: "read".into(),
                 actor: None,
+                transport: None,
+                runtime_id: None,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: "missing-message-actor".into(),
@@ -8603,6 +8623,8 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 lifecycle: "read".into(),
                 actor: Some("person/intruder".into()),
+                transport: None,
+                runtime_id: None,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: "wrong-message-actor".into(),
@@ -8613,12 +8635,35 @@ version 2
         assert_eq!(status, StatusCode::FORBIDDEN, "{wrong}");
         assert_eq!(wrong["code"], "wrong-message-recipient");
 
+        let (status, staged) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(MessageLifecycleRequest {
+                lifecycle: "staged".into(),
+                actor: Some("person/receiver".into()),
+                transport: Some("codex-app-server".into()),
+                runtime_id: Some("runtime/receiver".into()),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: "staged-by-recipient-driver".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{staged}");
+        assert_eq!(staged["body"]["fields"]["status"], "staged");
+        assert_eq!(staged["body"]["fields"]["recipient"], "person/receiver");
+        assert_eq!(staged["body"]["fields"]["transport"], "codex-app-server");
+        assert_eq!(staged["body"]["fields"]["runtime_id"], "runtime/receiver");
+
         let (status, read) = json_request(
             app.clone(),
             &path,
             serde_json::to_value(MessageLifecycleRequest {
                 lifecycle: "delivered".into(),
                 actor: Some("person/receiver".into()),
+                transport: None,
+                runtime_id: None,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: "right-message-actor".into(),

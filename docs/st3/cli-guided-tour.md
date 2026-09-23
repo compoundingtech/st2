@@ -168,7 +168,7 @@ and understandable.
 
 ### 6. `conversations` — messages and normalized harness sessions
 
-Why: human/agent mail and Codex, Claude, or OMP session timelines need one normalized product
+Why: human/agent mail and Codex, Claude, Pi, OMP, or OpenCode session timelines need one normalized product
 surface.
 
 ```sh
@@ -233,7 +233,7 @@ Use a harmless live terminal for `peek`. Attach only when we have agreed which t
 verify the caller's screen, cursor, input mode, and shell prompt are restored. `send` and `signal`
 are control mutations and are not aimed at arbitrary live work.
 
-### 9. `import` — adopt native Codex, Claude, and OMP sessions
+### 9. `import` — adopt native Codex, Claude, Pi, OMP, and OpenCode sessions
 
 Why: useful pre-st3 sessions should be readable before import and resumable under durable st3
 ownership afterward.
@@ -249,6 +249,10 @@ st3 import run --help
 Use a returned session ID for `show`; do not run an import unless we selected a disposable or
 intentionally adoptable session. Check harness type, live/saved state, workspace, process fence,
 importability, normalized timeline link, and refusal reason.
+
+An import performs an exact fenced takeover: it stops only the process whose native session and
+start fingerprint still match, declares one durable ownerless agent seat, records the native
+session identity in the graph, and starts that seat with the harness's canonical resume arguments.
 
 ### 10. `devices` — pair the TUI/mobile trust boundary
 

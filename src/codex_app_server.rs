@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -36,6 +36,7 @@ const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
     "initialize",
     "thread/loaded/list",
+    "thread/read",
     "thread/resume",
     "turn/start",
     "turn/steer",
@@ -99,6 +100,10 @@ const HOOK_TRUST_PREFLIGHT_REQUEST_ID: u64 = 1;
 const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
+const TRANSCRIPT_TURN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const TRANSCRIPT_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
+const TRANSCRIPT_DISCOVERY_FILE_LIMIT: usize = 10_000;
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
 const SOCKET_PATH_BUDGET: usize = 96;
 
@@ -511,6 +516,13 @@ struct PendingCodexDelivery {
     method: CodexDeliveryMethod,
 }
 
+#[derive(Debug, Clone)]
+struct PendingCodexSnapshot {
+    request_id: u64,
+    filename: String,
+    requested_at: Instant,
+}
+
 // One durable FIFO delivery attempt lives in the shared `crate::delivery_ledger`, which grades
 // Codex's two receipts honestly: the JSON-RPC result of `turn/start`/`turn/steer` is
 // `transportAccepted`, and only the exact completed typed user message — live, or found in a
@@ -551,10 +563,14 @@ struct CodexInboxDelivery {
     _watcher: Option<notify::RecommendedWatcher>,
     next_inbox_refresh: Instant,
     next_presence_refresh: Instant,
+    next_context_transcript_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
     ledger: delivery_ledger::Ledger,
     pending: Option<PendingCodexDelivery>,
+    pending_snapshot: Option<PendingCodexSnapshot>,
+    verified_snapshot: Option<(String, CodexObservedState)>,
+    require_snapshot: bool,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
     harness_writer: harness_state::Writer,
@@ -669,10 +685,14 @@ impl CodexInboxDelivery {
             _watcher: watcher,
             next_inbox_refresh: Instant::now(),
             next_presence_refresh: Instant::now(),
+            next_context_transcript_refresh: Instant::now(),
             head: None,
             suppressed: false,
             ledger,
             pending: None,
+            pending_snapshot: None,
+            verified_snapshot: None,
+            require_snapshot: true,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
             harness_writer,
@@ -718,6 +738,33 @@ impl CodexInboxDelivery {
             && let Err(error) = context.observe(message, thread_id)
         {
             tracing::warn!("st2 codex: harness-context write failed: {error:#}");
+        }
+    }
+
+    /// Codex 0.151 persists a manual `ContextCompaction` completion even when the secondary
+    /// app-server subscriber receives no matching item notification. Sample the same bounded
+    /// rollout tail used for turn recovery so that omission does not erase the context edge.
+    fn refresh_transcript_context_if_due(&mut self, thread_id: &str) {
+        if Instant::now() < self.next_context_transcript_refresh {
+            return;
+        }
+        self.next_context_transcript_refresh = Instant::now() + TRANSCRIPT_CONTEXT_REFRESH_INTERVAL;
+        let result = latest_codex_transcript(thread_id).and_then(|path| match path {
+            Some(path) => codex_transcript_tail(&path).map(Some),
+            None => Ok(None),
+        });
+        match (self.context.as_mut(), result) {
+            (Some(context), Ok(Some(frames))) => {
+                if let Err(error) = context.observe_transcript(&frames, thread_id) {
+                    tracing::warn!(
+                        "st2 codex: transcript harness-context recovery failed: {error:#}"
+                    );
+                }
+            }
+            (_, Err(error)) => {
+                tracing::warn!("st2 codex: bounded transcript context discovery failed: {error:#}")
+            }
+            _ => {}
         }
     }
 
@@ -807,9 +854,14 @@ impl CodexInboxDelivery {
         // A consumed message remains unread until the recipient's normal archive precedence
         // settles it. It is history, not a FIFO lock: select the earliest unread message that has
         // not already reached Codex's consumption ceiling.
+        let prior_head = self.head.as_ref().map(|message| message.filename.clone());
         self.head = unread
             .into_iter()
             .find(|message| !self.ledger.settled(&message.filename));
+        if self.head.as_ref().map(|message| &message.filename) != prior_head.as_ref() {
+            self.pending_snapshot = None;
+            self.verified_snapshot = None;
+        }
         self.suppressed =
             status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
         self.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
@@ -818,7 +870,11 @@ impl CodexInboxDelivery {
 
     fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
-        if self.pending.is_some() || !state.subscribed || self.suppressed {
+        if self.pending.is_some()
+            || self.pending_snapshot.is_some()
+            || !state.subscribed
+            || self.suppressed
+        {
             return Ok(None);
         }
         // Fail closed: an unreadable ledger holds and surfaces rather than guessing. It never
@@ -847,6 +903,14 @@ impl CodexInboxDelivery {
         let Some(head) = self.head.clone() else {
             return Ok(None);
         };
+        if self.require_snapshot
+            && self
+                .verified_snapshot
+                .as_ref()
+                .is_none_or(|(filename, _)| filename != &head.filename)
+        {
+            return Ok(None);
+        }
         if self.rejected.as_ref().is_some_and(|rejected| {
             rejected.filename == head.filename && rejected.observed == state.observed
         }) {
@@ -864,7 +928,12 @@ impl CodexInboxDelivery {
         if self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry {
             return Ok(None);
         }
-        let method = match &state.observed {
+        let observed = self
+            .verified_snapshot
+            .as_ref()
+            .map(|(_, observed)| observed)
+            .unwrap_or(&state.observed);
+        let method = match observed {
             CodexObservedState::Idle | CodexObservedState::TerminalError { .. } => {
                 CodexDeliveryMethod::Start
             }
@@ -905,7 +974,108 @@ impl CodexInboxDelivery {
             filename,
             method,
         });
+        self.verified_snapshot = None;
         Ok(Some(request))
+    }
+
+    #[cfg(test)]
+    fn without_snapshot_requirement(mut self) -> Self {
+        self.require_snapshot = false;
+        self
+    }
+
+    fn maybe_snapshot_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
+        self.refresh_if_due()?;
+        if self.pending.is_some()
+            || self.pending_snapshot.is_some()
+            || !state.subscribed
+            || self.suppressed
+        {
+            return Ok(None);
+        }
+        let Some(head) = self.head.as_ref() else {
+            return Ok(None);
+        };
+        if self
+            .verified_snapshot
+            .as_ref()
+            .is_some_and(|(filename, _)| filename == &head.filename)
+        {
+            return Ok(None);
+        }
+        if self.ledger.holds_other_than(&head.filename)
+            || self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry
+        {
+            return Ok(None);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .context("Codex snapshot request ID overflow")?;
+        self.pending_snapshot = Some(PendingCodexSnapshot {
+            request_id,
+            filename: head.filename.clone(),
+            requested_at: Instant::now(),
+        });
+        Ok(Some(json!({
+            "method": "thread/read",
+            "id": request_id,
+            "params": {
+                "threadId": state.thread_id(),
+                "includeTurns": true,
+            }
+        })))
+    }
+
+    fn accept_snapshot_response(
+        &mut self,
+        message: &Value,
+        state: &mut CodexControlState,
+    ) -> Result<bool> {
+        let Some(pending) = self.pending_snapshot.as_ref() else {
+            return Ok(false);
+        };
+        if message.get("method").is_some()
+            || message.get("id") != Some(&Value::from(pending.request_id))
+        {
+            return Ok(false);
+        }
+        let pending = self
+            .pending_snapshot
+            .take()
+            .context("Codex thread snapshot is not pending")?;
+        if message.get("error").is_some() {
+            // Keep the message fenced, but let the bounded transcript fallback run on the next
+            // poll. A temporary thread/read rejection must not kill the whole control pump.
+            self.pending_snapshot = Some(PendingCodexSnapshot {
+                requested_at: Instant::now()
+                    .checked_sub(TRANSCRIPT_TURN_RECOVERY_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+                ..pending
+            });
+            return Ok(true);
+        }
+        let observed = observed_from_thread_snapshot(message, state.thread_id())?;
+        state.observed = observed.clone();
+        self.verified_snapshot = Some((pending.filename, observed));
+        Ok(true)
+    }
+
+    fn transcript_recovery_due(&self) -> bool {
+        self.head.is_some()
+            && self.verified_snapshot.is_none()
+            && self.pending_snapshot.as_ref().is_some_and(|pending| {
+                pending.requested_at.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
+            })
+    }
+
+    fn accept_transcript_recovery(&mut self, observed: CodexObservedState) {
+        let Some(head) = self.head.as_ref() else {
+            return;
+        };
+        self.pending_snapshot = None;
+        self.verified_snapshot = Some((head.filename.clone(), observed));
     }
 
     fn accept_response(&mut self, message: &Value, observed: &CodexObservedState) -> Result<bool> {
@@ -1228,6 +1398,24 @@ impl CodexControlState {
         let before = (self.subscribed, self.observed.clone());
         self.subscribed = true;
         self.observe_thread_status(status, blocked);
+        let active_turns = message
+            .pointer("/result/thread/turns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .filter_map(|turn| turn.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        match active_turns.as_slice() {
+            [turn_id] => self.observe_turn_evidence(turn_id),
+            [_, _, ..] => {
+                self.observed = CodexObservedState::Held {
+                    reason: CodexHoldReason::ConflictingTurn,
+                    turn_id: None,
+                };
+            }
+            [] => {}
+        }
         Ok(SubscriptionAcceptance::Accepted {
             changed: (self.subscribed, self.observed.clone()) != before,
         })
@@ -1280,6 +1468,34 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let item_type = required_string(message, "/params/item/type", method)?;
+                let reported_turn_id = message
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .filter(|turn_id| !turn_id.is_empty());
+                // A control subscriber can attach after the owning TUI has already started its
+                // initial turn. Every typed item is exact evidence for that turn, so use it to
+                // recover steerability instead of holding the durable inbox until the turn ends.
+                // An exit marker is evidence only about a hold that already exists; using it as
+                // standalone turn-start evidence would turn a stale review exit into a live turn.
+                if item_type != "exitedReviewMode"
+                    && let Some(turn_id) = reported_turn_id
+                {
+                    self.observe_turn_evidence(turn_id);
+                }
+                // Codex 0.151 omitted `turnId` from ordinary item notifications. A hold item is
+                // still attributable when the turn lifecycle already established one, but an
+                // item without either source must never invent an identity.
+                let turn_id =
+                    reported_turn_id
+                        .map(str::to_owned)
+                        .or_else(|| match &self.observed {
+                            CodexObservedState::Active { turn_id }
+                            | CodexObservedState::Held {
+                                turn_id: Some(turn_id),
+                                ..
+                            } => Some(turn_id.clone()),
+                            _ => None,
+                        });
                 // The admitted `ThreadItem` schema has only three variants that change
                 // steerability. Every other classified item reports work inside a turn that the
                 // turn and thread status already model, so it is ignored on purpose. A later
@@ -1292,13 +1508,16 @@ impl CodexControlState {
                     "enteredReviewMode" => (CodexHoldReason::Review, false),
                     "exitedReviewMode" => (CodexHoldReason::Review, true),
                     "contextCompaction" => (CodexHoldReason::Compaction, false),
-                    _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => return Ok(false),
+                    _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => {
+                        return Ok(self.observed != before);
+                    }
                     _ => (CodexHoldReason::UnknownProtocol, false),
                 };
-                let turn_id = required_string(message, "/params/turnId", method)?;
                 if released {
-                    self.observe_hold_released(turn_id, reason);
-                } else {
+                    if let Some(turn_id) = turn_id.as_deref() {
+                        self.observe_hold_released(turn_id, reason);
+                    }
+                } else if let Some(turn_id) = turn_id.as_deref() {
                     self.observe_non_steerable(turn_id, reason);
                 }
             }
@@ -1407,6 +1626,27 @@ impl CodexControlState {
                 turn_id: None,
             },
             _ => CodexObservedState::Active { turn_id },
+        };
+    }
+
+    fn observe_turn_evidence(&mut self, turn_id: &str) {
+        self.observed = match &self.observed {
+            CodexObservedState::AwaitingStatus
+            | CodexObservedState::Held {
+                reason: CodexHoldReason::ActiveWithoutTurn,
+                ..
+            } => CodexObservedState::Active {
+                turn_id: turn_id.to_string(),
+            },
+            CodexObservedState::Held {
+                reason:
+                    reason @ (CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput),
+                turn_id: None,
+            } => CodexObservedState::Held {
+                reason: *reason,
+                turn_id: Some(turn_id.to_string()),
+            },
+            _ => self.observed.clone(),
         };
     }
 
@@ -1551,6 +1791,68 @@ impl CodexControlState {
             turn_id,
         };
     }
+}
+
+fn observed_from_thread_snapshot(
+    message: &Value,
+    expected_thread_id: &str,
+) -> Result<CodexObservedState> {
+    let thread_id = required_string(message, "/result/thread/id", "thread/read response")?;
+    anyhow::ensure!(
+        thread_id == expected_thread_id,
+        "Codex thread/read returned a different thread"
+    );
+    let status_value = message.pointer("/result/thread/status");
+    let status = required_string(
+        message,
+        "/result/thread/status/type",
+        "thread/read response",
+    )?;
+    let blocked = human_blocking_flag(status_value);
+    if status != "active" {
+        return Ok(match status {
+            "idle" => CodexObservedState::Idle,
+            "notLoaded" => CodexObservedState::Held {
+                reason: CodexHoldReason::NotLoaded,
+                turn_id: None,
+            },
+            "systemError" => CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                turn_id: None,
+            },
+            _ => CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                turn_id: None,
+            },
+        });
+    }
+    let active_turns = message
+        .pointer("/result/thread/turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        .filter_map(|turn| turn.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    Ok(match active_turns.as_slice() {
+        [turn_id] => match blocked {
+            Some(reason) => CodexObservedState::Held {
+                reason,
+                turn_id: Some((*turn_id).to_string()),
+            },
+            None => CodexObservedState::Active {
+                turn_id: (*turn_id).to_string(),
+            },
+        },
+        [] => CodexObservedState::Held {
+            reason: blocked.unwrap_or(CodexHoldReason::ActiveWithoutTurn),
+            turn_id: None,
+        },
+        [_, _, ..] => CodexObservedState::Held {
+            reason: CodexHoldReason::ConflictingTurn,
+            turn_id: None,
+        },
+    })
 }
 
 /// Read the delivery-relevant part of `ThreadStatus.activeFlags`: the first flag that says this
@@ -1764,6 +2066,7 @@ fn run_controlled_owned(
             run_connected(
                 server.child_mut(),
                 &socket_path,
+                state_dir,
                 &runtime,
                 &codex_argv,
                 resume_thread.as_deref(),
@@ -1820,6 +2123,7 @@ fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
 fn run_connected(
     server: &mut Child,
     socket_path: &Path,
+    state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
     resume_thread: Option<&str>,
@@ -1829,7 +2133,6 @@ fn run_connected(
     // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
     // detached app-server included); re-installing here would RESET a stop flag raised during
     // startup, so this function only relies on it.
-    let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
     let endpoint = format!("unix://{}", socket_path.display());
     let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
     let expected_resume =
@@ -2717,6 +3020,7 @@ fn pump_control(
         };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
+        let mut last_transcript_turn_recovery = None;
         let mut peer_closed = false;
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
@@ -2775,11 +3079,53 @@ fn pump_control(
                     }
                 };
             let Some(message) = message else {
-                if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
-                    && let Some(request) = delivery.maybe_request(state)?
-                {
-                    write_json_message(&mut websocket, &request)
-                        .context("sending Codex delivery request")?;
+                if let Some(state) = control_state.as_mut() {
+                    if let Some(delivery) = delivery.as_mut() {
+                        delivery.refresh_transcript_context_if_due(state.thread_id());
+                    }
+                    let recovery_due = last_transcript_turn_recovery.is_none_or(|last: Instant| {
+                        last.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
+                    });
+                    let transcript_needed = delivery
+                        .as_ref()
+                        .is_some_and(CodexInboxDelivery::transcript_recovery_due);
+                    if recovery_due
+                        && transcript_needed
+                        && matches!(
+                            state.observed,
+                            CodexObservedState::AwaitingStatus
+                                | CodexObservedState::Held {
+                                    reason: CodexHoldReason::ActiveWithoutTurn,
+                                    ..
+                                }
+                        )
+                    {
+                        last_transcript_turn_recovery = Some(Instant::now());
+                        if let Some(turn_id) = recover_active_codex_turn(state.thread_id())? {
+                            let before = state.observed.clone();
+                            state.observe_turn_evidence(&turn_id);
+                            if state.observed != before {
+                                atomic_json(control_state_path, state)
+                                    .context("persisting transcript-recovered Codex turn")?;
+                                if let Some(delivery) = delivery.as_mut() {
+                                    delivery.observe_harness(&state.observed);
+                                }
+                                let _ = events.send(ControlEvent::Observed);
+                            }
+                            if let Some(delivery) = delivery.as_mut() {
+                                delivery.accept_transcript_recovery(state.observed.clone());
+                            }
+                        }
+                    }
+                    if let Some(delivery) = delivery.as_mut() {
+                        if let Some(request) = delivery.maybe_snapshot_request(state)? {
+                            write_json_message(&mut websocket, &request)
+                                .context("sending Codex on-demand thread/read")?;
+                        } else if let Some(request) = delivery.maybe_request(state)? {
+                            write_json_message(&mut websocket, &request)
+                                .context("sending Codex delivery request")?;
+                        }
+                    }
                 }
                 continue;
             };
@@ -2871,6 +3217,12 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
+            if let Some(delivery) = delivery.as_mut() {
+                // Some Codex builds keep a secondary subscriber busy with status traffic while
+                // omitting the compaction item itself. Rate-limit this independently of socket
+                // timeouts so a chatty stream cannot starve transcript recovery.
+                delivery.refresh_transcript_context_if_due(state.thread_id());
+            }
             // The context record's whole input, taken before the delivery and state branches
             // because none of them reads a token count and every one of them may `continue`.
             //
@@ -2886,11 +3238,15 @@ fn pump_control(
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
             }
+            let before_delivery_state = state.observed.clone();
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
                     delivery
-                        .accept_response(&message, &state.observed)
-                        .context("accepting Codex delivery response")?
+                        .accept_snapshot_response(&message, state)
+                        .context("accepting Codex on-demand thread/read response")?
+                        || delivery
+                            .accept_response(&message, &state.observed)
+                            .context("accepting Codex delivery response")?
                         || delivery
                             .accept_typed_receipt(&message, state)
                             .context("accepting Codex typed receipt")?
@@ -2905,7 +3261,7 @@ fn pump_control(
                     .context("accepting Codex turn completion receipt")?;
             }
             let changed = if delivery_response {
-                false
+                state.observed != before_delivery_state
             } else if message.get("method").is_none()
                 && message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
             {
@@ -2956,17 +3312,129 @@ fn pump_control(
                 .context("sending Codex subscription request")?;
                 subscription_pending = true;
             }
-            if let Some(delivery) = delivery.as_mut()
-                && let Some(request) = delivery.maybe_request(state)?
-            {
-                write_json_message(&mut websocket, &request)
-                    .context("sending Codex delivery request")?;
+            if let Some(delivery) = delivery.as_mut() {
+                if let Some(request) = delivery.maybe_snapshot_request(state)? {
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex on-demand thread/read")?;
+                } else if let Some(request) = delivery.maybe_request(state)? {
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex delivery request")?;
+                }
             }
         }
     })();
     if let Err(error) = result {
         let _ = events.send(ControlEvent::Failed(format!("{error:#}")));
     }
+}
+
+fn recover_active_codex_turn(thread_id: &str) -> Result<Option<String>> {
+    latest_codex_transcript(thread_id)?
+        .map(|path| active_turn_from_codex_transcript(&path))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
+    let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    else {
+        return Ok(None);
+    };
+    let sessions = home.join("sessions");
+    let mut stack = vec![sessions];
+    let mut inspected = 0_usize;
+    let mut selected: Option<(SystemTime, PathBuf)> = None;
+    while let Some(directory) = stack.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            inspected = inspected.saturating_add(1);
+            if inspected > TRANSCRIPT_DISCOVERY_FILE_LIMIT {
+                return Ok(None);
+            }
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+                || !path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.contains(thread_id))
+            {
+                continue;
+            }
+            let modified = entry
+                .metadata()?
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if selected
+                .as_ref()
+                .is_none_or(|(current, _)| modified > *current)
+            {
+                selected = Some((modified, path));
+            }
+        }
+    }
+    Ok(selected.map(|(_, path)| path))
+}
+
+fn active_turn_from_codex_transcript(path: &Path) -> Result<Option<String>> {
+    let frames = codex_transcript_tail(path)?;
+    Ok(active_turn_from_codex_frames(&frames))
+}
+
+fn codex_transcript_tail(path: &Path) -> Result<Vec<Value>> {
+    let mut file =
+        File::open(path).with_context(|| format!("read Codex transcript {}", path.display()))?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(TRANSCRIPT_TURN_RECOVERY_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file);
+    if start != 0 {
+        let mut partial = String::new();
+        reader.read_line(&mut partial)?;
+    }
+    let mut frames = Vec::new();
+    for line in reader.lines() {
+        if let Ok(value) = serde_json::from_str::<Value>(&line?) {
+            frames.push(value);
+        }
+    }
+    Ok(frames)
+}
+
+fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+    let mut active = None;
+    for value in frames {
+        let event = value.pointer("/payload/type").and_then(Value::as_str);
+        let turn_id = value
+            .pointer("/payload/turn_id")
+            .or_else(|| {
+                value.pointer("/payload/internal_chat_message_metadata_passthrough/turn_id")
+            })
+            .and_then(Value::as_str);
+        match (event, turn_id) {
+            (Some("task_started"), Some(turn_id)) => active = Some(turn_id.to_string()),
+            (Some("task_complete" | "turn_aborted"), Some(turn_id))
+                if active.as_deref() == Some(turn_id) =>
+            {
+                active = None;
+            }
+            _ => {}
+        }
+    }
+    active
 }
 
 fn subscription_candidate(message: &Value, thread_id: &str) -> bool {

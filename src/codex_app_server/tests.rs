@@ -978,6 +978,94 @@ fn one_compaction_is_counted_once_across_every_spelling_of_its_edge() {
     assert_eq!(context_record(&agent_dir).unwrap().compactions, 5);
 }
 
+#[test]
+fn rollout_fallback_counts_only_new_context_compaction_completions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (agent_dir, mut producer) = context_producer(tmp.path());
+    let baseline = vec![json!({
+        "ordinal": 10,
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "thread_id": "thread-main",
+            "turn_id": "turn-before"
+        }
+    })];
+    assert!(
+        !producer
+            .observe_transcript(&baseline, "thread-main")
+            .unwrap()
+    );
+    assert!(context_record(&agent_dir).is_none());
+
+    let completed = vec![
+        baseline[0].clone(),
+        json!({
+            "ordinal": 11,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "thread-main",
+                "turn_id": "turn-compact",
+                "item": { "id": "compact-1", "type": "ContextCompaction" }
+            }
+        }),
+    ];
+    assert!(
+        producer
+            .observe_transcript(&completed, "thread-main")
+            .unwrap()
+    );
+    let observed = context_record(&agent_dir).unwrap();
+    assert_eq!(observed.compactions, 1);
+    assert_eq!(
+        observed.last_compaction_trigger,
+        Some(harness_context::CompactionTrigger::Unknown)
+    );
+    assert!(
+        !producer
+            .observe_transcript(&completed, "thread-main")
+            .unwrap()
+    );
+
+    let foreign = vec![json!({
+        "ordinal": 12,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": "thread-other",
+            "turn_id": "turn-foreign",
+            "item": { "id": "compact-2", "type": "ContextCompaction" }
+        }
+    })];
+    assert!(
+        !producer
+            .observe_transcript(&foreign, "thread-main")
+            .unwrap()
+    );
+    assert_eq!(context_record(&agent_dir).unwrap().compactions, 1);
+
+    let fresh_tmp = tempfile::tempdir().unwrap();
+    let (fresh_dir, mut fresh) = context_producer(fresh_tmp.path());
+    let first_live_snapshot = vec![json!({
+        "ordinal": 20,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": "thread-main",
+            "turn_id": "turn-live",
+            "completed_at_ms": u64::MAX,
+            "item": { "id": "compact-live", "type": "ContextCompaction" }
+        }
+    })];
+    assert!(
+        fresh
+            .observe_transcript(&first_live_snapshot, "thread-main")
+            .unwrap()
+    );
+    assert_eq!(context_record(&fresh_dir).unwrap().compactions, 1);
+}
+
 /// The producer runs beside a live delivery loop and sees every frame that loop sees. Replaying
 /// the captured #263 session — 23 real inbound frames, none of them a token count — must leave
 /// no record at all: absence here is "never observed", and a producer that manufactured a
@@ -1029,6 +1117,7 @@ fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDeliver
         CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
     )
     .unwrap()
+    .without_snapshot_requirement()
 }
 
 /// Read the ledger back through its own loader and the real correlation derivation: a test
@@ -2132,8 +2221,27 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
             }),
         )
         .unwrap();
+        let snapshot = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(snapshot["id"], FIRST_DELIVERY_REQUEST_ID);
+        assert_eq!(snapshot["method"], "thread/read");
+        assert_eq!(snapshot["params"]["threadId"], "thread-main");
+        assert_eq!(snapshot["params"]["includeTurns"], true);
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": FIRST_DELIVERY_REQUEST_ID,
+                "result": {
+                    "thread": {
+                        "id": "thread-main",
+                        "status": { "type": "idle" },
+                        "turns": []
+                    }
+                }
+            }),
+        )
+        .unwrap();
         let delivery = read_json_message(&mut websocket).unwrap().unwrap();
-        assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
+        assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID + 1);
         assert_eq!(delivery["method"], "turn/start");
         assert_eq!(delivery["params"]["threadId"], "thread-main");
         let head_id = server_filename
@@ -2159,7 +2267,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         write_json_message(
             &mut websocket,
             &json!({
-                "id": FIRST_DELIVERY_REQUEST_ID,
+                "id": FIRST_DELIVERY_REQUEST_ID + 1,
                 "result": { "turn": { "id": "turn-delivery" } }
             }),
         )
@@ -2956,6 +3064,147 @@ fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
             .unwrap()
     );
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn a_typed_item_recovers_the_startup_turn_for_immediate_steering() {
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state
+        .observe(&json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-main",
+                "status": { "type": "active", "activeFlags": [] }
+            }
+        }))
+        .unwrap();
+    assert!(matches!(
+        state.observed(),
+        CodexObservedState::Held {
+            reason: CodexHoldReason::ActiveWithoutTurn,
+            ..
+        }
+    ));
+
+    assert!(
+        state
+            .observe(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-recovered",
+                    "item": { "type": "commandExecution" }
+                }
+            }))
+            .unwrap()
+    );
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-recovered".into(),
+        }
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the staged message should steer the recovered turn");
+    assert_eq!(request["method"], "turn/steer");
+    assert_eq!(request["params"]["expectedTurnId"], "turn-recovered");
+}
+
+#[test]
+fn delivery_reads_the_current_turn_on_demand_before_steering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Active {
+        turn_id: "turn-stale".into(),
+    };
+
+    let read = delivery
+        .maybe_snapshot_request(&state)
+        .unwrap()
+        .expect("an unread inbox head requires a fresh thread snapshot");
+    assert_eq!(read["method"], "thread/read");
+    assert_eq!(read["params"]["includeTurns"], true);
+    let read_id = read["id"].clone();
+    assert!(
+        delivery
+            .accept_snapshot_response(
+                &json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-main",
+                            "status": { "type": "active", "activeFlags": [] },
+                            "turns": [{ "id": "turn-current", "status": "inProgress", "items": [] }]
+                        }
+                    }
+                }),
+                &mut state,
+            )
+            .unwrap()
+    );
+    let steer = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the verified current turn is steerable");
+    assert_eq!(steer["method"], "turn/steer");
+    assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
+    assert_ne!(steer["params"]["expectedTurnId"], "turn-stale");
+}
+
+#[test]
+fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-old"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-live"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"turn-live"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        Some("turn-live".into())
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"turn-live\"}}\n",
+        )
+        .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        None
+    );
 }
 
 #[test]
