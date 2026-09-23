@@ -8,10 +8,17 @@ mission "eval/work-wake-reliability/revisable" state="ready" revision-cutover="r
     goal "Claim this ready work, record one concise progress update containing REVISION-INITIAL, then complete it. Do not modify repository files."
   }
 
+  step "revision-window" timeout="30m" {
+    agentless
+    gate "the controller closes the explicit revision window" type="human" {
+      reviewer "person/eval-requester"
+    }
+  }
+
   finally {
     step "finalize" timeout="1m" {
       agentless
-      goal "Reach a durable final state when the standing run is cancelled."
+      goal "Reach a durable final state when the finite revisable run is cancelled."
     }
   }
 }

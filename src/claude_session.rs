@@ -51,6 +51,11 @@ pub fn run(
         // session's records: the wrapper can re-stamp them, and its terminal record fences them.
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
+        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        (
+            "CATALOG".to_string(),
+            catalog_root.to_string_lossy().into_owned(),
+        ),
     ];
     run_provider(
         "Claude",
@@ -91,6 +96,11 @@ pub fn run_controlled_paths(
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
+        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        (
+            "CATALOG".to_string(),
+            catalog_root.to_string_lossy().into_owned(),
+        ),
     ];
     run_provider(
         "Claude",

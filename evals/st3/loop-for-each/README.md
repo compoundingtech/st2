@@ -1,5 +1,4 @@
-# loop-for-each
+# loop-for-each (retired)
 
-This model-free eval proves that a loop snapshots a resource array and runs one child mission for each item.
-
-The three item runs write separate files from their automatic loop context. The final gate verifies all three files.
+The dynamic collection loop was removed from the st3 loop grammar. Collections are now expressed
+as explicit mission steps or queues, so ownership and concurrency remain visible in the graph.

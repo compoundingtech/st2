@@ -57,17 +57,17 @@ wait_for_started() {
       agent="${agents[$name]}"
       snapshot="$(agent_json "$agent" || true)"
       if jq -e '
-        .actual.status == "running"
-        and .actual.reachability == "reachable"
-        and (.harness.state != null)
-        and (.harness.state != "unknown")
-        and (.harness.state != "ended")
+        .value.state == "running"
+        and .value.reachability == "reachable"
+        and (.value.harness_state != null)
+        and (.value.harness_state != "unknown")
+        and (.value.harness_state != "ended")
       ' <<<"$snapshot" >/dev/null 2>&1; then
-        harness_state="$(jq -r '.harness.state' <<<"$snapshot")"
+        harness_state="$(jq -r '.value.harness_state' <<<"$snapshot")"
         state="$(jq \
           --arg name "$name" --arg id "$agent" --arg pre "$harness_state" \
-          --argjson observed "$(jq -r '.harness.observed_at_unix_ms // 0' <<<"$snapshot")" \
-          '.agents[$name] = {id: $id, startup_pre_state: $pre, startup_observed_at_unix_ms: $observed}' \
+          --argjson observed "$(jq -r '.snapshot.store_index // 0' <<<"$snapshot")" \
+          '.agents[$name] = {id: $id, startup_pre_state: $pre, startup_observed_store_index: $observed}' \
           <<<"$state")"
       else
         complete=0
@@ -92,14 +92,14 @@ wait_for_exact_idle() {
       agent="${agents[$name]}"
       snapshot="$(agent_json "$agent" || true)"
       if jq -e '
-        .actual.status == "running"
-        and .actual.reachability == "reachable"
-        and .harness.state == "idle"
+        .value.state == "running"
+        and .value.reachability == "reachable"
+        and .value.harness_state == "idle"
       ' <<<"$snapshot" >/dev/null 2>&1; then
         state="$(jq \
           --arg name "$name" \
-          --argjson observed "$(jq -r '.harness.observed_at_unix_ms // 0' <<<"$snapshot")" \
-          '.agents[$name].idle_pre_state = "idle" | .agents[$name].idle_observed_at_unix_ms = $observed' \
+          --argjson observed "$(jq -r '.snapshot.store_index // 0' <<<"$snapshot")" \
+          '.agents[$name].idle_pre_state = "idle" | .agents[$name].idle_observed_store_index = $observed' \
           <<<"$state")"
       else
         complete=0

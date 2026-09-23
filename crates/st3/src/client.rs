@@ -1036,6 +1036,11 @@ mod tests {
                                         pty_core::protocol::encode_exit(0).into(),
                                     ))
                                     .await;
+                                // Keep the successful route alive until the attach client consumes
+                                // the terminal exit and closes its bridge. Dropping the server side
+                                // immediately races the exit frame and can induce a valid third
+                                // reconnect before the fixture's result is observed.
+                                let _ = socket.recv().await;
                             },
                         )
                     }

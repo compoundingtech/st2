@@ -48,11 +48,12 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
                             .and_then(|body| body.get("model"))
                             .and_then(|model| model.entries().first())
                             .and_then(|entry| entry.value().as_string());
-                        assert_eq!(
-                            model,
-                            Some("claude-sonnet-5"),
-                            "{source_name} Claude seats must use Sonnet"
-                        );
+                        let expected_model = if source_name.contains("cross-harness-message-wake") {
+                            "opus"
+                        } else {
+                            "claude-sonnet-5"
+                        };
+                        assert_eq!(model, Some(expected_model), "{source_name} Claude model");
                         counts.0 += 1;
                     }
                     "codex" => counts.1 += 1,
@@ -355,7 +356,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_twenty_four_model_free_and_eighteen_model_backed_evals() {
+fn st3_eval_inventory_has_twenty_two_model_free_and_nineteen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -365,10 +366,8 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_eighteen_model_backed_evals
         "context-resource-continuity",
         "crash-escalation",
         "local-file-refresh",
-        "loop-best-of-n",
         "loop-exhaustion-attention",
         "loop-feedback",
-        "loop-for-each",
         "loop-until-green",
         "network-isolation",
         "network-smoke",
@@ -400,6 +399,7 @@ fn st3_eval_inventory_has_twenty_four_model_free_and_eighteen_model_backed_evals
         "poisoned-pr",
         "restart-continuity",
         "run-generation-revision",
+        "seat-mission-work",
         "signal-rename",
         "test-writing",
         "weird-git-setup",
@@ -466,6 +466,10 @@ fn cross_harness_message_wake_is_black_box_and_uses_all_account_backed_harnesses
 
     assert!(source.contains("judges/no-terminal-input.sh"));
     assert!(source.contains("cross-harness-message-wake/controller"));
+
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    assert!(controller.contains(".value.harness_state"));
+    assert!(!controller.contains(".actual.status"));
 }
 
 #[test]
@@ -481,6 +485,8 @@ fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worke
     assert!(source.contains("restart \"always\""));
 
     let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    assert!(controller.contains(".value.harness_state"));
+    assert!(!controller.contains(".actual.status"));
     for required in [
         "missions start",
         "work revise",

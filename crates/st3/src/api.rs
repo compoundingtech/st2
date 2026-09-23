@@ -5108,6 +5108,23 @@ async fn quick_agent(
         .subject
         .strip_prefix("agent/")
         .unwrap_or(&request.subject);
+    let agent_subject = if bus_id.contains('.') || bus_id.contains('/') {
+        format!("agent/{bus_id}")
+    } else {
+        format!("agent/{}.{bus_id}", state.node)
+    };
+    let selected_token = state
+        .store
+        .selected_desired_token(&agent_subject)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if selected_token != request.expected_subject {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-subject",
+            format!("the desired state for `{agent_subject}` changed"),
+        )));
+    }
     let mut driver_body = String::new();
     if let Some(model) = &request.model {
         driver_body.push_str(&format!("model {model:?}\n"));
@@ -5125,16 +5142,11 @@ async fn quick_agent(
     if let Some(prompt) = &request.prompt {
         driver_body.push_str(&format!("prompt {prompt:?}\n"));
     }
-    let mission_id = format!("standing/{bus_id}");
     let kdl = format!(
-        "version 2\nmission {mission_id:?} state=\"ready\" {{\n  goal \"Keep the agent ready for work and conversation.\"\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
+        "version 2\nagent {bus_id:?} {{\n  identity {bus_id:?}\n  workspace {:?}\n  restart \"always\"\n  harness {driver:?} {{\n{driver_body}  }}\n}}\n",
         request.worktree
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
-    let mission =
-        intent.missions.get(&mission_id).cloned().ok_or_else(|| {
-            ApiError::internal("quick agent normalization lost its standing mission")
-        })?;
     let planned = state
         .store
         .mission(
@@ -5149,63 +5161,13 @@ async fn quick_agent(
         .store
         .apply(&intent, &planned.subject_tokens, &request.idempotency_key)
         .map_err(ApiError::bad)?;
-    let mut active = state
-        .store
-        .active_mission_runs()
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .filter(|run| run.mission == format!("mission/{mission_id}"))
-        .collect::<Vec<_>>();
-    if active.len() > 1 {
-        return Err(ApiError::bad(St3Error::new(
-            "conflicting-standing-runs",
-            format!("standing mission `mission/{mission_id}` has more than one active run"),
-        )));
-    }
-    let run = if let Some(current) = active.pop() {
-        if current.revision == mission.revision {
-            current
-        } else {
-            state
-                .store
-                .adopt_mission_revision(
-                    &current.subject,
-                    &mission,
-                    "person/requester",
-                    "the quick agent configuration changed",
-                    &format!("{}:standing-revision", request.idempotency_key),
-                )
-                .map_err(ApiError::bad)?
-        }
-    } else {
-        state
-            .store
-            .create_mission_run(&crate::model::MissionRunRequest {
-                mission: mission_id.clone(),
-                revision: None,
-                workspace: request.worktree.clone(),
-                requester: Some("person/requester".into()),
-                mode: Some("run".into()),
-                inputs: BTreeMap::new(),
-                idempotency_key: format!("{}:standing-run", request.idempotency_key),
-            })
-            .map_err(ApiError::bad)?
-    };
-    let agent_subject = format!("agent/{}/{bus_id}", run.id);
-    let actual_agent_token = state
-        .store
-        .selected_desired_token(&agent_subject)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    if actual_agent_token != request.expected_subject {
-        return Err(ApiError::bad(St3Error::new(
-            "stale-subject",
-            format!("the desired state for `{agent_subject}` changed"),
-        )));
-    }
     signal_changed(state);
-    let runtime_id = format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', "."));
+    let runtime_id = intent
+        .subjects
+        .get(&agent_subject)
+        .and_then(|subject| subject.member.as_ref())
+        .map(|member| member.runtime_id.clone())
+        .ok_or_else(|| ApiError::internal("quick agent normalization lost its runtime"))?;
     let harness = state
         .store
         .current_harness(&agent_subject)
@@ -5215,9 +5177,9 @@ async fn quick_agent(
         .is_some_and(crate::model::CurrentHarnessView::is_ready);
     let response = QuickAgentResponse {
         subject: agent_subject,
-        mission: format!("mission/{mission_id}"),
-        mission_run: run.subject,
-        generation: run.generation,
+        mission: None,
+        mission_run: None,
+        generation: None,
         runtime_id,
         event_cursor: state.store.index().map_err(ApiError::internal)?,
         incarnation_id: harness.map(|harness| harness.incarnation_id),
@@ -6090,6 +6052,48 @@ async fn post_work_action(
     AxumPath((action, subject)): AxumPath<(String, String)>,
     Json(request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
+    let actor = request
+        .actor
+        .as_deref()
+        .and_then(normalized_agent_actor)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-work-actor",
+                "a work action needs an exact agent actor",
+            ))
+        })?;
+    let incarnation = request.incarnation.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-work-incarnation",
+            "a work action must be fenced to one exact live agent incarnation",
+        ))
+    })?;
+    // An exact retry returns the transaction's durable response even if the provider exited after
+    // committing it. The store repeats this lookup under its mutation boundary; this early read
+    // only prevents the live-incarnation precondition from breaking idempotent recovery.
+    if let Some(response) = state
+        .store
+        .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(response));
+    }
+    let harness = state
+        .store
+        .current_harness(&actor)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "inactive-work-incarnation",
+                format!("`{actor}` has no current live harness incarnation"),
+            ))
+        })?;
+    if harness.incarnation_id != incarnation || harness.state == "ended" {
+        return Err(ApiError::bad(St3Error::new(
+            "inactive-work-incarnation",
+            format!("`{incarnation}` is not the current live incarnation of `{actor}`"),
+        )));
+    }
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
         let response = store.work_action(&subject, &action, &request)?;
@@ -7090,6 +7094,57 @@ mod tests {
         (status, value)
     }
 
+    #[tokio::test]
+    async fn an_exact_work_retry_survives_provider_exit_after_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let response: StepRunView = serde_json::from_value(json!({
+            "subject": "step-run/run/work",
+            "run": "mission-run/run",
+            "generation": "run-generation/run",
+            "step": "work",
+            "definition_hash": "definition",
+            "status": "verifying",
+            "attempt": 1,
+            "assigned_to": "agent/node.worker",
+            "agentless": false,
+            "title": null,
+            "worker_reported": true,
+            "claimant": null,
+            "claim_incarnation": null,
+            "claim_expires_at_unix_ms": null,
+            "execution_elapsed_ms": 1,
+            "readiness_epoch": 1,
+            "blocked_reason": null,
+            "not_before_unix_ms": null,
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 2
+        }))
+        .unwrap();
+        state
+            .store
+            .cache_idempotency_response("work-retry", &response)
+            .unwrap();
+
+        let (status, body) = json_request(
+            router(state),
+            "/v1/work/complete/step-run/run/work",
+            serde_json::to_value(WorkRequest {
+                actor: Some("agent/node.worker".into()),
+                incarnation: Some("ended-incarnation".into()),
+                summary: Some("complete".into()),
+                reason: None,
+                evidence: Vec::new(),
+                idempotency_key: "work-retry".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["subject"], response.subject);
+        assert_eq!(body["status"], "verifying");
+    }
+
     async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(
@@ -7476,7 +7531,7 @@ mission "invalid-message" state="ready" {
     }
 
     #[test]
-    fn launch_candidates_accept_standing_agents_and_implicit_loop_missions() {
+    fn launch_candidates_accept_durable_seats_and_implicit_loop_missions() {
         let source = r#"
 version 2
 mission "planned/work" state="ready" {
@@ -7552,34 +7607,14 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 .unwrap(),
             b"Mission a two-step release without changing this workspace."
         );
-        let standing = store
-            .active_mission_runs()
+        let planner_seat = store
+            .desired_subjects()
             .unwrap()
             .into_iter()
-            .find(|run| run.steps.is_empty() && run.status == "running")
+            .find(|desired| desired.subject == planner)
             .unwrap();
-        let standing_mission = store
-            .mission_spec(
-                standing.mission.trim_start_matches("mission/"),
-                Some(&standing.revision),
-            )
-            .unwrap()
-            .unwrap();
-        let standing_intent = crate::graph::parse_execution_intent(
-            standing_mission.declarations_kdl.as_ref().unwrap(),
-            "node",
-            &standing.id,
-        )
-        .unwrap();
-        let planner_launch = standing_intent
-            .subjects
-            .get(planner)
-            .unwrap()
-            .member
-            .as_ref()
-            .unwrap()
-            .launch
-            .clone();
+        assert!(planner_seat.owner_run.is_none());
+        let planner_launch = planner_seat.member.as_ref().unwrap().launch.clone();
         assert!(matches!(
             &planner_launch,
             crate::model::LaunchSpec::Argv(arguments)
@@ -7587,7 +7622,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                     && arguments.iter().any(|argument| argument == "--dangerously-bypass-hook-trust")
         ));
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
-        assert_eq!(store.active_mission_runs().unwrap().len(), 1);
+        assert!(store.active_mission_runs().unwrap().is_empty());
 
         let first = br#"
 version 2
@@ -7624,7 +7659,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "runtime-outside-mission");
+        assert_eq!(rejected["code"], "wrong-launch-mission");
         assert!(
             store
                 .desired_subjects()
@@ -7926,9 +7961,10 @@ version 2
             approved["candidate"]["mission_revision"]
         );
         assert!(store.mission_spec("planned/work", None).unwrap().is_some());
-        let active = store.active_mission_runs().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].phase, "cleanup-cancelled");
+        // The planner is a durable top-level seat, not a synthetic standing
+        // mission. Approval removes that seat directly and leaves no planner
+        // mission run behind to clean up.
+        assert!(store.active_mission_runs().unwrap().is_empty());
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
         let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
@@ -7950,13 +7986,13 @@ version 2
             let (name, hash) = reference.rsplit_once('@').unwrap();
             assert!(store.get_document(name, hash).unwrap().is_some());
         }
-        assert!(
-            store
-                .desired_subjects()
-                .unwrap()
-                .into_iter()
-                .all(|desired| desired.subject != planner)
-        );
+        let stopped_planner = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == planner)
+            .expect("approval did not publish the planner stop tombstone");
+        assert_eq!(stopped_planner.kind, "stop");
 
         let (status, approved_again) = json_request(
             app.clone(),
@@ -8621,6 +8657,12 @@ version 2
                 r#"
 version 2
 
+  agent "eval/demo/worker" {{
+    workspace "${{EVAL_ROOT}}"
+    command "true"
+    restart "never"
+  }}
+
   mission "eval/demo" state="ready" timeout="2m" {{
     goal "Complete mission eval/demo."
     baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
@@ -8673,6 +8715,13 @@ version 2
         assert_eq!(eval_status["lifecycle"], "running");
         assert!(eval_status.get("active_checkpoint").is_none());
         let root = body["mission_run"].as_str().unwrap();
+        let eval_seat = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/eval/demo/worker")
+            .expect("the eval did not apply its mission-less seat");
+        assert_eq!(eval_seat.owner_run.as_deref(), Some(root));
         let (status, mission_runs) = get_request(
             app,
             &format!("/v1/mission-runs?root={}", urlencoding::encode(root)),
@@ -8810,6 +8859,7 @@ host "local" { document "doc/hosts/eval@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let mut fixture = parse_intent(
             r#"version 2
 resource "eval/fixture" { kind "filesystem.file" }
+agent "eval/fixture/worker" { workspace "/tmp"; command "true"; restart "never" }
 "#,
             "node",
         )
@@ -8817,6 +8867,12 @@ resource "eval/fixture" { kind "filesystem.file" }
         scope_eval_desired_subjects(&mut fixture, &current, "mission-run/eval-run").unwrap();
         assert_eq!(
             fixture.subjects["resource/eval/fixture"]
+                .owner_run
+                .as_deref(),
+            Some("mission-run/eval-run")
+        );
+        assert_eq!(
+            fixture.subjects["agent/eval/fixture/worker"]
                 .owner_run
                 .as_deref(),
             Some("mission-run/eval-run")

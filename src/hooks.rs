@@ -196,6 +196,40 @@ pub fn claude_settings_registration() -> serde_json::Value {
     })
 }
 
+/// Claude lifecycle observation used by an st3-controlled interactive seat.
+///
+/// Unlike the full st2 registration this does not inject the legacy SessionStart ritual or run
+/// legacy message/context helpers. The st3 boot document and native MCP channel own those jobs;
+/// these hooks only externalize Claude's real turn and context state.
+pub fn claude_st3_settings_registration() -> serde_json::Value {
+    fn observe(event: &str) -> serde_json::Value {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
+        }] }])
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/claude-code-settings.json",
+        "hooks": {
+            "SessionStart": observe("SessionStart"),
+            "PreCompact": observe("PreCompact"),
+            "PostCompact": observe("PostCompact"),
+            "StopFailure": observe("StopFailure"),
+            "UserPromptSubmit": observe("UserPromptSubmit"),
+            "Stop": observe("Stop"),
+            "PermissionRequest": observe("PermissionRequest"),
+            "PreToolUse": observe("PreToolUse"),
+            "PostToolUse": observe("PostToolUse"),
+        },
+        "statusLine": {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+            "padding": 0,
+            "refreshInterval": 5,
+        }
+    })
+}
+
 /// Whether one rendered string refers to a file of ANY st2 hook set, structurally — used by the
 /// union merge to supersede st2's own prior registrations without ever touching a foreign entry.
 /// Two spellings are owned: the `$ST_HOOKS` variable at a token boundary (`$ST_HOOKS/...`,
@@ -771,6 +805,17 @@ mod tests {
             .expect("example declares the settings.local.json upsert");
         let registered: serde_json::Value = serde_json::from_str(content).unwrap();
         assert_eq!(registered, claude_settings_registration());
+    }
+
+    #[test]
+    fn st3_claude_settings_externalize_lifecycle_without_the_legacy_boot_ritual() {
+        let settings = claude_st3_settings_registration();
+        let encoded = settings.to_string();
+        assert!(encoded.contains("claude-observe.sh"));
+        assert!(encoded.contains("UserPromptSubmit"));
+        assert!(encoded.contains("Stop"));
+        assert!(!encoded.contains("claude-session-start.sh"));
+        assert!(!encoded.contains("claude-stop-failure.sh"));
     }
 
     #[test]

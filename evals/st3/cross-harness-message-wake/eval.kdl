@@ -7,7 +7,7 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
   agent "wake.codex" {
     workspace "${ST_WORKSPACE}"
     harness "codex" {
-      model "gpt-5.6-sol"
+      model "gpt-6-sol"
       effort "medium"
       args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
     }
@@ -22,7 +22,7 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
     workspace "${ST_WORKSPACE}"
     under "agent/${ST_MISSION_RUN}/wake.codex" reason="participate in one bounded cross-harness consensus"
     harness "claude" {
-      model "claude-sonnet-5"
+      model "opus"
       effort "medium"
       args "--permission-mode" "bypassPermissions"
     }

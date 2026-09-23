@@ -117,7 +117,16 @@ fn run_named(
         if initialized {
             for msg in message::list_inbox(&inbox)? {
                 if delivered.insert(msg.filename.clone()) {
-                    let content = channel_content(msg.subject.as_deref(), &msg.body);
+                    // The marker is intentionally part of the synthetic user prompt. Claude's
+                    // `UserPromptSubmit` hook sees that prompt only after the interactive TUI has
+                    // promoted the channel notification into a real model turn. The outer st3
+                    // driver correlates this exact immutable inbox filename before publishing
+                    // `message.delivered`; writing MCP bytes alone is not a receipt.
+                    let content = format!(
+                        "[st3-delivery:{}]\n{}",
+                        msg.filename,
+                        channel_content(msg.subject.as_deref(), &msg.body)
+                    );
                     write_json(
                         &mut stdout,
                         &json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{

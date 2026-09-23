@@ -111,7 +111,7 @@ st3 missions start release \
   --as person/operator
 ```
 
-Use `--follow` to wait for a terminal or standing run. Use `--print-kdl` to inspect or save the generated declaration without publishing it.
+Use `--follow` to wait for a terminal run. Use `--print-kdl` to inspect or save the generated declaration without publishing it.
 
 The default mission capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
 
@@ -125,11 +125,15 @@ When invoked with `--as "$ST_AGENT"`, the command watches the complete event gra
 
 This keeps a narrow condition wait from hiding broader graph progress. Scripts outside an agent harness retain the ordinary subject-specific wait behavior.
 
-## Standing work
+## Durable seats
 
-A mission completes only through `completion`. A mission with no completion block remains open after it exhausts its current work. The run is then standing.
+A mission without a completion block uses the finite `all-steps-exhausted` default. Declare a
+long-lived conversation or worker harness as a top-level agent seat and assign finite mission work
+to that exact subject.
 
-This rule supports a long-lived conversation agent without a separate mission type. The open mission continues to assert the agent declaration. New mission revisions can add work. A named revision moves the run to a successor generation.
+Use `st3 agents apply`, or `st3 agents start ... --print-kdl` followed by the same command without
+the preview flag. Stop a seat explicitly with `st3 agents stop`. Mission revisions change mission
+work and generations without changing the seat's identity.
 
 ## Ordered queue authoring
 

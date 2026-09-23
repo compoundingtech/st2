@@ -19,8 +19,8 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - Missions and steps can repeat `baseline` and `gate`.
 - Missions and steps can contain one `produces` block.
 - All sibling products must exist. All sibling gates must pass.
-- A mission completes only through its explicit `completion` block.
-- A mission without `completion` stays open after its available work is exhausted.
+- A mission defaults to `completion { when "all-steps-exhausted" }`.
+- Durable availability belongs to top-level agent seats, not open mission runs.
 - `depends-on` defines execution order. Source order defines display order only.
 - A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
 - st3 rejects missing step references and dependency cycles.
@@ -187,7 +187,8 @@ The reviewer defaults to the mission run requester. `revision-cutover` is `resta
 
 A mission can contain direct declarations. Direct agents in the mission can revise the complete mission.
 
-A mission can contain zero steps. A zero-step mission without `completion` becomes standing after reconciliation.
+A mission can contain zero steps. Missions default to `completion { when "all-steps-exhausted" }`,
+so a zero-step mission completes immediately.
 
 `timeout` is optional for an ordinary mission. It starts when the mission run is created and applies to the complete run, not one step or generation. A revision cannot extend or reset the stored deadline.
 
@@ -203,11 +204,14 @@ The dependency form uses the same explicit dependency language as a step. It can
 
 A completion dependency cannot reference a final step.
 
-Without `completion`, the mission never becomes terminal because it exhausted its steps.
+Omitting `completion` means `all-steps-exhausted`. Long-lived harness availability is modeled by a
+top-level agent seat, not by omission on a mission.
 
 ## Run ownership and concurrency
 
-A mission run is the sole owner of execution state. An agent cannot exist outside a mission run.
+A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
+first-class durable seat with no mission owner. Seats can receive messages and claim work from many
+finite missions over their lifetime.
 
 The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
 
@@ -226,9 +230,9 @@ An authored runtime ID is local to the run. st3 expands it to these subjects:
 
 Two concurrent runs can use the same local IDs. Two declaration sites in one generation cannot declare the same runtime subject.
 
-An open mission keeps its runtimes present. This rule supports long-lived chat agents without a second mission type.
-
-A runtime `stop` can occur only inside the owner mission. Root control uses a named mission-run `cancellation` instead.
+Run-owned runtimes remain scoped to the run and stop during terminal cleanup. A root `stop` can stop
+an exact top-level agent seat. Named mission-run cancellation remains the way to stop a run and all
+of its run-owned state.
 
 The default mission permits one nonterminal run. This default also lets `st3 missions show MISSION` identify the current run.
 
@@ -441,58 +445,15 @@ A human exhaustion approval accepts the current best result. More rounds require
 
 A cancelled round or a structural child failure stops immediately. An ordinary failed round can start the next round.
 
-### Dynamic for-each loops
+### Collection and candidate composition
 
-```kdl
-loop "checks" for-each="resource/release" field="parts" max-parallel=4 {
-  max-rounds 100
-  round {
-    completion { when "all-steps-exhausted" }
-    step "check" {
-      agentless
-      goal "Check ${loop.item.id} at ${loop.item.path}."
-    }
-  }
-}
-```
+Loops are deliberately sequential: one bounded `round` mission runs at a time until `until`
+passes or `max-rounds` is exhausted. The former `for-each`, `max-parallel`, and `candidates`
+loop forms are not part of the grammar.
 
-The selected field must contain an array of objects. Each object needs a unique string `id`.
-
-st3 snapshots the array before it starts work. Later resource changes do not change that run.
-
-The array can contain at most 100 items. `max-rounds` can set a smaller item bound.
-
-`max-parallel` defaults to one. It can be between one and 100.
-
-Each item receives `${loop.item.FIELD}` and `ST_LOOP_ITEM_ID`. All item child runs must complete.
-
-### Best-of-N loops
-
-```kdl
-loop "choose" timeout="30m" {
-  max-rounds 3
-  metric "quality" direction="higher" {
-    field "score" "resource/candidate-${candidate.index}"
-  }
-  candidates 4 max-parallel=2 { select metric="quality" }
-  round {
-    completion { when "all-steps-exhausted" }
-    step "create" { agentless; goal "Create candidate ${candidate.index}." }
-  }
-}
-```
-
-The candidate count is between 2 and 16. `max-parallel` defaults to one and cannot exceed that count.
-
-Each candidate is a separate child mission run. It receives `${candidate.index}` and `ST_CANDIDATE_INDEX`.
-
-`select` can name a metric. It can instead contain one LLM gate or one human gate.
-
-The metric selector uses the metric direction. A gate selector tests candidates in stable index order.
-
-The selected candidate can run `on-keep`. Every other completed candidate can run `on-discard`.
-
-The selected candidate becomes the round result. An optional `until` block decides whether another candidate round starts.
+Model a known collection as explicit mission steps or a queue. Model best-of-N work as explicit
+candidate steps followed by a gated selection step. This keeps concurrency, ownership, retry, and
+review visible in the ordinary mission graph instead of hiding a second scheduler inside `loop`.
 
 ## Goals
 
@@ -781,7 +742,9 @@ The `completion` frontier selects when st3 checks mission products and gates. st
 
 The run reaches `completed` after successful final work. A final failure makes the run failed.
 
-A mission without `completion` stays open. It is `standing` when no step can move and no failure blocks movement.
+When `completion` is omitted, all normal steps exhausted selects completion. A mission stays
+nonterminal only while work, products, gates, finalization, or a declared completion frontier is
+still unresolved.
 
 ## Nested missions
 
@@ -856,12 +819,10 @@ st3 supplies these exact context names:
 | `ST3_BIN` | Absolute path to the exact st3 executable that started the runtime. |
 | `ST_LOOP_ROUND` | Current loop round. It is present in loop child missions. |
 | `ST_LOOP_FEEDBACK` | Exact prior feedback document, or an empty value. |
-| `ST_LOOP_ITEM_ID` | Current for-each item ID, or an empty value. |
-| `ST_CANDIDATE_INDEX` | Current candidate index, or an empty value. |
 
 The mission and step values are available for `${NAME}` KDL interpolation when the current context defines them. Step members and running gates receive those values as environment variables.
 
-Loop KDL can also use `${loop.round}`, `${loop.feedback}`, `${loop.item.FIELD}`, and `${candidate.index}`.
+Loop KDL can also use `${loop.round}` and `${loop.feedback}`.
 
 `ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 
@@ -1046,19 +1007,27 @@ The work queue is authoritative. A notification only tells an agent that the que
 
 The reconciler does not send periodic reminders. An undelivered message remains pending. A daemon or harness restart recreates the message only for a new runtime incarnation while the work remains ready.
 
-## Standing runs and cancellation
+## Durable agent seats and cancellation
 
-All mission runs use the same state machine. There is no separate standing mission type.
+Declare a durable seat directly at the publication root:
 
-An open mission becomes `standing` when it has no next step and has no explicit completion result.
+```kdl
+version 2
+agent "fleet/cos/standing/cos" {
+  host "local"
+  workspace "/work/cos"
+  restart "always"
+  harness "claude" { model "opus" }
+}
+```
 
-An open mission still asserts its direct declarations. This rule lets a standing conversation mission keep its agent present.
+The subject is exactly `agent/fleet/cos/standing/cos`; placement does not change its identity.
+Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st3
+channel. Use `exec {}` for non-interactive provider commands.
 
-`st3 codex` and `st3 claude` publish a deterministic zero-step standing mission. The first command for an agent starts one run.
-
-An exact retry returns the same run. A later configuration change creates a new generation in that run.
-
-The quick command returns the mission, mission run, run generation, and agent subjects.
+Use `st3 agents apply FILE --as person/NAME` for authored KDL or `st3 agents start ...` as a
+convenience. `--print-kdl` prints the exact declaration. `st3 agents stop SUBJECT` publishes an
+explicit root stop.
 
 A mission run does not stop because a controller deletes its runtime. The graph must publish cancellation.
 
@@ -1246,7 +1215,7 @@ displays changes, and returns the approval hash.
 `st3 launch approve-and-launch` performs the approval and idempotent start as one product workflow.
 An authorized agent uses `st3 work publish-mission`, fenced to its claimed producing step.
 
-`st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
+`st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
 `st3 missions show MISSION_RUN` reads one exact run. `st3 missions show MISSION` works only when that mission has exactly one nonterminal run.
 

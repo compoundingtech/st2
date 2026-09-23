@@ -1464,9 +1464,12 @@ pub struct QuickAgentRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuickAgentResponse {
     pub subject: String,
-    pub mission: String,
-    pub mission_run: String,
-    pub generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub runtime_id: String,
     pub event_cursor: u64,
     pub incarnation_id: Option<String>,

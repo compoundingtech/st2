@@ -8,11 +8,11 @@ readonly WORKER="agent/$ST_MISSION_RUN/wake.worker"
 readonly GENERATED="$PWD/generated"
 readonly STATE="$PWD/controller-state.json"
 
-standing_run=""
+revisable_run=""
 
 cleanup() {
-  if [[ -n "$standing_run" ]]; then
-    st3 missions cancel "$standing_run" \
+  if [[ -n "$revisable_run" ]]; then
+    st3 missions cancel "$revisable_run" \
       --reason "the reliability controller is cleaning up after an early exit" \
       --as "$REQUESTER" >/dev/null 2>&1 || true
   fi
@@ -35,11 +35,11 @@ wait_for_worker() {
   local expected_incarnation=${1:-} deadline=$((SECONDS + 300)) snapshot incarnation
   while (( SECONDS < deadline )); do
     snapshot="$(agent_json || true)"
-    incarnation="$(jq -r '.actual.incarnation_id // empty' <<<"${snapshot:-{}}" 2>/dev/null || true)"
+    incarnation="$(jq -r '.value.incarnation_id // empty' <<<"${snapshot:-{}}" 2>/dev/null || true)"
     if jq -e '
-      .actual.status == "running"
-      and .actual.reachability == "reachable"
-      and .harness.state == "idle"
+      .value.state == "running"
+      and .value.reachability == "reachable"
+      and .value.harness_state == "idle"
     ' <<<"$snapshot" >/dev/null 2>&1 \
       && [[ -n "$incarnation" ]] \
       && { [[ -z "$expected_incarnation" ]] || [[ "$incarnation" != "$expected_incarnation" ]]; }; then
@@ -96,13 +96,13 @@ start_fresh() {
 }
 
 fresh_file="$GENERATED/fresh.kdl"
-standing_v1="$GENERATED/standing-v1.kdl"
-standing_v2="$GENERATED/standing-v2.kdl"
-standing_v3="$GENERATED/standing-v3.kdl"
+revisable_v1="$GENERATED/revisable-v1.kdl"
+revisable_v2="$GENERATED/revisable-v2.kdl"
+revisable_v3="$GENERATED/revisable-v3.kdl"
 render_fixture fixtures/fresh.kdl "$fresh_file"
-render_fixture fixtures/standing-v1.kdl "$standing_v1"
-render_fixture fixtures/standing-v2.kdl "$standing_v2"
-render_fixture fixtures/standing-v3.kdl "$standing_v3"
+render_fixture fixtures/revisable-v1.kdl "$revisable_v1"
+render_fixture fixtures/revisable-v2.kdl "$revisable_v2"
+render_fixture fixtures/revisable-v3.kdl "$revisable_v3"
 
 first_incarnation="$(wait_for_worker)"
 state="$(jq --arg incarnation "$first_incarnation" '.incarnations += [$incarnation]' <<<"$state")"
@@ -112,34 +112,31 @@ st3 missions publish "$fresh_file" --as "$REQUESTER" >/dev/null
 start_fresh one
 start_fresh two
 
-st3 missions publish "$standing_v1" --as "$REQUESTER" >/dev/null
-standing_output="$(st3 missions start eval/work-wake-reliability/revisable \
+st3 missions publish "$revisable_v1" --as "$REQUESTER" >/dev/null
+revisable_output="$(st3 missions start eval/work-wake-reliability/revisable \
   --id "revisable-$ST_MISSION_RUN" \
   --workspace "$PWD" \
   --as "$REQUESTER" \
   --json)"
-standing_run="$(jq -er '.mission_run.subject' <<<"$standing_output")"
-initial_step="$(jq -er '.mission_run.steps[] | select(.step == "initial") | .subject' <<<"$standing_output")"
+revisable_run="$(jq -er '.mission_run.subject' <<<"$revisable_output")"
+initial_step="$(jq -er '.mission_run.steps[] | select(.step == "initial") | .subject' <<<"$revisable_output")"
 record_completed_step revision-initial "$initial_step"
-st3 trace wait "$standing_run" --for standing --timeout 2m >/dev/null
 
-revision_one="$(st3 work revise "$standing_run" "$standing_v2" \
+revision_one="$(st3 work revise "$revisable_run" "$revisable_v2" \
   --as "$REQUESTER" \
   --reason "exercise the first ordinary live revision wake" \
   --json)"
 jq -e '.status == "applied"' <<<"$revision_one" >/dev/null
 revision_one_step="$(jq -er '.mission_run.steps[] | select(.step == "revision-one") | .subject' <<<"$revision_one")"
 record_completed_step revision-one "$revision_one_step"
-st3 trace wait "$standing_run" --for standing --timeout 2m >/dev/null
 
-revision_two="$(st3 work revise "$standing_run" "$standing_v3" \
+revision_two="$(st3 work revise "$revisable_run" "$revisable_v3" \
   --as "$REQUESTER" \
   --reason "exercise the second ordinary live revision wake" \
   --json)"
 jq -e '.status == "applied"' <<<"$revision_two" >/dev/null
 revision_two_step="$(jq -er '.mission_run.steps[] | select(.step == "revision-two") | .subject' <<<"$revision_two")"
 record_completed_step revision-two "$revision_two_step"
-st3 trace wait "$standing_run" --for standing --timeout 2m >/dev/null
 
 st3 terminals signal "$WORKER" hangup >/dev/null
 second_incarnation="$(wait_for_worker "$first_incarnation")"
@@ -148,19 +145,19 @@ persist_state
 
 start_fresh after-restart
 
-st3 missions cancel "$standing_run" \
+st3 missions cancel "$revisable_run" \
   --reason "the revision wake scenarios completed" \
   --as "$REQUESTER" >/dev/null
-st3 trace wait "$standing_run" --for cancelled --timeout 2m >/dev/null
-st3 missions show "$standing_run" --json >"$GENERATED/cancelled.json"
+st3 trace wait "$revisable_run" --for cancelled --timeout 2m >/dev/null
+st3 missions show "$revisable_run" --json >"$GENERATED/cancelled.json"
 jq -e '
   .status == "cancelled"
   and (.steps[] | select(.step == "finalize") | .status) == "completed"
 ' "$GENERATED/cancelled.json" >/dev/null
-state="$(jq --arg run "$standing_run" \
+state="$(jq --arg run "$revisable_run" \
   '.scenarios += [{kind: "revision", run: $run, revisions: 2, status: "cancelled", finalizer: "completed"}]' <<<"$state")"
 persist_state
-standing_run=""
+revisable_run=""
 trap - EXIT HUP INT TERM
 
 printf 'fresh assignment, repeated revision, replacement, and cancellation wakes all converged\n'

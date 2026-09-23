@@ -2,6 +2,9 @@
 
 This paid black-box eval covers every account-backed interactive harness: Codex, Claude, Pi, and OMP. Codex and Claude form one consensus pair; Pi and OMP form another.
 
+The native Codex/Claude lane deliberately tracks the canaried current models: `gpt-6-sol` and
+Claude Code's `opus` alias. A live 2026-09-22 run recorded the latter as `claude-opus-5-5`.
+
 One run exercises two deliberately separate delivery conditions:
 
 1. `startup`: the controller sends as soon as every harness is running, reachable, and has a concrete native state. It records each exact pre-message state rather than treating `ready`, `active`, and `idle` as interchangeable.

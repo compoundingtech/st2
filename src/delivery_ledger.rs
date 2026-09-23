@@ -78,9 +78,9 @@ impl Profile {
     /// Whether this harness has a concrete observation for `phase`.
     fn proves(self, phase: Phase) -> bool {
         match self.harness {
-            // Claude stream-json echoes each accepted user input through
-            // `--replay-user-messages`. The exact replay is a consumption receipt; there is no
-            // separate durable-storage phase in the public protocol.
+            // Claude's native channel correlates an inbox file with the exact synthetic user
+            // prompt observed by `UserPromptSubmit`. That hook is a consumption receipt; there is
+            // no separate durable-storage phase in the public channel protocol.
             Harness::Claude => matches!(phase, Phase::Attempted | Phase::Consumed),
             // Codex exposes transport acceptance and a typed completed user message, but no
             // storage receipt.

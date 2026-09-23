@@ -51,6 +51,10 @@ The inventory is a set, not a high-water cursor. Sparse delivery and two candida
 
 Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
 
+The payload is only an immutable claim batch plus the content-addressed blobs those claims
+reference. Nodes do not send SQLite rows, leases, reducers, projections, or runtime snapshots.
+Each receiver derives projections locally from the admitted claims.
+
 ## Four durable stages
 
 1. Receipt verifies transport authentication and stores each new envelope.

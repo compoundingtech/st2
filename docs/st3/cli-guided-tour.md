@@ -211,7 +211,7 @@ st3 machines --help
 st3 machines
 ```
 
-Copy an agent ID into `show`. Check tree nesting, standing versus mission-owned agents, current
+Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
 
 ### 8. `terminals` — inspect and attach without shell nesting

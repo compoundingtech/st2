@@ -295,10 +295,18 @@ impl Reconciler<NativeRuntime> {
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
-            runtime_environment: BTreeMap::from([(
-                "PTY_ROOT".into(),
-                selected_pty_root.to_string_lossy().into_owned(),
-            )]),
+            runtime_environment: BTreeMap::from([
+                (
+                    "PTY_ROOT".into(),
+                    selected_pty_root.to_string_lossy().into_owned(),
+                ),
+                (
+                    "ST_HOOKS".into(),
+                    st2::hooks::versioned_hooks_dir()?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]),
             notify,
             event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1942,6 +1950,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             if matches!(view.status.as_str(), "completed" | "cancelled") {
                 continue;
             }
+            if view.status == "orphaned" {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "ready",
+                    Some("the prior worker incarnation ended"),
+                )?;
+                continue;
+            }
+            if matches!(
+                view.status.as_str(),
+                "claimed" | "working" | "verifying" | "blocked"
+            ) && self.store.work_claim_is_orphaned(view)?
+            {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "orphaned",
+                    Some("the exact worker incarnation ended"),
+                )?;
+                continue;
+            }
             if view.status == "ready"
                 && view.blocked_reason.as_deref() == Some("the worker lease expired")
             {
@@ -1962,7 +1990,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             if let Some(expiry) = view.claim_expires_at_unix_ms
                 && expiry <= now_ms()
-                && matches!(view.status.as_str(), "claimed" | "working")
+                && matches!(
+                    view.status.as_str(),
+                    "claimed" | "working" | "verifying" | "blocked"
+                )
             {
                 changed |= self.store.set_step_state(
                     &view.subject,
@@ -8002,13 +8033,24 @@ mission "nested-wake" state="ready" {
             })
             .unwrap();
         let notify = Arc::new(Notify::new());
+        let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
-            Arc::new(FakeRuntime::default()),
+            runtime.clone(),
             "node".into(),
             notify.clone(),
         );
         reconciler.reconcile_once().unwrap();
+        let runtime_id = runtime.started_members.lock().unwrap()[0]
+            .runtime_id
+            .clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id,
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("current".into()),
+        });
         reconciler.reconcile_once().unwrap();
         let run = store.mission_run(&run.id).unwrap().unwrap();
         let parent = run.steps.iter().find(|step| step.step == "outer").unwrap();
@@ -8212,6 +8254,7 @@ version 2
 mission "eval/start-failure" state="ready" timeout="1m" {
   goal "Clean an eval runtime after its start fails."
   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+  step "hold" { goal "Remain active until eval cleanup is requested." }
 }
 "#;
         apply_source(&store, source, "publish-eval-start-failure");
@@ -10965,13 +11008,13 @@ mission "scheduled-cycle" state="ready" {
     }
 
     #[test]
-    fn an_open_mission_stands_when_it_has_no_next_step() {
+    fn a_mission_completes_when_it_has_no_next_step() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
   mission "standing" state="ready" {
-    goal "Remain open without implicit completion."
+    goal "Complete when its work is exhausted."
     step "prepare" { agentless }
   }
 
@@ -10999,11 +11042,11 @@ version 2
         }
         let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.steps[0].status, "completed");
-        assert_eq!(run.status, "standing");
+        assert_eq!(run.status, "completed");
 
         let zero_source = r#"
 version 2
- mission "zero" state="ready" { goal "Remain open with no steps." }
+ mission "zero" state="ready" { goal "Complete with no steps." }
 "#;
         apply_source(&store, zero_source, "publish-zero");
         let zero = store
@@ -11017,10 +11060,12 @@ version 2
                 idempotency_key: "run-zero".into(),
             })
             .unwrap();
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
         assert_eq!(
             store.mission_run(&zero.id).unwrap().unwrap().status,
-            "standing"
+            "completed"
         );
     }
 
@@ -11298,7 +11343,8 @@ mission "stops" state="ready" {
     }
 
     #[test]
-    fn a_for_each_loop_snapshots_items_and_runs_each_child() {
+    #[should_panic(expected = "removed-loop-shape")]
+    fn a_removed_for_each_loop_is_rejected_before_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -11374,7 +11420,8 @@ mission "gauntlet" state="ready" {
     }
 
     #[test]
-    fn a_malformed_for_each_snapshot_fails_only_its_mission_run() {
+    #[should_panic(expected = "removed-loop-shape")]
+    fn a_removed_malformed_for_each_loop_is_rejected_before_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -11597,7 +11644,8 @@ mission "alert-exhaustion" state="ready" {
     }
 
     #[test]
-    fn a_best_of_n_loop_selects_the_metric_winner() {
+    #[should_panic(expected = "removed-loop-shape")]
+    fn a_removed_best_of_n_loop_is_rejected_before_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -11729,14 +11777,16 @@ mission "queue" state="ready" {
             let all_completed = view.steps.iter().all(|step| step.status == "completed");
             assert!(all_completed || view.status == "running");
             if all_completed {
-                reconciler.reconcile_once().unwrap();
+                for _ in 0..4 {
+                    reconciler.reconcile_once().unwrap();
+                }
                 break;
             }
         }
 
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().status,
-            "standing"
+            "completed"
         );
     }
 
@@ -11947,27 +11997,25 @@ mission "queue-nested" state="ready" {
     }
 
     #[test]
-    fn a_zero_step_standing_mission_materializes_its_runtime_graph() {
+    fn a_top_level_seat_outlives_a_zero_step_mission() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  mission "standing-agent" state="ready" {
-    goal "Keep one agent available."
-
-      agent "worker" {
-        command "sleep 60"
-        restart "on-failure"
-        exec "helper" { command "true" }
-      }
-
+  agent "standing-agent" {
+    command "sleep 60"
+    restart "on-failure"
+    exec "helper" { command "true" }
   }
 
+  mission "finite-zero" state="ready" {
+    goal "Complete without owning the durable seat."
+  }
 "#;
         apply_source(&store, source, "publish-standing-agent");
         let run = store
             .create_mission_run(&MissionRunRequest {
-                mission: "standing-agent".into(),
+                mission: "finite-zero".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11984,7 +12032,7 @@ version 2
             Arc::new(Notify::new()),
         );
 
-        for _ in 0..3 {
+        for _ in 0..6 {
             reconciler.reconcile_once().unwrap();
         }
 
@@ -11994,8 +12042,8 @@ version 2
             .into_iter()
             .map(|subject| subject.subject)
             .collect::<BTreeSet<_>>();
-        assert!(subjects.contains(&format!("agent/{}/worker", run.id)));
-        assert!(subjects.contains(&format!("exec/{}/worker/helper", run.id)));
+        assert!(subjects.contains("agent/node.standing-agent"));
+        assert!(subjects.contains("exec/node.standing-agent/helper"));
         let started = runtime
             .started_members
             .lock()
@@ -12006,7 +12054,7 @@ version 2
         assert_eq!(started.len(), 2);
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().status,
-            "standing"
+            "completed"
         );
     }
 
@@ -12187,7 +12235,7 @@ version 2
     }
 
     #[test]
-    fn one_agent_can_claim_multiple_pool_steps_and_a_claim_is_exclusive() {
+    fn one_agent_can_claim_only_one_independent_pool_step_and_a_claim_is_exclusive() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -12255,12 +12303,15 @@ version 2
             )
         };
         claim(&work[0], "pool-claim-a").unwrap();
-        claim(&work[1], "pool-claim-b").unwrap();
+        let capacity = claim(&work[1], "pool-claim-b").unwrap_err();
+        assert_eq!(capacity.code, "agent-capacity");
         let run = store.mission_run(&run.id).unwrap().unwrap();
-        assert!(
+        assert_eq!(
             run.steps
                 .iter()
-                .all(|step| step.claimant.as_deref() == Some("agent/node.one"))
+                .filter(|step| step.claimant.as_deref() == Some("agent/node.one"))
+                .count(),
+            1
         );
         let error = store
             .work_action(

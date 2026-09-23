@@ -344,7 +344,7 @@ fn parse_desired_node(
     if !context.allow_execution_root
         && matches!(
             kind,
-            "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule" | "stop"
+            "exec" | "pty" | "observer" | "subscription" | "schedule"
         )
     {
         return Err(St3Error::new(
@@ -1133,7 +1133,10 @@ fn parse_agent(
         .or_else(|| enclosing_host.map(str::to_owned))
         .unwrap_or_else(|| context.default_host.clone());
     let host = placement_host(host, &context.default_host);
-    let bus_id = if identity.contains('.') {
+    // A slash-qualified top-level identity is already the stable fleet seat path. Placement is a
+    // property of the seat, not part of its identity. Retain the historical host prefix for simple
+    // names so existing publications keep their subjects.
+    let bus_id = if identity.contains('.') || identity.contains('/') {
         identity.clone()
     } else {
         format!("{host}.{identity}")
@@ -1144,7 +1147,7 @@ fn parse_agent(
         |run| format!("agent/{}/{identity}", owner_run_id(run)),
     );
     let runtime_id = context.owner_run.as_ref().map_or_else(
-        || bus_id.clone(),
+        || bounded_runtime_id(&bus_id.replace('/', ".")),
         |run| {
             bounded_runtime_id(&format!(
                 "{}.{}",
@@ -1990,6 +1993,21 @@ fn driver_member(
     let effort = child_string(children, "effort")?;
     let extra = child_strings(children, "args")?.unwrap_or_default();
     let mut provider = vec![name.clone()];
+    if name == "claude" {
+        // A typed Claude harness is always the real interactive TUI and always carries st3's
+        // native channel. `dev-channels #true` is retained only so declarations written before
+        // the channel became intrinsic continue to parse; opting out would create an agent that
+        // cannot receive graph messages, so false is rejected below.
+        provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
+        // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
+        // resulting turn. Supplying the canonical registration as an additional native settings
+        // source keeps arbitrary user workspaces untouched and gives every typed st3 seat the
+        // same UserPromptSubmit/Stop state edges as a materialized st2 seat.
+        provider.extend([
+            "--settings".into(),
+            st2::hooks::claude_st3_settings_registration().to_string(),
+        ]);
+    }
     if let Some(model) = model {
         match name.as_str() {
             "codex" => provider.extend(["--model".into(), model]),
@@ -2502,7 +2520,7 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "prompt", "args"],
+        "claude" => &["model", "effort", "dev-channels", "prompt", "args"],
         "codex" | "pi" | "omp" => &["model", "effort", "prompt", "args"],
         "opencode" => &["model", "prompt", "args"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
@@ -2510,6 +2528,15 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     reject_unknown_children(body, allowed, "harness", &provider)?;
     for child in allowed {
         unique_child(body, child)?;
+    }
+    if provider == "claude"
+        && let Some(node) = unique_child(body, "dev-channels")?
+        && !one_bool(node)?
+    {
+        return Err(St3Error::new(
+            "native-channel-required",
+            "a typed Claude harness always requires the st3 native channel; use `exec` for an unmanaged non-interactive process",
+        ));
     }
     Ok(())
 }
@@ -3535,6 +3562,24 @@ fn canonical_child_values(value: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
+fn one_bool(node: &KdlNode) -> Result<bool, St3Error> {
+    ensure_no_properties(node)?;
+    ensure_no_children(node)?;
+    let [entry] = node.entries() else {
+        return Err(St3Error::new(
+            "wrong-argument-count",
+            format!("node `{}` needs one Boolean", node.name().value()),
+        ));
+    };
+    match entry.value() {
+        KdlValue::Bool(value) => Ok(*value),
+        _ => Err(St3Error::new(
+            "expected-boolean",
+            format!("node `{}` needs one Boolean", node.name().value()),
+        )),
+    }
+}
+
 fn property_bool(node: &KdlNode, property: &str) -> Result<Option<bool>, St3Error> {
     node.entries()
         .iter()
@@ -4122,7 +4167,9 @@ mod tests {
             if !eval.is_file() {
                 continue;
             }
-            let source = std::fs::read_to_string(&eval).unwrap();
+            let source = std::fs::read_to_string(&eval)
+                .unwrap()
+                .replace("${EVAL_ROOT}", "/tmp/st3-eval-fixture");
             let intent = parse_test_intent(&source, "eval-node")
                 .unwrap_or_else(|error| panic!("{}: {error}", eval.display()));
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -4140,9 +4187,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_runtime_outside_a_mission() {
-        let error = parse_intent("version 2\nagent \"worker\" { command \"true\" }", "host")
-            .expect_err("an unowned runtime must fail");
+    fn work_wake_revision_fixtures_use_the_current_graph_grammar() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("evals/st3/work-wake-reliability/fixtures");
+        for name in ["revisable-v1.kdl", "revisable-v2.kdl", "revisable-v3.kdl"] {
+            let fixture = fixtures.join(name);
+            let source = std::fs::read_to_string(&fixture)
+                .unwrap()
+                .replace("{{WORKER}}", "agent/eval-node.worker");
+            parse_test_intent(&source, "eval-node")
+                .unwrap_or_else(|error| panic!("{}: {error}", fixture.display()));
+        }
+    }
+
+    #[test]
+    fn accepts_a_durable_agent_seat_but_rejects_unowned_tasks() {
+        let intent = parse_intent(
+            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+            "host",
+        )
+        .expect("a durable seat is valid desired state");
+        let seat = &intent.subjects["agent/fleet/cos/standing/cos"];
+        assert!(seat.owner_run.is_none());
+        assert_eq!(
+            seat.member.as_ref().unwrap().runtime_id,
+            "fleet.cos.standing.cos"
+        );
+
+        let error = parse_intent("version 2\npty \"worker\" { command \"true\" }", "host")
+            .expect_err("an unowned task must fail");
         assert_eq!(error.code, "runtime-outside-mission");
     }
 
@@ -4393,7 +4467,7 @@ message "external" {
     }
 
     #[test]
-    fn claude_uses_the_native_stream_driver_without_a_channel() {
+    fn claude_always_uses_the_native_interactive_channel() {
         let intent = parse_test_intent(
             r#"
 version 2
@@ -4418,7 +4492,19 @@ version 2
             panic!("the native driver needs argv");
         };
         assert!(argv.iter().any(|arg| arg == "claude"));
-        assert!(!argv.iter().any(|arg| arg == "--channels"));
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--channels", st2::claude_channel::ST3_CHANNEL])
+        );
+        let settings = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .map(|pair| &pair[1])
+            .expect("typed Claude seats carry lifecycle hook settings");
+        assert_eq!(
+            serde_json::from_str::<Value>(settings).unwrap(),
+            st2::hooks::claude_st3_settings_registration()
+        );
         assert!(
             !argv
                 .iter()

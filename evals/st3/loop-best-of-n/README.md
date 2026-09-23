@@ -1,5 +1,4 @@
-# loop-best-of-n
+# loop-best-of-n (retired)
 
-This model-free eval proves that a loop runs bounded candidates and selects the highest numeric metric.
-
-The keep and discard child missions project the decision into files. The final gate verifies the exact winner.
+Best-of-N was removed from the st3 loop grammar. Candidate work is now modeled as explicit mission
+steps plus a gated selection step, rather than a second scheduler hidden inside a loop.

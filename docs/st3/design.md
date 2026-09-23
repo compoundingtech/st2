@@ -51,7 +51,8 @@ A mission defines goals, constraints, inputs, steps, dependencies, gates, produc
 work, and completion.
 
 The default mission permits one nonterminal run. `concurrent-runs` permits independent overlap. A
-mission without explicit completion becomes standing after it exhausts its current work.
+mission without explicit completion uses the finite `all-steps-exhausted` default. Long-lived
+harnesses are top-level agent seats rather than standing missions.
 
 `assigned-to` names one eligible agent. Repeated `available-to` entries define a worker pool. A step
 without a selector is agentless unless it inherits a selector from its containing graph.

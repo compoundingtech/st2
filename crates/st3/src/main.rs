@@ -812,6 +812,57 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Preview and apply one KDL file containing durable agent seats.
+    Apply(AgentApplyArgs),
+    /// Start or update one durable typed-harness seat.
+    Start(AgentStartArgs),
+    /// Stop one exact durable seat.
+    Stop(AgentStopArgs),
+}
+
+#[derive(Args)]
+struct AgentApplyArgs {
+    /// KDL file to publish; use `-` to read standard input.
+    file: PathBuf,
+    /// Complete person or agent subject authoring the publication.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+}
+
+#[derive(Args)]
+struct AgentStartArgs {
+    /// Stable seat identity. Slash-qualified identities are preserved exactly after `agent/`.
+    identity: String,
+    #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
+    harness: String,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    effort: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long = "arg")]
+    arguments: Vec<String>,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// Print the exact seat KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentStopArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    subject: String,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+    /// Print the exact stop KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -3691,9 +3742,11 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                 }
                 for version in response.items {
                     let latest = if version.latest { " latest" } else { "" };
-                    let hash = all
-                        .then(|| format!("@{}", version.hash))
-                        .unwrap_or_default();
+                    let hash = if all {
+                        format!("@{}", version.hash)
+                    } else {
+                        String::new()
+                    };
                     let created = chrono::DateTime::from_timestamp_millis(
                         version.created_at_unix_ms.min(i64::MAX as u128) as i64,
                     )
@@ -3878,6 +3931,109 @@ fn render_import_session(session: &st3_client::Session) -> String {
 }
 
 async fn run_agents(endpoint: &Endpoint, command: AgentsCommand, json_output: bool) -> Result<()> {
+    match command {
+        AgentsCommand::Apply(args) => {
+            let client = Client::new(endpoint.clone());
+            let (kdl, source_name) = read_intent(Some(&args.file))?;
+            let response = publish_text(
+                &client,
+                kdl,
+                source_name.unwrap_or_else(|| "standard input".into()),
+                args.actor,
+            )
+            .await?;
+            print_value(&response, json_output)
+        }
+        AgentsCommand::Start(args) => {
+            let kdl = agent_start_document(&args)?;
+            if args.print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            let response = publish_text(
+                &Client::new(endpoint.clone()),
+                kdl,
+                format!("st3 agents start {}", args.identity),
+                args.actor,
+            )
+            .await?;
+            print_value(&response, json_output)
+        }
+        AgentsCommand::Stop(args) => {
+            let subject = normalize_member_subject(&args.subject, "agent");
+            let kdl = publication_document(kdl_node("stop", [subject.as_str()]));
+            if args.print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            let response = publish_text(
+                &Client::new(endpoint.clone()),
+                kdl,
+                format!("st3 agents stop {subject}"),
+                args.actor,
+            )
+            .await?;
+            print_value(&response, json_output)
+        }
+        command => run_agent_inspection(endpoint, command, json_output).await,
+    }
+}
+
+fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
+    let mut agent = KdlNode::new("agent");
+    agent
+        .entries_mut()
+        .push(KdlEntry::new(args.identity.clone()));
+    let mut body = KdlDocument::new();
+    if let Some(host) = &args.host {
+        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
+    }
+    let workspace = fs::canonicalize(&args.workspace)
+        .with_context(|| format!("resolve workspace {}", args.workspace.display()))?
+        .display()
+        .to_string();
+    body.nodes_mut()
+        .push(kdl_node("workspace", [workspace.as_str()]));
+    body.nodes_mut().push(kdl_node("restart", ["always"]));
+
+    let mut harness = KdlNode::new("harness");
+    harness
+        .entries_mut()
+        .push(KdlEntry::new(args.harness.clone()));
+    let mut harness_body = KdlDocument::new();
+    if let Some(model) = &args.model {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("model", [model.as_str()]));
+    }
+    if let Some(effort) = &args.effort {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("effort", [effort.as_str()]));
+    }
+    if let Some(prompt) = &args.prompt {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("prompt", [prompt.as_str()]));
+    }
+    if !args.arguments.is_empty() {
+        let mut arguments = KdlNode::new("args");
+        arguments
+            .entries_mut()
+            .extend(args.arguments.iter().cloned().map(KdlEntry::new));
+        harness_body.nodes_mut().push(arguments);
+    }
+    harness.set_children(harness_body);
+    body.nodes_mut().push(harness);
+    agent.set_children(body);
+    Ok(publication_document(agent))
+}
+
+async fn run_agent_inspection(
+    endpoint: &Endpoint,
+    command: AgentsCommand,
+    json_output: bool,
+) -> Result<()> {
     let (args, tree) = match command {
         AgentsCommand::Ls(args) => (args, false),
         AgentsCommand::Tree(args) => (args, true),
@@ -3907,6 +4063,9 @@ async fn run_agents(endpoint: &Endpoint, command: AgentsCommand, json_output: bo
             };
             print!("{}", render_client_agent(&agent));
             return Ok(());
+        }
+        AgentsCommand::Apply(_) | AgentsCommand::Start(_) | AgentsCommand::Stop(_) => {
+            unreachable!("agent mutation commands return before inspection")
         }
     };
     anyhow::ensure!(
@@ -5525,7 +5684,9 @@ async fn run_st2_native_driver(
     argv: Vec<String>,
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
-    let interactive_claude = claude_uses_interactive_mode(driver, &argv);
+    if driver == "claude" {
+        reject_noninteractive_claude_argv(&argv)?;
+    }
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     publish_harness_state(
@@ -5540,27 +5701,14 @@ async fn run_st2_native_driver(
     let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
     let predecessor_harness_record = fs::read(&harness_state_path).ok();
     let mut current_harness_record_started = false;
-    let driver_state = catalog
-        .parent()
-        .context("the native driver catalog has no private root")?
-        .join("state");
     let task_catalog = catalog.clone();
-    let task_state = driver_state.clone();
     let task_agent = agent_dir.clone();
     let task_identity = identity.clone();
     let task_runtime = runtime_id.clone();
     let task_driver = driver.to_owned();
     let mut task = tokio::task::spawn_blocking(move || match task_driver.as_str() {
-        "claude" if interactive_claude => st2::claude_session::run_controlled_paths(
+        "claude" => st2::claude_session::run_controlled_paths(
             &task_catalog,
-            &task_agent,
-            task_identity,
-            task_runtime,
-            argv,
-        ),
-        "claude" => st2::claude_stream::run_controlled_paths(
-            &task_catalog,
-            &task_state,
             &task_agent,
             task_identity,
             task_runtime,
@@ -5651,10 +5799,8 @@ async fn run_st2_native_driver(
                                         ("driver".into(), Value::String(driver.into())),
                                         (
                                             "transport".into(),
-                                            Value::String(if driver == "claude" && interactive_claude {
-                                                "remote-control".into()
-                                            } else if driver == "claude" {
-                                                "stream-json".into()
+                                            Value::String(if driver == "claude" {
+                                                "claude-channel".into()
                                             } else {
                                                 "native".into()
                                             }),
@@ -5722,15 +5868,10 @@ async fn run_st2_native_driver(
                             subject,
                             &inbox,
                             &archive,
-                            if interactive_claude { "claude-channel" } else { "stream-json" },
-                            if interactive_claude {
-                                NativeDeliveryReceipts::ClaudeChannel
-                            } else {
-                                NativeDeliveryReceipts::Claude {
-                                    state_dir: &driver_state,
-                                    identity: &identity,
-                                    runtime_id: &runtime_id,
-                                }
+                            "claude-channel",
+                            NativeDeliveryReceipts::ClaudeChannel {
+                                agent_dir: &agent_dir,
+                                incarnation: &incarnation,
                             },
                         )
                         .await?;
@@ -5772,11 +5913,20 @@ async fn run_st2_native_driver(
     }
 }
 
-fn claude_uses_interactive_mode(driver: &str, argv: &[String]) -> bool {
-    driver == "claude"
-        && argv
-            .iter()
-            .any(|arg| arg == "--remote-control" || arg.starts_with("--remote-control="))
+fn reject_noninteractive_claude_argv(argv: &[String]) -> Result<()> {
+    let forbidden = argv.iter().find(|argument| {
+        matches!(
+            argument.as_str(),
+            "-p" | "--print" | "--input-format" | "--output-format" | "--replay-user-messages"
+        ) || argument.starts_with("--input-format=")
+            || argument.starts_with("--output-format=")
+    });
+    anyhow::ensure!(
+        forbidden.is_none(),
+        "typed Claude harnesses always run the interactive TUI; `{}` is non-interactive, so use an `exec` declaration instead",
+        forbidden.map(String::as_str).unwrap_or_default()
+    );
+    Ok(())
 }
 
 /// A provider task and its control loop start concurrently. Until the wrapper writes its session
@@ -6618,10 +6768,12 @@ fn work_claim_has_active_harness(
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(step.status.as_str(), "claimed" | "working")
-        && step.claimant.as_deref() == Some(subject)
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
         && harness.is_some_and(|harness| {
-            harness.state == "working"
+            harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
         })
 }
@@ -6657,12 +6809,10 @@ async fn forward_projected_messages(
             identity,
             runtime_id,
         } => st2::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
-        NativeDeliveryReceipts::Claude {
-            state_dir,
-            identity,
-            runtime_id,
-        } => st2::claude_stream::consumed_delivery_filenames(state_dir, identity, runtime_id),
-        NativeDeliveryReceipts::ClaudeChannel => Ok(BTreeSet::new()),
+        NativeDeliveryReceipts::ClaudeChannel {
+            agent_dir,
+            incarnation,
+        } => claude_channel_consumed_delivery_filenames(agent_dir, incarnation),
         NativeDeliveryReceipts::OpenCode {
             catalog_root,
             identity,
@@ -6730,19 +6880,42 @@ enum NativeDeliveryReceipts<'a> {
         identity: &'a str,
         runtime_id: &'a str,
     },
-    Claude {
-        state_dir: &'a Path,
-        identity: &'a str,
-        runtime_id: &'a str,
+    /// The interactive channel writes a marker into the synthetic user prompt. Only Claude's
+    /// `UserPromptSubmit` hook can project it into this exact incarnation's durable timeline.
+    ClaudeChannel {
+        agent_dir: &'a Path,
+        incarnation: &'a str,
     },
-    /// Interactive Claude channels expose no model-consumption receipt. Keep the graph message
-    /// queued instead of claiming delivery merely because the MCP child accepted bytes.
-    ClaudeChannel,
     OpenCode {
         catalog_root: &'a Path,
         identity: &'a str,
         runtime_id: &'a str,
     },
+}
+
+fn claude_channel_consumed_delivery_filenames(
+    agent_dir: &Path,
+    incarnation: &str,
+) -> Result<BTreeSet<String>> {
+    const PREFIX: &str = "[st3-delivery:";
+    let Some(record) =
+        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+    else {
+        return Ok(BTreeSet::new());
+    };
+    if record.driver != "claude" || record.incarnation_id != incarnation {
+        return Ok(BTreeSet::new());
+    }
+    Ok(record
+        .operations
+        .iter()
+        .filter(|operation| operation.role == "user" && operation.entry_type == "content")
+        .filter_map(|operation| operation.body.get("text").and_then(Value::as_str))
+        .flat_map(|text| text.split(PREFIX).skip(1))
+        .filter_map(|tail| tail.split_once(']').map(|(filename, _)| filename))
+        .filter(|filename| st2::message::is_message_filename(filename))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> bool {
@@ -7126,7 +7299,7 @@ mod tests {
     }
 
     #[test]
-    fn claimed_work_renews_only_while_the_exact_harness_incarnation_is_working() {
+    fn claimed_work_renews_for_the_exact_live_harness_incarnation_even_while_idle() {
         let step: StepRunView = serde_json::from_value(json!({
             "subject": "step-run/run/work",
             "run": "mission-run/run",
@@ -7165,10 +7338,17 @@ mod tests {
 
         let mut idle = harness.clone();
         idle.state = "idle".into();
-        assert!(!work_claim_has_active_harness(
+        assert!(work_claim_has_active_harness(
             &step,
             "agent/node.worker",
             Some(&idle)
+        ));
+        let mut blocked = idle;
+        blocked.state = "blocked".into();
+        assert!(work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&blocked)
         ));
         let mut replacement = harness;
         replacement.incarnation_id = "worker-two".into();
@@ -7599,23 +7779,56 @@ mod tests {
     }
 
     #[test]
-    fn remote_control_selects_the_interactive_claude_driver() {
-        assert!(claude_uses_interactive_mode(
-            "claude",
-            &["claude".into(), "--remote-control".into(), "cos".into()]
-        ));
-        assert!(claude_uses_interactive_mode(
-            "claude",
-            &["claude".into(), "--remote-control=cos".into()]
-        ));
-        assert!(!claude_uses_interactive_mode(
-            "claude",
-            &["claude".into(), "--model".into(), "opus".into()]
-        ));
-        assert!(!claude_uses_interactive_mode(
-            "codex",
-            &["codex".into(), "--remote-control".into()]
-        ));
+    fn typed_claude_accepts_tui_options_and_rejects_headless_protocol_options() {
+        reject_noninteractive_claude_argv(&["claude".into(), "--model".into(), "opus".into()])
+            .unwrap();
+        reject_noninteractive_claude_argv(&[
+            "claude".into(),
+            "--remote-control".into(),
+            "cos".into(),
+        ])
+        .unwrap();
+
+        for argv in [
+            vec!["claude".into(), "-p".into()],
+            vec!["claude".into(), "--print".into()],
+            vec!["claude".into(), "--input-format=stream-json".into()],
+            vec![
+                "claude".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+        ] {
+            let error = reject_noninteractive_claude_argv(&argv).unwrap_err();
+            assert!(error.to_string().contains("use an `exec` declaration"));
+        }
+    }
+
+    #[test]
+    fn claude_delivery_requires_the_exact_incarnations_prompt_submit_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = st2::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
+        writer
+            .append(
+                "prompt-1",
+                st2::harness_timeline::Role::User,
+                st2::harness_timeline::EntryType::Content,
+                serde_json::json!({
+                    "text": "[st3-delivery:1784649988123-abc23z.md]\nhello"
+                }),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            claude_channel_consumed_delivery_filenames(root.path(), "inc-1")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
+            BTreeSet::from(["1784649988123-abc23z.md".to_owned()])
+        );
     }
 
     #[test]
@@ -7708,7 +7921,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_requires_an_explicit_list_or_show_subcommand() {
+    fn agents_requires_an_explicit_subcommand_and_exposes_seat_lifecycle_commands() {
         assert!(Cli::try_parse_from(["st3", "agents"]).is_err());
 
         let cli = Cli::try_parse_from(["st3", "agents", "ls", "--status", "running", "--enrich"])
@@ -7740,6 +7953,52 @@ mod tests {
         };
         assert_eq!(subject, "worker");
         assert!(all);
+
+        let cli = Cli::try_parse_from([
+            "st3",
+            "agents",
+            "start",
+            "fleet/cos/standing/cos",
+            "--harness",
+            "claude",
+            "--model",
+            "opus",
+            "--as",
+            "person/nathan",
+            "--print-kdl",
+        ])
+        .unwrap();
+        let Command::Agents {
+            command: AgentsCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("agents start did not parse");
+        };
+        let kdl = agent_start_document(&args).unwrap();
+        let intent = st3::parse_intent(&kdl, "node").unwrap();
+        assert!(intent.subjects.contains_key("agent/fleet/cos/standing/cos"));
+        assert!(
+            intent.subjects["agent/fleet/cos/standing/cos"]
+                .owner_run
+                .is_none()
+        );
+
+        let cli = Cli::try_parse_from([
+            "st3",
+            "agents",
+            "stop",
+            "fleet/cos/standing/cos",
+            "--as",
+            "person/nathan",
+            "--print-kdl",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agents {
+                command: AgentsCommand::Stop(_)
+            }
+        ));
     }
 
     #[test]

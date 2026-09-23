@@ -37,39 +37,36 @@ host "local" {
 Include the host declaration in the mission candidate. Approval fails when the exact document is
 absent.
 
-## Prepare a standing mission
+## Prepare a durable seat
 
-Use an open mission when the agent must remain available after its current work is exhausted.
+Use a top-level agent when the harness must remain available across finite missions.
 
 ```kdl
 version 2
 
-mission "agents/example" state="ready" {
-  goal "Keep one agent available for current graph work."
-
-  agent "example" {
-    workspace "/work/example"
-    harness "codex" {}
-    restart "always"
-  }
+agent "agents/example" {
+  workspace "/work/example"
+  harness "codex" {}
+  restart "always"
 }
 ```
 
-Do not add a completion block. The run becomes standing and continues to assert the agent.
+The stable subject is `agent/agents/example`. The host places the seat but does not become part of
+that slash-qualified identity.
 
 The harness prompt is optional. st3 generates `.st3/boot.md` and appends the required boot instruction.
 
-Put current work in mission steps. Do not put it in the boot file, host document, or harness prompt.
+Put current work in separate finite mission steps assigned to this subject. Do not put it in the
+boot file, host document, or harness prompt.
 
-Publish exact authored mission KDL without creating a planner session:
+Publish exact authored seat KDL without creating a planner session:
 
 ```sh
-st3 missions publish missions/example.kdl --as person/operator
+st3 agents apply agents/example.kdl --as person/operator
 ```
 
-An agent may use the same command only when its current desired declaration already grants
-`mission-authority { publish "agents/example" }` (or a matching namespace pattern). Publication
-does not start a run; use `st3 missions start` separately.
+The convenience form is `st3 agents start agents/example --harness codex --workspace
+/work/example --as person/operator`. Add `--print-kdl` to review its exact KDL first.
 
 ## Review before start
 
@@ -97,16 +94,17 @@ The rehearsal proves these facts:
 - an agent claims and completes normal graph work;
 - mission cleanup stops the test agent.
 
-## Start one st3 run
+## Start the st3 seat and one work mission
 
-Do not start the live st3 missions while st2 still owns the same agent workspace.
+Do not start the live st3 seat while st2 still owns the same agent workspace.
 
 Stop the authorized st2 agent first. Remove only the st2-generated files that conflict with the st3 render.
 
-Use a readable run ID for the first trial:
+Apply the seat, then use a readable run ID for the first finite work trial:
 
 ```sh
-st3 missions start agents/example \
+st3 agents apply agents/example.kdl --as person/operator
+st3 missions start work/example \
   --id agents/example/pilot \
   --workspace /work/st3-runs/example \
   --as person/operator \
@@ -115,7 +113,7 @@ st3 missions start agents/example \
 
 Verify the exact mission run, agent subject, runtime incarnation, generated boot file, host document, and work queue.
 
-The new agent subject has the form `agent/agents/example/pilot/example`.
+The agent subject remains `agent/agents/example` across that mission and every later mission.
 
 ## Cut over the live identity
 
@@ -129,21 +127,19 @@ Run both systems during the fleet migration. Do not bridge their messages or cop
 
 ## Revise or cancel
 
-Publish a new mission revision when the agent needs new work. A revision creates a successor run generation.
+Publish or start a finite mission when the seat needs new work. A mission revision creates a
+successor run generation without changing the seat identity.
 
-Publish a named mission-run cancellation to stop the st3 agent:
+Publish an exact root stop to stop the st3 seat:
 
 ```kdl
 version 2
 
-mission-run "agents/example/pilot" {
-  cancellation "operator-stop" {
-    reason "The migration trial ended."
-  }
-}
+stop "agent/agents/example"
 ```
 
-Omission never cancels a run. Deleting a local KDL file never changes graph state.
+Cancel a still-running work mission separately. Omission never cancels a run or stops a seat.
+Deleting a local KDL file never changes graph state.
 
 ## Fleet sequence
 

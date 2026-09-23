@@ -6,11 +6,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopAttentionSpec,
-    LoopCandidateSelector, LoopCandidatesSpec, LoopExhaustionSpec, LoopForEachSpec, LoopSpec,
-    LoopStopSpec, MetricSource, MetricSpec, MissionInputKind, MissionInputSpec, MissionSpec,
-    MissionState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec, UsedMissionSpec,
-    WorkSelector,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, LoopAttentionSpec, LoopExhaustionSpec,
+    LoopSpec, LoopStopSpec, MetricSource, MetricSpec, MissionInputKind, MissionInputSpec,
+    MissionSpec, MissionState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec,
+    UsedMissionSpec, WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
@@ -58,11 +57,10 @@ pub fn parse_missions(
     default_host: &str,
 ) -> Result<BTreeMap<String, MissionSpec>, St3Error> {
     let mut missions = BTreeMap::new();
-    let outer_owners = direct_agent_owners(document, default_host)?;
     let mut top_level = Vec::new();
     for node in document.nodes() {
         if node.name().value() == "mission" {
-            let mission = parse_mission(node, outer_owners.clone(), default_host, true)?;
+            let mission = parse_mission(node, default_host, true, true)?;
             top_level.push(mission.id.clone());
             insert_mission(&mut missions, mission)?;
         }
@@ -195,9 +193,9 @@ fn insert_mission(
 
 fn parse_mission(
     node: &KdlNode,
-    outer_owners: Vec<String>,
     default_host: &str,
     require_state: bool,
+    default_completion: bool,
 ) -> Result<MissionSpec, St3Error> {
     reject_type(node)?;
     ensure_only_properties(
@@ -279,7 +277,7 @@ fn parse_mission(
     let mut baseline_names = BTreeSet::new();
     let mut gate_names = BTreeSet::new();
     let mut declarations = Vec::new();
-    let mut revision_owners = outer_owners;
+    let mut revision_owners = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
             "goal" => goals.push(plain_string(child)?),
@@ -452,6 +450,13 @@ fn parse_mission(
         }
     }
     validate_goal_count(&format!("mission `{id}`"), &goals, true)?;
+    // Missions are finite work graphs by default. Durable harness availability belongs to a
+    // top-level agent seat, so omitting completion must never silently create a standing run.
+    let completion = if default_completion {
+        completion.or(Some(CompletionSpec::AllStepsExhausted))
+    } else {
+        completion
+    };
     let work_selector =
         build_work_selector(&format!("mission `{id}`"), assigned_to, available_to, false)?;
     validate_dependencies(&id, &steps)?;
@@ -508,7 +513,16 @@ fn parse_loop_group(
     parent_timeout_ms: Option<u64>,
 ) -> Result<StepSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["timeout", "for-each", "field", "max-parallel"])?;
+    if ["for-each", "field", "max-parallel"]
+        .into_iter()
+        .any(|name| node.get(name).is_some())
+    {
+        return Err(St3Error::new(
+            "removed-loop-shape",
+            "loop for-each and parallel collection modes were removed; compose explicit mission steps around a sequential loop",
+        ));
+    }
+    ensure_only_properties(node, &["timeout"])?;
     let id = first_string(node)?;
     validate_id(&id, "loop")?;
     let path = id.clone();
@@ -521,45 +535,7 @@ fn parse_loop_group(
             format!("loop `{id}` timeout must be greater than zero"),
         ));
     }
-    let for_each = match property_string(node, "for-each")? {
-        Some(resource) => {
-            if !resource.starts_with("resource/") && !resource.contains("${") {
-                return Err(St3Error::new(
-                    "invalid-loop-resource",
-                    format!("loop `{id}` for-each needs a resource subject"),
-                ));
-            }
-            let field = property_string(node, "field")?.ok_or_else(|| {
-                St3Error::new(
-                    "missing-loop-field",
-                    format!("loop `{id}` for-each needs a field property"),
-                )
-            })?;
-            let max_parallel = property_integer(node, "max-parallel")?.unwrap_or(1);
-            if !(1..=100).contains(&max_parallel) {
-                return Err(St3Error::new(
-                    "invalid-loop-parallelism",
-                    "loop max-parallel must be between 1 and 100",
-                ));
-            }
-            Some(LoopForEachSpec {
-                resource,
-                field,
-                max_parallel: max_parallel as u32,
-            })
-        }
-        None => {
-            if property_string(node, "field")?.is_some()
-                || property_integer(node, "max-parallel")?.is_some()
-            {
-                return Err(St3Error::new(
-                    "orphan-loop-property",
-                    format!("loop `{id}` uses field or max-parallel without for-each"),
-                ));
-            }
-            None
-        }
-    };
+    let for_each = None;
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("empty-loop", format!("loop `{id}` is empty")))?;
@@ -622,15 +598,13 @@ fn parse_loop_group(
             ));
         }
     }
-    let candidates = unique_named_child(body, "candidates")?
-        .map(|child| parse_loop_candidates(child, &metric_names, default_host))
-        .transpose()?;
-    if candidates.is_some() && for_each.is_some() {
+    if unique_named_child(body, "candidates")?.is_some() {
         return Err(St3Error::new(
-            "conflicting-loop-shape",
-            "a loop cannot use candidates and for-each together",
+            "removed-loop-shape",
+            "loop best-of-N candidates were removed; model candidates as explicit mission steps and gate the selected result",
         ));
     }
+    let candidates = None;
     let round_node = unique_named_child(body, "round")?.ok_or_else(|| {
         St3Error::new(
             "missing-loop-round",
@@ -832,7 +806,7 @@ fn parse_embedded_mission(
     let mut mission = KdlNode::new("mission");
     mission.entries_mut().push(kdl::KdlEntry::new(id));
     mission.set_children(body);
-    let mut parsed = parse_mission(&mission, Vec::new(), default_host, false)?;
+    let mut parsed = parse_mission(&mission, default_host, false, false)?;
     parsed.max_active_runs = None;
     parsed.timeout_ms = timeout_ms;
     parsed.revision.clear();
@@ -1173,78 +1147,6 @@ fn parse_loop_attention(node: &KdlNode) -> Result<LoopAttentionSpec, St3Error> {
     })
 }
 
-fn parse_loop_candidates(
-    node: &KdlNode,
-    metrics: &BTreeSet<String>,
-    default_host: &str,
-) -> Result<LoopCandidatesSpec, St3Error> {
-    reject_type(node)?;
-    ensure_only_properties(node, &["max-parallel"])?;
-    let count = first_integer_value(node)?;
-    if !(2..=16).contains(&count) {
-        return Err(St3Error::new(
-            "invalid-candidate-count",
-            "candidate count must be between 2 and 16",
-        ));
-    }
-    let max_parallel = property_integer(node, "max-parallel")?.unwrap_or(1);
-    if !(1..=16).contains(&max_parallel) || max_parallel > count {
-        return Err(St3Error::new(
-            "invalid-candidate-parallelism",
-            "candidate max-parallel must be positive and cannot exceed count",
-        ));
-    }
-    let body = node
-        .children()
-        .ok_or_else(|| St3Error::new("missing-candidate-selector", "candidates needs select"))?;
-    let select = unique_named_child(body, "select")?
-        .ok_or_else(|| St3Error::new("missing-candidate-selector", "candidates needs select"))?;
-    if body.nodes().len() != 1 {
-        return Err(St3Error::new(
-            "invalid-candidate-selector",
-            "candidates accepts only one select",
-        ));
-    }
-    let selector = if let Some(metric) = property_string(select, "metric")? {
-        ensure_only_properties(select, &["metric"])?;
-        ensure_no_children(select)?;
-        if !metrics.contains(&metric) {
-            return Err(St3Error::new(
-                "unknown-candidate-metric",
-                format!("candidate selector names unknown metric `{metric}`"),
-            ));
-        }
-        LoopCandidateSelector::Metric { metric }
-    } else {
-        ensure_bare(select)?;
-        let children = select
-            .children()
-            .ok_or_else(|| St3Error::new("missing-candidate-selector", "select needs one gate"))?;
-        if children.nodes().len() != 1 || children.nodes()[0].name().value() != "gate" {
-            return Err(St3Error::new(
-                "invalid-candidate-selector",
-                "select needs one LLM or human gate",
-            ));
-        }
-        let gate = crate::graph::parse_gate(&children.nodes()[0], default_host)?;
-        match gate {
-            gate @ GateSpec::Llm { .. } => LoopCandidateSelector::Llm { gate },
-            gate @ GateSpec::Human { .. } => LoopCandidateSelector::Human { gate },
-            _ => {
-                return Err(St3Error::new(
-                    "invalid-candidate-selector",
-                    "select accepts only a metric, LLM gate, or human gate",
-                ));
-            }
-        }
-    };
-    Ok(LoopCandidatesSpec {
-        count: count as u32,
-        max_parallel: max_parallel as u32,
-        select: selector,
-    })
-}
-
 fn unique_named_child<'a>(
     body: &'a KdlDocument,
     name: &str,
@@ -1397,7 +1299,7 @@ fn parse_step(
                     gates.push(gate);
                 }
                 "mission" => {
-                    let mut mission = parse_mission(child, Vec::new(), default_host, false)?;
+                    let mut mission = parse_mission(child, default_host, false, true)?;
                     rewrite_nested_paths(&mut mission, &path)?;
                     nested_mission = Some(Box::new(mission));
                 }
@@ -2604,28 +2506,6 @@ fn child_integer_value(node: &KdlNode) -> Result<i64, St3Error> {
     }
 }
 
-fn first_integer_value(node: &KdlNode) -> Result<i64, St3Error> {
-    let values = node
-        .entries()
-        .iter()
-        .filter(|entry| entry.name().is_none())
-        .collect::<Vec<_>>();
-    if values.len() != 1 {
-        return Err(St3Error::new(
-            "invalid-field",
-            format!("`{}` needs one integer value", node.name().value()),
-        ));
-    }
-    match values[0].value() {
-        KdlValue::Integer(value) => i64::try_from(*value)
-            .map_err(|_| St3Error::new("invalid-field", "an integer is too large")),
-        _ => Err(St3Error::new(
-            "invalid-field",
-            format!("`{}` needs one integer value", node.name().value()),
-        )),
-    }
-}
-
 fn placement_host_for_mission(host: String, default_host: &str) -> String {
     if host == "local" {
         default_host.into()
@@ -2924,72 +2804,16 @@ mission "bad" state="ready" {
     }
 
     #[test]
-    fn loop_collection_modes_have_strict_bounds_and_selectors() {
-        let source = r#"
-version 2
-resource "items" { kind "custom.test.items" }
-mission "collections" state="ready" {
-  goal "Exercise both collection loop forms."
-  loop "items" for-each="resource/items" field="values" {
-    max-rounds 100
-    round {
-      completion { when "all-steps-exhausted" }
-      step "read" { agentless; goal "Read ${loop.item.name}." }
-    }
-  }
-  loop "candidates" {
-    max-rounds 1
-    metric "quality" direction="higher" { field "score" "resource/candidate-${candidate.index}" }
-    candidates 3 { select metric="quality" }
-    round {
-      completion { when "all-steps-exhausted" }
-      step "create" { agentless; goal "Create candidate ${candidate.index}." }
-    }
-    on-keep { completion { when "all-steps-exhausted" }; step "keep" { agentless } }
-    on-discard { completion { when "all-steps-exhausted" }; step "discard" { agentless } }
-  }
-}
-"#;
-        let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let mission = &intent.missions["collections"];
-        let for_each = mission.steps["items"]
-            .loop_spec
-            .as_ref()
-            .unwrap()
-            .for_each
-            .as_ref()
-            .unwrap();
-        assert_eq!(for_each.max_parallel, 1);
-        let candidates = mission.steps["candidates"]
-            .loop_spec
-            .as_ref()
-            .unwrap()
-            .candidates
-            .as_ref()
-            .unwrap();
-        assert_eq!(candidates.count, 3);
-        assert_eq!(candidates.max_parallel, 1);
-
-        for (source, code) in [
-            (
-                r#"version 2
-mission "bad" state="ready" { goal "Reject too many candidates."; loop "choose" { max-rounds 1; candidates 17 { select { gate "pick" type="human" { reviewer "person/operator" } } }; round { completion { when "all-steps-exhausted" } } } }"#,
-                "invalid-candidate-count",
-            ),
-            (
-                r#"version 2
-mission "bad" state="ready" { goal "Reject conflicting collections."; loop "choose" for-each="resource/items" field="values" { max-rounds 1; candidates 2 { select { gate "pick" type="human" { reviewer "person/operator" } } }; round { completion { when "all-steps-exhausted" } } } }"#,
-                "conflicting-loop-shape",
-            ),
-            (
-                r#"version 2
-mission "bad" state="ready" { goal "Reject a missing metric."; loop "choose" { max-rounds 1; candidates 2 { select metric="missing" }; round { completion { when "all-steps-exhausted" } } } }"#,
-                "unknown-candidate-metric",
-            ),
+    fn loop_collection_modes_are_removed_from_the_loop_grammar() {
+        for source in [
+            r#"version 2
+mission "bad" state="ready" { goal "Reject for-each."; loop "items" for-each="resource/items" field="values" { max-rounds 2; round { step "read" { agentless } } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject best-of-N."; loop "choose" { max-rounds 1; candidates 3 { select metric="quality" }; round { step "create" { agentless } } } }"#,
         ] {
             assert_eq!(
                 crate::graph::parse_intent(source, "node").unwrap_err().code,
-                code
+                "removed-loop-shape"
             );
         }
     }
@@ -3606,7 +3430,7 @@ mission "observed" state="ready" {
     }
 
     #[test]
-    fn a_zero_step_mission_is_valid_and_has_no_implicit_completion() {
+    fn a_zero_step_mission_is_valid_and_completes_by_default() {
         let intent = crate::graph::parse_intent(
             r#"version 2
  mission "standing" state="ready" { goal "Keep the agent available." } "#,
@@ -3615,7 +3439,10 @@ mission "observed" state="ready" {
         .unwrap();
         let mission = &intent.missions["standing"];
         assert!(mission.steps.is_empty());
-        assert!(mission.completion.is_none());
+        assert_eq!(
+            mission.completion,
+            Some(crate::model::CompletionSpec::AllStepsExhausted)
+        );
     }
 
     #[test]
@@ -3710,6 +3537,20 @@ version 2
         assert!(step.revisions_human_only);
         assert_eq!(step.revision_reviewer.as_deref(), Some("person/step"));
         assert!(!step.revision_owners.contains(&"agent/assignee".into()));
+
+        let separate_seat = crate::graph::parse_intent(
+            r#"
+version 2
+agent "fleet/reviewer" { workspace "."; command "true" }
+mission "finite" state="ready" {
+  goal "Keep root seats separate from mission authority."
+  step "work" { assigned-to "agent/fleet/reviewer" }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        assert!(separate_seat.missions["finite"].revision_owners.is_empty());
     }
 
     #[test]

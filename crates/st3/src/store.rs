@@ -3015,6 +3015,16 @@ impl Store {
             })?,
             "agent",
         );
+        let requested_incarnation = request
+            .incarnation
+            .as_deref()
+            .filter(|incarnation| !incarnation.is_empty())
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-work-incarnation",
+                    "a work action must be fenced to one exact live agent incarnation",
+                )
+            })?;
         let now = now_ms();
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -3120,6 +3130,46 @@ impl Store {
                 format!("`{subject}` is not available to `{actor}`"),
             ));
         }
+        if action == "claim" {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT subject, generation_id, step_path FROM step_runs
+                     WHERE lease_owner=?1
+                       AND subject<>?2
+                       AND status IN ('claimed','working','verifying','blocked')
+                       AND lease_expires_at_unix_ms IS NOT NULL
+                       AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
+                     ORDER BY subject",
+                )
+                .map_err(internal)?;
+            let active = statement
+                .query_map(params![actor, subject, now.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?;
+            drop(statement);
+            let current_generation = generation_id_from_subject(&current.generation);
+            if let Some((active_subject, _, _)) =
+                active.into_iter().find(|(_, generation, step)| {
+                    generation != current_generation
+                        || !(current.step.starts_with(&format!("{step}/"))
+                            || step.starts_with(&format!("{}/", current.step)))
+                })
+            {
+                return Err(St3Error::new(
+                    "agent-capacity",
+                    format!(
+                        "`{actor}` already owns independent work `{active_subject}`; finish or release it before claiming `{subject}`"
+                    ),
+                ));
+            }
+        }
         if matches!(
             current.status.as_str(),
             "completed" | "failed" | "cancelled"
@@ -3148,8 +3198,7 @@ impl Store {
         }
         if lease_valid
             && current.claimant.as_deref() == Some(actor.as_str())
-            && current.claim_incarnation.is_some()
-            && current.claim_incarnation != request.incarnation
+            && current.claim_incarnation.as_deref() != Some(requested_incarnation)
         {
             return Err(St3Error::new(
                 "wrong-work-incarnation",
@@ -3159,7 +3208,7 @@ impl Store {
         let effective_incarnation = current
             .claim_incarnation
             .clone()
-            .or_else(|| request.incarnation.clone());
+            .or_else(|| Some(requested_incarnation.to_owned()));
         let actor_incarnation = effective_incarnation.clone();
         let (status, worker_reported, claimant, claim_incarnation, claim_expiry) = match action {
             "claim" => {
@@ -7307,6 +7356,39 @@ impl Store {
     ) -> Result<Option<crate::model::CurrentHarnessView>> {
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Returns true only when durable runtime evidence proves that a claimed work incarnation is
+    /// no longer the actor's live incarnation. Absence of runtime evidence is unknown, not death.
+    pub fn work_claim_is_orphaned(&self, work: &StepRunView) -> Result<bool> {
+        let (Some(actor), Some(incarnation)) =
+            (work.claimant.as_deref(), work.claim_incarnation.as_deref())
+        else {
+            return Ok(false);
+        };
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT body FROM claims
+             WHERE subject=?1 AND kind='runtime.observed'
+             ORDER BY store_index DESC",
+        )?;
+        let bodies = statement.query_map([actor], |row| row.get::<_, String>(0))?;
+        for body in bodies {
+            let body: Value = serde_json::from_str(&body?)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            match fields.get("status").and_then(Value::as_str) {
+                Some("running") => {
+                    if let Some(current) = fields.get("incarnation_id").and_then(Value::as_str) {
+                        return Ok(current != incarnation);
+                    }
+                }
+                Some("exited" | "vanished" | "stopped" | "absent" | "failed") => {
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
@@ -12141,7 +12223,7 @@ fn operational_repair_plan_tx(
          JOIN mission_runs ON mission_runs.id=step_runs.run_id
          JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
          JOIN run_generations ON run_generations.id=step_runs.generation_id
-         WHERE step_runs.status IN ('claimed','working')
+         WHERE step_runs.status IN ('claimed','working','verifying','blocked')
            AND step_runs.lease_expires_at_unix_ms IS NOT NULL
            AND step_runs.generation_id=mission_runs.current_generation_id
            AND mission_runs.status NOT IN ('completed','failed','cancelled')
@@ -14271,9 +14353,9 @@ fn project_mission_run_update(
         transaction
             .execute(
                 "UPDATE step_runs SET status=?2, blocked_reason=?3,
-                        lease_owner=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_owner END,
-                        lease_incarnation=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_incarnation END,
-                        lease_expires_at_unix_ms=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_expires_at_unix_ms END,
+                    lease_owner=CASE WHEN ?2 IN ('ready','orphaned','completed','failed','cancelled') THEN NULL ELSE lease_owner END,
+                    lease_incarnation=CASE WHEN ?2 IN ('ready','orphaned','completed','failed','cancelled') THEN NULL ELSE lease_incarnation END,
+                    lease_expires_at_unix_ms=CASE WHEN ?2 IN ('ready','orphaned','completed','failed','cancelled') THEN NULL ELSE lease_expires_at_unix_ms END,
                         not_before_unix_ms=CASE WHEN ?2='ready' THEN NULL ELSE not_before_unix_ms END,
                         activated_at_unix_ms=CASE WHEN ?2='ready' THEN ?4 ELSE activated_at_unix_ms END,
                         readiness_epoch=COALESCE(?5, readiness_epoch), updated_at_unix_ms=?4 WHERE subject=?1",
@@ -15240,10 +15322,14 @@ fn carried_revision_step_paths(
         }
         unstable.extend(additions);
     }
-    compatible.extend(current.iter().filter_map(|step| {
-        (new_definitions.contains_key(&step.step) && !unstable.contains(&step.step))
-            .then(|| step.step.clone())
-    }));
+    compatible.extend(
+        current
+            .iter()
+            .filter(|step| {
+                new_definitions.contains_key(&step.step) && !unstable.contains(&step.step)
+            })
+            .map(|step| step.step.clone()),
+    );
     compatible
 }
 
@@ -15550,9 +15636,7 @@ fn work_wake_tag_incarnation<'a>(
     attempt: u32,
     readiness_epoch: u32,
 ) -> Option<&'a str> {
-    let Some(tag) = tag.strip_prefix("st3-work:") else {
-        return None;
-    };
+    let tag = tag.strip_prefix("st3-work:")?;
     let mut parts = tag.rsplitn(4, '@');
     let incarnation = parts.next()?;
     (parts.next().and_then(|value| value.parse::<u32>().ok()) == Some(readiness_epoch)
@@ -15770,10 +15854,12 @@ fn apply_effective_step_state(
         view.claim_expires_at_unix_ms = None;
         return Ok(());
     }
-    if matches!(view.status.as_str(), "claimed" | "working")
-        && view
-            .claim_expires_at_unix_ms
-            .is_some_and(|expiry| expiry <= snapshot_unix_ms)
+    if matches!(
+        view.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && view
+        .claim_expires_at_unix_ms
+        .is_some_and(|expiry| expiry <= snapshot_unix_ms)
     {
         view.status = "ready".into();
         view.blocked_reason = Some("the worker lease expired".into());
@@ -17277,6 +17363,20 @@ mission "eval/child" state="ready" {
                 idempotency_key: "eval-tree-root".into(),
             })
             .unwrap();
+        let mut seat = crate::graph::parse_intent(
+            r#"version 2
+agent "eval/root/seat" { workspace "/eval"; command "true"; restart "never" }
+"#,
+            "node",
+        )
+        .unwrap();
+        seat.subjects
+            .get_mut("agent/eval/root/seat")
+            .unwrap()
+            .owner_run = Some(root.subject.clone());
+        store
+            .apply_internal(&seat, "declare-eval-root-seat")
+            .unwrap();
         let child = store
             .create_child_mission_run(
                 &MissionRunRequest {
@@ -17305,10 +17405,9 @@ agent "worker" { workspace "/eval/child"; command "true"; restart "never" }
             .apply_internal(&declaration, "declare-eval-child-worker")
             .unwrap();
 
-        assert_eq!(
-            store.eval_runtime_records(&root.subject).unwrap(),
-            vec![(format!("{}.worker", child.id), true)]
-        );
+        let runtime_records = store.eval_runtime_records(&root.subject).unwrap();
+        assert!(runtime_records.contains(&(format!("{}.worker", child.id), true)));
+        assert!(runtime_records.contains(&("eval.root.seat".into(), true)));
         assert!(
             store
                 .desired_subjects()
@@ -19286,9 +19385,9 @@ version 2
                 r#"
 version 2
 
-  agent "owner" {{ workspace "."; command "true" }}
   mission "lineage" state="ready" {{
     goal "Replicate generation lineage."
+    agent "owner" {{ workspace "."; command "true" }}
     step "work" {{
       title "Work ${{ST_STEP}} in ${{ST_RUN_GENERATION}}"
       goal {goal:?}
@@ -19394,9 +19493,9 @@ version 2
                 r#"
 version 2
 
-  agent "owner" {{ workspace "."; command "true" }}
   mission "proposal" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
     goal "Replicate a revision proposal."
+    agent "owner" {{ workspace "."; command "true" }}
     step "work" {{ goal {goal:?} }}
   }}
 
@@ -20854,6 +20953,7 @@ version 2
   mission "lease" state="ready" {
     goal "Complete mission lease."
     step "work" { assigned-to "agent/worker" }
+    step "other" { assigned-to "agent/worker" }
   }
 
 "#,
@@ -20883,8 +20983,20 @@ version 2
                 idempotency_key: "lease-run".into(),
             })
             .unwrap();
-        let subject = &run.steps[0].subject;
+        let subject = &run
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap()
+            .subject;
+        let other = &run
+            .steps
+            .iter()
+            .find(|step| step.step == "other")
+            .unwrap()
+            .subject;
         store.set_step_state(subject, "ready", None).unwrap();
+        store.set_step_state(other, "ready", None).unwrap();
         let request = |incarnation: &str, key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
@@ -20893,6 +21005,13 @@ version 2
             evidence: Vec::new(),
             idempotency_key: key.into(),
         };
+
+        let missing = WorkRequest {
+            incarnation: None,
+            ..request("one", "claim-without-incarnation")
+        };
+        let error = store.work_action(subject, "claim", &missing).unwrap_err();
+        assert_eq!(error.code, "missing-work-incarnation");
 
         let error = store
             .work_action(
@@ -20906,11 +21025,18 @@ version 2
             .work_action(subject, "claim", &request("one", "claim-one"))
             .unwrap();
         let error = store
+            .work_action(other, "claim", &request("one", "claim-independent"))
+            .unwrap_err();
+        assert_eq!(error.code, "agent-capacity");
+        let error = store
             .work_action(subject, "progress", &request("two", "progress-two"))
             .unwrap_err();
         assert_eq!(error.code, "wrong-work-incarnation");
         store
             .work_action(subject, "progress", &request("one", "progress-one"))
+            .unwrap();
+        store
+            .set_step_state(subject, "blocked", Some("waiting for a dependency"))
             .unwrap();
 
         expire_work_lease_by_claim(&store, subject, "agent/node.worker", "one");
@@ -21237,11 +21363,9 @@ version 2
         store
             .set_step_state(&subjects["blocked"], "blocked", Some("waiting for a gate"))
             .unwrap();
-        for path in ["active", "expired"] {
-            store
-                .work_action(&subjects[path], "claim", &request(&format!("claim-{path}")))
-                .unwrap();
-        }
+        store
+            .work_action(&subjects["expired"], "claim", &request("claim-expired"))
+            .unwrap();
         expire_work_lease_by_claim(
             &store,
             &subjects["expired"],
@@ -21251,6 +21375,9 @@ version 2
         let expired = store.step_run(&subjects["expired"]).unwrap().unwrap();
         assert_eq!(expired.status, "ready");
         assert!(expired.claimant.is_none());
+        store
+            .work_action(&subjects["active"], "claim", &request("claim-active"))
+            .unwrap();
 
         assert!(
             store
@@ -22206,9 +22333,9 @@ mission "retry" state="ready" {
             r#"
 version 2
 
-  agent "worker" { workspace "."; command "true" }
   mission "revision" state="ready" {
     goal "Complete mission revision."
+    agent "worker" { workspace "."; command "true" }
     step "owned" { assigned-to "agent/worker"; goal "First goal." }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
@@ -22238,9 +22365,9 @@ version 2
             r#"
 version 2
 
-  agent "worker" { workspace "."; command "true" }
   mission "revision" state="ready" {
     goal "Complete mission revision."
+    agent "worker" { workspace "."; command "true" }
     step "owned" {
       assigned-to "agent/worker"
       goal "First goal."
@@ -22291,9 +22418,9 @@ version 2
                 r#"
 version 2
 
-  agent "worker" {{ workspace "."; command "true" }}
   mission "revision-delivery" state="ready" {{
     goal "Keep delivered work across mission guidance edits."
+    agent "worker" {{ workspace "."; command "true" }}
     constraint {constraint:?}
     step "completed" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Finish once." }}
     step "submitted" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Verify once." }}
@@ -22410,9 +22537,9 @@ version 2
             r#"
 version 2
 
-  agent "worker" { workspace "."; command "true" }
   mission "generation" state="ready" {
     goal "Test immutable generations."
+    agent "worker" { workspace "."; command "true" }
     step "active" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
     step "changed" { goal "Use the first definition." }
@@ -22472,9 +22599,9 @@ version 2
             r#"
 version 2
 
-  agent "worker" { workspace "."; command "true" }
   mission "generation" state="ready" {
     goal "Test immutable generations."
+    agent "worker" { workspace "."; command "true" }
     step "active" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
     step "changed" { goal "Use the second definition." }
@@ -22655,7 +22782,10 @@ version 2
             "assigned-to \"agent/node.two\"",
             "completion { when \"all-steps-exhausted\" }",
         );
-        let completion_changed = parse("assigned-to \"agent/node.one\"", "");
+        let completion_changed = parse(
+            "assigned-to \"agent/node.one\"",
+            "completion { depends-on { step \"work\" completed } }",
+        );
         let variables = BTreeMap::new();
         for candidate in [&selector_changed, &completion_changed] {
             let (compatible, _) = analyze_mission_revision(
@@ -22914,9 +23044,9 @@ version 2
                 r#"
 version 2
 
-  agent "worker" {{ workspace "."; command "true" }}
   mission "drain" state="ready"{cutover} {{
     goal "Test a drained cutover."
+    agent "worker" {{ workspace "."; command "true" }}
     step "active" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Keep active work." }}
     step "waiting" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal {goal:?} }}
   }}
@@ -24537,6 +24667,64 @@ message "human-attention" {
         let actual = store.latest_actual_value(subject).unwrap().unwrap();
         assert!(actual.get("deadline_unix_ms").is_none());
         assert!(actual.get("reason").is_none());
+    }
+
+    #[test]
+    fn work_orphaning_requires_terminal_or_replacement_runtime_evidence() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let work: StepRunView = serde_json::from_value(serde_json::json!({
+            "subject": "step-run/run/work",
+            "run": "mission-run/run",
+            "generation": "run-generation/run",
+            "step": "work",
+            "definition_hash": "definition",
+            "status": "blocked",
+            "attempt": 1,
+            "assigned_to": subject,
+            "agentless": false,
+            "title": null,
+            "worker_reported": false,
+            "claimant": subject,
+            "claim_incarnation": "worker-one",
+            "claim_expires_at_unix_ms": 10,
+            "execution_elapsed_ms": 0,
+            "readiness_epoch": 1,
+            "blocked_reason": "waiting",
+            "not_before_unix_ms": null,
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1
+        }))
+        .unwrap();
+        let observe = |status: &str, incarnation: Option<&str>, key: &str| {
+            let mut fields = BTreeMap::from([("status".into(), Value::String(status.to_owned()))]);
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+
+        assert!(!store.work_claim_is_orphaned(&work).unwrap());
+        observe("starting", None, "orphan-starting");
+        assert!(!store.work_claim_is_orphaned(&work).unwrap());
+        observe("running", Some("worker-one"), "orphan-current");
+        assert!(!store.work_claim_is_orphaned(&work).unwrap());
+        observe("starting", None, "orphan-inconclusive-after-current");
+        assert!(!store.work_claim_is_orphaned(&work).unwrap());
+        observe("running", Some("worker-two"), "orphan-replacement");
+        assert!(store.work_claim_is_orphaned(&work).unwrap());
+        observe("stopped", None, "orphan-stopped");
+        assert!(store.work_claim_is_orphaned(&work).unwrap());
     }
 
     #[test]
