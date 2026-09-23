@@ -3352,6 +3352,11 @@ dependencies = [
  "anyhow",
  "crossterm",
  "ratatui",
+ "serde_json",
+ "signal-hook",
+ "st3-client",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
