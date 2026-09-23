@@ -1084,7 +1084,19 @@ impl Client {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        self.request(Method::GET, path, None).await
+        let first_page = !request_has_page_cursor(path);
+        for attempt in 0..3 {
+            match self.request(Method::GET, path, None).await {
+                Ok(value) => return Ok(value),
+                Err(ClientError::Api(ErrorCode::PageCursorExpired, _, _))
+                    if first_page && attempt < 2 =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded first-page retry loop always returns")
     }
     async fn post<T: DeserializeOwned>(
         &self,
@@ -1158,6 +1170,15 @@ impl Client {
         }
         serde_json::from_slice(&bytes).map_err(|error| ClientError::Protocol(error.to_string()))
     }
+}
+
+fn request_has_page_cursor(path: &str) -> bool {
+    path.split_once('?').is_some_and(|(_, query)| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(name, _)| name == "cursor")
+    })
 }
 
 async fn unix_request(
@@ -1432,6 +1453,16 @@ mod tests {
         "value":{"kind":"timeline-page","session_id":"session/release-agent/9","items":[],"page":{"limit":25,"has_more":false}}
     }"#;
 
+    const PAGE_CURSOR_EXPIRED: &str = r#"{
+        "api_version":"st3.client.v0",
+        "error_version":"st3.client.error.v0",
+        "request_id":"request/expired",
+        "code":"page-cursor-expired",
+        "message":"the snapshot changed; restart pagination from the first page",
+        "retryable":true,
+        "details":{}
+    }"#;
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1560,6 +1591,108 @@ mod tests {
                 "GET /v1/client/sessions/release%20agent%2F9/timeline HTTP/1.1",
             ]);
         });
+    }
+
+    #[test]
+    fn first_page_reads_retry_snapshot_churn_but_cursor_reads_do_not() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("st3.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut request_lines = Vec::new();
+                for body in [PAGE_CURSOR_EXPIRED, EMPTY_PAGE] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    request_lines.push(
+                        String::from_utf8(request)
+                            .unwrap()
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                    let status = if body == PAGE_CURSOR_EXPIRED {
+                        "410 Gone"
+                    } else {
+                        "200 OK"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                request_lines
+            });
+
+            Client::unix(&socket)
+                .sessions_list(None, Some(1), false)
+                .await
+                .expect("a first-page session read must retry transient snapshot churn");
+            assert_eq!(
+                server.await.unwrap(),
+                [
+                    "GET /v1/client/sessions?limit=1 HTTP/1.1",
+                    "GET /v1/client/sessions?limit=1 HTTP/1.1"
+                ]
+            );
+
+            let cursor_socket = directory.path().join("cursor.sock");
+            let listener = tokio::net::UnixListener::bind(&cursor_socket).unwrap();
+            let cursor_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let response = format!(
+                    "HTTP/1.1 410 Gone\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    PAGE_CURSOR_EXPIRED.len(),
+                    PAGE_CURSOR_EXPIRED
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8(request)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            });
+            let error = Client::unix(&cursor_socket)
+                .sessions_list(Some("page/next"), Some(1), false)
+                .await
+                .expect_err("an explicit cursor must preserve its snapshot-expired error");
+            assert!(matches!(
+                error,
+                ClientError::Api(ErrorCode::PageCursorExpired, _, _)
+            ));
+            assert_eq!(
+                cursor_server.await.unwrap(),
+                "GET /v1/client/sessions?cursor=page/next&limit=1 HTTP/1.1"
+            );
+        });
+    }
+
+    #[test]
+    fn pagination_cursor_detection_uses_query_parameter_boundaries() {
+        assert!(!request_has_page_cursor("/v1/client/sessions"));
+        assert!(!request_has_page_cursor("/v1/client/sessions?limit=50"));
+        assert!(!request_has_page_cursor(
+            "/v1/client/sessions?timeline_cursor=value"
+        ));
+        assert!(request_has_page_cursor(
+            "/v1/client/sessions?limit=50&cursor=page%2Fnext"
+        ));
     }
 
     #[test]

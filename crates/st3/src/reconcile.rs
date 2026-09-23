@@ -960,7 +960,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 subject: message.subject.clone(),
                 kind: "message.closed".into(),
                 actor: Some(
-                    if message.status == "sent" {
+                    if matches!(message.status.as_str(), "sent" | "staged") {
                         "daemon/runtime"
                     } else {
                         agent
@@ -13078,6 +13078,26 @@ mission "work-alert" state="ready" {
         let replicated_step = replica.step_run(&run.steps[0].subject).unwrap().unwrap();
         assert_eq!(replicated_step.wake.unwrap().attempts, 1);
 
+        let stale_message = messages[0].subject.clone();
+        store
+            .append_claim(&ClaimInput {
+                subject: stale_message.clone(),
+                kind: "message.staged".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("staged".into())),
+                    (
+                        "recipient".into(),
+                        Value::String("agent/node.worker".into()),
+                    ),
+                    ("transport".into(), Value::String("claude-channel".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("stage-worker-one-wake".into()),
+            })
+            .unwrap();
+
         runtime.ptys.lock().unwrap()[0].incarnation_id = Some("worker-two".into());
         reconciler.reconcile_once().unwrap();
         store
@@ -13112,6 +13132,11 @@ mission "work-alert" state="ready" {
                 .count(),
             1
         );
+        let withdrawal = store
+            .latest_claim(&stale_message, Some("message.closed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(withdrawal.actor.as_deref(), Some("daemon/runtime"));
 
         let step = &run.steps[0];
         store

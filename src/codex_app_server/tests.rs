@@ -3171,6 +3171,129 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
 }
 
 #[test]
+fn idle_delivery_retries_snapshot_errors_with_fresh_ids_then_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+
+    for attempt in 0..SNAPSHOT_REQUEST_ATTEMPTS {
+        let read = delivery
+            .maybe_snapshot_request(&state)
+            .unwrap()
+            .expect("each bounded retry issues a request");
+        assert_eq!(
+            read["id"],
+            Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(attempt)),
+            "every retry must use a fresh JSON-RPC ID"
+        );
+        assert!(
+            delivery
+                .accept_snapshot_response(
+                    &json!({
+                        "id": read["id"],
+                        "error": { "code": -32000, "message": "temporarily unavailable" }
+                    }),
+                    &mut state,
+                )
+                .unwrap()
+        );
+    }
+
+    assert_eq!(delivery.maybe_snapshot_request(&state).unwrap(), None);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("bounded read errors must not permanently fence known-idle delivery");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(
+        request["id"],
+        Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(SNAPSHOT_REQUEST_ATTEMPTS))
+    );
+}
+
+#[test]
+fn idle_delivery_expires_missing_snapshot_responses_and_ignores_late_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+
+    let first = delivery
+        .maybe_snapshot_request(&state)
+        .unwrap()
+        .expect("the first snapshot request is issued");
+    for attempt in 1..SNAPSHOT_REQUEST_ATTEMPTS {
+        delivery.pending_snapshot.as_mut().unwrap().requested_at = Instant::now()
+            .checked_sub(SNAPSHOT_REQUEST_TIMEOUT + Duration::from_millis(1))
+            .unwrap();
+        let retry = delivery
+            .maybe_snapshot_request(&state)
+            .unwrap()
+            .expect("an expired request is replaced within the retry bound");
+        assert_eq!(
+            retry["id"],
+            Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(attempt))
+        );
+        assert_ne!(retry["id"], first["id"]);
+        assert!(
+            !delivery
+                .accept_snapshot_response(
+                    &json!({
+                        "id": first["id"],
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            }
+                        }
+                    }),
+                    &mut state,
+                )
+                .unwrap(),
+            "a late response for an expired request cannot satisfy the fresh request"
+        );
+    }
+    delivery.pending_snapshot.as_mut().unwrap().requested_at = Instant::now()
+        .checked_sub(SNAPSHOT_REQUEST_TIMEOUT + Duration::from_millis(1))
+        .unwrap();
+
+    assert_eq!(
+        delivery.maybe_snapshot_request(&state).unwrap(),
+        None,
+        "the final timeout clears the snapshot fence instead of issuing an unbounded retry"
+    );
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("missing read responses must not permanently fence known-idle delivery");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(
+        request["id"],
+        Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(SNAPSHOT_REQUEST_ATTEMPTS))
+    );
+}
+
+#[test]
 fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout-thread-main.jsonl");

@@ -862,7 +862,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     )?;
     let messages = message_statement
         .query_map(
-            params![session.native_id, MAX_TIMELINE_LINES as i64],
+            params![session.native_id, MAX_TIMELINE_LINES as i64 + 1],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -872,45 +872,57 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut messages = messages;
+    let mut truncated = messages.len() > MAX_TIMELINE_LINES;
+    if truncated {
+        messages.remove(0);
+    }
     let mut part_statement = connection.prepare(
         "SELECT data FROM part WHERE session_id = ?1 AND message_id = ?2 \
          ORDER BY time_created, id",
     )?;
-    let mut items = Vec::new();
-    let truncated = messages.len() == MAX_TIMELINE_LINES;
-    if truncated {
-        items.push(timeline_item(
-            0,
-            &timestamp(session.updated_at_unix_ms),
-            "system",
-            "truncation",
-            json!({
-                "reason": "the native OpenCode history prefix is outside the bounded read window",
-                "omitted_from_sequence": 0,
-                "omitted_to_sequence": 0
-            }),
-        ));
-    }
-    for (message_offset, (message_id, created, encoded)) in messages.into_iter().enumerate() {
+    let mut items = VecDeque::new();
+    // Include the surrounding JSON array delimiters so this remains an exact bound on the
+    // serialized timeline, not just on its native payloads.
+    let mut serialized_bytes = 2_usize;
+    let mut sequence = 1_u64;
+    for (message_id, created, encoded) in messages {
         let message = serde_json::from_str::<Value>(&encoded).unwrap_or(Value::Null);
         let role = normalized_role(message.get("role").and_then(Value::as_str));
         let at = timestamp(created.max(0) as u128);
-        let base = ((message_offset as u64).saturating_add(1)).saturating_mul(32);
-        push_message(&mut items, base, &at, role, &message_id);
-        let parts = part_statement
-            .query_map(params![session.native_id, message_id], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut sequence = base.saturating_add(1);
+        let mut additions = Vec::with_capacity(2);
+        push_message(
+            &mut additions,
+            next_opencode_sequence(&mut sequence)?,
+            &at,
+            role,
+            &message_id,
+        );
+        extend_bounded_opencode_timeline(
+            &mut items,
+            &mut serialized_bytes,
+            &mut truncated,
+            additions,
+        );
+        let parts = part_statement.query_map(params![session.native_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })?;
         for encoded_part in parts {
+            let encoded_part = encoded_part?;
             let Ok(part) = serde_json::from_str::<Value>(&encoded_part) else {
                 continue;
             };
+            let mut additions = Vec::with_capacity(2);
             match part.get("type").and_then(Value::as_str) {
                 Some("text") => {
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        push_content(&mut items, sequence, &at, role, text);
+                        push_content(
+                            &mut additions,
+                            next_opencode_sequence(&mut sequence)?,
+                            &at,
+                            role,
+                            text,
+                        );
                     }
                 }
                 Some("tool") => {
@@ -922,21 +934,20 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                     let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
                     let state = part.get("state").unwrap_or(&Value::Null);
                     push_tool_call(
-                        &mut items,
-                        sequence,
+                        &mut additions,
+                        next_opencode_sequence(&mut sequence)?,
                         &at,
                         call_id,
                         name,
                         state.get("input").cloned().unwrap_or_else(|| json!({})),
                     );
-                    sequence = sequence.saturating_add(1);
                     if matches!(
                         state.get("status").and_then(Value::as_str),
                         Some("completed" | "error")
                     ) {
                         push_tool_result(
-                            &mut items,
-                            sequence,
+                            &mut additions,
+                            next_opencode_sequence(&mut sequence)?,
                             &at,
                             call_id,
                             state
@@ -949,11 +960,112 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                 }
                 _ => {}
             }
-            sequence = sequence.saturating_add(1);
+            extend_bounded_opencode_timeline(
+                &mut items,
+                &mut serialized_bytes,
+                &mut truncated,
+                additions,
+            );
         }
     }
-    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
-    Ok(items)
+    if truncated {
+        prepend_opencode_truncation(
+            &mut items,
+            &mut serialized_bytes,
+            timeline_item(
+                0,
+                &timestamp(session.updated_at_unix_ms),
+                "system",
+                "truncation",
+                json!({
+                    "reason": "the native OpenCode history prefix is outside the bounded read window",
+                    "omitted_from_sequence": 0,
+                    "omitted_to_sequence": 0
+                }),
+            ),
+        );
+    }
+    Ok(items.into_iter().map(|(item, _)| item).collect())
+}
+
+fn next_opencode_sequence(sequence: &mut u64) -> Result<u64> {
+    let current = *sequence;
+    *sequence = (*sequence)
+        .checked_add(1)
+        .context("OpenCode timeline exceeds sequence capacity")?;
+    Ok(current)
+}
+
+fn extend_bounded_opencode_timeline(
+    items: &mut VecDeque<(Value, usize)>,
+    serialized_bytes: &mut usize,
+    truncated: &mut bool,
+    additions: Vec<Value>,
+) {
+    let byte_limit = usize::try_from(MAX_TIMELINE_BYTES).unwrap_or(usize::MAX);
+    for item in additions {
+        let item_bytes = serde_json::to_vec(&item).map_or(byte_limit, |encoded| encoded.len());
+        let mut additional_bytes = item_bytes + usize::from(!items.is_empty());
+        while items.len() >= MAX_TIMELINE_LINES
+            || serialized_bytes.saturating_add(additional_bytes) > byte_limit
+        {
+            if !pop_opencode_timeline_front(items, serialized_bytes) {
+                break;
+            }
+            *truncated = true;
+            additional_bytes = item_bytes + usize::from(!items.is_empty());
+        }
+        if serialized_bytes.saturating_add(additional_bytes) > byte_limit {
+            *truncated = true;
+            continue;
+        }
+        *serialized_bytes = serialized_bytes.saturating_add(additional_bytes);
+        items.push_back((item, item_bytes));
+    }
+}
+
+fn pop_opencode_timeline_front(
+    items: &mut VecDeque<(Value, usize)>,
+    serialized_bytes: &mut usize,
+) -> bool {
+    let Some((_, removed_bytes)) = items.pop_front() else {
+        return false;
+    };
+    let removed_comma = usize::from(!items.is_empty());
+    *serialized_bytes = serialized_bytes.saturating_sub(removed_bytes + removed_comma);
+    true
+}
+
+fn prepend_opencode_truncation(
+    items: &mut VecDeque<(Value, usize)>,
+    serialized_bytes: &mut usize,
+    mut truncation: Value,
+) {
+    let byte_limit = usize::try_from(MAX_TIMELINE_BYTES).unwrap_or(usize::MAX);
+    while items.len() >= MAX_TIMELINE_LINES {
+        if !pop_opencode_timeline_front(items, serialized_bytes) {
+            break;
+        }
+    }
+    loop {
+        truncation["body"]["omitted_to_sequence"] = items
+            .front()
+            .and_then(|(item, _)| item["sequence"].as_u64())
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .into();
+        let truncation_bytes =
+            serde_json::to_vec(&truncation).map_or(byte_limit, |encoded| encoded.len());
+        let additional_bytes = truncation_bytes + usize::from(!items.is_empty());
+        if serialized_bytes.saturating_add(additional_bytes) <= byte_limit {
+            *serialized_bytes = serialized_bytes.saturating_add(additional_bytes);
+            items.push_front((truncation, truncation_bytes));
+            break;
+        }
+        if !pop_opencode_timeline_front(items, serialized_bytes) {
+            break;
+        }
+    }
 }
 
 fn normalize_codex(
@@ -1255,6 +1367,16 @@ fn digest(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn path_executable(name: &str) -> PathBuf {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("the test environment must provide `{name}` on PATH"))
+    }
+
     #[test]
     fn codex_claude_pi_and_omp_transcripts_normalize_to_one_timeline_shape() {
         let session = |driver| ExternalSession {
@@ -1457,11 +1579,207 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opencode_timeline_sequences_remain_unique_after_many_tool_parts() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".local/share/opencode");
+        fs::create_dir_all(&parent).unwrap();
+        let database = parent.join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );",
+            )
+            .unwrap();
+        for (message_id, created, role) in [
+            ("msg_tools", 1_700_000_000_000_i64, "assistant"),
+            ("msg_after", 1_700_000_001_000_i64, "user"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        message_id,
+                        "ses_native",
+                        created,
+                        created,
+                        json!({"role": role}).to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+        for offset in 0..16_i64 {
+            connection
+                .execute(
+                    "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        format!("part_tool_{offset:02}"),
+                        "msg_tools",
+                        "ses_native",
+                        1_700_000_000_001_i64 + offset,
+                        1_700_000_000_001_i64 + offset,
+                        json!({
+                            "type": "tool",
+                            "callID": format!("call_{offset:02}"),
+                            "tool": "shell",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": "true"},
+                                "output": "ok"
+                            }
+                        })
+                        .to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "part_after",
+                    "msg_after",
+                    "ses_native",
+                    1_700_000_001_001_i64,
+                    1_700_000_001_001_i64,
+                    r#"{"type":"text","text":"after tools"}"#,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let external = ExternalSession {
+            id: external_session_id(ExternalDriver::OpenCode, "ses_native"),
+            revision: "revision".into(),
+            driver: ExternalDriver::OpenCode,
+            native_id: "ses_native".into(),
+            transcript: database,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_001_001,
+            process: None,
+        };
+        let timeline = normalized_timeline(&external).unwrap();
+
+        assert_eq!(timeline.len(), 35);
+        assert!(timeline.windows(2).all(|pair| {
+            pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap()
+        }));
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            timeline.len()
+        );
+        let following_message = timeline
+            .iter()
+            .find(|item| item["body"]["message_id"] == "msg_after")
+            .unwrap();
+        let final_tool_result = timeline
+            .iter()
+            .find(|item| item["body"]["call_id"] == "call_15" && item["type"] == "tool_result")
+            .unwrap();
+        assert!(following_message["sequence"].as_u64() > final_tool_result["sequence"].as_u64());
+    }
+
+    #[test]
+    fn opencode_timeline_retains_a_bounded_ordered_suffix() {
+        let home = tempfile::tempdir().unwrap();
+        let database = home.path().join("opencode.db");
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "msg_many_parts",
+                    "ses_native",
+                    1_700_000_000_000_i64,
+                    1_700_000_000_000_i64,
+                    r#"{"role":"assistant"}"#,
+                ],
+            )
+            .unwrap();
+        let part_count = MAX_TIMELINE_LINES + 16;
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+                .unwrap();
+            for offset in 0..part_count {
+                insert
+                    .execute(params![
+                        format!("part_{offset:05}"),
+                        "msg_many_parts",
+                        "ses_native",
+                        1_700_000_000_001_i64 + offset as i64,
+                        1_700_000_000_001_i64 + offset as i64,
+                        json!({"type": "text", "text": format!("part {offset}")}).to_string(),
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let external = ExternalSession {
+            id: external_session_id(ExternalDriver::OpenCode, "ses_native"),
+            revision: "revision".into(),
+            driver: ExternalDriver::OpenCode,
+            native_id: "ses_native".into(),
+            transcript: database,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_004_112,
+            process: None,
+        };
+        let timeline = normalized_timeline(&external).unwrap();
+
+        assert_eq!(timeline.len(), MAX_TIMELINE_LINES);
+        assert_eq!(timeline[0]["type"], "truncation");
+        assert!(timeline.windows(2).all(|pair| {
+            pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap()
+        }));
+        assert_eq!(
+            timeline.last().unwrap()["body"]["text"],
+            format!("part {}", part_count - 1)
+        );
+        assert!(serde_json::to_vec(&timeline).unwrap().len() <= MAX_TIMELINE_BYTES as usize);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn takeover_stops_only_the_process_matching_the_exact_start_fingerprint() {
-        let mut child = std::process::Command::new("/bin/bash")
-            .args(["-c", "exec -a codex /bin/sleep 30"])
+        let bash = path_executable("bash");
+        let mut child = std::process::Command::new(&bash)
+            .args([
+                "-c",
+                "exec -a codex \"$1\" -c 'while :; do :; done'",
+                "takeover-test",
+                bash.to_str().unwrap(),
+            ])
             .spawn()
             .unwrap();
         let process = (0..100)

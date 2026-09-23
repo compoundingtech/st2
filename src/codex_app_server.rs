@@ -102,6 +102,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const TRANSCRIPT_TURN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const TRANSCRIPT_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const SNAPSHOT_REQUEST_ATTEMPTS: u8 = 3;
 const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
 const TRANSCRIPT_DISCOVERY_FILE_LIMIT: usize = 10_000;
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
@@ -569,6 +571,7 @@ struct CodexInboxDelivery {
     ledger: delivery_ledger::Ledger,
     pending: Option<PendingCodexDelivery>,
     pending_snapshot: Option<PendingCodexSnapshot>,
+    snapshot_attempts: u8,
     verified_snapshot: Option<(String, CodexObservedState)>,
     require_snapshot: bool,
     rejected: Option<RejectedCodexDelivery>,
@@ -691,6 +694,7 @@ impl CodexInboxDelivery {
             ledger,
             pending: None,
             pending_snapshot: None,
+            snapshot_attempts: 0,
             verified_snapshot: None,
             require_snapshot: true,
             rejected: None,
@@ -860,6 +864,7 @@ impl CodexInboxDelivery {
             .find(|message| !self.ledger.settled(&message.filename));
         if self.head.as_ref().map(|message| &message.filename) != prior_head.as_ref() {
             self.pending_snapshot = None;
+            self.snapshot_attempts = 0;
             self.verified_snapshot = None;
         }
         self.suppressed =
@@ -974,6 +979,7 @@ impl CodexInboxDelivery {
             filename,
             method,
         });
+        self.snapshot_attempts = 0;
         self.verified_snapshot = None;
         Ok(Some(request))
     }
@@ -986,11 +992,21 @@ impl CodexInboxDelivery {
 
     fn maybe_snapshot_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
-        if self.pending.is_some()
-            || self.pending_snapshot.is_some()
-            || !state.subscribed
-            || self.suppressed
+        if self.pending.is_some() || !state.subscribed || self.suppressed {
+            return Ok(None);
+        }
+        if self
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|pending| pending.requested_at.elapsed() >= SNAPSHOT_REQUEST_TIMEOUT)
         {
+            let pending = self
+                .pending_snapshot
+                .take()
+                .context("Codex thread snapshot is not pending")?;
+            self.finish_failed_snapshot(pending, state, "timed out");
+        }
+        if self.pending_snapshot.is_some() {
             return Ok(None);
         }
         let Some(head) = self.head.as_ref() else {
@@ -1008,11 +1024,21 @@ impl CodexInboxDelivery {
         {
             return Ok(None);
         }
+        // A provider that rejects or silently drops thread/read must not hold an otherwise idle
+        // inbox forever. Each head gets a bounded set of fresh requests; after they are exhausted,
+        // fall back to the latest typed observer state. Delivery remains provider-fenced: stale
+        // active state uses expectedTurnId, while a rejected turn request remains retryable.
+        if self.snapshot_attempts >= SNAPSHOT_REQUEST_ATTEMPTS {
+            self.verified_snapshot = Some((head.filename.clone(), state.observed.clone()));
+            self.snapshot_attempts = 0;
+            return Ok(None);
+        }
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
             .checked_add(1)
             .context("Codex snapshot request ID overflow")?;
+        self.snapshot_attempts += 1;
         self.pending_snapshot = Some(PendingCodexSnapshot {
             request_id,
             filename: head.filename.clone(),
@@ -1046,20 +1072,46 @@ impl CodexInboxDelivery {
             .take()
             .context("Codex thread snapshot is not pending")?;
         if message.get("error").is_some() {
-            // Keep the message fenced, but let the bounded transcript fallback run on the next
-            // poll. A temporary thread/read rejection must not kill the whole control pump.
-            self.pending_snapshot = Some(PendingCodexSnapshot {
-                requested_at: Instant::now()
-                    .checked_sub(TRANSCRIPT_TURN_RECOVERY_INTERVAL)
-                    .unwrap_or_else(Instant::now),
-                ..pending
-            });
+            self.finish_failed_snapshot(pending, state, "was rejected");
             return Ok(true);
         }
-        let observed = observed_from_thread_snapshot(message, state.thread_id())?;
+        let observed = match observed_from_thread_snapshot(message, state.thread_id()) {
+            Ok(observed) => observed,
+            Err(error) => {
+                tracing::warn!("st2 codex: invalid thread/read response; retrying: {error:#}");
+                self.finish_failed_snapshot(pending, state, "was invalid");
+                return Ok(true);
+            }
+        };
         state.observed = observed.clone();
         self.verified_snapshot = Some((pending.filename, observed));
+        self.snapshot_attempts = 0;
         Ok(true)
+    }
+
+    fn finish_failed_snapshot(
+        &mut self,
+        pending: PendingCodexSnapshot,
+        state: &CodexControlState,
+        reason: &str,
+    ) {
+        tracing::warn!(
+            "st2 codex: thread/read request {} {reason} (attempt {}/{}); delivery remains fenced until retry or bounded fallback",
+            pending.request_id,
+            self.snapshot_attempts,
+            SNAPSHOT_REQUEST_ATTEMPTS,
+        );
+        if self.snapshot_attempts < SNAPSHOT_REQUEST_ATTEMPTS {
+            return;
+        }
+        if self
+            .head
+            .as_ref()
+            .is_some_and(|head| head.filename == pending.filename)
+        {
+            self.verified_snapshot = Some((pending.filename, state.observed.clone()));
+        }
+        self.snapshot_attempts = 0;
     }
 
     fn transcript_recovery_due(&self) -> bool {
@@ -1075,6 +1127,7 @@ impl CodexInboxDelivery {
             return;
         };
         self.pending_snapshot = None;
+        self.snapshot_attempts = 0;
         self.verified_snapshot = Some((head.filename.clone(), observed));
     }
 

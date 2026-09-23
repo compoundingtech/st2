@@ -16,4 +16,4 @@ pub use isolate::{
     wrap as wrap_isolated,
 };
 pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_token};
-pub use pty::{Launch, PtyObservation, PtyRuntime};
+pub use pty::{Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase};

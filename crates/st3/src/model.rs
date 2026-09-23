@@ -1271,6 +1271,34 @@ pub struct CurrentHarnessView {
 impl CurrentHarnessView {
     pub fn is_ready(&self) -> bool {
         matches!(self.state.as_str(), "ready" | "working" | "idle")
+            && self.reason.as_deref() != Some("providerAuth")
+    }
+}
+
+#[cfg(test)]
+mod current_harness_view_tests {
+    use super::CurrentHarnessView;
+
+    fn harness(reason: Option<&str>) -> CurrentHarnessView {
+        CurrentHarnessView {
+            state: "idle".into(),
+            driver: Some("claude".into()),
+            incarnation_id: "worker-one".into(),
+            transport: Some("claude-channel".into()),
+            reason: reason.map(str::to_owned),
+            blocked_on: None,
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim: "claim/one".into(),
+            observed_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn provider_auth_idle_is_not_ready_for_delivery() {
+        assert!(!harness(Some("providerAuth")).is_ready());
+        assert!(harness(Some("channelInitialized")).is_ready());
     }
 }
 

@@ -357,7 +357,9 @@ fn validate_model(
         let rust_discriminated_timeline = definition == "TimelineEntry"
             && property == "type"
             && rust_block.contains("pub body: TimelineBody")
-            && rust.contains("#[serde(tag = \"type\", content = \"body\"");
+            && (rust.contains("#[serde(tag = \"type\", content = \"body\"")
+                || (rust.contains("struct TaggedBody")
+                    && rust.contains("#[serde(rename = \"type\")]")));
         if !rust_block.contains(&format!("pub {rust_field}:")) && !rust_discriminated_timeline {
             bail!("Rust `{rust_name}` does not model schema field `{property}`");
         }

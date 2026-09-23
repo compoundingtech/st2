@@ -125,6 +125,137 @@ fn generated_resource_union_decodes_all_kinds() {
 }
 
 #[test]
+fn session_usage_context_decodes_through_flattened_resource() {
+    let resource: Resource = serde_json::from_value(serde_json::json!({
+        "id": "session/compatibility-test",
+        "kind": "session",
+        "revision": "s1",
+        "updated_at": "2026-09-23T12:00:00Z",
+        "owner_id": "agent/test",
+        "state": "running",
+        "started_at": "2026-09-23T11:00:00Z",
+        "ended_at": null,
+        "timeline_cursor": "timeline-cursor/compatibility-test/latest",
+        "usage": {
+            "total_tokens": 1200,
+            "input_tokens": 900,
+            "output_tokens": 300,
+            "cached_tokens": 100,
+            "cost": null,
+            "currency": null,
+            "incarnation_count": 2,
+            "aggregation": "response-deltas",
+            "context": {
+                "used_tokens": 800,
+                "window_tokens": 200000,
+                "used_percent": 0.4,
+                "model": "future-model",
+                "observed_at_unix_ms": 1_790_163_492_730_u64,
+                "new_harness_field": true
+            }
+        },
+        "new_session_field": {"preserved": true}
+    }))
+    .expect("session usage emitted by a newer harness must decode");
+
+    let Resource::Session(session) = resource else {
+        panic!("resource discriminator was not preserved");
+    };
+    assert_eq!(
+        session
+            .usage
+            .and_then(|usage| usage.context)
+            .map(|context| context.observed_at_unix_ms),
+        Some(1_790_163_492_730)
+    );
+    assert_eq!(session.extra["new_session_field"]["preserved"], true);
+}
+
+#[test]
+fn timeline_models_tolerate_future_discriminators() {
+    fn entry(entry_type: &str, body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("timeline-entry/{entry_type}"),
+            "sequence": 1,
+            "revision": 1,
+            "timestamp": "2026-09-23T12:00:00Z",
+            "role": "future_role",
+            "type": entry_type,
+            "final": true,
+            "body": body
+        })
+    }
+
+    let unknown: TimelineEntry = serde_json::from_value(entry(
+        "future_event",
+        serde_json::json!({"future": "payload"}),
+    ))
+    .expect("a newer harness timeline type must not break an older client");
+    assert_eq!(unknown.role, TimelineRole::Unknown);
+    assert!(matches!(
+        &unknown.body,
+        TimelineBody::Unknown { entry_type, body }
+            if entry_type == "future_event" && body["future"] == "payload"
+    ));
+    assert_eq!(unknown.body.entry_type(), TimelineType::Unknown);
+    assert_eq!(
+        serde_json::to_value(&unknown).unwrap()["type"],
+        "future_event",
+        "JSON output must preserve a future timeline discriminator"
+    );
+
+    let status: TimelineEntry = serde_json::from_value(entry(
+        "status",
+        serde_json::json!({"status": "future_status", "detail": null}),
+    ))
+    .expect("a newer harness status must not break an older client");
+    assert!(matches!(
+        status.body,
+        TimelineBody::Status(TimelineStatusBody {
+            status: TimelineStatus::Unknown,
+            ..
+        })
+    ));
+
+    let tool: TimelineEntry = serde_json::from_value(entry(
+        "tool_result",
+        serde_json::json!({
+            "call_id": "call/future",
+            "status": "future_status",
+            "media_type": "application/json",
+            "content": null
+        }),
+    ))
+    .expect("a newer tool status must not break an older client");
+    assert!(matches!(
+        tool.body,
+        TimelineBody::ToolResult(TimelineToolResultBody {
+            status: TimelineToolStatus::Unknown,
+            ..
+        })
+    ));
+
+    let usage: TimelineEntry = serde_json::from_value(entry(
+        "usage",
+        serde_json::json!({
+            "semantics": "future_semantics",
+            "driver": "future-driver",
+            "attribution": {
+                "agent_id": "agent/test",
+                "mission_run_id": null,
+                "generation_id": null,
+                "step_id": null
+            }
+        }),
+    ))
+    .expect("newer usage semantics must not break an older client");
+    assert!(matches!(
+        usage.body,
+        TimelineBody::Usage(body) if body.semantics == TimelineUsageSemantics::Unknown
+    ));
+}
+
+#[test]
 fn generated_action_union_and_machine_manifest_stay_in_lockstep() {
     let action: ActionRequest = decode("action.json");
     let operations: serde_json::Value = serde_json::from_str(include_str!(

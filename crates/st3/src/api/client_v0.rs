@@ -2184,7 +2184,6 @@ fn existing_terminal_attachment(
 
 fn terminal_capability_key(state: &AppState) -> Result<Vec<u8>, ApiError> {
     use std::io::{Read as _, Write as _};
-    use std::os::unix::fs::OpenOptionsExt as _;
 
     let path = state.state_dir.join("client-terminal.key");
     fn read_valid(path: &Path) -> Result<Vec<u8>, ApiError> {
@@ -2217,22 +2216,27 @@ fn terminal_capability_key(state: &AppState) -> Result<Vec<u8>, ApiError> {
     fs::create_dir_all(&state.state_dir).map_err(ApiError::internal)?;
     let mut key = vec![0_u8; 32];
     getrandom::fill(&mut key).map_err(ApiError::internal)?;
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(&key).map_err(ApiError::internal)?;
-            file.sync_all().map_err(ApiError::internal)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".client-terminal.key.")
+        .tempfile_in(&state.state_dir)
+        .map_err(ApiError::internal)?;
+    staged
+        .as_file_mut()
+        .write_all(&key)
+        .map_err(ApiError::internal)?;
+    staged
+        .as_file_mut()
+        .sync_all()
+        .map_err(ApiError::internal)?;
+    match staged.persist_noclobber(&path) {
+        Ok(_) => {
             fs::File::open(&state.state_dir)
                 .and_then(|directory| directory.sync_all())
                 .map_err(ApiError::internal)?;
             Ok(key)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_valid(&path),
-        Err(error) => Err(ApiError::internal(error)),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => read_valid(&path),
+        Err(error) => Err(ApiError::internal(error.error)),
     }
 }
 

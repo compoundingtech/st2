@@ -20,6 +20,25 @@ pub fn login_environment() -> Result<BTreeMap<String, String>> {
 }
 
 fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<String, String>> {
+    login_environment_with_args(
+        shell,
+        timeout,
+        None,
+        &[
+            "-l",
+            "-i",
+            "-c",
+            "/usr/bin/printf '\\0ST3_ENV_BEGIN\\0'; /usr/bin/env -0; /usr/bin/printf 'ST3_ENV_END\\0'",
+        ],
+    )
+}
+
+fn login_environment_with_args(
+    shell: &Path,
+    timeout: Duration,
+    cwd: Option<&Path>,
+    arguments: &[&str],
+) -> Result<BTreeMap<String, String>> {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -51,12 +70,10 @@ fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<St
         Ok((output, truncated))
     });
     let mut command = CommandBuilder::new(shell);
-    command.args([
-        "-l",
-        "-i",
-        "-c",
-        "/usr/bin/printf '\\0ST3_ENV_BEGIN\\0'; /usr/bin/env -0; /usr/bin/printf 'ST3_ENV_END\\0'",
-    ]);
+    if let Some(cwd) = cwd {
+        command.cwd(cwd);
+    }
+    command.args(arguments);
     command.env("TERM", "xterm-256color");
     command.env("TERM_PROGRAM", "st3");
     let mut child = pair
@@ -268,7 +285,14 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
+    fn test_shell() -> PathBuf {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| is_executable(candidate))
+            .expect("the test environment must provide executable `sh` on PATH")
+    }
 
     #[test]
     fn parser_ignores_shell_startup_output_before_the_record() {
@@ -303,18 +327,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_probe_accepts_startup_output_and_reads_the_exported_environment() {
-        let root = tempfile::tempdir().unwrap();
-        let shell = root.path().join("shell");
-        std::fs::write(
+        let shell = test_shell();
+        let environment = login_environment_with_args(
             &shell,
-            "#!/bin/sh\nprintf 'startup output\\n'\nprintf '\\0ST3_ENV_BEGIN\\0PATH=/fresh/bin:/usr/bin\\0FRESH=yes\\0ST3_ENV_END\\0'\n",
+            Duration::from_secs(1),
+            Some(&std::env::current_dir().unwrap()),
+            &[
+                "-c",
+                "printf 'startup output\\n'; printf '\\0ST3_ENV_BEGIN\\0PATH=/fresh/bin:/usr/bin\\0FRESH=yes\\0ST3_ENV_END\\0'",
+            ],
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&shell, permissions).unwrap();
-
-        let environment = login_environment_from(&shell, Duration::from_secs(1)).unwrap();
 
         assert_eq!(environment["PATH"], "/fresh/bin:/usr/bin");
         assert_eq!(environment["FRESH"], "yes");
@@ -323,14 +346,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_probe_stops_a_shell_whose_startup_does_not_finish() {
-        let root = tempfile::tempdir().unwrap();
-        let shell = root.path().join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nsleep 5\n").unwrap();
-        let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&shell, permissions).unwrap();
-
-        let error = login_environment_from(&shell, Duration::from_millis(25)).unwrap_err();
+        let shell = test_shell();
+        let error = login_environment_with_args(
+            &shell,
+            Duration::from_millis(25),
+            Some(&std::env::current_dir().unwrap()),
+            &["-c", "sleep 5"],
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("did not finish startup"));
     }

@@ -1,12 +1,50 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+
+const SPAWN_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PtySpawnTimeoutPhase {
+    Lock,
+    Publication,
+}
+
+#[derive(Debug)]
+pub struct PtySpawnTimeout {
+    pub runtime_id: String,
+    pub phase: PtySpawnTimeoutPhase,
+    pub timeout: Duration,
+}
+
+impl fmt::Display for PtySpawnTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "timed out after {}ms waiting for PTY `{}` spawn {}",
+            self.timeout.as_millis(),
+            self.runtime_id,
+            match self.phase {
+                PtySpawnTimeoutPhase::Lock => "lock",
+                PtySpawnTimeoutPhase::Publication => "publication",
+            }
+        )
+    }
+}
+
+impl std::error::Error for PtySpawnTimeout {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Launch {
@@ -56,6 +94,7 @@ struct PtyStatsDaemon {
 pub struct PtyRuntime {
     binary: String,
     root: PathBuf,
+    spawn_timeout: Duration,
 }
 
 impl PtyRuntime {
@@ -64,11 +103,18 @@ impl PtyRuntime {
         Self {
             binary: "pty".into(),
             root,
+            spawn_timeout: SPAWN_PUBLICATION_TIMEOUT,
         }
     }
 
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_spawn_timeout(mut self, timeout: Duration) -> Self {
+        self.spawn_timeout = timeout;
         self
     }
 
@@ -88,6 +134,29 @@ impl PtyRuntime {
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<()> {
+        let _spawn_lock = self.acquire_spawn_lock(id)?;
+        let fence = self.spawn_state_path(id, "pending");
+        let mut before = self
+            .snapshot()?
+            .into_iter()
+            .find(|observation| observation.name == id);
+        if fence.is_file() {
+            let previous = std::fs::read_to_string(&fence)
+                .with_context(|| format!("read PTY publication fence {}", fence.display()))?;
+            self.wait_for_publication(id, (!previous.is_empty()).then_some(previous.as_str()))?;
+            std::fs::remove_file(&fence)
+                .with_context(|| format!("clear PTY publication fence {}", fence.display()))?;
+            before = self
+                .snapshot()?
+                .into_iter()
+                .find(|observation| observation.name == id);
+        }
+        if before.as_ref().is_some_and(observation_is_live) {
+            return Ok(());
+        }
+        let previous_incarnation = before.as_ref().and_then(observation_incarnation);
+        std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
+            .with_context(|| format!("write PTY publication fence {}", fence.display()))?;
         let unit = crate::scope_unit("st3", id);
         let mut arguments = vec![
             OsString::from("run"),
@@ -144,18 +213,118 @@ impl PtyRuntime {
             let mut command =
                 crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
             command.env("PTY_ROOT", &self.root);
-            let output = command.output()?;
+            let output = match command.output() {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&fence);
+                    return Err(error.into());
+                }
+            };
             if output.status.success() {
+                self.wait_for_publication(id, previous_incarnation.as_deref())?;
+                std::fs::remove_file(&fence)
+                    .with_context(|| format!("clear PTY publication fence {}", fence.display()))?;
                 return Ok(());
             }
             last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
                 break;
             }
+            if self
+                .snapshot()?
+                .iter()
+                .any(|observation| observation.name == id && observation_is_live(observation))
+            {
+                let _ = std::fs::remove_file(&fence);
+                return Ok(());
+            }
             let _ = self.remove(id);
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
+        let _ = std::fs::remove_file(&fence);
         anyhow::bail!("spawn PTY failed: {last_error}")
+    }
+
+    fn acquire_spawn_lock(&self, id: &str) -> Result<File> {
+        let directory = self.spawn_state_directory();
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create PTY spawn-lock directory {}", directory.display()))?;
+        let path = self.spawn_state_path(id, "lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open PTY spawn lock {}", path.display()))?;
+        let deadline = Instant::now() + self.spawn_timeout;
+        loop {
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(lock);
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
+                return Err(error).with_context(|| format!("lock PTY spawn {}", path.display()));
+            }
+            if Instant::now() >= deadline {
+                return Err(PtySpawnTimeout {
+                    runtime_id: id.into(),
+                    phase: PtySpawnTimeoutPhase::Lock,
+                    timeout: self.spawn_timeout,
+                }
+                .into());
+            }
+            std::thread::sleep(SPAWN_POLL_INTERVAL.min(self.spawn_timeout));
+        }
+    }
+
+    fn spawn_state_path(&self, id: &str, extension: &str) -> PathBuf {
+        let digest = Sha256::digest(id.as_bytes());
+        self.spawn_state_directory()
+            .join(format!("{digest:x}.{extension}"))
+    }
+
+    fn spawn_state_directory(&self) -> PathBuf {
+        let root = self.root.canonicalize().unwrap_or_else(|_| {
+            let parent = self
+                .root
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            self.root
+                .file_name()
+                .map(|name| parent.join(name))
+                .unwrap_or(parent)
+        });
+        let digest = Sha256::digest(root.as_os_str().as_bytes());
+        root.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".st3-pty-spawn-locks")
+            .join(format!("{digest:x}"))
+    }
+
+    fn wait_for_publication(&self, id: &str, previous_incarnation: Option<&str>) -> Result<()> {
+        let deadline = Instant::now() + self.spawn_timeout;
+        loop {
+            if self.snapshot()?.into_iter().any(|observation| {
+                observation.name == id
+                    && observation_incarnation(&observation)
+                        .as_deref()
+                        .is_some_and(|current| Some(current) != previous_incarnation)
+            }) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PtySpawnTimeout {
+                    runtime_id: id.into(),
+                    phase: PtySpawnTimeoutPhase::Publication,
+                    timeout: self.spawn_timeout,
+                }
+                .into());
+            }
+            std::thread::sleep(SPAWN_POLL_INTERVAL.min(self.spawn_timeout));
+        }
     }
 
     pub fn stop(&self, id: &str) -> Result<()> {
@@ -350,6 +519,26 @@ fn isolation_name(mode: crate::Isolation) -> &'static str {
     }
 }
 
+fn observation_incarnation(observation: &PtyObservation) -> Option<String> {
+    match (&observation.pid, &observation.created_at) {
+        (Some(pid), Some(created_at)) => Some(format!("{pid}:{created_at}")),
+        _ => None,
+    }
+}
+
+fn observation_is_live(observation: &PtyObservation) -> bool {
+    if observation.status != "running" {
+        return false;
+    }
+    observation.pid.is_some_and(|pid| {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    })
+}
+
 fn ensure_incarnation(
     id: &str,
     observation: &PtyObservation,
@@ -486,10 +675,24 @@ exit 1
         let binary = fake_executable(
             root.path(),
             "fake-pty-spawn",
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  if [ -f "$0.published" ]; then
+    pid="$(cat "$0.pid")"
+    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
+  else
+    printf '[]'
+  fi
+  exit 0
+fi
+printf '%s\n' "$@" > "$0.args"
+touch "$0.published"
+"#,
         );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        assert!(!runtime.spawn_state_directory().starts_with(runtime.root()));
         runtime
             .spawn(
                 "work",
@@ -515,8 +718,21 @@ exit 1
         let binary = fake_executable(
             root.path(),
             "fake-pty-term",
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  if [ -f "$0.published" ]; then
+    pid="$(cat "$0.pid")"
+    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
+  else
+    printf '[]'
+  fi
+  exit 0
+fi
+printf '%s\n' "$@" > "$0.args"
+touch "$0.published"
+"#,
         );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
@@ -552,13 +768,23 @@ if [ "$1" = run ]; then
     printf '%s\n' 'Session id "work" is already in use.' >&2
     exit 1
   fi
+  touch "$0.published"
 fi
 if [ "$1" = remove ]; then
   touch "$0.removed"
 fi
+if [ "$1" = list ]; then
+  if [ -f "$0.published" ]; then
+    pid="$(cat "$0.pid")"
+    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
+  else
+    printf '[]'
+  fi
+fi
 exit 0
 "#,
         );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
@@ -580,5 +806,238 @@ exit 0
             "2"
         );
         assert!(binary.with_extension("removed").is_file());
+    }
+
+    #[test]
+    fn spawn_waits_for_an_exact_new_registry_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-delayed-publication",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  if [ ! -f "$0.started" ]; then
+    printf '[{"name":"work","status":"exited","pid":999,"createdAt":"old"}]'
+    exit 0
+  fi
+  count=0
+  test ! -f "$0.lists" || count="$(cat "$0.lists")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$0.lists"
+  if [ "$count" -lt 3 ]; then
+    printf '[{"name":"work","status":"exited","pid":999,"createdAt":"old"}]'
+  else
+    pid="$(cat "$0.pid")"
+    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
+  fi
+  exit 0
+fi
+if [ "$1" = run ]; then
+  touch "$0.started"
+fi
+exit 0
+"#,
+        );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert!(
+            fs::read_to_string(binary.with_extension("lists"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn concurrent_spawns_for_one_runtime_launch_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-concurrent",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  if [ -f "$0.published" ]; then
+    pid="$(cat "$0.pid")"
+    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
+  else
+    printf '[]'
+  fi
+  exit 0
+fi
+if [ "$1" = run ]; then
+  count=0
+  test ! -f "$0.count" || count="$(cat "$0.count")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$0.count"
+  touch "$0.published"
+fi
+exit 0
+"#,
+        );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
+        let runtime = std::sync::Arc::new(
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy()),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let runtime = runtime.clone();
+            let barrier = barrier.clone();
+            let cwd = root.path().to_path_buf();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                runtime.spawn(
+                    "work",
+                    &Launch::Argv(vec!["true".into()]),
+                    &cwd,
+                    &BTreeMap::new(),
+                    None,
+                    &BTreeMap::new(),
+                )
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(binary.with_extension("count"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn publication_timeout_is_typed_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-never-publishes",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  printf '[]'
+fi
+exit 0
+"#,
+        );
+        let timeout = Duration::from_millis(30);
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_spawn_timeout(timeout);
+        let started = Instant::now();
+
+        let error = runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+
+        let timeout_error = error.downcast_ref::<PtySpawnTimeout>().unwrap();
+        assert_eq!(timeout_error.phase, PtySpawnTimeoutPhase::Publication);
+        assert_eq!(timeout_error.timeout, timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_unresolved_publication_fences_followup_launches() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(
+            root.path(),
+            "fake-pty-unresolved-publication",
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  printf '[]'
+  exit 0
+fi
+if [ "$1" = run ]; then
+  count=0
+  test ! -f "$0.count" || count="$(cat "$0.count")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$0.count"
+fi
+exit 0
+"#,
+        );
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_spawn_timeout(Duration::from_millis(30));
+        let spawn = || {
+            runtime.spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+        };
+
+        let first = spawn().unwrap_err();
+        let second = spawn().unwrap_err();
+
+        assert_eq!(
+            first.downcast_ref::<PtySpawnTimeout>().unwrap().phase,
+            PtySpawnTimeoutPhase::Publication
+        );
+        assert_eq!(
+            second.downcast_ref::<PtySpawnTimeout>().unwrap().phase,
+            PtySpawnTimeoutPhase::Publication
+        );
+        assert_eq!(
+            fs::read_to_string(binary.with_extension("count"))
+                .unwrap()
+                .trim(),
+            "1",
+            "the unresolved first launch must fence later callers"
+        );
+    }
+
+    #[test]
+    fn spawn_lock_timeout_is_typed_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(root.path(), "fake-pty-lock-timeout", "#!/bin/sh\nexit 0\n");
+        let timeout = Duration::from_millis(30);
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_spawn_timeout(timeout);
+        let _held = runtime.acquire_spawn_lock("work").unwrap();
+        let started = Instant::now();
+
+        let error = runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+
+        let timeout_error = error.downcast_ref::<PtySpawnTimeout>().unwrap();
+        assert_eq!(timeout_error.phase, PtySpawnTimeoutPhase::Lock);
+        assert_eq!(timeout_error.timeout, timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

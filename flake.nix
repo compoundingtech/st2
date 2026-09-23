@@ -93,10 +93,12 @@
           inherit version;
           src = self;
 
-          # No git or crates.io-yanked deps in the lockfile, so the lockfile
-          # alone pins every input reproducibly — no per-dep outputHashes, and
-          # nothing here to hand-patch when a dep bumps.
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
 
           # This NixStamp is the binary's authoritative build identity; it wins
           # over the LocalStamp `build.rs` bakes from git (which is empty here
@@ -224,7 +226,12 @@
           pname = "st3";
           inherit version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
           cargoBuildFlags = [
             "-p"
             "st3"
@@ -332,7 +339,12 @@
           pname = "st2-provider-components";
           inherit version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
           buildPhase = ''
             runHook preBuild
             cargo build --offline --release --target wasm32-unknown-unknown \

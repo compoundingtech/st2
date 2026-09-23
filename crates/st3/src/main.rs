@@ -1142,6 +1142,7 @@ struct MessageSendArgs {
 
 #[derive(Args)]
 struct MessageListArgs {
+    /// Mailbox identity; defaults to the non-empty ST_AGENT value.
     identity: Option<String>,
     #[arg(long)]
     archive: bool,
@@ -3103,6 +3104,10 @@ fn print_timeline_page(
                     body.omitted_from_sequence, body.omitted_to_sequence, body.reason
                 );
             }
+            ClientTimelineBody::Unknown { entry_type, body } => {
+                let _ = writeln!(output, "unrecognized {entry_type} timeline entry");
+                let _ = writeln!(output, "{body}");
+            }
         }
     }
     if response.value.page.has_more
@@ -5044,26 +5049,14 @@ async fn run_message(
             }
         }
         MessageCommand::Ls(args) => {
-            let identity = args.identity.unwrap_or_default();
-            let mut path = if identity.is_empty() {
-                "/v1/messages".to_owned()
-            } else {
-                format!("/v1/messages?to={}", urlencoding::encode(&identity))
-            };
+            let identity = message_list_identity(args.identity, std::env::var("ST_AGENT").ok())?;
+            let mut path = format!("/v1/messages?to={}", urlencoding::encode(&identity));
             if args.archive {
-                path.push_str(if path.contains('?') {
-                    "&include_closed=true"
-                } else {
-                    "?include_closed=true"
-                });
+                path.push_str("&include_closed=true");
             }
             let mut messages: Vec<MessageView> = client.get(&path).await?;
             if let Some(sender) = args.sender {
-                let sender = if sender.contains('/') {
-                    sender
-                } else {
-                    format!("agent/{sender}")
-                };
+                let sender = normalize_message_subject(&sender);
                 messages.retain(|message| message.from == sender);
             }
             if args.count {
@@ -5090,12 +5083,9 @@ async fn run_message(
                 .context("message read needs explicit --as to record its lifecycle")?;
             let mut messages = Vec::with_capacity(args.references.len());
             for reference in args.references {
-                let message = read_message(client, &reference).await?;
-                accept_message(client, &message, &actor).await?;
-                if args.archive {
-                    close_message(client, &reference, &actor).await?;
-                }
-                messages.push(message);
+                messages.push(
+                    read_message_after_lifecycle(client, &reference, &actor, args.archive).await?,
+                );
             }
             if json_output {
                 if messages.len() == 1 {
@@ -5130,10 +5120,11 @@ async fn run_message(
         }
         MessageCommand::Reply(args) => {
             let original = read_message(client, &args.reference).await?;
+            let recipient = message_reply_recipient(&original, &args.from)?;
             let message = send_message(
                 client,
                 MessageSendArgs {
-                    to: original.from,
+                    to: recipient,
                     body: args.body,
                     subject: args
                         .subject
@@ -5345,6 +5336,48 @@ async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
             urlencoding::encode(&reference)
         ))
         .await
+}
+
+fn message_list_identity(explicit: Option<String>, ambient: Option<String>) -> Result<String> {
+    explicit
+        .filter(|identity| !identity.trim().is_empty())
+        .or_else(|| ambient.filter(|identity| !identity.trim().is_empty()))
+        .map(|identity| normalize_message_subject(&identity))
+        .context(
+            "conversations ls needs a mailbox identity argument or a non-empty ST_AGENT; refusing to list every fleet message",
+        )
+}
+
+fn message_reply_recipient(original: &MessageView, sender: &str) -> Result<String> {
+    let sender = normalize_message_subject(sender);
+    if sender == original.from {
+        Ok(original.to.clone())
+    } else if sender == original.to {
+        Ok(original.from.clone())
+    } else {
+        anyhow::bail!(
+            "message `{}` is between `{}` and `{}`; `{sender}` cannot reply as a non-participant",
+            original.subject,
+            original.from,
+            original.to
+        )
+    }
+}
+
+async fn read_message_after_lifecycle(
+    client: &Client,
+    reference: &str,
+    actor: &str,
+    archive: bool,
+) -> Result<MessageView> {
+    let message = read_message(client, reference).await?;
+    accept_message(client, &message, actor).await?;
+    if archive {
+        close_message(client, reference, actor).await?;
+    }
+    // Lifecycle writes are synchronous, so refetching makes JSON and other machine-readable
+    // output describe the state that this command actually committed instead of its input state.
+    read_message(client, &message.subject).await
 }
 
 async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> Result<()> {
@@ -8029,6 +8062,79 @@ mod tests {
     }
 
     #[test]
+    fn message_list_requires_one_exact_mailbox_and_explicit_identity_wins() {
+        let bare = Cli::try_parse_from(["st3", "conversations", "ls"]).unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Ls(bare),
+        } = bare.command
+        else {
+            panic!("conversations ls did not parse");
+        };
+        assert!(bare.identity.is_none());
+
+        assert_eq!(
+            message_list_identity(None, Some("agent/from-environment".into())).unwrap(),
+            "agent/from-environment"
+        );
+        assert_eq!(
+            message_list_identity(
+                Some("person/explicit".into()),
+                Some("agent/from-environment".into())
+            )
+            .unwrap(),
+            "person/explicit"
+        );
+        let error = message_list_identity(None, Some(String::new())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to list every fleet message")
+        );
+
+        let explicit =
+            Cli::try_parse_from(["st3", "conversations", "ls", "agent/explicit", "--archive"])
+                .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Ls(explicit),
+        } = explicit.command
+        else {
+            panic!("conversations ls with an identity did not parse");
+        };
+        assert_eq!(explicit.identity.as_deref(), Some("agent/explicit"));
+        assert!(explicit.archive);
+    }
+
+    #[test]
+    fn message_replies_route_to_the_other_participant() {
+        let original = MessageView {
+            subject: "message/original".into(),
+            from: "agent/h".into(),
+            to: "agent/s".into(),
+            content: "Hello".into(),
+            status: "read".into(),
+            title: Some("Greeting".into()),
+            in_reply_to: None,
+            tags: Vec::new(),
+            created_index: 1,
+        };
+
+        assert_eq!(
+            message_reply_recipient(&original, "agent/h").unwrap(),
+            "agent/s"
+        );
+        assert_eq!(
+            message_reply_recipient(&original, "agent/s").unwrap(),
+            "agent/h"
+        );
+        let error = message_reply_recipient(&original, "agent/outsider").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reply as a non-participant")
+        );
+    }
+
+    #[test]
     fn message_archive_accepts_more_than_one_reference() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -8073,6 +8179,78 @@ mod tests {
         assert_eq!(args.references, ["message/first", "message/second"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
         assert!(args.archive);
+    }
+
+    #[tokio::test]
+    async fn message_read_returns_the_committed_lifecycle_state() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let state = AppState {
+            store: Arc::new(Store::open_memory("message-read-state").unwrap()),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "message-read-state".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            native_session_home: None,
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        let client = Client::unix(&socket);
+
+        let first: MessageView = client
+            .post(
+                "/v1/messages",
+                &MessageSendRequest {
+                    idempotency_key: "message-read-final-state".into(),
+                    from: "agent/sender".into(),
+                    to: "agent/sup".into(),
+                    content: "Read me".into(),
+                    title: None,
+                    in_reply_to: None,
+                    tags: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let read = read_message_after_lifecycle(&client, &first.subject, "agent/sup", false)
+            .await
+            .unwrap();
+        assert_eq!(read.status, "read");
+
+        let second: MessageView = client
+            .post(
+                "/v1/messages",
+                &MessageSendRequest {
+                    idempotency_key: "message-read-archive-final-state".into(),
+                    from: "agent/sender".into(),
+                    to: "agent/sup".into(),
+                    content: "Archive me".into(),
+                    title: None,
+                    in_reply_to: None,
+                    tags: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let archived = read_message_after_lifecycle(&client, &second.subject, "agent/sup", true)
+            .await
+            .unwrap();
+        assert_eq!(archived.status, "closed");
+
+        server.abort();
     }
 
     #[test]

@@ -378,7 +378,7 @@ pub struct UsageContext {
     pub compactions: u64,
     pub last_compaction_ms: Option<u64>,
     pub last_compaction_trigger: Option<String>,
-    pub observed_at_unix_ms: u128,
+    pub observed_at_unix_ms: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsageSummary {
@@ -670,8 +670,7 @@ pub enum TimelineType {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", content = "body", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TimelineBody {
     Message(TimelineMessageBody),
     Content(TimelineContentBody),
@@ -682,6 +681,100 @@ pub enum TimelineBody {
     Usage(Box<TimelineUsageBody>),
     Redaction(TimelineRedactionBody),
     Truncation(TimelineTruncationBody),
+    Unknown { entry_type: String, body: Value },
+}
+
+impl<'de> Deserialize<'de> for TimelineBody {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TaggedBody {
+            #[serde(rename = "type")]
+            entry_type: String,
+            body: Value,
+        }
+
+        fn decode<T, E>(body: Value) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            serde_json::from_value(body).map_err(E::custom)
+        }
+
+        let tagged = TaggedBody::deserialize(deserializer)?;
+        match tagged.entry_type.as_str() {
+            "message" => decode(tagged.body).map(Self::Message),
+            "content" => decode(tagged.body).map(Self::Content),
+            "tool_call" => decode(tagged.body).map(Self::ToolCall),
+            "tool_result" => decode(tagged.body).map(Self::ToolResult),
+            "status" => decode(tagged.body).map(Self::Status),
+            "error" => decode(tagged.body).map(Self::Error),
+            "usage" => decode(tagged.body).map(|body| Self::Usage(Box::new(body))),
+            "redaction" => decode(tagged.body).map(Self::Redaction),
+            "truncation" => decode(tagged.body).map(Self::Truncation),
+            _ => Ok(Self::Unknown {
+                entry_type: tagged.entry_type,
+                body: tagged.body,
+            }),
+        }
+    }
+}
+
+impl Serialize for TimelineBody {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let mut state = serializer.serialize_struct("TimelineBody", 2)?;
+        match self {
+            Self::Message(body) => {
+                state.serialize_field("type", "message")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Content(body) => {
+                state.serialize_field("type", "content")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::ToolCall(body) => {
+                state.serialize_field("type", "tool_call")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::ToolResult(body) => {
+                state.serialize_field("type", "tool_result")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Status(body) => {
+                state.serialize_field("type", "status")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Error(body) => {
+                state.serialize_field("type", "error")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Usage(body) => {
+                state.serialize_field("type", "usage")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Redaction(body) => {
+                state.serialize_field("type", "redaction")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Truncation(body) => {
+                state.serialize_field("type", "truncation")?;
+                state.serialize_field("body", body)?;
+            }
+            Self::Unknown { entry_type, body } => {
+                state.serialize_field("type", entry_type)?;
+                state.serialize_field("body", body)?;
+            }
+        }
+        state.end()
+    }
 }
 
 impl TimelineBody {
@@ -696,6 +789,7 @@ impl TimelineBody {
             Self::Usage(_) => TimelineType::Usage,
             Self::Redaction(_) => TimelineType::Redaction,
             Self::Truncation(_) => TimelineType::Truncation,
+            Self::Unknown { .. } => TimelineType::Unknown,
         }
     }
 }
@@ -736,6 +830,8 @@ pub struct TimelineToolResultBody {
 pub enum TimelineToolStatus {
     Success,
     Error,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -754,6 +850,8 @@ pub enum TimelineStatus {
     Completed,
     Failed,
     Cancelled,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -803,6 +901,8 @@ pub enum TimelineUsageSemantics {
     ContextOccupancy,
     SessionCumulative,
     Response,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
