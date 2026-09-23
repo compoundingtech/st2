@@ -13,7 +13,8 @@
             "enableSceneSupport": true
           }
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "ios": {
       "bundleIdentifier": "com.compoundingtech.smalltalk.starter",
