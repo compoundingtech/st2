@@ -126,7 +126,7 @@ pub(crate) fn mission_closure_ids(mission: &MissionSpec) -> BTreeSet<String> {
     output
 }
 
-pub(crate) fn top_level_mission_ids(missions: &BTreeMap<String, MissionSpec>) -> BTreeSet<String> {
+pub fn top_level_mission_ids(missions: &BTreeMap<String, MissionSpec>) -> BTreeSet<String> {
     let mut embedded = BTreeSet::new();
     for mission in missions.values() {
         for id in mission_closure_ids(mission) {

@@ -4678,8 +4678,8 @@ async fn run_work(
                 )
             })?;
             anyhow::ensure!(
-                parsed.missions.len() == 1,
-                "a mission revision file must contain exactly one mission"
+                st3::mission::top_level_mission_ids(&parsed.missions).len() == 1,
+                "a mission revision file must contain exactly one top-level mission"
             );
             let operation = format!("revision-{}", uuid::Uuid::now_v7().simple());
             let revision_kdl = mission_revision_intent(
@@ -8461,6 +8461,31 @@ mod tests {
             panic!("the work revise command did not parse");
         };
         assert!(args.print_kdl);
+    }
+
+    #[test]
+    fn work_revise_counts_only_top_level_missions() {
+        let source = r#"
+version 2
+mission "review" state="ready" {
+  goal "Review the source."
+  loop "rounds" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "write" {
+        goal "Write the review."
+      }
+    }
+  }
+}
+"#;
+        let parsed = st3::parse_intent(source, "local").unwrap();
+        assert!(parsed.missions.len() > 1);
+        assert_eq!(
+            st3::mission::top_level_mission_ids(&parsed.missions),
+            std::collections::BTreeSet::from(["review".to_owned()])
+        );
     }
 
     #[test]

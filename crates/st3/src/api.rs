@@ -5484,10 +5484,10 @@ async fn revise_mission_run(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))?;
     let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
-    if initial.missions.len() != 1 {
+    if crate::mission::top_level_mission_ids(&initial.missions).len() != 1 {
         return Err(ApiError::bad(St3Error::new(
             "invalid-mission-revision-intent",
-            "a run revision must contain exactly one mission",
+            "a run revision must contain exactly one top-level mission",
         )));
     }
     if !initial.subjects.is_empty() {
@@ -5503,24 +5503,16 @@ async fn revise_mission_run(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
-    let replacement = intent
-        .missions
-        .values()
-        .next()
-        .expect("one mission was checked");
     let mission_id = current
         .mission
         .strip_prefix("mission/")
         .unwrap_or(&current.mission);
-    if replacement.id != mission_id {
+    let Some(replacement) = intent.missions.get(mission_id) else {
         return Err(ApiError::bad(St3Error::new(
             "wrong-mission-revision",
-            format!(
-                "revision `{}` does not replace mission `{mission_id}`",
-                replacement.id
-            ),
+            format!("revision does not replace mission `{mission_id}`"),
         )));
-    }
+    };
     let old = state
         .store
         .mission_spec(mission_id, Some(&current.revision))
@@ -9379,6 +9371,71 @@ version 2
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
         assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_revision_accepts_a_loop_round_embedded_mission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+mission "loop-review" state="ready" revision-cutover="restart-active" {
+  goal "Review the source."
+  loop "review" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "write" { goal "Write the review." }
+    }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "loop-review-initial")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "loop-review".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "loop-review-run".into(),
+            })
+            .unwrap();
+        let replacement = source.replace("Write the review.", "Write a corrected review.");
+        let (status, revised) = json_request(
+            router(state),
+            &format!("/v1/mission-runs/{}/revision", run.id),
+            serde_json::to_value(MissionRevisionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: replacement,
+                    source_name: None,
+                },
+                actor: "person/test".into(),
+                reason: "Move the review to its corrected definition".into(),
+                idempotency_key: "loop-review-revision".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{revised}");
+        assert_eq!(revised["status"], "applied");
+        assert_ne!(revised["mission_run"]["revision"], run.revision);
     }
 
     #[tokio::test]
