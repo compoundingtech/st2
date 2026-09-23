@@ -804,6 +804,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .current_harness(&subject.subject)?
             .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
         if harness_ready {
+            if driver == "claude" {
+                self.resolve_superseded_claude_auth_attention(&subject.subject, incarnation)?;
+            }
             if self
                 .store
                 .attention_request(&attention_subject)?
@@ -905,6 +908,46 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         if changed {
             self.signal_changed();
+        }
+        Ok(())
+    }
+
+    fn resolve_superseded_claude_auth_attention(
+        &self,
+        subject: &str,
+        current_incarnation: &str,
+    ) -> Result<()> {
+        for claim in self.store.claims_for(subject, Some("harness.diagnostic"))? {
+            if claim.body.pointer("/fields/code").and_then(Value::as_str)
+                != Some("provider-auth-expired")
+            {
+                continue;
+            }
+            let Some(old_incarnation) = claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if old_incarnation == current_incarnation {
+                continue;
+            }
+            let key = format!("claude-auth-expired:{subject}:{old_incarnation}");
+            let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+            let attention_subject = format!("attention/{}", &digest[..32]);
+            if self
+                .store
+                .attention_request(&attention_subject)?
+                .is_some_and(|attention| attention.status == "pending")
+            {
+                self.store.resolve_attention_automatically(
+                    &attention_subject,
+                    "a new Claude runtime incarnation became ready",
+                    &format!("{key}:resolved"),
+                )?;
+                self.signal_changed();
+            }
         }
         Ok(())
     }
