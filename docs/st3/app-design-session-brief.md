@@ -12,7 +12,7 @@ From either app Nathan can:
 2. see and resolve what needs his attention;
 3. have a native back-and-forth conversation with Codex to shape a launch;
 4. approve and launch durable missions onto eligible machines;
-5. read normalized Codex, Claude, and OMP conversations and import native sessions;
+5. read normalized Codex, Claude, Pi, OMP, and OpenCode conversations and import native sessions;
 6. inspect or control terminals across machines without nesting a Fabric shell;
 7. see connection, pairing, Fabric/Tailscale, topology, update, and recovery state; and
 8. ask an agent to change either app, follow that mission, and receive the accepted update on his
@@ -39,7 +39,7 @@ The foundation is materially ready for UI work:
   reconnect, and incarnation fencing over WebSocket.
 - A generated Rust client supports local Unix sockets and authenticated remote HTTP. A generated
   Swift package supports the remote contract.
-- Saved/running Codex, Claude, and OMP sessions have a harness-neutral normalized timeline and a
+- Saved/running Codex, Claude, Pi, OMP, and OpenCode sessions have a harness-neutral normalized timeline and a
   fenced import action.
 
 The Expo choice exposes one foundation gap we should address in the first app mission: generate a
@@ -95,7 +95,7 @@ We should design these screens together and then build vertical slices across bo
 | Agents | Who is working under which mission? | Open agent, runtime, work, conversation, terminal |
 | Machines | Where can work run and what is reachable? | Inspect capacity, connection, diagnostics |
 | Conversations | What did a person or harness say/do? | Reply, mark read, archive, open tools/usage |
-| Native sessions | Which Codex/Claude/OMP sessions exist outside st3? | Read timeline, inspect fence, import |
+| Native sessions | Which Codex/Claude/Pi/OMP/OpenCode sessions exist outside st3? | Read timeline, inspect fence, import |
 | Terminals | Which sessions can I view or control? | Peek, attach, detach, input, resize |
 | Devices | Which clients can act as me? | Pair, inspect scopes, revoke |
 | Network | How is this client reaching the fleet? | Inspect Fabric/Tailscale config, topology, reachability, retry |

@@ -374,6 +374,10 @@ pub struct UsageContext {
     pub window_tokens: Option<u64>,
     pub used_percent: Option<f64>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub compactions: u64,
+    pub last_compaction_ms: Option<u64>,
+    pub last_compaction_trigger: Option<String>,
     pub observed_at_unix_ms: u128,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -780,6 +784,12 @@ pub struct TimelineUsageBody {
     pub context_window_tokens: Option<u64>,
     #[serde(default)]
     pub context_used_percent: Option<f64>,
+    #[serde(default)]
+    pub compactions: Option<u64>,
+    #[serde(default)]
+    pub last_compaction_ms: Option<u64>,
+    #[serde(default)]
+    pub last_compaction_trigger: Option<String>,
     #[serde(default)]
     pub cost: Option<f64>,
     #[serde(default)]

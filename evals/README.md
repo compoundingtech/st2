@@ -43,6 +43,8 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Continuous Stewardship | Not supported | `st3/continuous-stewardship` |
 | Agent Migration Rehearsal | Not supported | `st3/agent-migration-rehearsal` |
 | Automatic GitHub Intake | Not supported | `st3/automatic-github-intake` |
+| Codex compaction message delivery | Not supported | `st3/codex-compaction-message-delivery` |
+| Native session import | Not supported | `st3/native-session-import` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -54,7 +56,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the launch API.
 
-The st3 corpus has 41 active evals. Twenty-two are model-free, and nineteen use at least one model.
+The st3 corpus has 43 active evals. Twenty-two are model-free, and twenty-one use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -94,8 +96,11 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Continuous Stewardship | Codex × 1 | None |
 | st3 | Agent Migration Rehearsal | Codex × 1 | None |
 | st3 | Automatic GitHub Intake | Codex × 1 | None |
+| st3 | Codex compaction message delivery | Codex × 1 | None |
+| st3 | Native session import | Claude × 1, Codex × 1, Pi × 1, OMP × 1, OpenCode × 1 (raw, then imported) | None |
 
-The paired and st3-only corpus has 12 Claude seats, 41 Codex seats, one Pi seat, and one OMP seat. It also has three Codex LLM judges.
+The paired and st3-only corpus has 13 Claude seats, 43 Codex seats, two Pi seats, two OMP seats,
+and one OpenCode seat. It also has three Codex LLM judges.
 
 The twenty-two model-free st3 evals add no model seats and no LLM judges.
 

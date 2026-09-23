@@ -5355,11 +5355,11 @@ async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> 
         message.subject,
         message.to
     );
-    if !matches!(message.status.as_str(), "sent" | "delivered") {
+    if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") {
         return Ok(());
     }
     let reference = message.subject.trim_start_matches("message/");
-    if message.status == "sent" {
+    if matches!(message.status.as_str(), "sent" | "staged") {
         deliver_message(
             client,
             reference,
@@ -5374,6 +5374,8 @@ async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> 
             &MessageLifecycleRequest {
                 lifecycle: "read".into(),
                 actor: Some(actor),
+                transport: None,
+                runtime_id: None,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-read:{}", message.subject),
@@ -5396,6 +5398,34 @@ async fn deliver_message(
             &MessageLifecycleRequest {
                 lifecycle: "delivered".into(),
                 actor: Some(actor.into()),
+                transport: None,
+                runtime_id: None,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn stage_message(
+    client: &Client,
+    reference: &str,
+    actor: &str,
+    transport: &str,
+    runtime_id: Option<&str>,
+    idempotency_key: String,
+) -> Result<()> {
+    let reference = normalize_message_reference(reference);
+    let _: ClaimRecord = client
+        .post(
+            &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
+            &MessageLifecycleRequest {
+                lifecycle: "staged".into(),
+                actor: Some(actor.into()),
+                transport: Some(transport.into()),
+                runtime_id: runtime_id.map(str::to_owned),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key,
@@ -5413,6 +5443,8 @@ async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<
             &MessageLifecycleRequest {
                 lifecycle: "closed".into(),
                 actor: Some(normalize_message_subject(actor)),
+                transport: None,
+                runtime_id: None,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-closed:{reference}"),
@@ -5817,6 +5849,11 @@ async fn run_st2_native_driver(
                                 client,
                                 subject,
                                 driver,
+                                if driver == "claude" {
+                                    "claude-channel"
+                                } else {
+                                    "native"
+                                },
                                 Some(&incarnation),
                                 &observed,
                                 &mut last_activity_fingerprint,
@@ -5983,6 +6020,7 @@ async fn publish_harness_activity(
     client: &Client,
     subject: &str,
     driver: &str,
+    transport: &str,
     incarnation: Option<&str>,
     observed: &st2::harness_state::Observed,
     last_fingerprint: &mut Option<String>,
@@ -5991,6 +6029,7 @@ async fn publish_harness_activity(
     let mut fields = BTreeMap::from([
         ("state".into(), Value::String(status.into())),
         ("driver".into(), Value::String(driver.into())),
+        ("transport".into(), Value::String(transport.into())),
         (
             "blocked_on".into(),
             Value::String(observed.blocked_on.as_str().into()),
@@ -6012,6 +6051,39 @@ async fn publish_harness_activity(
             "exit".into(),
             observed
                 .exit
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "observed_since_ms".into(),
+            observed.since_ms.map(Value::from).unwrap_or(Value::Null),
+        ),
+        (
+            "observed_at_ms".into(),
+            observed
+                .observed_at_ms
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "ownership_sequence".into(),
+            observed
+                .ownership_sequence
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "transition_sequence".into(),
+            observed
+                .transition_sequence
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "evidence_incarnation".into(),
+            observed
+                .evidence_incarnation
                 .clone()
                 .map(Value::String)
                 .unwrap_or(Value::Null),
@@ -6065,6 +6137,7 @@ async fn publish_harness_usage(
     if observed.used_tokens.is_some()
         || observed.window_tokens.is_some()
         || observed.used_percent.is_some()
+        || observed.compactions != 0
     {
         let mut fields = BTreeMap::from([
             (
@@ -6082,6 +6155,29 @@ async fn publish_harness_usage(
         }
         if let Some(value) = observed.used_percent {
             fields.insert("context_used_percent".into(), Value::from(value));
+        }
+        fields.insert("compactions".into(), Value::from(observed.compactions));
+        if let Some(value) = observed.last_compaction_ms {
+            fields.insert("last_compaction_ms".into(), Value::from(value));
+        }
+        let manually_requested = match observed.last_compaction_ms {
+            Some(compacted_at) => {
+                manual_compaction_request_matches(client, subject, incarnation, compacted_at)
+                    .await
+                    .unwrap_or(false)
+            }
+            None => false,
+        };
+        if manually_requested {
+            fields.insert(
+                "last_compaction_trigger".into(),
+                Value::String("manual".into()),
+            );
+        } else if let Some(value) = &observed.last_compaction_trigger {
+            fields.insert(
+                "last_compaction_trigger".into(),
+                Value::String(value.as_str().into()),
+            );
         }
         if let Some(value) = &observed.model {
             fields.insert("model".into(), Value::String(value.clone()));
@@ -6135,6 +6231,47 @@ async fn publish_harness_usage(
     }
     *last_fingerprint = Some(fingerprint);
     Ok(())
+}
+
+async fn manual_compaction_request_matches(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    compacted_at_ms: u64,
+) -> Result<bool> {
+    const MANUAL_COMPACTION_WINDOW_MS: u128 = 5 * 60 * 1_000;
+    let page: ClaimsPage = client
+        .get(&format!(
+            "/v1/claims?subject={}&order=desc&limit=200",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    let compacted_at_ms = u128::from(compacted_at_ms);
+    let earliest = compacted_at_ms.saturating_sub(MANUAL_COMPACTION_WINDOW_MS);
+    let latest = compacted_at_ms.saturating_add(5_000);
+    let requests = page
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.kind == "terminal.input.requested"
+                && claim.accepted_at_unix_ms >= earliest
+                && claim.accepted_at_unix_ms <= latest
+                && claim.body.pointer("/fields/intent").and_then(Value::as_str)
+                    == Some("context-compaction")
+                && claim
+                    .body
+                    .pointer("/fields/incarnation_id")
+                    .and_then(Value::as_str)
+                    == Some(incarnation)
+        })
+        .collect::<Vec<_>>();
+    Ok(requests.iter().any(|request| {
+        page.claims.iter().any(|claim| {
+            claim.kind == "terminal.input.result"
+                && claim.predecessors.iter().any(|id| id == &request.id)
+                && claim.body.pointer("/fields/result").and_then(Value::as_str) == Some("written")
+        })
+    }))
 }
 
 async fn publish_harness_timeline(
@@ -6341,7 +6478,10 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                 let messages: Vec<MessageView> = client
                     .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
                     .await?;
-                for message in messages.into_iter().filter(|message| message.status == "sent") {
+                for message in messages
+                    .into_iter()
+                    .filter(|message| matches!(message.status.as_str(), "sent" | "staged"))
+                {
                     if !delivered.insert(message.subject.clone()) {
                         continue;
                     }
@@ -6363,6 +6503,17 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
+                    if message.status == "sent" {
+                        stage_message(
+                            client,
+                            &message.subject,
+                            subject,
+                            &format!("{driver}-channel"),
+                            None,
+                            format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
+                        )
+                        .await?;
+                    }
                 }
             }
             _ = work_interval.tick() => {
@@ -6411,23 +6562,17 @@ async fn message_content(client: &Client, message: &MessageView) -> Result<Strin
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
-    let root = PathBuf::from(
-        std::env::var_os("ST3_DRIVER_STATE_DIR")
-            .context("the Codex driver has no ST3_DRIVER_STATE_DIR")?,
-    )
-    .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
+    let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    let root = catalog
+        .parent()
+        .context("the Codex driver catalog has no state root")?
+        .to_path_buf();
     let state_dir = root.join("state");
-    let agent_dir = root.join("agent");
     let inbox = st2::message::inbox_dir(&agent_dir);
     let archive = st2::message::archive_dir(&agent_dir);
-    let driver_root = root.clone();
+    let driver_root = catalog.clone();
     let driver_state = state_dir.clone();
     let driver_agent = agent_dir.clone();
-    let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
-    let runtime_id = format!(
-        "st3.{}",
-        &hex::encode(Sha256::digest(subject.as_bytes()))[..16]
-    );
     let driver_identity = identity.clone();
     let driver_runtime_id = runtime_id.clone();
     let mut task = tokio::task::spawn_blocking(move || {
@@ -6446,6 +6591,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut ready = false;
+    let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
     let mut published_timeline = BTreeSet::new();
     let mut last_control_warning = None;
@@ -6489,30 +6635,23 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         &st2::harness_state::harness_state_path(&agent_dir),
                         None,
                     ) {
-                        let status = harness_activity_state(observed.state);
-                        let fields = BTreeMap::from([
-                            ("state".into(), Value::String(status.into())),
-                            ("driver".into(), Value::String("codex".into())),
-                            ("incarnation_id".into(), Value::String(incarnation.clone())),
-                            ("blocked_on".into(), Value::String(observed.blocked_on.as_str().into())),
-                            ("ask".into(), Value::String(observed.ask.as_str().into())),
-                            ("input_buffer".into(), Value::String(observed.input_buffer.as_str().into())),
-                            ("reason".into(), observed.reason.clone().map(Value::String).unwrap_or(Value::Null)),
-                            ("exit".into(), observed.exit.clone().map(Value::String).unwrap_or(Value::Null)),
-                        ]);
+                        publish_harness_activity(
+                            client,
+                            subject,
+                            "codex",
+                            "app-server",
+                            Some(&incarnation),
+                            &observed,
+                            &mut last_activity_fingerprint,
+                        )
+                        .await?;
                         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
                             observed.since_ms,
-                            &fields,
+                            observed.observed_at_ms,
+                            observed.ownership_sequence,
+                            observed.transition_sequence,
+                            observed.reason.as_deref(),
                         ))?));
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.observed".into(),
-                            actor: Some(subject.into()),
-                            fields,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!("codex-activity:{subject}:{fingerprint}")),
-                        }).await?;
                         if observed.reason.as_deref() == Some("providerCapacity") {
                             if last_capacity_fingerprint.as_deref() != Some(fingerprint.as_str()) {
                                 publish_provider_capacity_diagnostic(
@@ -6803,6 +6942,11 @@ async fn forward_projected_messages(
         .await?;
     sync_closed_projected_messages(inbox, archive, &messages)?;
     let mut present = projected_message_files(inbox, archive)?;
+    let stage_runtime_id = match receipts {
+        NativeDeliveryReceipts::Codex { runtime_id, .. }
+        | NativeDeliveryReceipts::OpenCode { runtime_id, .. } => Some(runtime_id),
+        NativeDeliveryReceipts::ClaudeChannel { .. } => None,
+    };
     let consumed = match receipts {
         NativeDeliveryReceipts::Codex {
             state_dir,
@@ -6821,7 +6965,7 @@ async fn forward_projected_messages(
     }?;
     for message in messages
         .into_iter()
-        .filter(|message| message.status == "sent")
+        .filter(|message| matches!(message.status.as_str(), "sent" | "staged"))
     {
         let filename = if let Some(filename) = present.get(&message.subject) {
             filename.clone()
@@ -6856,6 +7000,17 @@ async fn forward_projected_messages(
             present.insert(message.subject.clone(), filename.clone());
             filename
         };
+        if message.status == "sent" {
+            stage_message(
+                client,
+                &message.subject,
+                subject,
+                transport,
+                stage_runtime_id,
+                format!("native-staged:{transport}:{subject}:{}", message.subject),
+            )
+            .await?;
+        }
         // Receipt-backed transports advance graph delivery only after their durable ledger proves
         // that the exact inbox file was consumed by a provider turn. Materialization alone is
         // merely queued native delivery.

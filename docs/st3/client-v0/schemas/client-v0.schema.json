@@ -368,6 +368,9 @@
         "window_tokens": { "type": "integer", "minimum": 0 },
         "used_percent": { "type": "number", "minimum": 0 },
         "model": { "type": "string" },
+        "compactions": { "type": "integer", "minimum": 0 },
+        "last_compaction_ms": { "type": "integer", "minimum": 0 },
+        "last_compaction_trigger": { "enum": ["manual", "auto", "threshold", "overflow", "idle", "unknown"] },
         "observed_at_unix_ms": { "type": "integer", "minimum": 0 }
       }
     },
@@ -705,6 +708,9 @@
         "context_used_tokens": { "type": "integer", "minimum": 0 },
         "context_window_tokens": { "type": "integer", "minimum": 0 },
         "context_used_percent": { "type": "number", "minimum": 0 },
+        "compactions": { "type": "integer", "minimum": 0 },
+        "last_compaction_ms": { "type": "integer", "minimum": 0 },
+        "last_compaction_trigger": { "enum": ["manual", "auto", "threshold", "overflow", "idle", "unknown"] },
         "cost": { "type": "number", "minimum": 0 },
         "currency": { "type": "string" },
         "attribution": {
@@ -718,7 +724,7 @@
         }
       },
       "allOf": [
-        { "if": { "properties": { "semantics": { "const": "context_occupancy" } } }, "then": { "anyOf": [{ "required": ["context_used_tokens"] }, { "required": ["context_window_tokens"] }, { "required": ["context_used_percent"] }] } },
+        { "if": { "properties": { "semantics": { "const": "context_occupancy" } } }, "then": { "anyOf": [{ "required": ["context_used_tokens"] }, { "required": ["context_window_tokens"] }, { "required": ["context_used_percent"] }, { "required": ["compactions"] }] } },
         { "if": { "properties": { "semantics": { "enum": ["session_cumulative", "response"] } } }, "then": { "required": ["total_tokens"] } }
       ]
     },

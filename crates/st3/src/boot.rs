@@ -15,6 +15,10 @@ A notification does not create work. Repeated delivery does not authorize repeat
 
 Run `"$ST3_BIN" work ls` to list work that is available to you. Claim one eligible step.
 
+Do not keep substantive work only in this conversation or a private todo. Before starting new work
+authorized by a person, make sure the graph exposes it as active work across the fleet, then claim
+that work. If you cannot create or claim the graph work with your authority, request person action.
+
 If no step is ready, finish this turn. Do not wait for work that is not ready.
 
 Do its work and finish the step in the same turn when possible.
@@ -82,6 +86,8 @@ mod tests {
         );
         assert!(BOOT_DOCUMENT.contains("ST3_BIN"));
         assert!(BOOT_DOCUMENT.contains("If no step is ready, finish this turn."));
+        assert!(BOOT_DOCUMENT.contains("graph exposes it as active work across the fleet"));
+        assert!(BOOT_DOCUMENT.contains("Do not keep substantive work only in this conversation"));
         assert!(BOOT_DOCUMENT.contains("trace wait ... --as \"$ST_AGENT\"` only when"));
         assert!(BOOT_DOCUMENT.contains("conversations --help"));
         assert!(!BOOT_DOCUMENT.contains("message --help"));

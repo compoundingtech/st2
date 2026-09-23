@@ -356,7 +356,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_twenty_two_model_free_and_nineteen_model_backed_evals() {
+fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -388,6 +388,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_nineteen_model_backed_evals(
         "agent-migration-rehearsal",
         "automatic-github-intake",
         "claude-skill-inheritance",
+        "codex-compaction-message-delivery",
         "continuous-stewardship",
         "cross-harness-message-wake",
         "fork-in-the-road",
@@ -395,6 +396,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_nineteen_model_backed_evals(
         "license-mit",
         "mixed-worker-pool",
         "mission-document-lift",
+        "native-session-import",
         "planning-mode",
         "poisoned-pr",
         "restart-continuity",
@@ -429,14 +431,75 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_nineteen_model_backed_evals(
         let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
         let has_authored_model = authored_harness_counts(&source, name) != (0, 0)
             || !authored_model_gates(&source).is_empty();
-        let has_dynamic_planner = matches!(name, "planning-mode" | "run-generation-revision")
-            && fs::read_to_string(root.join(name).join("controller.sh"))
-                .unwrap()
-                .contains("launch start");
+        let controller = root.join(name).join("controller.sh");
+        let dynamic_model = controller.is_file() && {
+            let controller = fs::read_to_string(controller).unwrap();
+            (matches!(name, "planning-mode" | "run-generation-revision")
+                && controller.contains("launch start"))
+                || (name == "native-session-import" && controller.contains("pty run"))
+        };
         assert!(
-            has_authored_model || has_dynamic_planner,
+            has_authored_model || dynamic_model,
             "{name} must use a model"
         );
+    }
+}
+
+#[test]
+fn codex_compaction_delivery_eval_proves_staging_steering_and_post_compaction_delivery() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/codex-compaction-message-delivery");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "codex-compaction-message-delivery/eval.kdl"),
+        (0, 1)
+    );
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    for required in [
+        "message.staged",
+        "message.delivered",
+        "message.read",
+        "/compact",
+        "last_compaction_trigger",
+        "POST-COMPACT-SEEN",
+    ] {
+        assert!(
+            controller.contains(required),
+            "missing `{required}` scenario"
+        );
+    }
+}
+
+#[test]
+fn native_session_import_eval_uses_raw_ptys_and_all_five_drivers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/native-session-import");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "native-session-import/eval.kdl"),
+        (0, 0),
+        "the five harnesses must begin outside st3"
+    );
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    assert!(controller.contains("env -u PTY_SESSION PTY_ROOT=\"$RAW_PTY_ROOT\" pty"));
+    assert!(controller.contains(".name == \\$id and .status == \\\"running\\\""));
+    assert!(!controller.contains("st3 terminals send"));
+    for driver in ["codex", "claude", "pi", "omp", "opencode"] {
+        assert!(
+            controller.contains(&format!("    {driver})")),
+            "missing raw {driver} launch"
+        );
+    }
+    for required in [
+        "exact_session == true",
+        "st3 import run",
+        "raw process",
+        "owner_run_id == null",
+        "managed_process_has_native_id",
+    ] {
+        assert!(controller.contains(required), "missing `{required}` proof");
     }
 }
 

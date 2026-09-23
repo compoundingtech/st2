@@ -544,6 +544,14 @@ pub struct Observed {
     pub ask: Ask,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
+    /// When the owning driver last refreshed this evidence.
+    pub observed_at_ms: Option<u64>,
+    /// Monotonic ownership fence from the driver record.
+    pub ownership_sequence: Option<u64>,
+    /// Monotonic state-transition counter from the driver record.
+    pub transition_sequence: Option<u64>,
+    /// Driver-session identity that owns the source record.
+    pub evidence_incarnation: Option<String>,
     pub exit: Option<String>,
     pub reason: Option<String>,
 }
@@ -559,9 +567,22 @@ impl Observed {
             ask: Ask::Unknown,
             harness,
             since_ms: None,
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: Some(reason.to_string()),
         }
+    }
+
+    fn with_record_evidence(mut self, record: &Record) -> Self {
+        self.harness = Some(record.harness.clone());
+        self.observed_at_ms = Some(record.written_at_ms);
+        self.ownership_sequence = Some(record.seq);
+        self.transition_sequence = Some(record.transitions);
+        self.evidence_incarnation = Some(record.incarnation.clone());
+        self
     }
 }
 
@@ -605,14 +626,14 @@ fn read_raw_at(
     }
     if record.written_at_ms > now_ms {
         if record.written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
-            return Observed::indeterminate("future-skew", harness);
+            return Observed::indeterminate("future-skew", harness).with_record_evidence(&record);
         }
     } else if now_ms - record.written_at_ms >= duration_ms(HARNESS_STATE_STALE) {
-        return Observed::indeterminate("stale", harness);
+        return Observed::indeterminate("stale", harness).with_record_evidence(&record);
     }
     if record.state == Activity::Unknown {
         // A literal `unknown` is never written by this crate; treat one like malformation.
-        return Observed::indeterminate("literal-unknown", harness);
+        return Observed::indeterminate("literal-unknown", harness).with_record_evidence(&record);
     }
     if record.state == Activity::Ended
         && record.exit.is_none()
@@ -622,7 +643,7 @@ fn read_raw_at(
         // and has observed nothing yet. Reading it as definite `ended` would flip a live seat
         // to dead for every consumer whose harness never publishes its first frame promptly —
         // indeterminate, distinctly, until the first real observation or the ordinary horizon.
-        return Observed::indeterminate("claimed", harness);
+        return Observed::indeterminate("claimed", harness).with_record_evidence(&record);
     }
     if record.state != Activity::Ended
         && let Some(probe) = probe
@@ -634,10 +655,11 @@ fn read_raw_at(
         // (enforced in `observe`); a fenced record whose session is provably dead is downgraded,
         // and an unreadable registry still downgrades nothing.
         let Some(session) = record.pty_session.as_deref() else {
-            return Observed::indeterminate("unfenced-record", harness);
+            return Observed::indeterminate("unfenced-record", harness)
+                .with_record_evidence(&record);
         };
         if probe(session) == SessionLiveness::Dead {
-            return Observed::indeterminate("session-dead", harness);
+            return Observed::indeterminate("session-dead", harness).with_record_evidence(&record);
         }
     }
     Observed {
@@ -647,6 +669,10 @@ fn read_raw_at(
         ask: record.ask,
         harness,
         since_ms: Some(record.since_ms),
+        observed_at_ms: Some(record.written_at_ms),
+        ownership_sequence: Some(record.seq),
+        transition_sequence: Some(record.transitions),
+        evidence_incarnation: Some(record.incarnation),
         exit: record.exit,
         reason: record.reason,
     }

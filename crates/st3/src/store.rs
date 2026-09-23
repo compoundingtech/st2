@@ -7066,6 +7066,17 @@ impl Store {
                                 .get("model")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
+                            compactions: fields
+                                .get("compactions")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            last_compaction_ms: fields
+                                .get("last_compaction_ms")
+                                .and_then(Value::as_u64),
+                            last_compaction_trigger: fields
+                                .get("last_compaction_trigger")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             observed_at_unix_ms: accepted_at.parse().unwrap_or_default(),
                         },
                     ));
@@ -10838,6 +10849,7 @@ fn validate_message_transition(
 ) -> Result<bool, St3Error> {
     let requested = match input.kind.as_str() {
         "message.sent" => "sent",
+        "message.staged" => "staged",
         "message.delivered" => "delivered",
         "message.read" => "read",
         "message.closed" => "closed",
@@ -10864,7 +10876,7 @@ fn validate_message_transition(
 
     let current: Option<String> = transaction
         .query_row(
-            "SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.delivered','message.read','message.closed') ORDER BY store_index DESC LIMIT 1",
+            "SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.staged','message.delivered','message.read','message.closed') ORDER BY store_index DESC LIMIT 1",
             [&input.subject],
             |row| row.get(0),
         )
@@ -10872,6 +10884,7 @@ fn validate_message_transition(
         .map_err(internal)?;
     let current = current.as_deref().map(|kind| match kind {
         "message.sent" => "sent",
+        "message.staged" => "staged",
         "message.delivered" => "delivered",
         "message.read" => "read",
         "message.closed" => "closed",
@@ -10899,11 +10912,14 @@ fn validate_message_transition(
     let valid = matches!(
         (current, requested),
         (None, "sent")
+            | (Some("sent"), "staged")
+            | (Some("staged"), "delivered")
+            // Older and non-native transports do not expose a durable staging boundary.
             | (Some("sent"), "delivered")
             | (Some("delivered"), "read")
             | (Some("read"), "closed")
     );
-    let daemon_withdrawal = current == Some("sent")
+    let daemon_withdrawal = matches!(current, Some("sent" | "staged"))
         && requested == "closed"
         && input.actor.as_deref() == Some("daemon/runtime");
     if !valid && !daemon_withdrawal {
@@ -20551,7 +20567,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     #[test]
-    fn message_lifecycle_cannot_skip_delivery_or_read() {
+    fn message_lifecycle_exposes_native_staging_without_breaking_direct_delivery() {
         let store = Store::open_memory("node").unwrap();
         let subject = "message/demo";
         let append = |kind: &str, status: &str, actor: Option<&str>, key: &str| {
@@ -20572,6 +20588,8 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .code,
             "invalid-message-transition"
         );
+        append("message.staged", "staged", Some("agent/worker"), "staged").unwrap();
+        assert_eq!(store.messages(None, true).unwrap()[0].status, "staged");
         append(
             "message.delivered",
             "delivered",
@@ -20594,6 +20612,21 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(repeated_close.id, closed.id);
         assert_eq!(store.messages(None, true).unwrap()[0].status, "closed");
         assert!(store.messages(None, false).unwrap().is_empty());
+
+        let direct = "message/direct";
+        let append_direct = |kind: &str, status: &str, key: &str| {
+            store.append_claim(&ClaimInput {
+                subject: direct.into(),
+                kind: kind.into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            })
+        };
+        append_direct("message.sent", "sent", "direct-sent").unwrap();
+        append_direct("message.delivered", "delivered", "direct-delivered").unwrap();
     }
 
     #[test]

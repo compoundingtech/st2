@@ -4,6 +4,7 @@
 //! turns its token-usage and rate-limit frames into a harness-context reading.
 
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -124,6 +125,10 @@ pub(super) struct CodexContextProducer {
     /// known windows ride along with the next reading instead of blanking it.
     rate_limits: harness_context::RateLimits,
     counted_compactions: VecDeque<CodexCompactionKey>,
+    /// Highest rollout ordinal examined by the bounded transcript fallback. The first snapshot
+    /// establishes a baseline; only later ordinals belong to this live observer incarnation.
+    transcript_ordinal: Option<u64>,
+    transcript_started_at_ms: u64,
 }
 
 impl CodexContextProducer {
@@ -132,7 +137,71 @@ impl CodexContextProducer {
             writer,
             rate_limits: harness_context::RateLimits::default(),
             counted_compactions: VecDeque::new(),
+            transcript_ordinal: None,
+            transcript_started_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis() as u64),
         }
+    }
+
+    /// Recover compaction completions that Codex persisted to its rollout but did not broadcast
+    /// to this secondary app-server subscriber. `frames` is already bounded by the caller.
+    pub(super) fn observe_transcript(&mut self, frames: &[Value], thread_id: &str) -> Result<bool> {
+        let newest = frames
+            .iter()
+            .filter_map(|frame| frame.get("ordinal").and_then(Value::as_u64))
+            .max();
+        let Some(newest) = newest else {
+            return Ok(false);
+        };
+        let first_snapshot = self.transcript_ordinal.is_none();
+        let previous = self.transcript_ordinal.replace(newest).unwrap_or(0);
+        if newest <= previous {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        for frame in frames {
+            let Some(ordinal) = frame.get("ordinal").and_then(Value::as_u64) else {
+                continue;
+            };
+            if ordinal <= previous
+                || frame.get("type").and_then(Value::as_str) != Some("event_msg")
+                || frame.pointer("/payload/type").and_then(Value::as_str) != Some("item_completed")
+                || frame.pointer("/payload/thread_id").and_then(Value::as_str) != Some(thread_id)
+            {
+                continue;
+            }
+            if first_snapshot
+                && frame
+                    .pointer("/payload/completed_at_ms")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|completed| completed < self.transcript_started_at_ms)
+            {
+                // A resumed rollout may contain old compactions. On the first snapshot, admit
+                // only completions whose native timestamp proves they happened after this
+                // observer started; later snapshots are fenced by ordinal.
+                continue;
+            }
+            let item_type = frame.pointer("/payload/item/type").and_then(Value::as_str);
+            if !matches!(item_type, Some("ContextCompaction" | "contextCompaction")) {
+                continue;
+            }
+            let (Some(turn_id), Some(item_id)) = (
+                frame.pointer("/payload/turn_id").and_then(Value::as_str),
+                frame.pointer("/payload/item/id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            changed |= self.compacted(
+                CodexCompactionKey {
+                    turn_id: turn_id.to_string(),
+                    item_id: Some(item_id.to_string()),
+                },
+                harness_context::CompactionTrigger::Unknown,
+            )?;
+        }
+        Ok(changed)
     }
 
     /// Project one inbound control frame onto the context record, returning whether a write landed.
@@ -174,10 +243,13 @@ impl CodexContextProducer {
                 ) else {
                     return Ok(false);
                 };
-                self.compacted(CodexCompactionKey {
-                    turn_id: turn_id.to_string(),
-                    item_id: Some(item_id.to_string()),
-                })
+                self.compacted(
+                    CodexCompactionKey {
+                        turn_id: turn_id.to_string(),
+                        item_id: Some(item_id.to_string()),
+                    },
+                    harness_context::CompactionTrigger::Unknown,
+                )
             }
             // Deprecated in the protocol in favour of the item ("Deprecated: Use
             // `ContextCompaction` item type instead") and unobserved on 0.150.1. Handled anyway,
@@ -191,10 +263,13 @@ impl CodexContextProducer {
                 else {
                     return Ok(false);
                 };
-                self.compacted(CodexCompactionKey {
-                    turn_id: turn_id.to_string(),
-                    item_id: None,
-                })
+                self.compacted(
+                    CodexCompactionKey {
+                        turn_id: turn_id.to_string(),
+                        item_id: None,
+                    },
+                    harness_context::CompactionTrigger::Unknown,
+                )
             }
             _ => Ok(false),
         }
@@ -260,7 +335,11 @@ impl CodexContextProducer {
     /// does the counting and the relaunch claim's record removal resets it (HC-R12, HC-R15). The
     /// trigger is `unknown` because `ContextCompactionThreadItem` carries `id` and `type` and no
     /// reason at all.
-    fn compacted(&mut self, key: CodexCompactionKey) -> Result<bool> {
+    fn compacted(
+        &mut self,
+        key: CodexCompactionKey,
+        trigger: harness_context::CompactionTrigger,
+    ) -> Result<bool> {
         if self
             .counted_compactions
             .iter()
@@ -272,8 +351,7 @@ impl CodexContextProducer {
         while self.counted_compactions.len() > CODEX_COMPACTION_MEMORY {
             self.counted_compactions.pop_front();
         }
-        self.writer.compacted(harness_context::Compaction::new(
-            harness_context::CompactionTrigger::Unknown,
-        ))
+        self.writer
+            .compacted(harness_context::Compaction::new(trigger))
     }
 }
