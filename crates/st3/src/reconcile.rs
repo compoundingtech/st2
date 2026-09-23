@@ -26,6 +26,11 @@ const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 
+fn claude_login_expired(screen: &str) -> bool {
+    screen.contains("Login expired · Please run /login")
+        || screen.contains("Not logged in · Run /login")
+}
+
 fn provider_capacity_retry_key(claim_id: &str) -> String {
     format!("provider-capacity-retry:{claim_id}")
 }
@@ -557,6 +562,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             match observed {
                 Some(observation) if observation.status == "running" => {
                     self.record_member(subject, &observation, true)?;
+                    self.reconcile_claude_auth_screen(subject, member, &observation)?;
                     self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
                     if subject.kind == "agent"
                         && let Some(incarnation) = observation.incarnation_id.as_deref()
@@ -900,6 +906,61 @@ impl<R: RuntimeControl> Reconciler<R> {
         if changed {
             self.signal_changed();
         }
+        Ok(())
+    }
+
+    fn reconcile_claude_auth_screen(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+    ) -> Result<()> {
+        if subject.kind != "agent" || member.driver.as_deref() != Some("claude") || !member.terminal
+        {
+            return Ok(());
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(());
+        };
+        // Claude's login prompt does not emit a StopFailure hook. The initialized MCP channel
+        // remains alive, so hook-only observation incorrectly reports this session as ready.
+        let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+            return Ok(());
+        };
+        if !claude_login_expired(&screen) {
+            return Ok(());
+        }
+        let key = format!("claude-auth-expired:{}:{incarnation}", subject.subject);
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention_subject = format!("attention/{}", &digest[..32]);
+        if self.store.attention_request(&attention_subject)?.is_some() {
+            return Ok(());
+        }
+        self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.subject.clone()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("unauthenticated".into())),
+                    ("code".into(), Value::String("provider-auth-expired".into())),
+                    ("reason".into(), Value::String("Claude reports an expired login; a person must run /login in this terminal and restart the harness".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.clone()),
+        })?;
+        self.store.request_attention(&attention_subject, &AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: "Claude login expired".into(),
+                reason: format!("{} on {} is unauthenticated. Run /login in its terminal, then restart this harness; work delivery is held until a new authenticated incarnation.", subject.subject, self.host),
+                severity: "error".into(),
+                targets: vec![subject.subject.clone()],
+                actor: "agent/st3/reconciler".into(),
+                idempotency_key: format!("{key}:attention"),
+        })?;
+        self.signal_changed();
         Ok(())
     }
 
@@ -7270,6 +7331,16 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_login_screen_recognizes_only_explicit_auth_prompts() {
+        assert!(super::claude_login_expired(
+            "● Login expired · Please run /login"
+        ));
+        assert!(super::claude_login_expired("Not logged in · Run /login"));
+        assert!(!super::claude_login_expired(
+            "Please use /login to switch accounts"
+        ));
+    }
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

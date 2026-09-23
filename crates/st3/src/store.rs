@@ -11302,6 +11302,36 @@ fn current_harness_at(
         return Ok(None);
     };
 
+    // A login prompt is positive evidence that the current Claude incarnation cannot accept
+    // work. It has no hook edge, and channel initialization or work activity can otherwise
+    // overwrite a one-off blocked observation. Fence the entire incarnation instead.
+    let auth_rejection = connection
+        .query_row(
+            "SELECT id, accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
+               AND json_extract(body, '$.fields.code')='provider-auth-expired'
+               AND json_extract(body, '$.fields.incarnation_id')=?3
+             ORDER BY store_index DESC LIMIT 1",
+            params![subject, at_index, incarnation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((claim, observed_at_unix_ms)) = auth_rejection {
+        return Ok(Some(crate::model::CurrentHarnessView {
+            state: "unauthenticated".into(),
+            driver: Some("claude".into()),
+            incarnation_id: incarnation_id.to_owned(),
+            transport: Some("claude-channel".into()),
+            reason: Some("providerAuth".into()),
+            blocked_on: Some("human".into()),
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim,
+            observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
+        }));
+    }
+
     let mut statement = connection.prepare(
         "SELECT id, store_index, body, accepted_at_unix_ms FROM claims
          WHERE subject=?1 AND kind='harness.observed' AND store_index<=?2
@@ -24902,5 +24932,81 @@ message "human-attention" {
                 .total_tokens,
             150
         );
+    }
+
+    #[test]
+    fn expired_claude_login_fences_later_ready_and_work_claims_in_same_incarnation() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.claude";
+        let append = |kind: &str, actor: Option<&str>, fields: BTreeMap<String, Value>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: actor.map(str::to_owned),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        append(
+            "runtime.observed",
+            None,
+            BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("runtime_id".into(), Value::String("node.claude".into())),
+                ("incarnation_id".into(), Value::String("first".into())),
+            ]),
+        );
+        append(
+            "harness.observed",
+            Some(subject),
+            BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                ("incarnation_id".into(), Value::String("first".into())),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
+        append(
+            "harness.diagnostic",
+            Some(subject),
+            BTreeMap::from([
+                ("status".into(), Value::String("unauthenticated".into())),
+                ("code".into(), Value::String("provider-auth-expired".into())),
+                ("incarnation_id".into(), Value::String("first".into())),
+            ]),
+        );
+        append(
+            "harness.observed",
+            Some(subject),
+            BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                ("incarnation_id".into(), Value::String("first".into())),
+            ]),
+        );
+        let blocked = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(blocked.state, "unauthenticated");
+        assert_eq!(blocked.reason.as_deref(), Some("providerAuth"));
+        assert!(!blocked.is_ready());
+        append(
+            "runtime.observed",
+            None,
+            BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("runtime_id".into(), Value::String("node.claude".into())),
+                ("incarnation_id".into(), Value::String("second".into())),
+            ]),
+        );
+        append(
+            "harness.observed",
+            Some(subject),
+            BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                ("incarnation_id".into(), Value::String("second".into())),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 }
