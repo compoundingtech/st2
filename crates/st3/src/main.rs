@@ -6190,6 +6190,14 @@ fn prepare_native_driver_in(
 ) -> Result<(PathBuf, PathBuf, String, String)> {
     let state_root = state_root.join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]);
     let catalog = state_root.join("catalog");
+    fs::create_dir_all(&catalog)?;
+    // This private catalog exists for st2 hook resolution, not for PTY ownership.
+    // Its deeply nested state path would otherwise fail st2's portable socket-path
+    // validation for slash-qualified st3 identities, silently disabling hooks.
+    fs::write(
+        catalog.join("catalog.kdl"),
+        "catalog { pty-root \"/tmp/st3-native\" }\n",
+    )?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
     let host = st2::run::detect_host();
     let leaf = &hex::encode(Sha256::digest(identity.as_bytes()))[..16];
@@ -8809,6 +8817,10 @@ mission "review" state="ready" {
         );
         assert_eq!(identity, "node.worker");
         assert_eq!(runtime_id, "node.worker");
+        let (long_catalog, _, _, _) =
+            prepare_native_driver_in("agent/fleet/app-web/standing/app-web", root.path()).unwrap();
+        let report = st2::validate::validate_for_host(&long_catalog, &st2::run::detect_host());
+        assert!(report.issues.is_empty(), "{report:?}");
     }
 
     #[test]
