@@ -1150,7 +1150,6 @@ fn main() -> Result<()> {
         let mut last_cache_save = Instant::now();
         let mut was_offline = false;
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
             let mut changed = match model.sync(&background_client).await {
                 Ok((changed, invalidated_sessions)) => {
                     for id in invalidated_sessions {
@@ -1176,6 +1175,7 @@ fn main() -> Result<()> {
                     {
                         break;
                     }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     false
                 }
             };

@@ -129,7 +129,7 @@ impl Model {
 
     pub async fn sync(&mut self, client: &Client) -> Result<(bool, Vec<String>)> {
         let response = client
-            .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(0))
+            .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(15_000))
             .await;
         let events = match response {
             Ok(envelope) => envelope.value,
@@ -177,14 +177,20 @@ impl Model {
             if self.recent_events.len() > 256 {
                 self.recent_events.pop_front();
             }
-            changed |= matches!(
-                event.event_type,
-                EventType::Upsert
-                    | EventType::Delete
-                    | EventType::TimelineDelta
-                    | EventType::CapabilitiesChanged
-                    | EventType::TerminalAvailable
-            );
+            let projection_changed = event.resource_ids.is_empty()
+                || event
+                    .resource_ids
+                    .iter()
+                    .any(|id| !id.starts_with("session/"));
+            changed |= projection_changed
+                && matches!(
+                    event.event_type,
+                    EventType::Upsert
+                        | EventType::Delete
+                        | EventType::TimelineDelta
+                        | EventType::CapabilitiesChanged
+                        | EventType::TerminalAvailable
+                );
             if event.body.get("reason").and_then(serde_json::Value::as_str)
                 == Some("session-timeline-invalidated")
             {
@@ -561,6 +567,24 @@ mod tests {
         let mut model = Model::default();
         let (changed, sessions) = model.consume_events(events);
         assert!(changed);
+        assert_eq!(sessions, vec!["session/current"]);
+    }
+
+    #[test]
+    fn session_only_timeline_event_does_not_reload_fleet_projections() {
+        let events: EventPage = serde_json::from_value(serde_json::json!({
+            "kind":"event-page", "oldest_cursor":"event-cursor/node/0",
+            "resume_cursor":"event-cursor/node/1", "has_more":false,
+            "items":[{"id":"event/one", "epoch":"node", "sequence":1,
+                "previous_cursor":"event-cursor/node/0", "next_cursor":"event-cursor/node/1",
+                "timestamp":"2026-09-24T15:00:00Z", "type":"upsert",
+                "resource_ids":["session/current"], "snapshot_id":"snapshot/one",
+                "body":{"reason":"session-timeline-invalidated"}}]
+        }))
+        .unwrap();
+        let mut model = Model::default();
+        let (changed, sessions) = model.consume_events(events);
+        assert!(!changed);
         assert_eq!(sessions, vec!["session/current"]);
     }
 
