@@ -80,6 +80,7 @@ export default function App() {
   const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const projectionEventCursor = useRef<string | null>(null), projectionValidated = useRef(false);
+  const lastFullRefreshAt = useRef(0);
   const cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, TimelineEntry[]>()), draftCache = useRef(new Map<string, string>());
   const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
@@ -151,7 +152,7 @@ export default function App() {
     setStatus(s => s === 'online' ? s : 'connecting');
     try {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
-      if (checkChanges && firstDataShown.current && projectionValidated.current && cachedActor.current === capability.value.session_actor) {
+      if (checkChanges && firstDataShown.current && projectionValidated.current && Date.now() - lastFullRefreshAt.current < 30_000 && cachedActor.current === capability.value.session_actor) {
         if (cachedIndex.current === capability.snapshot.store_index) { setSnapshot(capability.snapshot); setStatus('online'); setError(''); return; }
         if (projectionEventCursor.current) {
           try {
@@ -168,7 +169,7 @@ export default function App() {
       }
       if (cachedActor.current && cachedActor.current !== capability.value.session_actor) {
         cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0;
-        projectionEventCursor.current = null; projectionValidated.current = false;
+        projectionEventCursor.current = null; projectionValidated.current = false; lastFullRefreshAt.current = 0;
         setData(emptyData); setTruncated({}); setHasSynced(false); firstDataShown.current = false; setCachedHostId(''); setSnapshot(null); setStatus('connecting');
         void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
       }
@@ -218,6 +219,7 @@ export default function App() {
       cachedActor.current = actor; cachedIndex.current = index;
       projectionEventCursor.current = capability.value.event_cursor;
       projectionValidated.current = true;
+      lastFullRefreshAt.current = Date.now();
       snapshotRetry.current = 0; setHasSynced(true); setStatus('online'); setError('');
     } catch (e) {
       if (generation !== cacheGeneration.current) return;
@@ -338,7 +340,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; projectionValidated.current = false; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; projectionValidated.current = false; lastFullRefreshAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
