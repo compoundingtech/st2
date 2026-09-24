@@ -7773,6 +7773,7 @@ async fn forward_projected_messages(
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
     let mut consumed_by_recipient = BTreeSet::new();
+    let mut active_subjects = BTreeSet::new();
     let stage_runtime_id = match receipts {
         NativeDeliveryReceipts::Codex { runtime_id, .. }
         | NativeDeliveryReceipts::OpenCode { runtime_id, .. } => Some(runtime_id),
@@ -7796,8 +7797,9 @@ async fn forward_projected_messages(
     }?;
     let mut cursor = None;
     loop {
-        let page = message_page(client, Some(subject), true, cursor.as_deref()).await?;
+        let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
         for message in page.items {
+            active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
                 consumed_by_recipient.insert(message.subject);
                 continue;
@@ -7866,6 +7868,26 @@ async fn forward_projected_messages(
         match page.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
+        }
+    }
+    // A message can close between polls. The active page intentionally excludes
+    // history, so inspect only projected files still in the native inbox before
+    // deciding whether to archive them. A failed lookup keeps the file in place.
+    for file in st2::message::list_dir(inbox)? {
+        for reference in file
+            .tags
+            .iter()
+            .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
+        {
+            if active_subjects.contains(reference) || consumed_by_recipient.contains(reference) {
+                continue;
+            }
+            if let Ok(message) = read_message(client, reference).await
+                && message.to == subject
+                && matches!(message.status.as_str(), "read" | "closed")
+            {
+                consumed_by_recipient.insert(reference.to_owned());
+            }
         }
     }
     sync_consumed_projected_messages(inbox, archive, &consumed_by_recipient)?;
@@ -9849,6 +9871,67 @@ mission "review" state="ready" {
         assert!(archive.join(old).is_file());
         assert!(inbox.join(next).is_file());
         assert_eq!(st2::message::list_dir(&archive).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_message_missing_from_the_active_page_archives_its_projected_file() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/v1/messages/page",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "api_version": "st3.v1",
+                        "value": { "items": [], "has_more": false, "next_cursor": null, "limit": 100 }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/messages/read/{*subject}",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "api_version": "st3.v1",
+                        "value": {
+                            "subject": "message/closed", "from": "agent/sender", "to": "agent/test",
+                            "content": "done", "status": "closed", "created_index": 1
+                        }
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let filename = st2::message::send_to_inbox(
+            &inbox,
+            "agent/sender",
+            Some("done"),
+            None,
+            &["st3-message:message/closed".into()],
+            "done",
+        )
+        .unwrap();
+
+        forward_projected_messages(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!inbox.join(&filename).exists());
+        assert!(archive.join(filename).is_file());
+        server.abort();
     }
 
     #[tokio::test]
