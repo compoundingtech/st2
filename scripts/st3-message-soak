@@ -30,34 +30,56 @@ probe() {
   started=$(/usr/bin/date +%s)
   if [[ $direction == hetz-to-silber ]]; then
     recipient=$SILBER_RECIPIENT
-    response=$(/usr/bin/timeout 30s "$ST3_BIN" conversations send "$recipient" --from "$MONITOR" \
-      --subject 'soak request' --body "Reply once with exact receipt token $token." --json) || return 1
+    if ! response=$(/usr/bin/timeout 30s "$ST3_BIN" conversations send "$recipient" --from "$MONITOR" \
+      --subject 'soak request' --body "Reply once with exact receipt token $token." --json); then
+      log "FAILED direction=$direction stage=send token=$token"
+      return 1
+    fi
   elif [[ $direction == silber-to-hetz ]]; then
     recipient=$HETZ_RECIPIENT
-    response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec silber -- "$SILBER_ST3" conversations send "$recipient" \
+    if ! response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec silber -- "$SILBER_ST3" conversations send "$recipient" \
       --from "$MONITOR" --subject 'soak request' \
-      --body "Reply once with exact receipt token $token." --json) || return 1
+      --body "Reply once with exact receipt token $token." --json); then
+      log "FAILED direction=$direction stage=send token=$token"
+      return 1
+    fi
   else
     log "invalid direction=$direction"
     return 2
   fi
-  subject=$(/usr/bin/jq -er '.subject' <<<"$response") || return 1
+  if ! subject=$(/usr/bin/jq -er '.subject' <<<"$response"); then
+    log "FAILED direction=$direction stage=send-response token=$token"
+    return 1
+  fi
   LAST_SUBJECT=$subject
   deadline=$((started + DEADLINE_SECONDS))
   while (( $(/usr/bin/date +%s) < deadline )); do
     if thread=$(/usr/bin/timeout 15s "$ST3_BIN" conversations thread "$subject" --json 2>/dev/null); then
-      count=$(/usr/bin/jq --arg subject "$subject" --arg token "$token" \
+      if ! count=$(/usr/bin/jq --arg subject "$subject" --arg token "$token" \
         --arg recipient "$recipient" --arg monitor "$MONITOR" \
         '[.[] | select(.in_reply_to == $subject and .from == $recipient and .to == $monitor and .content == $token)] | length' \
-        <<<"$thread") || return 1
-      if (( count > 0 )); then
-        reply_ids=$(/usr/bin/jq -r --arg subject "$subject" --arg recipient "$recipient" \
+        <<<"$thread"); then
+        log "FAILED direction=$direction subject=$subject token=$token stage=thread-parse"
+        return 1
+      fi
+      if (( count > 1 )); then
+        log "FAILED direction=$direction subject=$subject token=$token duplicate_matching_replies=$count"
+        return 1
+      fi
+      if (( count == 1 )); then
+        if ! reply_ids=$(/usr/bin/jq -r --arg subject "$subject" --arg recipient "$recipient" \
           --arg monitor "$MONITOR" \
           '.[] | select(.in_reply_to == $subject and .from == $recipient and .to == $monitor) | .subject' \
-          <<<"$thread") || return 1
+          <<<"$thread"); then
+          log "FAILED direction=$direction subject=$subject token=$token stage=reply-parse"
+          return 1
+        fi
         while IFS= read -r reply_id; do
           [[ -z $reply_id ]] && continue
-          /usr/bin/timeout 15s "$ST3_BIN" conversations archive "$reply_id" --as "$MONITOR" --json >/dev/null || true
+          if ! /usr/bin/timeout 15s "$ST3_BIN" conversations archive "$reply_id" --as "$MONITOR" --json >/dev/null; then
+            log "FAILED direction=$direction subject=$subject token=$token stage=archive-reply"
+            return 1
+          fi
         done <<<"$reply_ids"
         log "ok direction=$direction subject=$subject token=$token latency_seconds=$(( $(/usr/bin/date +%s) - started )) matching_replies=$count"
         return 0
@@ -136,6 +158,7 @@ if [[ ${1:-} == --once ]]; then
 fi
 
 direction=hetz-to-silber
+log 'monitor-started evidence_format=2'
 while true; do
   if probe "$direction"; then
     record_result "$direction" true

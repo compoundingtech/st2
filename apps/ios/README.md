@@ -18,4 +18,6 @@ For an offline device build, run `npm run export:ios` and build Release with loc
 
 The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
+For connected Debug smoke tests, `com.compoundingtech.smalltalk.starter://tab/Fleet` opens a tab, `com.compoundingtech.smalltalk.starter://mission?id=mission/...` opens a mission, and `com.compoundingtech.smalltalk.starter://session?id=session/...` opens an exact conversation. Add `&terminal=terminal/...` to the session link to inspect its live terminal screen. These links are disabled in Release and carry no authorization: the already-paired client still has to pass the gateway's normal checks.
+
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
