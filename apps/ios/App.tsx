@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, Linking, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
@@ -47,6 +47,32 @@ export default function App() {
     if (c.status === 'fulfilled' && c.value) setCredential(c.value);
     if (c.status === 'rejected') setError('Secure credential storage is unavailable on this build.');
   }); }, []);
+  useEffect(() => {
+    if (!__DEV__) return;
+    let handled = false;
+    async function handleDevPairLink(link: string | null) {
+      if (!link || handled) return;
+      const parsed = new URL(link);
+      if (parsed.hostname !== 'pair') return;
+      const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
+      const id = parsed.searchParams.get('id');
+      const code = parsed.searchParams.get('code');
+      if (!gateway?.startsWith('https://') || !id || !code) return;
+      handled = true;
+      setBusy(true);
+      try {
+        const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
+        const result = await new St3Client({ baseUrl: gateway }).completePairing(id, { api_version: API_VERSION, code, device_public_key: publicKey });
+        await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+        await AsyncStorage.setItem(URL_KEY, gateway);
+        setUrl(gateway); setUrlDraft(gateway); setCredential(result.value.credential); setError('');
+      } catch (e) { setError(errorText(e)); }
+      finally { setBusy(false); }
+    }
+    void Linking.getInitialURL().then(handleDevPairLink);
+    const subscription = Linking.addEventListener('url', event => { void handleDevPairLink(event.url); });
+    return () => subscription.remove();
+  }, []);
 
   const refresh = useCallback(async () => {
     if (!client || !credential) { setStatus('setup'); return; }
