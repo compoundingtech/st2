@@ -77,7 +77,14 @@ export default function App() {
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, TimelineEntry[]>()), draftCache = useRef(new Map<string, string>());
+  const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined }) : null, [url, credential]);
+
+  useEffect(() => {
+    if (active !== 'Chat' || !chatDetailOpen || !sessionId) return;
+    const frame = requestAnimationFrame(() => scrollView.current?.scrollTo({ y: chatScrollCache.current.get(sessionId) ?? 0, animated: false }));
+    return () => cancelAnimationFrame(frame);
+  }, [active, chatDetailOpen, sessionId]);
 
   useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
     if (u.status === 'fulfilled' && u.value) { setUrl(u.value); setUrlDraft(u.value); }
@@ -294,7 +301,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
@@ -326,7 +333,7 @@ export default function App() {
   const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
   const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
-  function selectSession(id: string) { setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
+  function selectSession(id: string) { if (sessionId && chatDetailOpen) chatScrollCache.current.set(sessionId, currentScrollY.current); while (chatScrollCache.current.size > 24) chatScrollCache.current.delete(chatScrollCache.current.keys().next().value!); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
   const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
   const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
   const selectedMission = visibleMissions.find(m => m.id === selectedMissionId);
@@ -334,7 +341,7 @@ export default function App() {
   return <SafeAreaView style={styles.page}>
     <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? offlinePresentation(hasSynced).title : 'Pair this device'}</Text></View>
     {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}{busy ? <ActivityIndicator color="#67d6c5" /> : null}
-    <ScrollView style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+    <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) chatScrollCache.current.set(sessionId, currentScrollY.current); }}>
       {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only Tailscale HTTPS gateway. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
         <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://your-tailnet-host" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} /><Button label="Save gateway" onPress={() => void saveUrl()} />
         {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : !hasSynced && status !== 'online' ? <>

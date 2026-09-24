@@ -102,6 +102,7 @@ struct App {
     dirty: bool,
     timeline_requested: Option<String>,
     timeline_cache: BTreeMap<String, (Vec<st3_client::TimelineEntry>, bool)>,
+    chat_scroll_cache: BTreeMap<String, u16>,
     last_timeline: Instant,
     last_terminal: Instant,
 }
@@ -123,9 +124,26 @@ impl App {
             dirty: true,
             timeline_requested: None,
             timeline_cache: BTreeMap::new(),
+            chat_scroll_cache: BTreeMap::new(),
             last_timeline: Instant::now(),
             last_terminal: Instant::now(),
         }
+    }
+    fn remember_chat_scroll(&mut self) {
+        if let Some(id) = self.selected_session_id() {
+            self.chat_scroll_cache.insert(id, self.scroll[1]);
+            while self.chat_scroll_cache.len() > 32 {
+                if let Some(oldest) = self.chat_scroll_cache.keys().next().cloned() {
+                    self.chat_scroll_cache.remove(&oldest);
+                }
+            }
+        }
+    }
+    fn restore_chat_scroll(&mut self) {
+        self.scroll[1] = self
+            .selected_session_id()
+            .and_then(|id| self.chat_scroll_cache.get(&id).copied())
+            .unwrap_or_default();
     }
     fn peer(&self) -> Option<&st3_client::Agent> {
         self.agent_tree()
@@ -994,15 +1012,39 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             app.selected[2] = app.selected[2].min(app.count_for(2).saturating_sub(1));
         }
         KeyCode::Up => {
+            if app.tab == 1 {
+                app.remember_chat_scroll();
+            }
             app.selected[app.tab] = app.selected[app.tab].saturating_sub(1);
-            app.scroll[app.tab] = 0;
+            if app.tab == 1 {
+                app.restore_chat_scroll();
+            } else {
+                app.scroll[app.tab] = 0;
+            }
         }
         KeyCode::Down => {
+            if app.tab == 1 {
+                app.remember_chat_scroll();
+            }
             app.selected[app.tab] = (app.selected[app.tab] + 1).min(app.count().saturating_sub(1));
-            app.scroll[app.tab] = 0;
+            if app.tab == 1 {
+                app.restore_chat_scroll();
+            } else {
+                app.scroll[app.tab] = 0;
+            }
         }
-        KeyCode::PageUp => app.scroll[app.tab] = app.scroll[app.tab].saturating_sub(10),
-        KeyCode::PageDown => app.scroll[app.tab] = app.scroll[app.tab].saturating_add(10),
+        KeyCode::PageUp => {
+            app.scroll[app.tab] = app.scroll[app.tab].saturating_sub(10);
+            if app.tab == 1 {
+                app.remember_chat_scroll();
+            }
+        }
+        KeyCode::PageDown => {
+            app.scroll[app.tab] = app.scroll[app.tab].saturating_add(10);
+            if app.tab == 1 {
+                app.remember_chat_scroll();
+            }
+        }
         KeyCode::Char('c') if app.tab == 1 => {
             if !app.live_ready {
                 app.model.status = "Reconnect before composing".into();
@@ -1199,6 +1241,7 @@ fn main() -> Result<()> {
                         model.timeline_truncated = app.model.timeline_truncated;
                     } else {
                         app.timeline_cache.clear();
+                        app.chat_scroll_cache.clear();
                         app.timeline_requested = None;
                     }
                     app.model = *model;
@@ -1409,5 +1452,31 @@ mod tests {
             app.selected_session_id().as_deref(),
             Some("session/cos-current")
         );
+    }
+
+    #[test]
+    fn chat_restores_each_sessions_scroll_position() {
+        let mut model = Model::default();
+        for (name, session) in [("alpha", "session/alpha"), ("beta", "session/beta")] {
+            let agent: st3_client::Resource = serde_json::from_value(serde_json::json!({
+                "kind":"agent", "id":format!("agent/{name}"), "revision":"one",
+                "updated_at":"2026-09-24T09:00:00Z", "name":name, "state":"running",
+                "reachability":"reachable", "current_session_id":session
+            }))
+            .unwrap();
+            model.agents.items.push(agent);
+        }
+        let mut app = App::new(model);
+        app.tab = 1;
+        app.scroll[1] = 18;
+        app.remember_chat_scroll();
+        app.selected[1] = 1;
+        app.restore_chat_scroll();
+        assert_eq!(app.scroll[1], 0);
+        app.scroll[1] = 4;
+        app.remember_chat_scroll();
+        app.selected[1] = 0;
+        app.restore_chat_scroll();
+        assert_eq!(app.scroll[1], 18);
     }
 }
