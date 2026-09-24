@@ -2774,6 +2774,8 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
                     approvals_reviewer: None,
                     sandbox: Some("danger-full-access".into()),
                 }),
+                preload: false,
+                preloaded: None,
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -2810,6 +2812,99 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         .unwrap();
     assert!(state.subscribed());
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let request = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(request["method"], "thread/resume");
+        assert_eq!(request["params"]["threadId"], "thread-prior");
+        assert_eq!(request["params"]["approvalPolicy"], "never");
+        assert_eq!(request["params"]["sandbox"], "danger-full-access");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } },
+                    "approvalPolicy": "never",
+                    "sandbox": { "type": "dangerFullAccess" }
+                }
+            }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (events_tx, events_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (preloaded_tx, preloaded_rx) = mpsc::channel();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_path,
+            &control_state_path,
+            &runtime,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
+                preload: true,
+                preloaded: Some(preloaded_tx),
+            }),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            events_tx,
+        )
+    });
+    ready_tx.send(()).unwrap();
+    preloaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::ResumePermissionPolicyApplied(_)
+    ));
+    assert!(matches!(
+        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::Bound
+    ));
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
 }
 
 #[test]
@@ -2912,6 +3007,8 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
                     approvals_reviewer: None,
                     sandbox: Some("danger-full-access".into()),
                 }),
+                preload: false,
+                preloaded: None,
             }),
             None,
             fallback_for_pump,
@@ -3046,6 +3143,8 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
                 permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             Some(config),
             Arc::new(AtomicBool::new(false)),
@@ -3125,6 +3224,8 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
                 ready: resume_ready_rx,
                 tui_loaded_timeout: Duration::from_millis(50),
                 permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -3223,6 +3324,8 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
                 permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -4928,6 +5031,18 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
 
     let prepared =
         prepare_controlled_launch_args("unix:///server.sock", &authored, Some("thread-prior"));
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "approval_policy=\"never\""] })
+    );
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "sandbox_mode=\"workspace-write\""] })
+    );
     let permissions = prepared
         .resume_permissions
         .expect("automatic resume projects the declared permission policy through control");
@@ -4984,6 +5099,12 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
     ];
     let prepared =
         prepare_controlled_launch_args("unix:///server.sock", &standing_seat, Some("thread-prior"));
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "sandbox_mode=\"danger-full-access\""] })
+    );
     assert_eq!(
         prepared.tui_args,
         [

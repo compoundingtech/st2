@@ -2508,6 +2508,13 @@ fn run_connected(
     } else {
         (None, None)
     };
+    let preload_resume = expected_resume.is_some() && resume_permissions.is_some();
+    let (preloaded_tx, preloaded_rx) = if preload_resume {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let harness_agent_dir = delivery.agent_dir.clone();
     let harness_identity = delivery.identity.clone();
     let fallback_for_reader = safe_fallback_active.clone();
@@ -2520,6 +2527,8 @@ fn run_connected(
                 ready,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
                 permission_overrides: resume_permissions,
+                preload: preload_resume,
+                preloaded: preloaded_tx,
             });
         pump_control(
             websocket,
@@ -2533,9 +2542,29 @@ fn run_connected(
         )
     });
 
-    // A fresh initialized observer reads before this child can issue thread/start. A resumed
-    // observer waits on the gate below, then proves through thread/loaded/list that the TUI issued
-    // its own resume. Only after that typed observation may control send its redundant resume.
+    // Permission-declared resumes must load through control first. Once a remote TUI loads a saved
+    // thread with the provider's default read-only profile, a later control resume cannot change
+    // that live thread's sandbox. Resumes without declared permissions keep the TUI-first path.
+    if let Some(preloaded) = preloaded_rx {
+        let preload_result = (|| -> Result<()> {
+            resume_ready_tx
+                .take()
+                .context("preloaded Codex resume has no start gate")?
+                .send(())
+                .context("starting preloaded Codex control resume")?;
+            preloaded
+                .recv_timeout(STARTUP_TIMEOUT)
+                .context("Codex control did not preload the declared resume policy")?;
+            Ok(())
+        })();
+        if let Err(error) = preload_result {
+            drop(resume_ready_tx);
+            let _ = shutdown.shutdown(Shutdown::Both);
+            let _ = event_thread.join();
+            return Err(error);
+        }
+    }
+    // A fresh initialized observer reads before this child can issue thread/start.
     // Insert the remote endpoint as a global Codex option and preserve every authored argument
     // after the provider executable.
     let mut tui = match spawn_controlled_tui(&codex_argv[0], &tui_args) {
@@ -2704,6 +2733,20 @@ struct ResumePermissionOverrides {
 }
 
 impl ResumePermissionOverrides {
+    fn app_server_config_overrides(&self) -> Vec<String> {
+        let mut overrides = Vec::new();
+        for (key, value) in [
+            ("approval_policy", self.approval_policy.as_deref()),
+            ("approvals_reviewer", self.approvals_reviewer.as_deref()),
+            ("sandbox_mode", self.sandbox.as_deref()),
+        ] {
+            if let Some(value) = value {
+                overrides.push(format!("{key}={}", toml::Value::String(value.into())));
+            }
+        }
+        overrides
+    }
+
     fn apply_to(&self, params: &mut serde_json::Map<String, Value>) {
         if let Some(policy) = &self.approval_policy {
             params.insert("approvalPolicy".into(), Value::String(policy.clone()));
@@ -2732,12 +2775,22 @@ fn prepare_controlled_launch_args(
     resume_thread: Option<&str>,
 ) -> PreparedControlledLaunch {
     let declared_options = declared_option_names(authored_args);
-    let exact = controlled_app_server_args(endpoint, authored_args).and_then(|server_args| {
+    let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
+        let resume_permissions =
+            automatic_resume_permission_overrides(authored_args, resume_thread)?;
+        if let Some(permissions) = &resume_permissions {
+            // The remote TUI's resume argv cannot contain CLI permission flags. Project the
+            // declaration into app-server defaults before either client loads the saved thread;
+            // a later thread/resume cannot reliably change an already-loaded thread.
+            for override_value in permissions.app_server_config_overrides() {
+                insert_app_server_config_override(&mut server_args, override_value)?;
+            }
+        }
         Ok((
             server_args,
             controlled_tui_args(endpoint, authored_args, resume_thread)?,
             expected_resume_thread(authored_args, resume_thread)?.map(str::to_owned),
-            automatic_resume_permission_overrides(authored_args, resume_thread)?,
+            resume_permissions,
         ))
     });
     match exact {
@@ -3708,6 +3761,8 @@ struct ControlResume<'a> {
     ready: Receiver<()>,
     tui_loaded_timeout: Duration,
     permission_overrides: Option<ResumePermissionOverrides>,
+    preload: bool,
+    preloaded: Option<Sender<()>>,
 }
 
 fn control_resume_request(
@@ -3769,16 +3824,24 @@ fn pump_control(
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
-        let (expected_resume, resume_ready, tui_loaded_timeout, mut resume_permissions) =
-            match resume {
-                Some(resume) => (
-                    Some(resume.thread_id),
-                    Some(resume.ready),
-                    resume.tui_loaded_timeout,
-                    resume.permission_overrides,
-                ),
-                None => (None, None, TUI_LOADED_TIMEOUT, None),
-            };
+        let (
+            expected_resume,
+            resume_ready,
+            tui_loaded_timeout,
+            mut resume_permissions,
+            preload,
+            mut preloaded,
+        ) = match resume {
+            Some(resume) => (
+                Some(resume.thread_id),
+                Some(resume.ready),
+                resume.tui_loaded_timeout,
+                resume.permission_overrides,
+                resume.preload,
+                resume.preloaded,
+            ),
+            None => (None, None, TUI_LOADED_TIMEOUT, None, false, None),
+        };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut last_transcript_turn_recovery = None;
@@ -3800,16 +3863,17 @@ fn pump_control(
                 .context("saved Codex binding has no TUI-start gate")?
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
-            wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
-                .context("waiting for Codex TUI thread load")?;
-            let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
-            eprintln!("codex control: emitting TuiThreadLoaded");
-            events
-                .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
-                .context("recording that the Codex TUI loaded the preserved thread")?;
-            diagnostic_rx
-                .recv()
-                .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
+            if !preload {
+                wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
+                    .context("waiting for Codex TUI thread load")?;
+                let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+                events
+                    .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
+                    .context("recording that the Codex TUI loaded the preserved thread")?;
+                diagnostic_rx
+                    .recv()
+                    .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
+            }
             if safe_fallback_active.load(Ordering::SeqCst) {
                 resume_permissions = None;
             }
@@ -3963,6 +4027,9 @@ fn pump_control(
                         delivery.observe_harness(&bound.observed);
                     }
                     control_state = Some(bound);
+                    if let Some(preloaded) = preloaded.take() {
+                        let _ = preloaded.send(());
+                    }
                     let _ = events.send(ControlEvent::Bound);
                     continue;
                 }
