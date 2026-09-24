@@ -824,14 +824,20 @@ async fn detach(app: &mut App, client: &Client) -> Result<()> {
 }
 async fn terminal_fence(client: &Client, terminal_id: &str, incarnation: &str) -> Result<Fence> {
     let screen = client.terminal_screen(terminal_id).await?;
+    terminal_screen_fence(&screen, incarnation)
+}
+fn terminal_screen_fence(
+    screen: &st3_client::Envelope<st3_client::TerminalScreen>,
+    incarnation: &str,
+) -> Result<Fence> {
     anyhow::ensure!(
         screen.value.runtime_incarnation == incarnation,
         "terminal incarnation changed; reattach before sending input"
     );
     Ok(Fence {
-        snapshot_id: screen.snapshot.id,
+        snapshot_id: screen.snapshot.id.clone(),
         runtime_incarnation: Some(incarnation.to_owned()),
-        terminal_sequence: Some(screen.snapshot.store_index),
+        terminal_sequence: Some(screen.value.next_sequence),
         ..Fence::default()
     })
 }
@@ -1395,6 +1401,20 @@ mod tests {
             key_input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)).as_deref(),
             Some("C-x")
         );
+    }
+
+    #[test]
+    fn terminal_fence_uses_owner_sequence_for_relayed_screen() {
+        let mut screen: st3_client::Envelope<st3_client::TerminalScreen> = serde_json::from_str(
+            include_str!("../../../docs/st3/client-v0/fixtures/terminal-screen.json"),
+        )
+        .unwrap();
+        screen.snapshot.store_index = 10;
+        screen.value.next_sequence = 42;
+        let incarnation = screen.value.runtime_incarnation.clone();
+        let fence = terminal_screen_fence(&screen, &incarnation).unwrap();
+        assert_eq!(fence.terminal_sequence, Some(42));
+        assert_eq!(fence.snapshot_id, screen.snapshot.id);
     }
 
     #[test]
