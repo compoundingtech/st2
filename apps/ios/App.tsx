@@ -72,6 +72,7 @@ export default function App() {
   const [provider, setProvider] = useState<'codex' | 'claude' | 'pi' | 'omp' | 'opencode'>('codex');
   const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [feedback, setFeedback] = useState('');
   const refreshing = useRef(false), snapshotRetry = useRef(0);
+  const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const cacheGeneration = useRef(0);
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined }) : null, [url, credential]);
@@ -82,7 +83,7 @@ export default function App() {
     if (c.status === 'fulfilled' && c.value) {
       if (u.status === 'fulfilled' && u.value && p.status === 'fulfilled') {
         const cache = hydrateProjectionForPairedDevice(p.value, u.value, true);
-        if (cache) { setData(cache.data); setTruncated(Object.fromEntries(cache.truncated.map(key => [key, true]))); setHasSynced(true); setStatus('connecting'); cachedActor.current = cache.actor; cachedIndex.current = cache.storeIndex; cacheSavedAt.current = cache.savedAt; setCachedHostId(cache.hostId); }
+        if (cache) { setData(cache.data); setTruncated(Object.fromEntries(cache.truncated.map(key => [key, true]))); setHasSynced(true); firstDataShown.current = true; setStatus('connecting'); cachedActor.current = cache.actor; cachedIndex.current = cache.storeIndex; cacheSavedAt.current = cache.savedAt; setCachedHostId(cache.hostId); }
       }
       setCredential(c.value);
     }
@@ -127,8 +128,28 @@ export default function App() {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
       if (cachedActor.current && cachedActor.current !== capability.value.session_actor) {
         cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0;
-        setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setStatus('connecting');
+        setData(emptyData); setTruncated({}); setHasSynced(false); firstDataShown.current = false; setCachedHostId(''); setSnapshot(null); setStatus('connecting');
         void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
+      }
+      if (!firstDataShown.current) {
+        const [attentionFirst, sessionsFirst] = await Promise.all([
+          client.attentionList({ limit }),
+          client.sessionsList({ limit }),
+        ]);
+        if (generation !== cacheGeneration.current) return;
+        const initial: Data = {
+          ...emptyData,
+          attention: items(attentionFirst.value, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'),
+          sessions: items(sessionsFirst.value, 'session') as SessionView[],
+        };
+        const incomplete: Array<keyof Data> = ['messages', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'];
+        if (attentionFirst.value.page.has_more) incomplete.push('attention');
+        if (sessionsFirst.value.page.has_more) incomplete.push('sessions');
+        setData(initial); setTruncated(Object.fromEntries(incomplete.map(key => [key, true])));
+        setCaps(capability.value); setSnapshot(attentionFirst.snapshot); setCachedHostId(attentionFirst.snapshot.host_id);
+        setHasSynced(true); firstDataShown.current = true; setStatus('online');
+        const encoded = encodeProjectionCache(url, capability.value.session_actor, attentionFirst.snapshot.host_id, attentionFirst.snapshot.store_index, initial, Date.now(), incomplete);
+        if (encoded) void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => {});
       }
       const [collections, sessions] = await Promise.all([Promise.all([
         listCollectionPages(options => client.attentionList(options), limit, 10),
@@ -220,7 +241,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
