@@ -2151,6 +2151,9 @@ async fn client_work(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "work", Vec::new(), &query).map(Json);
+    }
     let store = state.store.clone();
     let actor = query.actor.clone();
     let history = query.history;
@@ -2193,6 +2196,9 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "agents", Vec::new(), &query).map(Json);
+    }
     let mut items = client_agent_resources(
         &state.store,
         query.history,
@@ -2359,6 +2365,9 @@ async fn client_attention(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
+    if effective_query.cursor.is_some() {
+        return client_page(&state, &snapshot, "attention", Vec::new(), &effective_query).map(Json);
+    }
     let items = client_attention_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
@@ -2386,9 +2395,14 @@ async fn client_messages(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
+    let mut effective_query = query.clone();
+    effective_query.person.clone_from(&person);
+    if effective_query.cursor.is_some() {
+        return client_page(&state, &snapshot, "messages", Vec::new(), &effective_query).map(Json);
+    }
     let items = client_message_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "messages", items, &query).map(Json)
+    client_page(&state, &snapshot, "messages", items, &effective_query).map(Json)
 }
 
 async fn client_messages_detail(
@@ -7596,6 +7610,75 @@ mod tests {
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn cached_page_cursor_survives_graph_change_and_stays_person_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let query = ClientListQuery {
+            limit: Some(2),
+            person: Some("person/nathan".into()),
+            ..ClientListQuery::default()
+        };
+        let first = client_page(
+            &state,
+            &snapshot,
+            "messages",
+            vec![
+                json!({"id":"message/1"}),
+                json!({"id":"message/2"}),
+                json!({"id":"message/3"}),
+            ],
+            &query,
+        )
+        .unwrap();
+        let cursor = first
+            .page
+            .next_cursor
+            .expect("three rows require a second page");
+        state
+            .store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "custom/client/pairing-page-churn".into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("credential_hash".into(), Value::String("unused".into())),
+                    (
+                        "session_actor".into(),
+                        Value::String("client/unused".into()),
+                    ),
+                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("scopes".into(), json!(["read.projections"])),
+                    ("expires_at_unix_ms".into(), json!(u64::MAX)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_ne!(
+            new_client_snapshot(&state).store_index,
+            snapshot.store_index
+        );
+        let continuation = ClientListQuery {
+            cursor: Some(cursor),
+            ..query
+        };
+        let second = client_page(&state, &snapshot, "messages", Vec::new(), &continuation).unwrap();
+        assert_eq!(second.items[0]["id"], "message/3");
+        let other_person = ClientListQuery {
+            person: Some("person/other".into()),
+            ..continuation
+        };
+        assert_eq!(
+            client_page(&state, &snapshot, "messages", Vec::new(), &other_person)
+                .unwrap_err()
+                .code,
+            "page-cursor-expired"
+        );
     }
 
     #[test]

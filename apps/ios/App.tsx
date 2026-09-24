@@ -236,7 +236,7 @@ export default function App() {
           const result = await client!.eventsList({ after: projectionEventCursor.current, limit: 100, wait_ms: 30_000 });
           if (!live) return;
           projectionEventCursor.current = result.value.resume_cursor;
-          if (projectionEventsRequireRefresh(result.value.items)) await refresh();
+          if (projectionEventsRequireRefresh(result.value.items, active)) await refresh();
           else if (Date.now() - lastNativeRefreshAt.current >= 30_000) await refreshNativeSessions();
         } catch {
           if (!live) return;
@@ -247,7 +247,8 @@ export default function App() {
     }
     void followProjectionChanges();
     return () => { live = false; };
-  }, [client, refresh, refreshNativeSessions, status]);
+  }, [active, client, refresh, refreshNativeSessions, status]);
+  useEffect(() => { if (status === 'online') void refresh(); }, [active]);
   useEffect(() => { if (status !== 'offline') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15_000); return () => clearInterval(timer); }, [refresh, status]);
   useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
   useEffect(() => {

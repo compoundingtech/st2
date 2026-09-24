@@ -896,6 +896,9 @@ pub(super) async fn missions(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "missions", Vec::new(), &query).map(Json);
+    }
     let store = state.store.clone();
     let snapshot_index = snapshot.store_index;
     let history = query.history;
@@ -929,6 +932,9 @@ pub(super) async fn runtimes(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "runtimes", Vec::new(), &query).map(Json);
+    }
     let items = runtime_resources(&state, query.history, &snapshot, &session)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "runtimes", items, &query).map(Json)
@@ -941,6 +947,9 @@ pub(super) async fn terminals(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
+    if query.cursor.is_some() {
+        return client_page(&state, &snapshot, "terminals", Vec::new(), &query).map(Json);
+    }
     let mut items = runtime_resources(&state, query.history, &snapshot, &session)
         .map_err(ApiError::internal)?;
     items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
@@ -1108,11 +1117,16 @@ pub(super) async fn devices(
     let person = person_filter(&session, query.person.as_deref())?
         .filter(|person| person.starts_with("person/"))
         .ok_or_else(|| forbidden("device inventory requires an explicitly authenticated person"))?;
+    let mut effective_query = query.clone();
+    effective_query.person = Some(person.clone());
+    if effective_query.cursor.is_some() {
+        return client_page(&state, &snapshot, "devices", Vec::new(), &effective_query).map(Json);
+    }
     let mut items = device_resources(&state, &snapshot, &person)?;
     if !query.history {
         items.retain(|item| item["state"] == "active");
     }
-    client_page(&state, &snapshot, "devices", items, &query).map(Json)
+    client_page(&state, &snapshot, "devices", items, &effective_query).map(Json)
 }
 
 pub(super) async fn operation_detail(
@@ -1857,9 +1871,9 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     {
         resource_ids.push(record.subject.clone());
     } else if record.subject.starts_with("mission-run/")
-        && let Ok(Some(run)) = state.store.mission_run(&record.subject)
+        && let Ok(Some(mission)) = state.store.mission_for_run(&record.subject)
     {
-        resource_ids.push(run.mission);
+        resource_ids.push(mission);
     } else if record.subject.starts_with("planning-session/") {
         resource_ids.push(format!(
             "launch/{}",

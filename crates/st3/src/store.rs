@@ -1630,6 +1630,20 @@ impl Store {
         Ok(mission_run_view_tx(&connection, run).optional()?)
     }
 
+    /// Resolve the stable mission owner without hydrating the run's step history.
+    pub fn mission_for_run(&self, run: &str) -> Result<Option<String>> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT mission_id FROM mission_runs WHERE id=?1",
+                [run],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|id| format!("mission/{id}")))
+    }
+
     pub fn run_generations(&self, run: &str) -> Result<Vec<RunGenerationView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.readers.get();
@@ -17550,6 +17564,10 @@ mission "origin-owned" state="ready" {
         let presentation = store.mission_run(&run.id).unwrap().unwrap();
         let headers = store.mission_run_headers().unwrap();
         assert_eq!(headers.len(), 1);
+        assert_eq!(
+            store.mission_for_run(&run.subject).unwrap(),
+            Some(run.mission.clone())
+        );
         assert_eq!(headers[0].subject, presentation.subject);
         assert_eq!(headers[0].mission, presentation.mission);
         assert_eq!(headers[0].generation, presentation.generation);

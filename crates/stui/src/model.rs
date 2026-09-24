@@ -181,6 +181,11 @@ impl Model {
             if self.recent_events.len() > 256 {
                 self.recent_events.pop_front();
             }
+            if event.body.get("change").and_then(serde_json::Value::as_str) == Some("work.renewed")
+            {
+                self.event_cursor = event.next_cursor;
+                continue;
+            }
             let projection_changed = event.resource_ids.is_empty()
                 || event
                     .resource_ids
@@ -596,6 +601,23 @@ mod tests {
         let (changed, sessions) = model.consume_events(events);
         assert!(!changed);
         assert_eq!(sessions, vec!["session/current"]);
+    }
+
+    #[test]
+    fn lease_renewal_does_not_reload_fleet_projections() {
+        let events: EventPage = serde_json::from_value(serde_json::json!({
+            "kind":"event-page", "oldest_cursor":"event-cursor/node/0",
+            "resume_cursor":"event-cursor/node/1", "has_more":false,
+            "items":[{"id":"event/renewal", "epoch":"node", "sequence":1,
+                "previous_cursor":"event-cursor/node/0", "next_cursor":"event-cursor/node/1",
+                "timestamp":"2026-09-24T15:00:00Z", "type":"upsert",
+                "resource_ids":["step-run/one"], "snapshot_id":"snapshot/one",
+                "body":{"change":"work.renewed","state":"working"}}]
+        }))
+        .unwrap();
+        let mut model = Model::default();
+        assert!(!model.consume_events(events).0);
+        assert_eq!(model.event_cursor, "event-cursor/node/1");
     }
 
     #[test]
