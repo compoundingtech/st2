@@ -128,7 +128,7 @@ export default function App() {
   async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { setError(errorText(e)); } finally { setHistoryBusy(false); } }
   function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
   const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
-  const currentSessions = data.sessions.filter(s => s.state === 'running');
+  const currentSessions = data.sessions.filter(s => s.state === 'running').sort((a, b) => Number(isUnmanaged(b)) - Number(isUnmanaged(a)));
   const sourceHost = data.machines.find(m => m.id === snapshot?.host_id)?.name ?? snapshot?.host_id ?? 'connected gateway host';
   const undeclaredSessions = currentSessions.filter(isUnmanaged);
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
