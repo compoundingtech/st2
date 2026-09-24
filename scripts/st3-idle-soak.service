@@ -1,0 +1,13 @@
+[Unit]
+Description=Continuous two-host st3 idle stability samples
+After=st3.service network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/st3/message-soak.env
+ExecStart=/usr/bin/bash %h/.local/bin/st3-idle-soak
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
