@@ -6180,7 +6180,7 @@ impl Store {
         // Native harnesses repeatedly ask for their complete durable mailbox so
         // they can reconcile delivery receipts. Start at the indexed recipient
         // claims, not every lifecycle claim for every message in the fleet.
-        let fast_recipient = recipient.as_deref().filter(|_| include_closed);
+        let fast_recipient = recipient.as_deref();
         let bare_recipient = fast_recipient.map(|value| {
             value
                 .strip_prefix("agent/")
@@ -6207,6 +6207,10 @@ impl Store {
                  )
                  SELECT subject, created_index FROM created
                  WHERE created_index>?3 AND created_index<=?4
+                   AND (?6 OR NOT EXISTS (
+                     SELECT 1 FROM claims closed
+                     WHERE closed.subject=created.subject AND closed.kind='message.closed'
+                   ))
                  ORDER BY created_index, subject LIMIT ?5",
             )?;
             let mut subjects = statement
@@ -6216,7 +6220,8 @@ impl Store {
                         bare_recipient,
                         after.unwrap_or(0),
                         through,
-                        limit.saturating_add(1)
+                        limit.saturating_add(1),
+                        include_closed,
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
                 )?
@@ -6229,7 +6234,7 @@ impl Store {
             let mut output = Vec::new();
             for (subject, created_index) in subjects {
                 let message = message_view_tx(&connection, &subject, created_index)?;
-                if message.to == recipient {
+                if message.to == recipient && (include_closed || message.status != "closed") {
                     output.push(message);
                 }
             }
@@ -21564,6 +21569,31 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(second[0].subject, "message/second");
         assert!(next.is_none());
         assert_eq!(store.messages(Some("agent/other"), true).unwrap().len(), 1);
+
+        for (kind, status) in [
+            ("message.staged", "staged"),
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/first".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("mailbox-first-{status}")),
+                })
+                .unwrap();
+        }
+        let (open, next) = store
+            .messages_page(Some("agent/worker"), false, None, store.index().unwrap(), 1)
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].subject, "message/second");
+        assert!(next.is_none());
     }
 
     #[test]
@@ -21659,6 +21689,18 @@ version 2
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from, "requester");
         assert_eq!(messages[0].to, "agent/mix.sup");
+        let (page, next) = store
+            .messages_page(
+                Some("agent/mix.sup"),
+                false,
+                None,
+                store.index().unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].subject, messages[0].subject);
+        assert!(next.is_none());
     }
 
     #[test]
