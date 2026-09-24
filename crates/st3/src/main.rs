@@ -6088,11 +6088,18 @@ async fn run_st2_native_driver(
                             .await?;
                         }
                     }
+                    let provider_incarnation = if current_harness_record_started {
+                        st2::harness_state::read(&harness_state_path, None)
+                            .and_then(|observed| observed.evidence_incarnation)
+                    } else {
+                        None
+                    };
                     publish_harness_timeline(
                         client,
                         subject,
                         driver,
                         &incarnation,
+                        provider_incarnation.as_deref(),
                         &agent_dir,
                         &mut published_timeline,
                     )
@@ -6485,6 +6492,7 @@ async fn publish_harness_timeline(
     subject: &str,
     driver: &str,
     incarnation: &str,
+    provider_incarnation: Option<&str>,
     agent_dir: &Path,
     published: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -6495,7 +6503,7 @@ async fn publish_harness_timeline(
     };
     // A replaced harness can leave a valid predecessor record at this stable path. It is history,
     // not authority for the live runtime, and must never be relabelled as the successor.
-    if record.driver != driver || record.incarnation_id != incarnation {
+    if !timeline_record_is_current(&record, driver, provider_incarnation) {
         return Ok(());
     }
     for operation in record.operations {
@@ -6509,29 +6517,7 @@ async fn publish_harness_timeline(
         // Usage ownership is graph state, not a driver fact. Persist no placeholder/null owner
         // fields here; the client projection joins the exact desired owner run/generation/step at
         // its snapshot index and overwrites attribution on every explicit usage entry.
-        let body = operation.body;
-        let fields = BTreeMap::from([
-            (
-                "operation".into(),
-                Value::String(operation.operation.clone()),
-            ),
-            ("entry_id".into(), Value::String(operation.entry_id.clone())),
-            ("sequence".into(), Value::from(operation.sequence)),
-            ("revision".into(), Value::from(operation.revision)),
-            ("role".into(), Value::String(operation.role)),
-            ("entry_type".into(), Value::String(operation.entry_type)),
-            ("final".into(), Value::Bool(operation.final_entry)),
-            ("body".into(), body),
-            ("driver".into(), Value::String(operation.driver)),
-            (
-                "incarnation_id".into(),
-                Value::String(operation.incarnation_id),
-            ),
-            (
-                "observed_at_unix_ms".into(),
-                Value::from(operation.observed_at_unix_ms),
-            ),
-        ]);
+        let fields = timeline_claim_fields(operation, incarnation);
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
         let _: ClaimRecord = client
             .post(
@@ -6556,6 +6542,46 @@ async fn publish_harness_timeline(
         published.clear();
     }
     Ok(())
+}
+
+fn timeline_record_is_current(
+    record: &st2::harness_timeline::Record,
+    driver: &str,
+    provider_incarnation: Option<&str>,
+) -> bool {
+    record.driver == driver && provider_incarnation == Some(record.incarnation_id.as_str())
+}
+
+fn timeline_claim_fields(
+    operation: st2::harness_timeline::Operation,
+    runtime_incarnation: &str,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "operation".into(),
+            Value::String(operation.operation.clone()),
+        ),
+        ("entry_id".into(), Value::String(operation.entry_id.clone())),
+        ("sequence".into(), Value::from(operation.sequence)),
+        ("revision".into(), Value::from(operation.revision)),
+        ("role".into(), Value::String(operation.role)),
+        ("entry_type".into(), Value::String(operation.entry_type)),
+        ("final".into(), Value::Bool(operation.final_entry)),
+        ("body".into(), operation.body),
+        ("driver".into(), Value::String(operation.driver)),
+        (
+            "incarnation_id".into(),
+            Value::String(runtime_incarnation.into()),
+        ),
+        (
+            "evidence_incarnation".into(),
+            Value::String(operation.incarnation_id),
+        ),
+        (
+            "observed_at_unix_ms".into(),
+            Value::from(operation.observed_at_unix_ms),
+        ),
+    ])
 }
 
 async fn publish_harness_state(
@@ -6890,6 +6916,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         subject,
                         "codex",
                         &incarnation,
+                        Some(&incarnation),
                         &agent_dir,
                         &mut published_timeline,
                     )
@@ -8821,6 +8848,52 @@ mission "review" state="ready" {
             prepare_native_driver_in("agent/fleet/app-web/standing/app-web", root.path()).unwrap();
         let report = st2::validate::validate_for_host(&long_catalog, &st2::run::detect_host());
         assert!(report.issues.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn native_timeline_fences_provider_session_but_claims_runtime_session() {
+        let record = st2::harness_timeline::Record {
+            schema: "st2.harness-timeline.v1".into(),
+            driver: "claude".into(),
+            incarnation_id: "provider-current".into(),
+            next_sequence: 2,
+            operations: Vec::new(),
+        };
+        assert!(timeline_record_is_current(
+            &record,
+            "claude",
+            Some("provider-current")
+        ));
+        assert!(!timeline_record_is_current(
+            &record,
+            "claude",
+            Some("provider-old")
+        ));
+        assert!(!timeline_record_is_current(
+            &record,
+            "codex",
+            Some("provider-current")
+        ));
+        let fields = timeline_claim_fields(
+            st2::harness_timeline::Operation {
+                operation: "append".into(),
+                entry_id: "timeline-entry/test".into(),
+                sequence: 1,
+                revision: 1,
+                role: "assistant".into(),
+                entry_type: "content".into(),
+                final_entry: true,
+                body: json!({"text":"answer"}),
+                driver: "claude".into(),
+                incarnation_id: "provider-current".into(),
+                observed_at_unix_ms: 1,
+                source_id: None,
+            },
+            "runtime-current",
+        );
+        assert_eq!(fields["incarnation_id"], "runtime-current");
+        assert_eq!(fields["evidence_incarnation"], "provider-current");
+        assert_eq!(fields["body"]["text"], "answer");
     }
 
     #[test]
