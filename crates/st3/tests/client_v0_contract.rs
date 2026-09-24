@@ -507,6 +507,71 @@ async fn completed_read_surface_is_versioned_and_cursor_gaps_require_resync() {
 }
 
 #[tokio::test]
+async fn default_now_is_human_attention_and_explicit_run_filter_can_show_work() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"version 2
+mission "now-work" state="ready" {
+  goal "Keep mission work in Control by default."
+  step "implement" { assigned-to "agent/worker" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "now-work-mission")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "now-work".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/nathan".into()),
+            mode: Some("run".into()),
+            inputs: std::collections::BTreeMap::new(),
+            idempotency_key: "now-work-run".into(),
+        })
+        .unwrap();
+    state
+        .store
+        .set_step_state(&run.steps[0].subject, "ready", None)
+        .unwrap();
+    let app = st3::api::router(state);
+    let (_, default) = client_json_person(app.clone(), "/v1/client/now", "person/nathan").await;
+    assert!(
+        default["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["kind"] != "work")
+    );
+    let (_, filtered) = client_json_person(
+        app,
+        &format!("/v1/client/now?owner_run={}", run.subject),
+        "person/nathan",
+    )
+    .await;
+    assert!(
+        filtered["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == run.steps[0].subject)
+    );
+}
+
+#[tokio::test]
 async fn unchanged_store_index_names_one_stable_snapshot_and_payload() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

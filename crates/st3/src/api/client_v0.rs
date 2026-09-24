@@ -966,18 +966,22 @@ pub(super) async fn now(
     let mut items =
         super::client_attention_resources(&state.store, person.as_deref(), query.history)
             .map_err(ApiError::internal)?;
-    let mut work = super::client_work_resources(
-        &state.store,
-        query.actor.as_deref(),
-        query.history,
-        client_snapshot_time(&snapshot),
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?;
-    if let Some(owner_run) = query.owner_run.as_deref() {
-        work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
+    // The default Now view is the person's attention queue. Mission work belongs
+    // in Control; only an explicit work filter opts it into this combined view.
+    if query.actor.is_some() || query.owner_run.is_some() {
+        let mut work = super::client_work_resources(
+            &state.store,
+            query.actor.as_deref(),
+            query.history,
+            client_snapshot_time(&snapshot),
+            snapshot.store_index,
+        )
+        .map_err(ApiError::internal)?;
+        if let Some(owner_run) = query.owner_run.as_deref() {
+            work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
+        }
+        items.extend(work);
     }
-    items.extend(work);
     items.extend(
         operation_resources(&state, &snapshot.created_at)?
             .into_iter()
