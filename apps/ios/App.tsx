@@ -93,8 +93,14 @@ export default function App() {
     if (!__DEV__) return;
     let handled = false;
     async function handleDevPairLink(link: string | null) {
-      if (!link || handled) return;
+      if (!link) return;
       const parsed = new URL(link);
+      if (parsed.hostname === 'tab') {
+        const tab = parsed.pathname.replace(/^\//, '');
+        if (tabs.includes(tab as Tab)) setActive(tab as Tab);
+        return;
+      }
+      if (handled) return;
       if (parsed.hostname !== 'pair') return;
       const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
       const id = parsed.searchParams.get('id');
