@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isUnmanaged, isUnresolved, listSessionPages, sessionLabel } from './sessionView.ts';
+import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, sessionLabel } from './sessionView.ts';
 
 const managed = { id: 'session/managed', kind: 'session', owner_id: 'agent/one', state: 'running' };
 const exact = { id: 'session/exact', kind: 'session', owner_id: 'external-session/codex/one', state: 'running', managed: false, driver: 'codex', native_session_id: 'one' };
@@ -25,3 +25,19 @@ await listSessionPages(async () => {
   return { value: { items: [exact], page: { has_more: true, next_cursor: `page-${boundedCalls}` } } };
 }, 2);
 assert.equal(boundedCalls, 5);
+const expired = { response: { code: 'page-cursor-expired' } };
+assert.equal(isSnapshotChurn(expired), true);
+assert.equal(isSnapshotChurn(new Error('offline')), false);
+let firstPages = 0, secondPages = 0;
+const restarted = await listSessionPages(async options => {
+  if (!options.cursor) {
+    firstPages++;
+    return { value: { items: [managed], page: { has_more: true, next_cursor: 'next' } } };
+  }
+  secondPages++;
+  if (secondPages === 1) throw expired;
+  return { value: { items: [exact], page: { has_more: false, next_cursor: null } } };
+}, 2);
+assert.equal(firstPages, 2);
+assert.equal(secondPages, 2);
+assert.deepEqual(restarted.map(session => session.id), ['session/managed', 'session/exact']);

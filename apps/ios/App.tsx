@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Device, type Launch, type LaunchVariant, type Message, type Mission, type Page, type Resource, type Runtime, type Snapshot, type TerminalScreen, type TimelineEntry, type Work } from '../../clients/typescript/st3-client';
-import { isUnmanaged, isUnresolved, listSessionPages, sessionDetail, sessionLabel, type SessionView } from './sessionView';
+import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, sessionDetail, sessionLabel, type SessionView } from './sessionView';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -40,6 +40,7 @@ export default function App() {
   const [data, setData] = useState<Data>(empty);
   const [caps, setCaps] = useState<Capabilities | null>(null), [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [status, setStatus] = useState<'setup' | 'connecting' | 'online' | 'offline'>('setup');
+  const [hasSynced, setHasSynced] = useState(false);
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [sessionId, setSessionId] = useState(''), [timeline, setTimeline] = useState<TimelineEntry[]>([]), [composer, setComposer] = useState('');
   const [showHistory, setShowHistory] = useState(false), [historicalSessions, setHistoricalSessions] = useState<SessionView[]>([]), [historyBusy, setHistoryBusy] = useState(false);
@@ -95,22 +96,51 @@ export default function App() {
       const [pages, sessions] = await Promise.all([Promise.all([client.attentionList({ limit }), client.messagesList({ limit }), client.missionsList({ limit }), client.launchesList({ limit }), client.machinesList({ limit }), client.devicesList({ limit }), client.runtimesList({ limit }), client.workList({ limit })]), listSessionPages(options => client.sessionsList(options), limit)]);
       setCaps(capability.value); setSnapshot(pages[0].snapshot);
       setData({ attention: items(pages[0].value, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'), messages: items(pages[1].value, 'message'), missions: items(pages[2].value, 'mission'), launches: items(pages[3].value, 'launch'), machines: pages[4].value.items.filter(i => (i as unknown as { kind: string }).kind === 'machine') as unknown as MachineView[], devices: items(pages[5].value, 'device'), sessions, runtimes: items(pages[6].value, 'runtime'), work: items(pages[7].value, 'work') });
-      snapshotRetry.current = 0; setStatus('online'); setError('');
+      snapshotRetry.current = 0; setHasSynced(true); setStatus('online'); setError('');
     } catch (e) {
-      if (e instanceof ClientError && e.response.code === 'page-cursor-expired') {
+      if (isSnapshotChurn(e)) {
         const delay = Math.min(2000, 200 * 2 ** Math.min(snapshotRetry.current++, 4));
         setStatus(s => s === 'online' ? s : 'connecting');
-        setError('Data changed during refresh; retrying.');
         if (AppState.currentState === 'active') setTimeout(() => { void refresh(); }, delay);
-      } else { setStatus('offline'); setError(errorText(e)); }
+      } else {
+        setStatus('offline');
+        setError(e instanceof ClientError && e.status >= 400 && e.status < 500 ? errorText(e) : '');
+      }
     } finally { refreshing.current = false; }
   }, [client, credential]);
   useEffect(() => { void refresh(); }, [refresh]);
-  useEffect(() => { if (status !== 'online') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15000); return () => clearInterval(timer); }, [refresh, status]);
+  useEffect(() => { if (status === 'setup') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15000); return () => clearInterval(timer); }, [refresh, status]);
   useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
   const timelineSession = data.sessions.find(s => s.id === sessionId) ?? historicalSessions.find(s => s.id === sessionId);
   const timelineUnresolved = timelineSession ? isUnresolved(timelineSession) : false;
-  useEffect(() => { if (!client || !sessionId || status !== 'online' || timelineUnresolved) { setTimeline([]); return; } let live = true; (async () => { try { let cursor: string | undefined; let entries: TimelineEntry[] = []; for (let page = 0; page < 5; page++) { const result = await client.timelineList(sessionId, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30), cursor }); entries = entries.concat(result.value.items); if (!result.value.page.has_more || !result.value.page.next_cursor) break; cursor = result.value.page.next_cursor; } if (live) setTimeline(entries.slice(-100)); } catch (e) { if (live) setError(errorText(e)); } })(); return () => { live = false; }; }, [client, sessionId, status, caps, timelineUnresolved]);
+  useEffect(() => {
+    if (!client || !sessionId || timelineUnresolved) { setTimeline([]); return; }
+    if (status !== 'online') return;
+    let live = true;
+    void (async () => {
+      for (let attempt = 0; attempt < 4 && live; attempt++) {
+        try {
+          let cursor: string | undefined;
+          let entries: TimelineEntry[] = [];
+          for (let page = 0; page < 5; page++) {
+            const result = await client.timelineList(sessionId, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30), cursor });
+            entries = entries.concat(result.value.items);
+            if (!result.value.page.has_more || !result.value.page.next_cursor) break;
+            cursor = result.value.page.next_cursor;
+          }
+          if (live) setTimeline(entries.slice(-100));
+          return;
+        } catch (error) {
+          if (!isSnapshotChurn(error)) {
+            if (live && error instanceof ClientError && error.status >= 400 && error.status < 500) setError(errorText(error));
+            return;
+          }
+          if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
+        }
+      }
+    })();
+    return () => { live = false; };
+  }, [client, sessionId, status, caps, timelineUnresolved]);
 
   async function review(id: string) { if (!client || status !== 'online') return; try { const result = await client.launchVariantsList(id, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30) }); setReviewLaunch(id); setVariants(items(result.value, 'launch-variant')); setError(''); } catch (e) { setError(errorText(e)); } }
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
@@ -140,8 +170,8 @@ export default function App() {
   async function createLaunch() { if (!client || !title.trim() || !request.trim() || !workspace.trim()) return; await runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: title.trim(), request: request.trim(), target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: workspace.trim() }, provider, ...(model.trim() ? { model: model.trim() } : {}), ...(effort.trim() ? { effort: effort.trim() } : {}) } }); setTitle(''); setRequest(''); }); }
   async function reviseLaunch(launch: Launch) { if (!client || !feedback.trim()) return; await runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback: feedback.trim() } }); setFeedback(''); }); }
   async function resolve(item: Attention) { if (!client) return; await runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); }); }
-  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); setCredential(null); setCaps(null); setData(empty); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setStatus('setup'); }
-  async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { setError(errorText(e)); } finally { setHistoryBusy(false); } }
+  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); setCredential(null); setCaps(null); setData(empty); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setHasSynced(false); setStatus('setup'); }
+  async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { if (!isSnapshotChurn(e)) setError(errorText(e)); } finally { setHistoryBusy(false); } }
   function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
   const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
   const currentSessions = data.sessions.filter(s => s.state === 'running').sort((a, b) => Number(isUnmanaged(b)) - Number(isUnmanaged(a)));
@@ -150,15 +180,19 @@ export default function App() {
   const undeclaredSessions = currentSessions.filter(isUnmanaged);
   const managedSessions = currentSessions.filter(s => !isUnmanaged(s));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
-  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setScreen(null); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
+  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setTimeline([]); setScreen(null); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
 
   return <SafeAreaView style={styles.page}>
-    <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? 'Connecting…' : status === 'offline' ? 'Offline · reconnecting' : 'Pair this device'}</Text></View>
+    <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? hasSynced ? 'Offline · showing last data' : 'Offline · reconnecting' : 'Pair this device'}</Text></View>
     {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}{busy ? <ActivityIndicator color="#67d6c5" /> : null}
     <ScrollView style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
       {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only Tailscale HTTPS gateway. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
         <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://your-tailnet-host" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} /><Button label="Save gateway" onPress={() => void saveUrl()} />
-        {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : <>
+        {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : !hasSynced && status !== 'online' ? <>
+        <Text style={styles.title}>{status === 'offline' ? 'Offline' : 'Connecting…'}</Text>
+        <Text style={styles.muted}>{status === 'offline' ? 'No data is cached yet. Reconnect to load your workspace.' : 'Loading your workspace for the first time.'}</Text>
+        {status === 'offline' ? <Button label="Reconnect" onPress={() => void refresh()} /> : null}
+      </> : <>
         {status === 'offline' ? <Button label="Reconnect" onPress={() => void refresh()} /> : null}
         {active === 'Now' ? <><Text style={styles.title}>Needs your attention</Text><Text style={styles.muted}>{data.attention.length ? `${data.attention.length} actionable items` : 'Nothing needs your attention.'}</Text>{data.attention.map(a => <Card key={a.id} title={a.title} detail={`${a.priority} · ${a.detail}`}><Text style={styles.small}>{a.attention_kind} · {a.source_id}</Text>{a.actions.includes('attention.resolve') ? <Button label="Resolve" disabled={busy} onPress={() => Alert.alert('Resolve attention?', a.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void resolve(a) }])} /> : null}</Card>)}<Button label="Refresh" onPress={() => void refresh()} /></> : null}
         {active === 'Chat' ? <><Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text><Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}<Text style={styles.section}>Declared agents</Text>{managedSessions.map(sessionChoice)}{!managedSessions.length ? <Text style={styles.muted}>No running declared agents.</Text> : null}<Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}{selectedSession ? <><Text style={styles.section}>Session history</Text>{isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session ID or session history.</Text> : null}{timeline.map(e => <Card key={e.id} title={`${e.role} · ${e.type}`} detail={JSON.stringify(e.body).slice(0, 800)} />)}{sessionMessages.map(m => <Card key={m.id} title={m.from} detail={m.content} />)}{!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><Text style={styles.section}>Terminals</Text>{data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label={`${r.runtime_id} · ${r.state}`} onPress={() => void showTerminal(r.terminal_id!)} />)}{screen && terminalId ? <Card title={`Terminal ${terminalId}`} detail={screen.lines.map(line => line.text).join('\n')} /> : null}<TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={setComposer} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}</> : null}</> : null}

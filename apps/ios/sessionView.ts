@@ -18,6 +18,12 @@ export function isUnresolved(session: SessionView): boolean {
   return isUnmanaged(session) && session.native_session_id == null;
 }
 
+export function isSnapshotChurn(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'response' in error
+    && typeof error.response === 'object' && error.response !== null
+    && 'code' in error.response && error.response.code === 'page-cursor-expired';
+}
+
 export function sessionLabel(session: SessionView, sourceHost: string): string {
   if (!isUnmanaged(session)) return `Declared · ${session.owner_id}`;
   const driver = session.driver ?? 'Native harness';
@@ -35,17 +41,25 @@ export async function listSessionPages(
   limit: number,
   history = false,
 ): Promise<SessionView[]> {
-  const sessions: SessionView[] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (let pageNumber = 0; pageNumber < 5; pageNumber++) {
-    const page = (await list({ limit, cursor, history })).value;
-    sessions.push(...page.items.filter((item): item is Session => item.kind === 'session'));
-    if (!page.page.has_more) break;
-    const next = page.page.next_cursor;
-    if (!next || seen.has(next)) throw new Error('Session pagination did not advance.');
-    seen.add(next);
-    cursor = next;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const sessions: SessionView[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    try {
+      for (let pageNumber = 0; pageNumber < 5; pageNumber++) {
+        const page = (await list({ limit, cursor, history })).value;
+        sessions.push(...page.items.filter((item): item is Session => item.kind === 'session'));
+        if (!page.page.has_more) break;
+        const next = page.page.next_cursor;
+        if (!next || seen.has(next)) throw new Error('Session pagination did not advance.');
+        seen.add(next);
+        cursor = next;
+      }
+      return sessions;
+    } catch (error) {
+      if (!isSnapshotChurn(error) || attempt === 2) throw error;
+      await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+    }
   }
-  return sessions;
+  throw new Error('Session pagination retries exhausted.');
 }
