@@ -1905,6 +1905,126 @@ fn a_consumed_unarchived_head_releases_the_next_fifo_message_exactly_once() {
 }
 
 #[test]
+fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("first ping"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let steer = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(steer["method"], "turn/steer");
+    let client_id = steer["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    delivery
+        .accept_response(
+            &json!({"id": steer["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("second ping"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+
+    delivery.next_delivery_receipt_refresh = Instant::now();
+    let read = delivery
+        .maybe_snapshot_request(&state)
+        .unwrap()
+        .expect("accepted head needs a typed-history receipt check");
+    assert_eq!(read["method"], "thread/read");
+    delivery
+        .accept_snapshot_response(
+            &json!({
+                "id": read["id"],
+                "result": {"thread": {
+                    "id": "thread-main",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": [{"id": "turn-live", "status": "inProgress", "items": [
+                        {"type": "userMessage", "clientId": client_id, "content": []}
+                    ]}]
+                }}
+            }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-live".into()
+        }
+    );
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("next PING must reach the still-running turn");
+    assert_eq!(next["method"], "turn/steer");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+}
+
+#[test]
+fn a_transcript_user_message_receipt_is_exact_and_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let filename =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "ping").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let steer = delivery.maybe_request(&state).unwrap().unwrap();
+    let client_id = steer["params"]["clientUserMessageId"].as_str().unwrap();
+    delivery
+        .accept_response(
+            &json!({"id": steer["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+    let receipt = json!({"type": "event_msg", "payload": {"type": "item_completed", "thread_id": "thread-main", "turn_id": "turn-live", "item": {"type": "UserMessage", "client_id": client_id}}});
+    delivery
+        .accept_transcript_receipts(&[receipt.clone()], "other-thread")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&filename).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    delivery
+        .accept_transcript_receipts(&[receipt.clone(), receipt], "thread-main")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&filename).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+}
+
+#[test]
 fn a_successful_exact_turn_completion_settles_when_codex_omits_the_item_receipt() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
