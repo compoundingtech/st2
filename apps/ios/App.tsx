@@ -369,7 +369,7 @@ export default function App() {
             {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={text => { draftCache.current.set(sessionId, text); setComposer(text); }} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
           </>}
         </> : <>
-          <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text>
+          <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Declared agents across the fleet; undeclared sessions discovered on this gateway.</Text>
           <Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}
           <Text style={styles.section}>Declared agents</Text>{truncated.agents ? <Text style={styles.warning}>More agents exist beyond this view.</Text> : null}
           {declaredAgentRows.map(({ agent, depth }) => {
