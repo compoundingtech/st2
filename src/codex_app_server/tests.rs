@@ -3451,6 +3451,75 @@ fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
 }
 
 #[test]
+fn a_long_active_turn_recovers_from_recent_typed_transcript_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    let mut content = String::from(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-live\"}}\n",
+    );
+    content.push_str(&" ".repeat(TRANSCRIPT_TURN_RECOVERY_BYTES as usize));
+    content.push('\n');
+    content.push_str(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"turn-live\"}}\n",
+    );
+    fs::write(&transcript, content).unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        Some("turn-live".into()),
+        "the task-start frame is outside the bounded tail"
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-live\"}}\n",
+        )
+        .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_successful_snapshot_without_turn_allows_transcript_recovery_and_steer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    let read = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    delivery
+        .accept_snapshot_response(
+            &json!({
+                "id": read["id"],
+                "result": {"thread": {
+                    "id": "thread-main",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }}
+            }),
+            &mut state,
+        )
+        .unwrap();
+    assert!(delivery.transcript_recovery_due());
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    state.observe_turn_evidence("turn-live");
+    delivery.accept_transcript_recovery(state.observed.clone());
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/steer");
+    assert_eq!(request["params"]["expectedTurnId"], "turn-live");
+}
+
+#[test]
 fn watcher_holds_review_compaction_and_conflicting_turns_until_safe() {
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());

@@ -1236,10 +1236,22 @@ impl CodexInboxDelivery {
 
     fn transcript_recovery_due(&self) -> bool {
         self.head.is_some()
-            && self.verified_snapshot.is_none()
-            && self.pending_snapshot.as_ref().is_some_and(|pending| {
-                pending.requested_at.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
-            })
+            && (self
+                .verified_snapshot
+                .as_ref()
+                .is_some_and(|(_, observed)| {
+                    matches!(
+                        observed,
+                        CodexObservedState::Held {
+                            reason: CodexHoldReason::ActiveWithoutTurn,
+                            ..
+                        }
+                    )
+                })
+                || (self.verified_snapshot.is_none()
+                    && self.pending_snapshot.as_ref().is_some_and(|pending| {
+                        pending.requested_at.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
+                    })))
     }
 
     fn accept_transcript_recovery(&mut self, observed: CodexObservedState) {
@@ -3260,40 +3272,13 @@ fn pump_control(
                     if let Some(delivery) = delivery.as_mut() {
                         delivery.refresh_transcript_context_if_due(state.thread_id());
                     }
-                    let recovery_due = last_transcript_turn_recovery.is_none_or(|last: Instant| {
-                        last.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
-                    });
-                    let transcript_needed = delivery
-                        .as_ref()
-                        .is_some_and(CodexInboxDelivery::transcript_recovery_due);
-                    if recovery_due
-                        && transcript_needed
-                        && matches!(
-                            state.observed,
-                            CodexObservedState::AwaitingStatus
-                                | CodexObservedState::Held {
-                                    reason: CodexHoldReason::ActiveWithoutTurn,
-                                    ..
-                                }
-                        )
-                    {
-                        last_transcript_turn_recovery = Some(Instant::now());
-                        if let Some(turn_id) = recover_active_codex_turn(state.thread_id())? {
-                            let before = state.observed.clone();
-                            state.observe_turn_evidence(&turn_id);
-                            if state.observed != before {
-                                atomic_json(control_state_path, state)
-                                    .context("persisting transcript-recovered Codex turn")?;
-                                if let Some(delivery) = delivery.as_mut() {
-                                    delivery.observe_harness(&state.observed);
-                                }
-                                let _ = events.send(ControlEvent::Observed);
-                            }
-                            if let Some(delivery) = delivery.as_mut() {
-                                delivery.accept_transcript_recovery(state.observed.clone());
-                            }
-                        }
-                    }
+                    recover_transcript_turn_if_due(
+                        state,
+                        &mut delivery,
+                        &mut last_transcript_turn_recovery,
+                        control_state_path,
+                        &events,
+                    )?;
                     if let Some(delivery) = delivery.as_mut() {
                         if let Some(request) = delivery.maybe_snapshot_request(state)? {
                             write_json_message(&mut websocket, &request)
@@ -3489,6 +3474,13 @@ fn pump_control(
                 .context("sending Codex subscription request")?;
                 subscription_pending = true;
             }
+            recover_transcript_turn_if_due(
+                state,
+                &mut delivery,
+                &mut last_transcript_turn_recovery,
+                control_state_path,
+                &events,
+            )?;
             if let Some(delivery) = delivery.as_mut() {
                 if let Some(request) = delivery.maybe_snapshot_request(state)? {
                     write_json_message(&mut websocket, &request)
@@ -3510,6 +3502,48 @@ fn recover_active_codex_turn(thread_id: &str) -> Result<Option<String>> {
         .map(|path| active_turn_from_codex_transcript(&path))
         .transpose()
         .map(Option::flatten)
+}
+
+fn recover_transcript_turn_if_due(
+    state: &mut CodexControlState,
+    delivery: &mut Option<CodexInboxDelivery>,
+    last_recovery: &mut Option<Instant>,
+    control_state_path: &Path,
+    events: &Sender<ControlEvent>,
+) -> Result<()> {
+    if last_recovery.is_some_and(|last| last.elapsed() < TRANSCRIPT_TURN_RECOVERY_INTERVAL)
+        || !delivery
+            .as_ref()
+            .is_some_and(CodexInboxDelivery::transcript_recovery_due)
+        || !matches!(
+            state.observed,
+            CodexObservedState::AwaitingStatus
+                | CodexObservedState::Held {
+                    reason: CodexHoldReason::ActiveWithoutTurn,
+                    ..
+                }
+        )
+    {
+        return Ok(());
+    }
+    *last_recovery = Some(Instant::now());
+    let Some(turn_id) = recover_active_codex_turn(state.thread_id())? else {
+        return Ok(());
+    };
+    let before = state.observed.clone();
+    state.observe_turn_evidence(&turn_id);
+    if state.observed != before {
+        atomic_json(control_state_path, state)
+            .context("persisting transcript-recovered Codex turn")?;
+        if let Some(delivery) = delivery.as_mut() {
+            delivery.observe_harness(&state.observed);
+        }
+        let _ = events.send(ControlEvent::Observed);
+    }
+    if let Some(delivery) = delivery.as_mut() {
+        delivery.accept_transcript_recovery(state.observed.clone());
+    }
+    Ok(())
 }
 
 fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
@@ -3607,6 +3641,18 @@ fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
                 if active.as_deref() == Some(turn_id) =>
             {
                 active = None;
+            }
+            // A long-running turn can put task_started more than the bounded
+            // transcript tail behind us. Its recent typed tool/response frames
+            // still carry the same turn ID, which turn/steer fences at Codex.
+            (Some("item_completed"), Some(turn_id)) if active.is_none() => {
+                active = Some(turn_id.to_string());
+            }
+            (_, Some(turn_id))
+                if active.is_none()
+                    && value.get("type").and_then(Value::as_str) == Some("response_item") =>
+            {
+                active = Some(turn_id.to_string());
             }
             _ => {}
         }
