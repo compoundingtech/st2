@@ -14597,9 +14597,16 @@ fn reconcile_carried_steps_tx(
                 "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
                     blocked_reason=CASE WHEN status=?2 THEN blocked_reason ELSE NULL END,
                     not_before_unix_ms=CASE WHEN status=?2 THEN not_before_unix_ms ELSE NULL END,
-                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL
+                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                    updated_at_unix_ms=?5
                  WHERE subject=?1 AND status<>?2",
-                params![claim.subject, status, attempt, worker_reported],
+                params![
+                    claim.subject,
+                    status,
+                    attempt,
+                    worker_reported,
+                    claim.accepted_at_unix_ms.to_string()
+                ],
             )
             .map_err(internal)?;
     }
