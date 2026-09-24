@@ -89,6 +89,7 @@ struct App {
     return_focused: bool,
     dirty: bool,
     last_sync: Instant,
+    last_external_scan: Instant,
     last_terminal: Instant,
 }
 impl App {
@@ -106,11 +107,24 @@ impl App {
             return_focused: false,
             dirty: true,
             last_sync: Instant::now(),
+            last_external_scan: Instant::now(),
             last_terminal: Instant::now(),
         }
     }
     fn peer(&self) -> Option<&st3_client::Agent> {
         self.model.agents().nth(self.selected[1])
+    }
+    fn undeclared_session(&self) -> Option<&st3_client::Session> {
+        let index = self.selected[1].checked_sub(self.model.agents().count())?;
+        self.model.undeclared_sessions().nth(index)
+    }
+    fn selected_session_id(&self) -> Option<String> {
+        self.peer()
+            .and_then(|peer| peer.current_session_id.clone())
+            .or_else(|| {
+                self.undeclared_session()
+                    .map(|session| session.header.id.clone())
+            })
     }
     fn runtime(&self) -> Option<&st3_client::Runtime> {
         self.model.runtimes().nth(self.selected[2])
@@ -118,7 +132,7 @@ impl App {
     fn count(&self) -> usize {
         match self.tab {
             0 => self.model.attention().count(),
-            1 => self.model.agents().count(),
+            1 => self.model.agents().count() + self.model.undeclared_sessions().count(),
             2 => self.model.runtimes().count(),
             _ => self.model.machines().count(),
         }
@@ -218,6 +232,14 @@ impl App {
                     .model
                     .agents()
                     .map(|v| format!("{} {}", v.name, v.state))
+                    .chain(self.model.undeclared_sessions().map(|v| {
+                        let driver = v
+                            .extra
+                            .get("driver")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("harness");
+                        format!("[undeclared] {driver} {}", v.header.id)
+                    }))
                     .collect(),
                 2 => self
                     .model
@@ -292,8 +314,42 @@ impl App {
                     if self.model.timeline_truncated || self.model.messages.truncated {
                         lines.push("[More history beyond bounded view]".into());
                     }
+                } else if let Some(session) = self.undeclared_session() {
+                    let driver = session
+                        .extra
+                        .get("driver")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("harness");
+                    let exact = session
+                        .extra
+                        .get("native_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                    lines.push(format!("Undeclared {driver} · {}", session.state));
+                    lines.push(format!("Session: {}", session.header.id));
+                    lines.push(
+                        if exact {
+                            "Exact native session · read-only"
+                        } else {
+                            "Unresolved running process · read-only"
+                        }
+                        .into(),
+                    );
+                    if let Some(workspace) = session
+                        .extra
+                        .get("workspace")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        lines.push(format!("Workspace: {workspace}"));
+                    }
+                    lines.push("── Normalized history ──".into());
+                    lines.extend(self.model.timeline.iter().map(timeline_line));
+                    if self.model.timeline_truncated || self.model.sessions.truncated {
+                        lines.push("[More sessions or history beyond bounded view]".into());
+                    }
+                    lines.push("This session is not managed by st3; message and terminal controls are unavailable.".into());
                 } else {
-                    lines.push("No agents available.".into());
+                    lines.push("No agents or undeclared sessions available.".into());
                 }
             }
             2 => {
@@ -339,6 +395,36 @@ impl App {
                 for v in self.model.devices() {
                     lines.push(format!("{} · {} · {}", v.header.id, v.person_id, v.state));
                 }
+                let gateway = self
+                    .model
+                    .sessions
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.host_id.as_str())
+                    .unwrap_or("connected machine");
+                lines.push(format!("── Undeclared sessions on {gateway} ──"));
+                for session in self.model.undeclared_sessions() {
+                    let driver = session
+                        .extra
+                        .get("driver")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("harness");
+                    let exact = session
+                        .extra
+                        .get("native_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                    lines.push(format!(
+                        "{driver} · {} · {}",
+                        if exact {
+                            "native session"
+                        } else {
+                            "unresolved process"
+                        },
+                        session.header.id
+                    ));
+                }
+                lines.push("Discovery is local to this connected machine.".into());
                 if self.model.machines.truncated || self.model.devices.truncated {
                     lines.push("[More fleet items beyond bounded view]".into());
                 }
@@ -630,8 +716,12 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         KeyCode::PageUp => app.scroll[app.tab] = app.scroll[app.tab].saturating_sub(10),
         KeyCode::PageDown => app.scroll[app.tab] = app.scroll[app.tab].saturating_add(10),
         KeyCode::Char('c') if app.tab == 1 => {
-            app.mode = Mode::Chat;
-            app.input.clear();
+            if app.peer().is_some() {
+                app.mode = Mode::Chat;
+                app.input.clear();
+            } else {
+                app.model.status = "Undeclared sessions are read-only".into();
+            }
         }
         KeyCode::Char('c') if app.tab == 2 => {
             app.mode = Mode::Title;
@@ -639,14 +729,14 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         }
         KeyCode::Enter if app.tab == 2 => attach(app, client).await?,
         KeyCode::Enter if app.tab == 1 => {
-            if let Some(id) = app.peer().and_then(|p| p.current_session_id.clone()) {
+            if let Some(id) = app.selected_session_id() {
                 app.model.load_timeline(client, &id).await?;
             }
         }
         _ => {}
     }
     if app.tab == 1 {
-        if let Some(id) = app.peer().and_then(|p| p.current_session_id.clone()) {
+        if let Some(id) = app.selected_session_id() {
             app.model.load_timeline(client, &id).await?;
         } else {
             app.model.timeline.clear();
@@ -714,7 +804,7 @@ fn main() -> Result<()> {
             match runtime.block_on(app.model.sync(&client)) {
                 Ok(changed) => {
                     if changed && app.tab == 1 {
-                        if let Some(id) = app.peer().and_then(|p| p.current_session_id.clone()) {
+                        if let Some(id) = app.selected_session_id() {
                             let _ = runtime.block_on(app.model.load_timeline(&client, &id));
                         }
                     }
@@ -729,6 +819,24 @@ fn main() -> Result<()> {
                 }
             }
             app.last_sync = Instant::now();
+        }
+        if app.last_external_scan.elapsed() >= Duration::from_secs(15) {
+            match runtime.block_on(app.model.refresh_sessions(&client)) {
+                Ok(changed) => {
+                    let count =
+                        app.model.agents().count() + app.model.undeclared_sessions().count();
+                    app.selected[1] = app.selected[1].min(count.saturating_sub(1));
+                    app.dirty |= changed;
+                }
+                Err(error) => {
+                    let status = format!("Session discovery: {error}");
+                    if app.model.status != status {
+                        app.model.status = status;
+                        app.dirty = true;
+                    }
+                }
+            }
+            app.last_external_scan = Instant::now();
         }
         if app.attached.is_some() && app.last_terminal.elapsed() >= Duration::from_millis(400) {
             let attached = app.attached.as_mut().unwrap();
@@ -776,5 +884,29 @@ mod tests {
             key_input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)).as_deref(),
             Some("C-x")
         );
+    }
+
+    #[test]
+    fn chat_and_fleet_label_undeclared_sessions() {
+        let session: st3_client::Resource = serde_json::from_str(
+            r#"{"kind":"session","id":"session/external","revision":"one","updated_at":"2026-09-24T09:00:00Z","owner_id":"external-session/codex/one","state":"running","started_at":"2026-09-24T08:00:00Z","ended_at":null,"timeline_cursor":"cursor/one","managed":false,"driver":"codex","native_session_id":"one"}"#,
+        )
+        .unwrap();
+        let mut model = Model::default();
+        model.sessions.items.push(session);
+        let mut app = App::new(model);
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        for tab in [1, 3] {
+            app.tab = tab;
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Undeclared") || content.contains("undeclared"));
+        }
     }
 }

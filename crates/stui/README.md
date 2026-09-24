@@ -10,8 +10,12 @@ client has read-only identity; sending messages and creating launches require a 
 
 Keys: `1`–`4` switch Now, Chat, Control, and Fleet; arrow keys select an item; PageUp/PageDown
 scroll the detail pane; `s` hides the sidebar; `q` quits. Chat shows messages for the selected
-agent's current session and bounded
-normalized session history. Press `c` to compose and Enter to send. In Control, `c` starts a
+managed agent's current session and bounded normalized session history. Running undeclared
+harness sessions discovered on the connected host also appear there and in Fleet, clearly marked
+read-only; the app never offers them managed-agent controls. Their discovery refreshes every
+15 seconds even without a graph event. Discovery is local to the connected host, not a claim
+that unqueried machines have no undeclared sessions. Press `c` to compose for a managed agent
+and Enter to open its session. In Control, `c` starts a
 new mission launch and Enter attaches to the selected runtime terminal. During attach, the
 terminal receives every key except Ctrl+backslash, which detaches. The visible Return control
 can be focused by clicking it and activated with Enter. On terminals narrower than 66 columns,

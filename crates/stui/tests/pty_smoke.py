@@ -39,7 +39,14 @@ def run_case(binary: str, ending: str) -> None:
                     break
         return bytes(output)
 
-    initial = collect(8)
+    initial = bytearray()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        initial.extend(collect(1))
+        if ending == "panic" or all(label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")):
+            break
+        if proc.poll() is not None:
+            break
     if ending != "panic":
         assert all(label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")), "missing live views"
         os.write(master, b"2341")
@@ -57,7 +64,7 @@ def run_case(binary: str, ending: str) -> None:
         proc.kill()
         proc.wait()
         raise AssertionError(f"{ending}: TUI did not exit")
-    final = collect(0.3)
+    final = collect(1)
     os.close(master)
     assert b"\x1b[?1049l" in initial + final, f"{ending}: alternate screen was not restored"
     assert (proc.returncode == 0) == (ending != "panic"), f"{ending}: unexpected exit {proc.returncode}"

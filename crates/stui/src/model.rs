@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, VecDeque};
 use anyhow::{Context, Result};
 use st3_client::{
     Agent, Attention, Client, ClientError, Device, Envelope, ErrorCode, EventPage, EventType,
-    Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Snapshot, TimelineBody,
-    TimelineEntry, Work,
+    Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Session, Snapshot,
+    TimelineBody, TimelineEntry, Work,
 };
 
 /// Each collection is deliberately capped. The UI shows a truncation marker when a cap is hit.
@@ -46,6 +46,7 @@ pub struct Model {
     pub missions: Collection,
     pub work: Collection,
     pub agents: Collection,
+    pub sessions: Collection,
     pub runtimes: Collection,
     pub machines: Collection,
     pub devices: Collection,
@@ -80,6 +81,7 @@ impl Model {
         let missions = read_pages(client, Kind::Missions).await?;
         let work = read_pages(client, Kind::Work).await?;
         let agents = read_pages(client, Kind::Agents).await?;
+        let sessions = read_pages(client, Kind::Sessions).await?;
         let runtimes = read_pages(client, Kind::Runtimes).await?;
         let machines = read_pages(client, Kind::Machines).await?;
         let devices = read_pages(client, Kind::Devices).await?;
@@ -90,11 +92,12 @@ impl Model {
             self.missions,
             self.work,
             self.agents,
+            self.sessions,
             self.runtimes,
             self.machines,
             self.devices,
         ) = (
-            now, messages, launches, missions, work, agents, runtimes, machines, devices,
+            now, messages, launches, missions, work, agents, sessions, runtimes, machines, devices,
         );
         self.status = "Connected".into();
         Ok(())
@@ -122,6 +125,15 @@ impl Model {
         if changed {
             self.reload(client).await?;
         }
+        Ok(changed)
+    }
+
+    /// Native harnesses may start outside st3, so no graph event announces them.
+    pub async fn refresh_sessions(&mut self, client: &Client) -> Result<bool> {
+        let next = read_pages(client, Kind::Sessions).await?;
+        let changed =
+            self.sessions.items != next.items || self.sessions.truncated != next.truncated;
+        self.sessions = next;
         Ok(changed)
     }
 
@@ -190,6 +202,18 @@ impl Model {
             _ => None,
         })
     }
+    pub fn undeclared_sessions(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.items.iter().filter_map(|item| match item {
+            Resource::Session(v)
+                if v.state == "running"
+                    && v.extra.get("managed").and_then(serde_json::Value::as_bool)
+                        == Some(false) =>
+            {
+                Some(v)
+            }
+            _ => None,
+        })
+    }
     pub fn messages(&self, session: Option<&str>, peer: &str) -> impl Iterator<Item = &Message> {
         self.messages
             .items
@@ -251,6 +275,7 @@ enum Kind {
     Missions,
     Work,
     Agents,
+    Sessions,
     Runtimes,
     Machines,
     Devices,
@@ -291,6 +316,11 @@ async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
             Kind::Agents => {
                 client
                     .agents_list(cursor.as_deref(), Some(PAGE_SIZE), false)
+                    .await?
+            }
+            Kind::Sessions => {
+                client
+                    .sessions_list(cursor.as_deref(), Some(PAGE_SIZE), false)
                     .await?
             }
             Kind::Runtimes => {
@@ -402,5 +432,30 @@ mod tests {
         let cursor = model.event_cursor.clone();
         assert!(!model.consume_events(envelope.value));
         assert_eq!(model.event_cursor, cursor);
+    }
+
+    #[test]
+    fn running_undeclared_sessions_are_separate_from_managed_and_history() {
+        let resources: Vec<Resource> = serde_json::from_str(
+            r#"[
+                {"kind":"session","id":"session/external","revision":"one","updated_at":"2026-09-24T09:00:00Z","owner_id":"external-session/codex/one","state":"running","started_at":"2026-09-24T08:00:00Z","ended_at":null,"timeline_cursor":"cursor/one","managed":false,"driver":"codex","native_session_id":"one"},
+                {"kind":"session","id":"session/unresolved","revision":"two","updated_at":"2026-09-24T09:00:00Z","owner_id":"external-process/claude/42","state":"running","started_at":"2026-09-24T08:00:00Z","ended_at":null,"timeline_cursor":"cursor/two","managed":false,"driver":"claude","native_session_id":null},
+                {"kind":"session","id":"session/managed","revision":"three","updated_at":"2026-09-24T09:00:00Z","owner_id":"agent/one","state":"running","started_at":"2026-09-24T08:00:00Z","ended_at":null,"timeline_cursor":"cursor/three"},
+                {"kind":"session","id":"session/old","revision":"four","updated_at":"2026-09-24T09:00:00Z","owner_id":"external-session/codex/old","state":"completed","started_at":"2026-09-23T08:00:00Z","ended_at":"2026-09-23T09:00:00Z","timeline_cursor":"cursor/four","managed":false}
+            ]"#,
+        )
+        .unwrap();
+        let model = Model {
+            sessions: Collection {
+                items: resources,
+                ..Collection::default()
+            },
+            ..Model::default()
+        };
+        let ids = model
+            .undeclared_sessions()
+            .map(|session| session.header.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["session/external", "session/unresolved"]);
     }
 }
