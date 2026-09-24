@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS claims (
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_message_to_index
+ON claims(json_extract(body, '$.fields.to'), subject)
+WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -6067,6 +6070,64 @@ impl Store {
     ) -> Result<(Vec<MessageView>, Option<u64>)> {
         let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
+        // Native harnesses repeatedly ask for their complete durable mailbox so
+        // they can reconcile delivery receipts. Start at the indexed recipient
+        // claims, not every lifecycle claim for every message in the fleet.
+        let fast_recipient = recipient.as_deref().filter(|_| include_closed);
+        let bare_recipient = fast_recipient.map(|value| {
+            value
+                .strip_prefix("agent/")
+                .filter(|suffix| !suffix.contains('/'))
+                .unwrap_or(value)
+        });
+        if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
+            let mut statement = connection.prepare(
+                "WITH candidates(subject) AS (
+                     SELECT subject FROM claims
+                     WHERE kind='message.sent'
+                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                     UNION
+                     SELECT desired.subject FROM desired,
+                            json_each(desired.body, '$.children') child
+                     WHERE desired.kind='message'
+                       AND json_extract(child.value, '$.name')='to'
+                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                 ), created AS (
+                     SELECT subject,
+                            (SELECT MIN(store_index) FROM claims
+                             WHERE claims.subject=candidates.subject) created_index
+                     FROM candidates
+                 )
+                 SELECT subject, created_index FROM created
+                 WHERE created_index>?3 AND created_index<=?4
+                 ORDER BY created_index, subject LIMIT ?5",
+            )?;
+            let mut subjects = statement
+                .query_map(
+                    params![
+                        recipient,
+                        bare_recipient,
+                        after.unwrap_or(0),
+                        through,
+                        limit.saturating_add(1)
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_more = subjects.len() > limit;
+            subjects.truncate(limit);
+            let next_after = has_more
+                .then(|| subjects.last().map(|(_, index)| *index))
+                .flatten();
+            let mut output = Vec::new();
+            for (subject, created_index) in subjects {
+                let message = message_view_tx(&connection, &subject, created_index)?;
+                if message.to == recipient {
+                    output.push(message);
+                }
+            }
+            return Ok((output, next_after));
+        }
         let mut statement = connection.prepare(
             "SELECT claims.subject, claims.store_index
              FROM claims
@@ -20883,6 +20944,46 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         };
         append_direct("message.sent", "sent", "direct-sent").unwrap();
         append_direct("message.delivered", "delivered", "direct-delivered").unwrap();
+    }
+
+    #[test]
+    fn native_mailbox_pages_use_exact_recipient_and_stable_created_cursors() {
+        let store = Store::open_memory("node").unwrap();
+        for (id, to) in [
+            ("first", "agent/worker"),
+            ("other", "agent/other"),
+            ("second", "agent/worker"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/test".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("person/test".into())),
+                        ("to".into(), Value::String(to.into())),
+                        ("content".into(), Value::String(id.into())),
+                        ("status".into(), Value::String("sent".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("mailbox-page-{id}")),
+                })
+                .unwrap();
+        }
+        let through = store.index().unwrap();
+        let (first, cursor) = store
+            .messages_page(Some("agent/worker"), true, None, through, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].subject, "message/first");
+        let (second, next) = store
+            .messages_page(Some("agent/worker"), true, cursor, through, 1)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].subject, "message/second");
+        assert!(next.is_none());
+        assert_eq!(store.messages(Some("agent/other"), true).unwrap().len(), 1);
     }
 
     #[test]
