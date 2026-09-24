@@ -6781,6 +6781,37 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The origin used to attribute a runtime to its owner. This deliberately follows
+    /// `selected_actual_source_at`'s preference for a runtime observation over later
+    /// non-runtime claims, without reducing the subject's entire history.
+    pub fn selected_actual_origin(&self, subject: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let runtime_origin = connection
+            .query_row(
+                "SELECT origin FROM claims
+                 WHERE subject=?1 AND kind='runtime.observed'
+                 ORDER BY store_index DESC LIMIT 1",
+                [subject],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if runtime_origin.is_some() {
+            return Ok(runtime_origin);
+        }
+        connection
+            .query_row(
+                "SELECT origin FROM claims
+                 WHERE subject=?1 AND kind!='intent.desired'
+                   AND kind NOT LIKE 'harness.%'
+                   AND kind!='runtime.readiness-deadline-reached'
+                 ORDER BY store_index DESC LIMIT 1",
+                [subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_resource_observation(
         &self,

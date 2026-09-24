@@ -1273,13 +1273,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = actual.get("fields").unwrap_or(&actual);
-        let selected_origin = self
-            .store
-            .status(Some(&subject.subject))?
-            .subjects
-            .into_iter()
-            .next()
-            .and_then(|status| status.actual_origin);
+        let selected_origin = self.store.selected_actual_origin(&subject.subject)?;
         let owner_host = subject
             .member
             .as_ref()
