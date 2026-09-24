@@ -1593,6 +1593,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
     )?);
     tokio::spawn(reconciler.run());
+    #[cfg(target_os = "macos")]
+    tokio::spawn(async {
+        // Startup and replication can leave large, empty malloc zones resident on macOS.
+        // Give the system a chance to reclaim those pages without making request handling wait.
+        loop {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let _ = tokio::task::spawn_blocking(|| unsafe {
+                malloc_zone_pressure_relief(std::ptr::null_mut(), 0)
+            })
+            .await;
+        }
+    });
     eprintln!("st3: local API listening at {}", config.socket.display());
     eprintln!(
         "st3: paired client gateway listening at {}",
@@ -1605,6 +1617,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
 
 async fn run_launch(
