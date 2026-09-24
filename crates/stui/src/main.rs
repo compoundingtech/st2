@@ -25,7 +25,7 @@ use st3_client::{
     TerminalScreen,
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::{self, IsTerminal, Stdout},
     path::PathBuf,
     sync::{
@@ -100,6 +100,7 @@ struct App {
     live_ready: bool,
     dirty: bool,
     timeline_requested: Option<String>,
+    timeline_cache: BTreeMap<String, (Vec<st3_client::TimelineEntry>, bool)>,
     last_timeline: Instant,
     last_terminal: Instant,
 }
@@ -120,6 +121,7 @@ impl App {
             live_ready: false,
             dirty: true,
             timeline_requested: None,
+            timeline_cache: BTreeMap::new(),
             last_timeline: Instant::now(),
             last_terminal: Instant::now(),
         }
@@ -1186,6 +1188,9 @@ fn main() -> Result<()> {
                     if app.model.actor == model.actor {
                         model.timeline = std::mem::take(&mut app.model.timeline);
                         model.timeline_truncated = app.model.timeline_truncated;
+                    } else {
+                        app.timeline_cache.clear();
+                        app.timeline_requested = None;
                     }
                     app.model = *model;
                     app.live_ready = true;
@@ -1195,14 +1200,20 @@ fn main() -> Result<()> {
                     }
                     app.dirty = true;
                 }
-                Update::Timeline(id, timeline, truncated)
-                    if app.selected_session_id().as_deref() == Some(&id) =>
-                {
-                    app.model.timeline = timeline;
-                    app.model.timeline_truncated = truncated;
-                    app.dirty = true;
+                Update::Timeline(id, timeline, truncated) => {
+                    app.timeline_cache
+                        .insert(id.clone(), (timeline.clone(), truncated));
+                    while app.timeline_cache.len() > 32 {
+                        if let Some(oldest) = app.timeline_cache.keys().next().cloned() {
+                            app.timeline_cache.remove(&oldest);
+                        }
+                    }
+                    if app.selected_session_id().as_deref() == Some(&id) {
+                        app.model.timeline = timeline;
+                        app.model.timeline_truncated = truncated;
+                        app.dirty = true;
+                    }
                 }
-                Update::Timeline(_, _, _) => {}
                 Update::Error(error) => {
                     if error.starts_with("Sync:") || error.starts_with("Initial load:") {
                         app.live_ready = false;
@@ -1220,8 +1231,11 @@ fn main() -> Result<()> {
                 || app.last_timeline.elapsed() >= Duration::from_secs(10)
             {
                 if selected_id != app.timeline_requested {
-                    app.model.timeline.clear();
-                    app.model.timeline_truncated = false;
+                    let cached = selected_id
+                        .as_ref()
+                        .and_then(|id| app.timeline_cache.get(id))
+                        .cloned();
+                    (app.model.timeline, app.model.timeline_truncated) = cached.unwrap_or_default();
                     app.dirty = true;
                 }
                 app.timeline_requested = selected_id.clone();

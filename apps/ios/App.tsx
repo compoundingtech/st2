@@ -76,6 +76,7 @@ export default function App() {
   const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const cacheGeneration = useRef(0);
+  const conversationCache = useRef(new Map<string, TimelineEntry[]>()), draftCache = useRef(new Map<string, string>());
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined }) : null, [url, credential]);
 
   useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
@@ -206,11 +207,13 @@ export default function App() {
   const timelineUnresolved = timelineSession ? isUnresolved(timelineSession) : false;
   useEffect(() => {
     if (!client || !sessionId || timelineUnresolved) { setTimeline([]); return; }
-    if (status !== 'online' || active !== 'Chat' || !chatDetailOpen) return;
+    if (status !== 'online' || active !== 'Chat' || !chatDetailOpen || terminalId) return;
     const timelineClient = client;
     let live = true;
     let polling = false;
     let lastRevision = '';
+    let lastPollAt = 0;
+    let eventCursor = caps?.event_cursor;
     async function poll() {
       if (polling || !live) return;
       polling = true;
@@ -226,7 +229,13 @@ export default function App() {
           }
           const recent = recentTimeline(entries);
           const revision = recent.map(entry => `${entry.id}:${entry.revision}`).join('|');
-          if (live && revision !== lastRevision) { lastRevision = revision; setTimeline(recent); }
+          if (live && revision !== lastRevision) {
+            lastRevision = revision;
+            conversationCache.current.delete(sessionId);
+            conversationCache.current.set(sessionId, recent);
+            while (conversationCache.current.size > 24) conversationCache.current.delete(conversationCache.current.keys().next().value!);
+            setTimeline(recent);
+          }
           break;
         } catch (error) {
           if (!isSnapshotChurn(error)) {
@@ -237,11 +246,32 @@ export default function App() {
         }
       }
       polling = false;
+      lastPollAt = Date.now();
     }
-    void poll();
-    const timer = setInterval(() => void poll(), 5_000);
-    return () => { live = false; clearInterval(timer); };
-  }, [client, sessionId, status, caps, timelineUnresolved, active, chatDetailOpen]);
+    async function followVisibleConversation() {
+      await poll();
+      while (live) {
+        if (AppState.currentState !== 'active' || !eventCursor) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
+        try {
+          const events = await timelineClient.eventsList({ after: eventCursor, limit: 100, wait_ms: 5_000 });
+          eventCursor = events.value.resume_cursor;
+          if (events.value.items.some(event => event.resource_ids.includes(sessionId)) || Date.now() - lastPollAt >= 5_000) await poll();
+        } catch (error) {
+          if (error instanceof ClientError && error.response.code === 'cursor-gap') {
+            try { eventCursor = (await timelineClient.capabilities()).value.event_cursor; await poll(); }
+            catch { await new Promise(resolve => setTimeout(resolve, 1000)); }
+          } else {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      }
+    }
+    void followVisibleConversation();
+    return () => { live = false; };
+  }, [client, sessionId, status, caps, timelineUnresolved, active, chatDetailOpen, terminalId]);
   useEffect(() => {
     if (!client || !terminalId || !chatDetailOpen || active !== 'Chat') return;
     let live = true, polling = false, unavailable = false;
@@ -264,7 +294,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
@@ -276,7 +306,7 @@ export default function App() {
   async function runAction(action: () => Promise<unknown>) { if (status !== 'online') { setError('Reconnect before sending an action.'); return; } setBusy(true); try { await action(); setError(''); await refresh(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
   function fence(revisions: Record<string, string> = {}) { if (!snapshot) throw new Error('Refresh before acting.'); return { snapshot_id: snapshot.id, subject_revisions: revisions }; }
   function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
-  async function send() { const session = data.sessions.find(s => s.id === sessionId); if (!client || !session || isUnmanaged(session) || session.state !== 'running' || !composer.trim()) return; const content = composer.trim(); await runAction(async () => { const id = actionId(); await client.messageSend({ id, idempotency_key: id, fence: fence(), parameters: { content, session_id: session.id, to: session.owner_id } }); setComposer(''); }); }
+  async function send() { const session = data.sessions.find(s => s.id === sessionId); if (!client || !session || isUnmanaged(session) || session.state !== 'running' || !composer.trim()) return; const content = composer.trim(); await runAction(async () => { const id = actionId(); await client.messageSend({ id, idempotency_key: id, fence: fence(), parameters: { content, session_id: session.id, to: session.owner_id } }); draftCache.current.delete(sessionId); setComposer(''); }); }
   async function createLaunch() { if (!client || !title.trim() || !request.trim() || !workspace.trim()) return; await runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: title.trim(), request: request.trim(), target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: workspace.trim() }, provider, ...(model.trim() ? { model: model.trim() } : {}), ...(effort.trim() ? { effort: effort.trim() } : {}) } }); setTitle(''); setRequest(''); }); }
   async function reviseLaunch(launch: Launch) { if (!client || !feedback.trim()) return; await runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback: feedback.trim() } }); setFeedback(''); }); }
   async function resolve(item: Attention) { if (!client) return; await runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); }); }
@@ -296,7 +326,8 @@ export default function App() {
   const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
   const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
-  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
+  function selectSession(id: string) { setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
+  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
   const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
   const selectedMission = visibleMissions.find(m => m.id === selectedMissionId);
 
@@ -328,7 +359,7 @@ export default function App() {
             {isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session history.</Text> : null}
             {conversationEntries.map(e => <Card key={e.id} title={e.role === 'assistant' ? 'Agent' : e.role === 'user' ? 'You' : e.role} detail={timelineText(e.body) ?? ''} />)}
             {!conversationEntries.length ? sessionMessages.map(m => <Card key={m.id} title={m.from} detail={m.content} />) : null}
-            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={setComposer} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
+            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={text => { draftCache.current.set(sessionId, text); setComposer(text); }} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
           </>}
         </> : <>
           <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text>
@@ -336,7 +367,7 @@ export default function App() {
           <Text style={styles.section}>Declared agents</Text>{truncated.agents ? <Text style={styles.warning}>More agents exist beyond this view.</Text> : null}
           {declaredAgentRows.map(({ agent, depth }) => {
             const session = managedSessions.find(s => s.id === agent.current_session_id) ?? managedSessions.find(s => s.owner_id === agent.id);
-            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) { setSessionId(session.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); } }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agentLabel(agent)}</Text><Text style={styles.small}>{agent.state}{agent.owner_run_id ? ` · ${agent.owner_run_id.replace(/^mission-run\//, '')}` : ''}{session ? ` · ${session.state} session` : ' · no current session'}</Text></Pressable>;
+            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) selectSession(session.id); }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agentLabel(agent)}</Text><Text style={styles.small}>{agent.state}{agent.owner_run_id ? ` · ${agent.owner_run_id.replace(/^mission-run\//, '')}` : ''}{session ? ` · ${session.state} session` : ' · no current session'}</Text></Pressable>;
           })}
           {unmatchedDeclaredSessions.length ? <><Text style={styles.section}>Other declared sessions</Text>{unmatchedDeclaredSessions.map(sessionChoice)}</> : null}
           {!declaredAgentRows.length && !managedSessions.length ? <Text style={styles.muted}>No declared agents are visible.</Text> : null}

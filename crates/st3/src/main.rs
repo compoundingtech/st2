@@ -35,11 +35,12 @@ use st3::model::{
 use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
-    API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient, Envelope as ClientEnvelope,
+    API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient,
+    ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
     TargetParameters as ClientTargetParameters, TimelineBody as ClientTimelineBody,
-    TimelinePage as ClientTimelinePage,
+    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
 };
 use tokio::sync::{Notify, watch};
 
@@ -1133,6 +1134,12 @@ enum MessageCommand {
         /// Continue toward older entries using the preceding response's next cursor.
         #[arg(long)]
         cursor: Option<String>,
+    },
+    /// Follow the visible normalized conversation; JSON output is one entry per line.
+    Follow {
+        session: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Write a disposable mailbox tree for translated tools.
     Export { directory: PathBuf },
@@ -3161,6 +3168,111 @@ fn print_timeline_page(
     }
     print!("{output}");
     Ok(())
+}
+
+fn unseen_timeline_entries(
+    entries: &[ClientTimelineEntry],
+    seen: &mut BTreeMap<String, (u32, u64)>,
+) -> Vec<ClientTimelineEntry> {
+    let mut changed = Vec::new();
+    for entry in entries {
+        if seen
+            .get(&entry.id)
+            .is_none_or(|(revision, _)| *revision < entry.revision)
+        {
+            seen.insert(entry.id.clone(), (entry.revision, entry.sequence));
+            changed.push(entry.clone());
+        }
+    }
+    if seen.len() > 4_096 {
+        let mut oldest = seen
+            .iter()
+            .map(|(id, (_, sequence))| (id.clone(), *sequence))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|(_, sequence)| *sequence);
+        for (id, _) in oldest.into_iter().take(seen.len() - 4_096) {
+            seen.remove(&id);
+        }
+    }
+    changed.sort_by_key(|entry| entry.sequence);
+    changed
+}
+
+fn print_follow_entries(
+    response: &ClientEnvelope<ClientTimelinePage>,
+    changed: Vec<ClientTimelineEntry>,
+    json_output: bool,
+) -> Result<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    if json_output {
+        for entry in changed {
+            println!("{}", serde_json::to_string(&entry)?);
+        }
+        return Ok(());
+    }
+    let mut delta = response.clone();
+    delta.value.items = changed;
+    delta.value.page.has_more = false;
+    delta.value.page.next_cursor = None;
+    print_timeline_page(&delta, false)
+}
+
+async fn follow_conversation(
+    client: &GeneratedClient,
+    session: &str,
+    limit: usize,
+    json_output: bool,
+) -> Result<()> {
+    // Subscribe before reading the first page so a change during that read cannot be lost.
+    let mut event_cursor = client.capabilities().await?.value.event_cursor;
+    let mut seen = BTreeMap::new();
+    let initial = client.timeline(session, None, Some(limit)).await?;
+    print_follow_entries(
+        &initial,
+        unseen_timeline_entries(&initial.value.items, &mut seen),
+        json_output,
+    )?;
+    let mut last_read = Instant::now();
+    loop {
+        let events = match client
+            .events(Some(&event_cursor), Some(200), Some(3_000))
+            .await
+        {
+            Ok(events) => events,
+            Err(GeneratedClientError::Api(ClientErrorCode::CursorGap, _, _)) => {
+                // Keep the visible window; re-establish the subscription and compare revisions.
+                event_cursor = client.capabilities().await?.value.event_cursor;
+                let page = client.timeline(session, None, Some(limit)).await?;
+                print_follow_entries(
+                    &page,
+                    unseen_timeline_entries(&page.value.items, &mut seen),
+                    json_output,
+                )?;
+                last_read = Instant::now();
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        event_cursor = events.value.resume_cursor;
+        let relevant = events
+            .value
+            .items
+            .iter()
+            .any(|event| event.resource_ids.iter().any(|id| id == session));
+        // Native host-local transcripts may advance without a graph event. This bounded
+        // fallback runs only while this explicit follow command is active.
+        if relevant || last_read.elapsed() >= Duration::from_secs(3) {
+            let page = client.timeline(session, None, Some(limit)).await?;
+            print_follow_entries(
+                &page,
+                unseen_timeline_entries(&page.value.items, &mut seen),
+                json_output,
+            )?;
+            last_read = Instant::now();
+        }
+    }
 }
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
@@ -5369,6 +5481,19 @@ async fn run_message(
                 .await?;
             print_timeline_page(&response, json_output)
         }
+        MessageCommand::Follow { session, limit } => {
+            anyhow::ensure!(
+                limit > 0 && limit <= 200,
+                "the timeline limit must be 1 through 200"
+            );
+            follow_conversation(
+                &generated_client(endpoint, None)?,
+                &session,
+                limit,
+                json_output,
+            )
+            .await
+        }
         MessageCommand::Export { directory } => {
             let mut export = st3::projection::MessageExport::new(&directory)?;
             let mut count = 0_u64;
@@ -7454,6 +7579,57 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_follow_is_explicit_and_bounded() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "follow",
+            "session/remote-agent",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Follow { session, limit },
+        } = cli.command
+        else {
+            panic!("the conversation follow command did not parse");
+        };
+        assert_eq!(session, "session/remote-agent");
+        assert_eq!(limit, 25);
+    }
+
+    #[test]
+    fn conversation_follow_emits_new_entries_and_revisions_once() {
+        let entry = |id: &str, sequence: u64, revision: u32| {
+            serde_json::from_value::<ClientTimelineEntry>(json!({
+                "id": id,
+                "sequence": sequence,
+                "revision": revision,
+                "timestamp": "2026-09-24T15:00:00Z",
+                "role": "assistant",
+                "final": true,
+                "type": "content",
+                "body": {"media_type":"text/plain","text":"hello","attachment_id":null}
+            }))
+            .unwrap()
+        };
+        let mut seen = BTreeMap::new();
+        let initial = vec![entry("timeline-entry/a", 1, 1)];
+        assert_eq!(unseen_timeline_entries(&initial, &mut seen), initial);
+        assert!(unseen_timeline_entries(&initial, &mut seen).is_empty());
+        let changed = vec![
+            entry("timeline-entry/b", 2, 1),
+            entry("timeline-entry/a", 1, 2),
+        ];
+        assert_eq!(
+            unseen_timeline_entries(&changed, &mut seen),
+            vec![changed[1].clone(), changed[0].clone()]
+        );
+        assert!(unseen_timeline_entries(&changed, &mut seen).is_empty());
+    }
 
     #[test]
     fn every_cli_command_has_a_valid_help_surface() {

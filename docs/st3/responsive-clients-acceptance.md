@@ -12,7 +12,10 @@ This record extends the active `product-and-idle-recovery` remediation work afte
 ## Data and cache
 
 - Shared client getters and CLI representations must expose the same underlying facts. Measure representative local daemon reads and address slow projections; do not use async rendering to disguise a slow getter.
+- This CLI parity is a standing product requirement, not a new UI-only feature: every datum and operation presented by TUI or iOS has a typed client API and a CLI command that can prove it independently. Session lists and history must have usable bounded pagination; normalized conversation has a CLI follow mode.
+- A client paired to any fleet gateway can inspect agents and normalized conversations on every reachable host. Replicated projections are the fast path; bounded host-local transcript reads and live terminal screen/attach use an authenticated, owner-routed daemon relay with exact runtime-incarnation fences. The UI never needs a second pairing or a direct host URL.
 - TUI and iOS render the last successful snapshot while refreshing or briefly offline. New selections never show the previous selection's timeline. Cache is read-only; every action still requires online authority and a fresh fence.
+- Keep bounded per-session conversation caches (including pagination position, draft, and scroll state) while switching screens or agents. Only the visible conversation holds a live subscription; switching away closes it, and switching back shows cached content immediately while re-establishing the stream. A cursor gap triggers a quiet background resync without discarding visible data.
 - iOS persists a bounded projection cache per paired gateway/device so an app restart while offline can show prior data. It must not persist the bearer credential in ordinary storage, print it, or commit personal URLs/IDs. With no cache, show a clear offline empty state.
 - TUI may persist a bounded local cache for remote use. It must be scoped to the endpoint and actor, private to the local user, and never treated as action authority.
 - Cursor expiry is expected snapshot churn: retry a bounded read from page one, retain old data during retry, and do not display a red error banner for that condition.
@@ -20,6 +23,7 @@ This record extends the active `product-and-idle-recovery` remediation work afte
 ## Verification
 
 - Unit/integration tests cover delayed getters with instant key handling, session owner fallback, timeline ordering and stale-response discard, cache restart/offline behavior, and terminal attach/input/detach fences.
+- CLI-first connected tests prove cross-host session pagination, normalized conversation follow and resume, owner-routed transcript pages, terminal screen/attach/input/detach, stale-incarnation rejection, cache/reconnect behavior, and no accidental subscription for hidden conversations. The same typed API operations are then exercised by TUI and iOS.
 - A live PTY test records cold first-frame and key-to-render latency. A separate measured run records absolute API response times for capabilities, attention, sessions, missions, work, and fleet. A slow getter is fixed or documented with a concrete bound before the UI is considered ready.
 - Signed Debug simulator and local TUI are checked against the live paired gateway; physical iPhone reinstallation is not required for every iteration.
 
