@@ -241,7 +241,7 @@ export default function App() {
           projectionEventCursor.current = result.value.resume_cursor;
           for (const tab of tabsChangedByProjectionEvents(result.value.items)) dirtyProjectionTabs.current.add(tab);
           if (dirtyProjectionTabs.current.has(active)) await refresh();
-          else if (Date.now() - lastNativeRefreshAt.current >= 30_000) await refreshNativeSessions();
+          else if ((active === 'Chat' || active === 'Fleet') && Date.now() - lastNativeRefreshAt.current >= 30_000) await refreshNativeSessions();
         } catch {
           if (!live) return;
           await refresh(); // cursor gaps and lost connections both require a bounded resync
@@ -253,6 +253,9 @@ export default function App() {
     return () => { live = false; };
   }, [active, client, refresh, refreshNativeSessions, status]);
   useEffect(() => { if (status === 'online' && dirtyProjectionTabs.current.has(active)) void refresh(); }, [active, refresh, status]);
+  useEffect(() => {
+    if (status === 'online' && (active === 'Chat' || active === 'Fleet') && Date.now() - lastNativeRefreshAt.current >= 30_000) void refreshNativeSessions();
+  }, [active, refreshNativeSessions, status]);
   useEffect(() => { if (status !== 'offline') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15_000); return () => clearInterval(timer); }, [refresh, status]);
   useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
   useEffect(() => {
