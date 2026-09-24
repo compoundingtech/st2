@@ -493,7 +493,7 @@ pub struct Store {
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     replica_generation: AtomicU64,
-    replication_snapshot: Mutex<Option<ReplicationSnapshot>>,
+    replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     origin: String,
 }
 
@@ -7841,10 +7841,10 @@ impl Store {
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
-        Ok(self.replication_snapshot()?.inventory)
+        Ok(self.replication_snapshot()?.inventory.clone())
     }
 
-    fn replication_snapshot(&self) -> Result<ReplicationSnapshot> {
+    fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
         let store_index = self.index()?;
         let replica_generation = self.replica_generation.load(Ordering::Acquire);
         if let Some(snapshot) = self
@@ -7882,13 +7882,13 @@ impl Store {
             digest: replication_inventory_digest(&envelopes),
             envelopes,
         };
-        let snapshot = ReplicationSnapshot {
+        let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             inventory,
             authority_digest: authority_digest(&connection)?,
             graph_digest: graph_digest(&connection)?,
-        };
+        });
         *self
             .replication_snapshot
             .lock()
@@ -7902,10 +7902,10 @@ impl Store {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
-            authority_digest: snapshot.authority_digest,
-            graph_digest: snapshot.graph_digest,
+            authority_digest: snapshot.authority_digest.clone(),
+            graph_digest: snapshot.graph_digest.clone(),
             inventory: ReplicationInventory {
-                digest: snapshot.inventory.digest,
+                digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
             },
             envelopes: Vec::new(),
@@ -7963,15 +7963,15 @@ impl Store {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
-            authority_digest: snapshot.authority_digest,
-            graph_digest: snapshot.graph_digest,
+            authority_digest: snapshot.authority_digest.clone(),
+            graph_digest: snapshot.graph_digest.clone(),
             inventory: if same {
                 ReplicationInventory {
-                    digest: snapshot.inventory.digest,
+                    digest: snapshot.inventory.digest.clone(),
                     envelopes: Vec::new(),
                 }
             } else {
-                snapshot.inventory
+                snapshot.inventory.clone()
             },
             envelopes,
         })
@@ -8047,7 +8047,7 @@ impl Store {
             received,
             duplicate,
             inventory: ReplicationInventory {
-                digest: snapshot.inventory.digest,
+                digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
             },
         })
@@ -13712,6 +13712,15 @@ fn streamed_digest_matches_materialized_rows() {
         }
     }
     assert_eq!(streamed, hex::encode(digest.finalize()));
+}
+
+#[cfg(test)]
+#[test]
+fn unchanged_replication_snapshot_reuses_inventory() {
+    let store = Store::open_memory("node").unwrap();
+    let first = store.replication_snapshot().unwrap();
+    let second = store.replication_snapshot().unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
 }
 
 fn collect_referenced_blobs(
