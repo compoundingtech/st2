@@ -1055,7 +1055,10 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
         let incarnation_key = harness_incarnation_key(incarnation);
-        let messages = self.store.messages(Some(agent), false)?;
+        // Closed work wakes still count as attempts. A closed wake can mean the
+        // harness started a turn but could not claim this independent step yet;
+        // forgetting it would replay attempt 1 and notify this reconciler forever.
+        let messages = self.store.messages(Some(agent), true)?;
         let work = self.store.work_for_reconcile(agent)?;
         let harness = self.store.current_harness(agent)?;
 
@@ -13229,6 +13232,137 @@ version 2
                 .actor
                 .as_deref(),
             Some("daemon/runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_work_wake_does_not_spin_reconciliation_or_replay_attempt_one() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true" }
+mission "wake" state="ready" {
+  goal "Do the work."
+  step "report" { assigned-to "agent/node.worker" }
+}
+"#,
+            "closed-wake-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "wake".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "closed-wake-run".into(),
+            })
+            .unwrap();
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        });
+        let setup = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        setup.reconcile_once().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("closed-wake-ready".into()),
+            })
+            .unwrap();
+        setup.reconcile_once().unwrap();
+        let wake = store
+            .messages(Some(&desired.subject), true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            wake.tags
+                .iter()
+                .any(|tag| tag.contains(&run.steps[0].subject))
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: wake.subject.clone(),
+                kind: "message.staged".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("staged".into())),
+                    ("recipient".into(), Value::String(desired.subject.clone())),
+                    ("transport".into(), Value::String("codex-channel".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("stage-work-wake".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: wake.subject.clone(),
+                kind: "message.closed".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("close-work-wake".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("closed-wake-working".into()),
+            })
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(store.clone(), runtime, "node".into(), notify.clone());
+        let before = store.index().unwrap();
+        reconciler
+            .reconcile_work_messages(&desired.subject, "worker-one")
+            .unwrap();
+        assert_eq!(store.index().unwrap(), before);
+        assert_eq!(
+            store.messages(Some(&desired.subject), true).unwrap().len(),
+            1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), notify.notified())
+                .await
+                .is_err()
         );
     }
 
