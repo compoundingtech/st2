@@ -687,10 +687,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                     Mode::Normal => {}
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if app.input.len() < 4096 {
-                    app.input.push(c);
-                }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && app.input.len() < 4096 =>
+            {
+                app.input.push(c);
             }
             _ => {}
         }
@@ -803,10 +803,11 @@ fn main() -> Result<()> {
         if app.last_sync.elapsed() >= Duration::from_secs(2) {
             match runtime.block_on(app.model.sync(&client)) {
                 Ok(changed) => {
-                    if changed && app.tab == 1 {
-                        if let Some(id) = app.selected_session_id() {
-                            let _ = runtime.block_on(app.model.load_timeline(&client, &id));
-                        }
+                    if changed
+                        && app.tab == 1
+                        && let Some(id) = app.selected_session_id()
+                    {
+                        let _ = runtime.block_on(app.model.load_timeline(&client, &id));
                     }
                     app.dirty |= changed;
                 }
@@ -838,13 +839,14 @@ fn main() -> Result<()> {
             }
             app.last_external_scan = Instant::now();
         }
-        if app.attached.is_some() && app.last_terminal.elapsed() >= Duration::from_millis(400) {
-            let attached = app.attached.as_mut().unwrap();
-            if let Ok(screen) = runtime.block_on(client.terminal_screen(&attached.terminal_id)) {
-                if attached.screen != screen.value {
-                    attached.screen = screen.value;
-                    app.dirty = true;
-                }
+        if let Some(attached) = app.attached.as_mut()
+            && app.last_terminal.elapsed() >= Duration::from_millis(400)
+        {
+            if let Ok(screen) = runtime.block_on(client.terminal_screen(&attached.terminal_id))
+                && attached.screen != screen.value
+            {
+                attached.screen = screen.value;
+                app.dirty = true;
             }
             app.last_terminal = Instant::now();
         }
@@ -864,7 +866,7 @@ mod tests {
         let mut app = App::new(Model::default());
         for width in [80, 40] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-            for tab in 0..4 {
+            for (tab, label) in TABS.iter().enumerate() {
                 app.tab = tab;
                 terminal.draw(|frame| app.render(frame)).unwrap();
                 let content = terminal
@@ -874,7 +876,7 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect::<String>();
-                assert!(content.contains(TABS[tab]));
+                assert!(content.contains(label));
             }
         }
     }
