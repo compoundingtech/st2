@@ -6190,7 +6190,7 @@ impl Store {
         if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
             let mut statement = connection.prepare(
                 "WITH candidates(subject) AS (
-                     SELECT subject FROM claims
+                     SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
                        AND json_extract(body, '$.fields.to') IN (?1, ?2)
                      UNION
