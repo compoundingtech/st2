@@ -36,7 +36,7 @@ public struct ErrorEnvelope: Codable, Error, Sendable {
 public enum ErrorCode: Codable, Sendable, Equatable {
     case notFound, forbidden, unsupportedCapability, validationFailed, idempotencyConflict
     case staleFence, cursorGap, pageCursorExpired, rateLimited
-    case runtimeNotLocal, runtimeAuthorityIndeterminate, `internal`
+    case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -47,7 +47,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "idempotency-conflict": .idempotencyConflict; case "stale-fence": .staleFence
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
-        case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "internal": .internal
+        case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
     }
@@ -58,7 +58,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .idempotencyConflict: "idempotency-conflict"; case .staleFence: "stale-fence"
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
-        case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .internal: "internal"
+        case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)

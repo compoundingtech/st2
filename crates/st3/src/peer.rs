@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use hmac::{Hmac, Mac as _};
 use notify::Watcher as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -31,6 +31,8 @@ use crate::store::Store;
 
 const PROTOCOL: &str = "st3-replication-v1";
 const EXCHANGE_PATH: &str = "/v1/peer/exchange";
+const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 const HEADER_FLEET: &str = "x-st3-fleet";
 const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
@@ -109,20 +111,24 @@ impl FleetAuth {
     }
 
     fn request_headers(&self, node: &str, body: &[u8]) -> Result<HeaderMap> {
+        self.request_headers_for(EXCHANGE_PATH, node, body)
+    }
+
+    fn request_headers_for(&self, path: &str, node: &str, body: &[u8]) -> Result<HeaderMap> {
         let digest = Self::body_digest(body);
-        let signature = self.signature("POST", EXCHANGE_PATH, node, &digest, None);
+        let signature = self.signature("POST", path, node, &digest, None);
         headers(&self.fleet_id, node, &digest, &signature, None)
     }
 
-    fn response_headers(&self, node: &str, body: &[u8], request_digest: &str) -> Result<HeaderMap> {
+    fn response_headers_for(
+        &self,
+        path: &str,
+        node: &str,
+        body: &[u8],
+        request_digest: &str,
+    ) -> Result<HeaderMap> {
         let digest = Self::body_digest(body);
-        let signature = self.signature(
-            "RESPONSE",
-            EXCHANGE_PATH,
-            node,
-            &digest,
-            Some(request_digest),
-        );
+        let signature = self.signature("RESPONSE", path, node, &digest, Some(request_digest));
         headers(
             &self.fleet_id,
             node,
@@ -182,6 +188,155 @@ impl FleetAuth {
         mac.verify_slice(&signature)
             .context("the replication signature does not match")?;
         Ok(node.into())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ClientReadOperation {
+    Timeline {
+        session_id: String,
+        limit: usize,
+        cursor: Option<String>,
+    },
+    TerminalScreen {
+        terminal_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientReadRequest {
+    pub authority_actor: String,
+    pub request: ClientReadOperation,
+}
+
+#[derive(Debug)]
+pub struct ClientReadRejected {
+    pub code: String,
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ClientReadRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "owner rejected client read ({}): {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ClientReadRejected {}
+
+/// A paired gateway uses this only for bounded owner-local client reads. The peer worker
+/// authenticates both ends and the owner daemon rechecks the requested resource locally.
+#[derive(Clone)]
+pub struct ClientRelay {
+    node: String,
+    peers: Vec<PeerConfig>,
+    auth: FleetAuth,
+    http: reqwest::Client,
+}
+
+impl ClientRelay {
+    pub fn from_config(config: &Config) -> Result<Option<Self>> {
+        let (Some(fleet), Some(secret)) = (
+            config.fleet_id.as_deref(),
+            config.shared_secret_file.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            node: config.node.clone(),
+            peers: config.peers.clone(),
+            auth: FleetAuth::load(fleet, secret)?,
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(15))
+                .build()?,
+        }))
+    }
+
+    pub async fn read(
+        &self,
+        host_id: &str,
+        request: &ClientReadRequest,
+    ) -> Result<serde_json::Value> {
+        let name = host_id
+            .strip_prefix("host/")
+            .context("the owner host ID is invalid")?;
+        let peer = self
+            .peers
+            .iter()
+            .find(|peer| peer.name == name)
+            .with_context(|| format!("owner `{host_id}` is not a configured peer"))?;
+        let body = serde_json::to_vec(request)?;
+        anyhow::ensure!(
+            body.len() <= 16_384,
+            "the client read request exceeds its bound"
+        );
+        let digest = FleetAuth::body_digest(&body);
+        let headers = self
+            .auth
+            .request_headers_for(CLIENT_READ_PATH, &self.node, &body)?;
+        let mut response = self
+            .http
+            .post(format!(
+                "{}{}",
+                peer.url.trim_end_matches('/'),
+                CLIENT_READ_PATH
+            ))
+            .headers(headers)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_CLIENT_READ_BYTES as u64),
+            "the peer client read response exceeds its bound"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                bytes.len().saturating_add(chunk.len()) <= MAX_CLIENT_READ_BYTES,
+                "the peer client read response exceeds its bound"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        self.auth.verify(
+            &response_headers,
+            "RESPONSE",
+            CLIENT_READ_PATH,
+            &bytes,
+            Some(name),
+            Some(&digest),
+        )?;
+        let envelope: ApiResponse<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            envelope.api_version == "st3.v1",
+            "the peer client read protocol differs"
+        );
+        if !status.is_success() {
+            return Err(ClientReadRejected {
+                code: envelope.value["code"]
+                    .as_str()
+                    .unwrap_or("remote-unavailable")
+                    .into(),
+                status: status.as_u16(),
+                message: envelope.value["message"]
+                    .as_str()
+                    .unwrap_or("owner read failed")
+                    .into(),
+            }
+            .into());
+        }
+        Ok(envelope.value)
     }
 }
 
@@ -377,8 +532,132 @@ pub async fn run_worker(config: Config) -> Result<()> {
 fn peer_router(state: PeerState) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
+        .route(
+            CLIENT_READ_PATH,
+            post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
+        )
         .layer(DefaultBodyLimit::max(MAX_EXCHANGE_BYTES))
         .with_state(state)
+}
+
+async fn receive_client_read(
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let sender = match state
+        .auth
+        .verify(&headers, "POST", CLIENT_READ_PATH, &body, None, None)
+    {
+        Ok(sender) if state.peers.contains(&sender) => sender,
+        _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
+    };
+    let request_digest = FleetAuth::body_digest(&body);
+    let result: Result<serde_json::Value> = async {
+        anyhow::ensure!(
+            body.len() <= 16_384,
+            "the client read request exceeds its bound"
+        );
+        let request: ClientReadRequest = serde_json::from_slice(&body)?;
+        anyhow::ensure!(
+            request.authority_actor.starts_with("person/")
+                && request.authority_actor.matches('/').count() == 1,
+            "a fleet client read needs one concrete person"
+        );
+        let client = st3_client::Client::unix_as(&state.main_socket, &request.authority_actor);
+        match request.request {
+            ClientReadOperation::Timeline {
+                session_id,
+                limit,
+                cursor,
+            } => {
+                anyhow::ensure!((1..=200).contains(&limit), "the timeline limit is invalid");
+                let value = client
+                    .timeline(&session_id, cursor.as_deref(), Some(limit))
+                    .await?
+                    .value;
+                Ok(serde_json::to_value(value)?)
+            }
+            ClientReadOperation::TerminalScreen { terminal_id } => {
+                let value = client.terminal_screen(&terminal_id).await?.value;
+                Ok(serde_json::to_value(value)?)
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(value)
+            if serde_json::to_vec(&value)
+                .is_ok_and(|bytes| bytes.len() <= MAX_CLIENT_READ_BYTES - 1024) =>
+        {
+            signed_response_for(&state, CLIENT_READ_PATH, &request_digest, 0, value)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Ok(_) => signed_error_response_for(
+            &state,
+            CLIENT_READ_PATH,
+            &request_digest,
+            0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the client read response exceeds its bound",
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(error) => {
+            let (status, code, message) = match error.downcast_ref::<st3_client::ClientError>() {
+                Some(st3_client::ClientError::Api(code, message, _)) => {
+                    let status = match code {
+                        st3_client::ErrorCode::PageCursorExpired
+                        | st3_client::ErrorCode::CursorGap => StatusCode::GONE,
+                        st3_client::ErrorCode::NotFound => StatusCode::NOT_FOUND,
+                        st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
+                        _ => StatusCode::UNPROCESSABLE_ENTITY,
+                    };
+                    (
+                        status,
+                        serde_json::to_value(code)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "remote-unavailable".into()),
+                        message.clone(),
+                    )
+                }
+                _ => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "remote-unavailable".into(),
+                    format!("fleet client read from {sender} failed"),
+                ),
+            };
+            signed_client_read_failure(&state, &request_digest, status, &code, &message)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+fn signed_client_read_failure(
+    state: &PeerState,
+    request_digest: &str,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Result<Response> {
+    let envelope = ApiResponse {
+        api_version: "st3.v1".into(),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        snapshot_host: state.node.clone(),
+        store_index: 0,
+        value: serde_json::json!({"code":code,"message":message}),
+    };
+    let body = serde_json::to_vec(&envelope)?;
+    let headers =
+        state
+            .auth
+            .response_headers_for(CLIENT_READ_PATH, &state.node, &body, request_digest)?;
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    response.headers_mut().extend(headers);
+    Ok(response)
 }
 
 async fn wait_for_main_daemon(socket: &Path) {
@@ -516,6 +795,16 @@ fn signed_response<T: Serialize>(
     store_index: u64,
     value: T,
 ) -> Result<Response> {
+    signed_response_for(state, EXCHANGE_PATH, request_digest, store_index, value)
+}
+
+fn signed_response_for<T: Serialize>(
+    state: &PeerState,
+    path: &str,
+    request_digest: &str,
+    store_index: u64,
+    value: T,
+) -> Result<Response> {
     let envelope = ApiResponse {
         api_version: "st3.v1".into(),
         request_id: uuid::Uuid::now_v7().to_string(),
@@ -526,7 +815,7 @@ fn signed_response<T: Serialize>(
     let body = serde_json::to_vec(&envelope)?;
     let headers = state
         .auth
-        .response_headers(&state.node, &body, request_digest)?;
+        .response_headers_for(path, &state.node, &body, request_digest)?;
     let mut response = body.into_response();
     response
         .headers_mut()
@@ -537,6 +826,24 @@ fn signed_response<T: Serialize>(
 
 fn signed_error_response(
     state: &PeerState,
+    request_digest: &str,
+    store_index: u64,
+    status: StatusCode,
+    message: &str,
+) -> Result<Response> {
+    signed_error_response_for(
+        state,
+        EXCHANGE_PATH,
+        request_digest,
+        store_index,
+        status,
+        message,
+    )
+}
+
+fn signed_error_response_for(
+    state: &PeerState,
+    path: &str,
     request_digest: &str,
     store_index: u64,
     status: StatusCode,
@@ -555,7 +862,7 @@ fn signed_error_response(
     let body = serde_json::to_vec(&envelope)?;
     let headers = state
         .auth
-        .response_headers(&state.node, &body, request_digest)?;
+        .response_headers_for(path, &state.node, &body, request_digest)?;
     let mut response = (status, body).into_response();
     response
         .headers_mut()
@@ -682,6 +989,114 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt as _;
 
+    #[tokio::test]
+    async fn signed_client_read_returns_an_owner_local_native_timeline() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("native-home");
+        let transcript = home.join(".codex/sessions/2026/09/24/relay.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","timestamp":"2026-09-24T15:00:00Z","payload":{"id":"relay-native-id","cwd":root.path(),"source":"test"}}),
+            serde_json::json!({"type":"response_item","timestamp":"2026-09-24T15:00:01Z","payload":{"type":"message","role":"assistant","id":"answer","content":[{"type":"output_text","text":"Relay owner answer"}]}}),
+        )).unwrap();
+        let session = crate::external_sessions::discover_fresh(Some(&home), true)
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|session| session.native_id == "relay-native-id")
+            .unwrap();
+        let socket = root.path().join("st3.sock");
+        let main = crate::api::AppState {
+            store: Arc::new(Store::open_memory("owner").unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "owner".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: vec!["source".into()],
+            client_relay: None,
+            native_session_home: Some(home),
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, crate::api::router(main))
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists());
+        let auth = FleetAuth::test("fleet-test", &[4; 32]);
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&socket)),
+            node: "owner".into(),
+            auth: auth.clone(),
+            peers: BTreeSet::from(["source".into()]),
+            main_socket: socket,
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let body = serde_json::to_vec(&ClientReadRequest {
+            authority_actor: "person/test".into(),
+            request: ClientReadOperation::Timeline {
+                session_id: session.id,
+                limit: 20,
+                cursor: None,
+            },
+        })
+        .unwrap();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(CLIENT_READ_PATH)
+            .body(Body::from(body.clone()))
+            .unwrap();
+        *request.headers_mut() = auth
+            .request_headers_for(CLIENT_READ_PATH, "source", &body)
+            .unwrap();
+        let response = peer_router(peer.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_CLIENT_READ_BYTES)
+            .await
+            .unwrap();
+        auth.verify(
+            &headers,
+            "RESPONSE",
+            CLIENT_READ_PATH,
+            &bytes,
+            Some("owner"),
+            Some(&FleetAuth::body_digest(&body)),
+        )
+        .unwrap();
+        let value: ApiResponse<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value.value["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["body"]["text"] == "Relay owner answer")
+        );
+
+        let mut rejected = Request::builder()
+            .method("POST")
+            .uri(CLIENT_READ_PATH)
+            .body(Body::from(body.clone()))
+            .unwrap();
+        *rejected.headers_mut() = auth
+            .request_headers_for(CLIENT_READ_PATH, "unconfigured", &body)
+            .unwrap();
+        let response = peer_router(peer).oneshot(rejected).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+    }
+
     #[test]
     fn signed_messages_detect_tampering_and_wrong_fleets() {
         let auth = FleetAuth::test("1f91ca65-7793-48cc-866e-ac15690130e1", &[7; 32]);
@@ -714,7 +1129,9 @@ mod tests {
     fn response_signatures_bind_to_one_request() {
         let auth = FleetAuth::test("1f91ca65-7793-48cc-866e-ac15690130e1", &[9; 32]);
         let body = b"response";
-        let headers = auth.response_headers("node-b", body, "request-a").unwrap();
+        let headers = auth
+            .response_headers_for(EXCHANGE_PATH, "node-b", body, "request-a")
+            .unwrap();
         assert!(
             auth.verify(
                 &headers,
@@ -992,6 +1409,7 @@ mod tests {
             pty_binary: std::path::PathBuf::from("pty"),
             fleet_id: Some(fleet.into()),
             configured_peers: vec!["source".into()],
+            client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         });

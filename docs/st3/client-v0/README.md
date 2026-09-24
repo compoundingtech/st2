@@ -280,7 +280,7 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `retryable`, structured details, and optional `retry_after_ms`. Required v0 codes are `not-found`,
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
 `cursor-gap`, `page-cursor-expired`, `rate-limited`, `runtime-not-local`,
-`runtime-authority-indeterminate`, and `internal`.
+`runtime-authority-indeterminate`, `remote-unavailable`, and `internal`.
 
 Adding optional fields is compatible. Removing or retyping a field, changing ordering or token
 rules, adding a required action parameter, or changing action semantics requires a new capability

@@ -127,7 +127,7 @@ impl Model {
         Ok(())
     }
 
-    pub async fn sync(&mut self, client: &Client) -> Result<bool> {
+    pub async fn sync(&mut self, client: &Client) -> Result<(bool, Vec<String>)> {
         let response = client
             .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(0))
             .await;
@@ -141,15 +141,15 @@ impl Model {
                 self.recent_events.clear();
                 self.reload(client).await?;
                 self.status = "Resynchronized after cursor gap".into();
-                return Ok(true);
+                return Ok((true, Vec::new()));
             }
             Err(error) => return Err(error.into()),
         };
-        let changed = self.consume_events(events);
+        let (changed, invalidated_sessions) = self.consume_events(events);
         if changed {
             self.reload(client).await?;
         }
-        Ok(changed)
+        Ok((changed, invalidated_sessions))
     }
 
     /// Native harnesses may start outside st3, so no graph event announces them.
@@ -161,12 +161,13 @@ impl Model {
         Ok(changed)
     }
 
-    fn consume_events(&mut self, events: EventPage) -> bool {
+    fn consume_events(&mut self, events: EventPage) -> (bool, Vec<String>) {
         if events.items.is_empty() {
             self.event_cursor = events.resume_cursor;
-            return false;
+            return (false, Vec::new());
         }
         let mut changed = false;
+        let mut invalidated_sessions = Vec::new();
         for event in events.items {
             if self.recent_events.contains(&event.id) {
                 self.event_cursor = event.next_cursor;
@@ -184,9 +185,22 @@ impl Model {
                     | EventType::CapabilitiesChanged
                     | EventType::TerminalAvailable
             );
+            if event.body.get("reason").and_then(serde_json::Value::as_str)
+                == Some("session-timeline-invalidated")
+            {
+                invalidated_sessions.extend(
+                    event
+                        .resource_ids
+                        .iter()
+                        .filter(|id| id.starts_with("session/"))
+                        .cloned(),
+                );
+            }
             self.event_cursor = event.next_cursor;
         }
-        changed
+        invalidated_sessions.sort();
+        invalidated_sessions.dedup();
+        (changed, invalidated_sessions)
     }
 
     pub async fn load_timeline(&mut self, client: &Client, session_id: &str) -> Result<()> {
@@ -516,10 +530,38 @@ mod tests {
         ))
         .unwrap();
         let mut model = Model::default();
-        assert!(model.consume_events(envelope.value.clone()));
+        assert!(model.consume_events(envelope.value.clone()).0);
         let cursor = model.event_cursor.clone();
-        assert!(!model.consume_events(envelope.value));
+        assert!(!model.consume_events(envelope.value).0);
         assert_eq!(model.event_cursor, cursor);
+    }
+
+    #[test]
+    fn only_a_changed_session_invalidates_its_visible_timeline() {
+        let events: EventPage = serde_json::from_value(serde_json::json!({
+            "kind":"event-page",
+            "oldest_cursor":"event-cursor/node/0",
+            "resume_cursor":"event-cursor/node/2",
+            "items":[{
+                "id":"event/one", "epoch":"node", "sequence":1,
+                "previous_cursor":"event-cursor/node/0", "next_cursor":"event-cursor/node/1",
+                "timestamp":"2026-09-24T15:00:00Z", "type":"upsert",
+                "resource_ids":["session/current"], "snapshot_id":"snapshot/one",
+                "body":{"reason":"session-timeline-invalidated"}
+            }, {
+                "id":"event/two", "epoch":"node", "sequence":2,
+                "previous_cursor":"event-cursor/node/1", "next_cursor":"event-cursor/node/2",
+                "timestamp":"2026-09-24T15:00:01Z", "type":"upsert",
+                "resource_ids":["agent/unrelated"], "snapshot_id":"snapshot/two",
+                "body":{"reason":"client-projection-invalidated"}
+            }],
+            "has_more":false
+        }))
+        .unwrap();
+        let mut model = Model::default();
+        let (changed, sessions) = model.consume_events(events);
+        assert!(changed);
+        assert_eq!(sessions, vec!["session/current"]);
     }
 
     #[test]

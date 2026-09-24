@@ -1119,6 +1119,8 @@ enum MessageCommand {
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        actor: Option<String>,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -1129,6 +1131,8 @@ enum MessageCommand {
     /// Render one normalized session timeline, including tools and usage.
     Timeline {
         session: String,
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Continue toward older entries using the preceding response's next cursor.
@@ -1138,6 +1142,8 @@ enum MessageCommand {
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
         session: String,
+        #[arg(long = "as", value_parser = parse_person_subject)]
+        actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
@@ -1348,7 +1354,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
         Command::Agents { command } => run_agents(&endpoint, command, cli.json).await,
         Command::Conversations { command } => {
-            run_message(&client, &endpoint, command, cli.json).await
+            run_message(
+                &client,
+                &endpoint,
+                config.person.as_deref(),
+                command,
+                cli.json,
+            )
+            .await
         }
         Command::Activity(args) => run_activity(&endpoint, args, cli.json).await,
         Command::Devices(args) => {
@@ -1498,6 +1511,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         pty_binary: pty_binary.clone(),
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+        client_relay: st3::peer::ClientRelay::from_config(&config)?,
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
@@ -2418,21 +2432,7 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
         args.limit > 0 && args.limit <= 500,
         "the trace limit must be 1 through 500"
     );
-    let mut query = vec![format!("limit={}", args.limit), "order=desc".into()];
-    if let Some(subject) = &args.subject {
-        query.push(format!("subject={}", urlencoding::encode(subject)));
-    }
-    if let Some(owner_run) = &args.owner_run {
-        query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
-    }
-    if let Some(after) = args.after_index {
-        query.push(format!("after_index={after}"));
-    }
-    let page: ClaimsPage = client
-        .get(&format!("/v1/claims?{}", query.join("&")))
-        .await?;
-    let mut claims = page.claims;
-    claims.reverse();
+    let claims = trace_claims(client, &args).await?;
     let mut cursor = args.after_index.unwrap_or_default();
     for claim in claims {
         cursor = cursor.max(claim.store_index);
@@ -2483,6 +2483,32 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
             }
         }
     }
+}
+
+async fn trace_claims(client: &Client, args: &TraceArgs) -> Result<Vec<ClaimRecord>> {
+    let order = if args.after_index.is_some() {
+        "asc"
+    } else {
+        "desc"
+    };
+    let mut query = vec![format!("limit={}", args.limit), format!("order={order}")];
+    if let Some(subject) = &args.subject {
+        query.push(format!("subject={}", urlencoding::encode(subject)));
+    }
+    if let Some(owner_run) = &args.owner_run {
+        query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
+    }
+    if let Some(after) = args.after_index {
+        query.push(format!("after_index={after}"));
+    }
+    let page: ClaimsPage = client
+        .get(&format!("/v1/claims?{}", query.join("&")))
+        .await?;
+    let mut claims = page.claims;
+    if args.after_index.is_none() {
+        claims.reverse();
+    }
+    Ok(claims)
 }
 
 fn print_trace_claim(claim: &ClaimRecord) {
@@ -5280,6 +5306,7 @@ async fn for_each_message(
 async fn run_message(
     client: &Client,
     endpoint: &Endpoint,
+    configured_person: Option<&str>,
     command: MessageCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -5451,12 +5478,17 @@ async fn run_message(
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
         }
-        MessageCommand::Sessions { all, cursor, limit } => {
+        MessageCommand::Sessions {
+            actor,
+            all,
+            cursor,
+            limit,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the session limit must be 1 through 200"
             );
-            let response = generated_client(endpoint, None)?
+            let response = generated_client(endpoint, actor.as_deref().or(configured_person))?
                 .sessions_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
@@ -5469,6 +5501,7 @@ async fn run_message(
         }
         MessageCommand::Timeline {
             session,
+            actor,
             limit,
             cursor,
         } => {
@@ -5476,18 +5509,22 @@ async fn run_message(
                 limit > 0 && limit <= 200,
                 "the timeline limit must be 1 through 200"
             );
-            let response = generated_client(endpoint, None)?
+            let response = generated_client(endpoint, actor.as_deref().or(configured_person))?
                 .timeline(&session, cursor.as_deref(), Some(limit))
                 .await?;
             print_timeline_page(&response, json_output)
         }
-        MessageCommand::Follow { session, limit } => {
+        MessageCommand::Follow {
+            session,
+            actor,
+            limit,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the timeline limit must be 1 through 200"
             );
             follow_conversation(
-                &generated_client(endpoint, None)?,
+                &generated_client(endpoint, actor.as_deref().or(configured_person))?,
                 &session,
                 limit,
                 json_output,
@@ -7580,6 +7617,82 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn trace_after_index_reads_the_first_bounded_page() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("trace-cursor-test").unwrap());
+        let indexes = (0..5)
+            .map(|number| {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "host/trace-cursor-test".into(),
+                        kind: "transport.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("trace-cursor-test-{number}")),
+                    })
+                    .unwrap()
+                    .store_index
+            })
+            .collect::<Vec<_>>();
+        let state = AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "trace-cursor-test".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        let client = Client::unix(&socket);
+        let mut args = TraceArgs {
+            subject: Some("host/trace-cursor-test".into()),
+            owner_run: None,
+            limit: 2,
+            after_index: Some(indexes[0]),
+            follow: false,
+        };
+
+        let after = trace_claims(&client, &args).await.unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|claim| claim.store_index)
+                .collect::<Vec<_>>(),
+            indexes[1..3]
+        );
+
+        args.after_index = None;
+        let recent = trace_claims(&client, &args).await.unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|claim| claim.store_index)
+                .collect::<Vec<_>>(),
+            indexes[3..5]
+        );
+        server.abort();
+    }
+
     #[test]
     fn conversation_follow_is_explicit_and_bounded() {
         let cli = Cli::try_parse_from([
@@ -7592,12 +7705,18 @@ mod tests {
         ])
         .unwrap();
         let Command::Conversations {
-            command: MessageCommand::Follow { session, limit },
+            command:
+                MessageCommand::Follow {
+                    session,
+                    actor,
+                    limit,
+                },
         } = cli.command
         else {
             panic!("the conversation follow command did not parse");
         };
         assert_eq!(session, "session/remote-agent");
+        assert_eq!(actor, None);
         assert_eq!(limit, 25);
     }
 
@@ -8594,6 +8713,7 @@ mod tests {
             pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         };

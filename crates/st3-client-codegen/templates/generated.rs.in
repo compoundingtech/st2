@@ -55,6 +55,7 @@ pub enum ErrorCode {
     RateLimited,
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
+    RemoteUnavailable,
     Internal,
     #[serde(other)]
     Unknown,

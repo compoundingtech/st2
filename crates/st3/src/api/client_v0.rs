@@ -2221,7 +2221,45 @@ pub(super) async fn terminal_screen(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "terminal.read")?;
-    terminal_screen_value(&state, &id, None).map(|(screen, _)| Json(screen))
+    match terminal_screen_value(&state, &id, None) {
+        Ok((screen, _)) => Ok(Json(screen)),
+        Err(error) if error.code == "runtime-not-local" => {
+            let subject = terminal_subject(&id);
+            let status = state
+                .store
+                .status(Some(&subject))
+                .map_err(ApiError::internal)?;
+            let host = status
+                .subjects
+                .first()
+                .and_then(|subject| subject.actual_origin.as_deref())
+                .map(client_host_id)
+                .ok_or_else(|| stale("the terminal owner is not known"))?;
+            let relay = state
+                .client_relay
+                .as_ref()
+                .ok_or_else(|| remote_unavailable(&host))?;
+            if !session.authority_actor.starts_with("person/") {
+                return Err(forbidden(
+                    "remote terminal screen requires a concrete person",
+                ));
+            }
+            let value = relay
+                .read(
+                    &host,
+                    &crate::peer::ClientReadRequest {
+                        authority_actor: session.authority_actor.clone(),
+                        request: crate::peer::ClientReadOperation::TerminalScreen {
+                            terminal_id: client_detail_id("terminal", &id),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| remote_read_error(&host, error))?;
+            Ok(Json(value))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -3902,6 +3940,7 @@ mod tests {
             pty_binary: root.join("unused-pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }

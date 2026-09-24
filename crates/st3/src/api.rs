@@ -64,6 +64,7 @@ pub struct AppState {
     pub pty_binary: std::path::PathBuf,
     pub fleet_id: Option<String>,
     pub configured_peers: Vec<String>,
+    pub client_relay: Option<crate::peer::ClientRelay>,
     pub native_session_home: Option<std::path::PathBuf>,
     pub planner_default: PlannerSpec,
 }
@@ -640,6 +641,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "rate-limited"
         | "runtime-not-local"
         | "runtime-authority-indeterminate"
+        | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
         _ => "internal".into(),
@@ -2172,6 +2174,60 @@ async fn client_sessions_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
+        let session_id = client_detail_id("session", id);
+        let session_resource = client_session_resources(
+            &state.store,
+            true,
+            &snapshot.created_at,
+            snapshot.store_index,
+            state.native_session_home.as_deref(),
+        )
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|item| item["id"] == session_id);
+        if let Some(owner) = session_resource
+            .as_ref()
+            .and_then(|item| item["owner_id"].as_str())
+            && owner.starts_with("agent/")
+        {
+            let owner_status = state
+                .store
+                .status(Some(owner))
+                .map_err(ApiError::internal)?;
+            let remote_host = owner_status
+                .subjects
+                .first()
+                .and_then(|subject| subject.actual_origin.as_deref())
+                .filter(|origin| *origin != state.store.origin())
+                .map(client_host_id);
+            if let Some(remote_host) = remote_host {
+                let relay = state
+                    .client_relay
+                    .as_ref()
+                    .ok_or_else(|| remote_unavailable(&remote_host))?;
+                if !session.authority_actor.starts_with("person/") {
+                    return Err(ApiError::bad(St3Error::new(
+                        "forbidden",
+                        "remote session detail requires a concrete person",
+                    )));
+                }
+                let value = relay
+                    .read(
+                        &remote_host,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            request: crate::peer::ClientReadOperation::Timeline {
+                                session_id,
+                                limit: query.limit.unwrap_or(50).clamp(1, 200),
+                                cursor: query.cursor.clone(),
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(&remote_host, error))?;
+                return Ok(Json(value));
+            }
+        }
         return client_v0::timeline_value(&state, &snapshot, &session, id, &query);
     }
     client_detail(
@@ -2186,6 +2242,35 @@ async fn client_sessions_detail(
         "session",
         &id,
     )
+}
+
+fn remote_unavailable(host: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "remote-unavailable".into(),
+        message: format!(
+            "owner {host} is temporarily unavailable; cached conversation remains usable"
+        ),
+        details: Box::default(),
+    }
+}
+
+fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
+    let Some(rejected) = error.downcast_ref::<crate::peer::ClientReadRejected>() else {
+        return remote_unavailable(host);
+    };
+    if !matches!(
+        rejected.code.as_str(),
+        "page-cursor-expired" | "cursor-gap" | "not-found" | "stale-fence"
+    ) {
+        return remote_unavailable(host);
+    }
+    ApiError {
+        status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        code: rejected.code.clone(),
+        message: rejected.message.clone(),
+        details: Box::default(),
+    }
 }
 
 async fn client_attention(
@@ -7396,6 +7481,21 @@ mod tests {
     use axum::http::Request;
     use std::path::PathBuf;
 
+    #[test]
+    fn owner_cursor_expiry_remains_a_typed_retryable_gateway_error() {
+        let rejected = crate::peer::ClientReadRejected {
+            code: "page-cursor-expired".into(),
+            status: 410,
+            message: "the owner page expired".into(),
+        };
+        let error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "page-cursor-expired");
+        let unavailable = remote_read_error("host/owner", anyhow::anyhow!("transport down"));
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.code, "remote-unavailable");
+    }
+
     fn state(root: &Path) -> AppState {
         AppState {
             store: Arc::new(Store::open_memory("node").unwrap()),
@@ -7407,6 +7507,7 @@ mod tests {
             pty_binary: PathBuf::from("pty"),
             fleet_id: None,
             configured_peers: Vec::new(),
+            client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }

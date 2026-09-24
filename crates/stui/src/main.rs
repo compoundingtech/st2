@@ -83,6 +83,7 @@ enum Update {
     Partial(Box<Model>),
     Model(Box<Model>),
     Timeline(String, Vec<st3_client::TimelineEntry>, bool),
+    TimelineInvalidated(String),
     Error(String),
 }
 struct App {
@@ -1103,7 +1104,15 @@ fn main() -> Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut changed = match model.sync(&background_client).await {
-                Ok(changed) => {
+                Ok((changed, invalidated_sessions)) => {
+                    for id in invalidated_sessions {
+                        if background_updates
+                            .send(Update::TimelineInvalidated(id))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     let recovered = was_offline;
                     was_offline = false;
                     if recovered {
@@ -1212,6 +1221,11 @@ fn main() -> Result<()> {
                         app.model.timeline = timeline;
                         app.model.timeline_truncated = truncated;
                         app.dirty = true;
+                    }
+                }
+                Update::TimelineInvalidated(id) => {
+                    if app.selected_session_id().as_deref() == Some(&id) {
+                        app.last_timeline = Instant::now() - Duration::from_secs(10);
                     }
                 }
                 Update::Error(error) => {

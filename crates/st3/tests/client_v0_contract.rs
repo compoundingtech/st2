@@ -346,6 +346,7 @@ fn test_state(root: &Path) -> AppState {
         pty_binary: PathBuf::from("pty"),
         fleet_id: None,
         configured_peers: Vec::new(),
+        client_relay: None,
         native_session_home: None,
         planner_default: st3::model::PlannerSpec::default(),
     }
