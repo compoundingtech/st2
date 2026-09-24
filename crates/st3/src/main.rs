@@ -5948,7 +5948,10 @@ async fn run_st2_native_driver(
     });
     let inbox = st2::message::inbox_dir(&agent_dir);
     let archive = st2::message::archive_dir(&agent_dir);
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    // Mailbox projection reads the durable message history. A one-second poll
+    // bounds delivery latency without repeatedly walking it four times a
+    // second for every native harness during idle periods.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6619,7 +6622,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     stdout.flush().await?;
 
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -6782,7 +6785,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
             argv,
         )
     });
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
