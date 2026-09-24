@@ -1251,8 +1251,16 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
             // A stop-only declaration with no observed runtime is already satisfied.
-            // Project that fact so the declaring step can complete.
-            if subject.kind == "stop" && subject.member.is_none() {
+            // Only its declaring host may project that fact. Otherwise every peer
+            // creates a concurrent runtime observation for the same subject.
+            if subject.kind == "stop"
+                && subject.member.is_none()
+                && self
+                    .store
+                    .selected_desired_origin(&subject.subject)?
+                    .as_deref()
+                    == Some(self.host.as_str())
+            {
                 self.record_once(
                     &subject.subject,
                     "runtime.observed",
@@ -1265,6 +1273,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = actual.get("fields").unwrap_or(&actual);
+        let selected_origin = self
+            .store
+            .status(Some(&subject.subject))?
+            .subjects
+            .into_iter()
+            .next()
+            .and_then(|status| status.actual_origin);
+        let owner_host = subject
+            .member
+            .as_ref()
+            .map(|member| member.host.as_str())
+            .or_else(|| fields.get("host").and_then(Value::as_str))
+            .or(selected_origin.as_deref());
+        if owner_host != Some(self.host.as_str()) {
+            // A stop intent is fleet-visible, but only the runtime's owner can
+            // observe or terminate its process. A remote empty PTY snapshot is
+            // not evidence that the owner's process stopped.
+            return Ok(());
+        }
         let Some(runtime_id) = fields.get("runtime_id").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -12559,6 +12586,62 @@ version 2
                 && desired.kind == "stop"
                 && desired.owner_run.as_deref() == Some(run.subject.as_str())
         }));
+    }
+
+    #[test]
+    fn a_remote_reconciler_does_not_observe_a_local_stop_for_another_host() {
+        let store = Arc::new(Store::open_memory("Silber").unwrap());
+        let subject = "agent/fleet/probe";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("host".into(), Value::String("Silber".into())),
+                    ("runtime_id".into(), Value::String("fleet.probe".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let stop = DesiredSubject {
+            subject: subject.into(),
+            kind: "stop".into(),
+            desired: Value::Null,
+            member: None,
+            owner_run: None,
+            owner_generation: None,
+            owner_step: None,
+        };
+        let remote = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "hetz".into(),
+            Arc::new(Notify::new()),
+        );
+        remote.reconcile_stop(&stop, &HashMap::new()).unwrap();
+        assert_eq!(
+            store
+                .claims_for(subject, Some("runtime.observed"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let owner = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "Silber".into(),
+            Arc::new(Notify::new()),
+        );
+        owner.reconcile_stop(&stop, &HashMap::new()).unwrap();
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["status"],
+            "stopped"
+        );
     }
 
     #[test]

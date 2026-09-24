@@ -5655,9 +5655,17 @@ impl Store {
         let mut pending_actions = Vec::new();
         for subject in subject_names {
             let desired = desired_row_at(&connection, &subject, at_index)?;
+            let member = desired
+                .as_ref()
+                .and_then(|row| row.member.as_deref())
+                .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
             let actual = latest_actual_at(&connection, &subject, at_index)?;
-            let (actual_claim, actual_origin, actual_origin_conflict) =
-                selected_actual_source_at(&connection, &subject, at_index)?;
+            let (actual_claim, actual_origin, actual_origin_conflict) = selected_actual_source_at(
+                &connection,
+                &subject,
+                at_index,
+                member.as_ref().map(|member| member.host.as_str()),
+            )?;
             let harness = current_harness_at(&connection, &subject, at_index)?;
             let claims = claim_ids_at(&connection, &subject, at_index)?;
             let conflicts = desired_conflicts_at(
@@ -5674,10 +5682,6 @@ impl Store {
             if selected_owner_run.is_some_and(|run| owner_run.as_deref() != Some(run)) {
                 continue;
             }
-            let member = desired
-                .as_ref()
-                .and_then(|row| row.member.as_deref())
-                .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
             let status = actual
                 .as_ref()
                 .and_then(|value| value.get("status"))
@@ -11521,10 +11525,12 @@ fn selected_actual_source_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
+    desired_host: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare(
-        "SELECT id, kind, origin, predecessors FROM claims
+        "SELECT id, kind, origin, predecessors,
+                CASE WHEN kind='runtime.observed' THEN body END FROM claims
          WHERE subject=?1 AND store_index<=?2
          ORDER BY store_index",
     )?;
@@ -11535,26 +11541,29 @@ fn selected_actual_source_at(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?).unwrap_or_default(),
+                row.get::<_, Option<String>>(4)?
+                    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                    .unwrap_or(Value::Null),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .find(|(_, kind, _, _, _)| kind == "runtime.observed")
         .or_else(|| {
-            rows.iter().rev().find(|(_, kind, _, _)| {
+            rows.iter().rev().find(|(_, kind, _, _, _)| {
                 kind != "intent.desired"
                     && !kind.starts_with("harness.")
                     && kind != "runtime.readiness-deadline-reached"
             })
         });
-    let Some((selected_id, _, selected_origin, _)) = selected else {
+    let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
         return Ok((None, None, false));
     };
     let predecessors = rows
         .iter()
-        .map(|(id, _, _, predecessors)| (id.as_str(), predecessors.as_slice()))
+        .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice()))
         .collect::<BTreeMap<_, _>>();
     let descends_from = |ancestor: &str| {
         let mut pending = vec![selected_id.as_str()];
@@ -11572,10 +11581,17 @@ fn selected_actual_source_at(
         }
         false
     };
-    let runtime_conflict = rows.iter().any(|(id, kind, origin, _)| {
+    let runtime_conflict = rows.iter().any(|(id, kind, origin, _, body)| {
         kind == "runtime.observed"
             && id != selected_id
             && origin != selected_origin
+            && !nonowner_terminal_observation(
+                desired_host,
+                selected_origin,
+                selected_body,
+                origin,
+                body,
+            )
             && !descends_from(id)
     });
     Ok((
@@ -11583,6 +11599,30 @@ fn selected_actual_source_at(
         Some(selected_origin.clone()),
         runtime_conflict,
     ))
+}
+
+fn nonowner_terminal_observation(
+    desired_host: Option<&str>,
+    selected_origin: &str,
+    selected_body: &Value,
+    other_origin: &str,
+    other_body: &Value,
+) -> bool {
+    let selected_fields = selected_body.get("fields").unwrap_or(selected_body);
+    let owner = desired_host.or_else(|| {
+        if selected_fields.get("status").and_then(Value::as_str) == Some("running") {
+            selected_fields.get("host").and_then(Value::as_str)
+        } else {
+            None
+        }
+    });
+    let other_fields = other_body.get("fields").unwrap_or(other_body);
+    owner == Some(selected_origin)
+        && other_origin != selected_origin
+        && matches!(
+            other_fields.get("status").and_then(Value::as_str),
+            Some("stopped" | "absent" | "exited" | "vanished")
+        )
 }
 
 fn latest_actual_at(
@@ -18784,6 +18824,34 @@ observer "ordered/file" {
             status.subjects[0].reason.as_deref(),
             Some("concurrent runtime observations have indeterminate authority")
         );
+    }
+
+    #[test]
+    fn a_remote_stop_without_process_authority_cannot_poison_the_running_owner() {
+        let owner = json!({"fields": {"status": "running", "host": "Silber"}});
+        let remote_stop = json!({"fields": {"status": "stopped"}});
+        let remote_running = json!({"fields": {"status": "running", "host": "hetz"}});
+        assert!(nonowner_terminal_observation(
+            None,
+            "Silber",
+            &owner,
+            "hetz",
+            &remote_stop,
+        ));
+        assert!(!nonowner_terminal_observation(
+            Some("hetz"),
+            "Silber",
+            &owner,
+            "hetz",
+            &remote_stop,
+        ));
+        assert!(!nonowner_terminal_observation(
+            None,
+            "Silber",
+            &owner,
+            "hetz",
+            &remote_running,
+        ));
     }
 
     #[test]
