@@ -8199,7 +8199,12 @@ impl Store {
                 | "daemon.started"
                 | "transport.observed"
                 | "render.applied"
+                | "work.claimed"
                 | "work.renewed"
+                | "work.progress"
+                | "work.submitted"
+                | "work.failed"
+                | "work.released"
         )
     }
 
@@ -14275,7 +14280,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         if !Store::simple_replication_kind(&claim.kind) || claim.body.get("_operation").is_some() {
             return Ok(false);
         }
-        if claim.kind == "work.renewed" {
+        if claim.kind.starts_with("work.") {
             let previous: Option<String> = transaction
                 .query_row(
                     "SELECT updated_at_unix_ms FROM step_runs WHERE subject=?1",
@@ -14302,7 +14307,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             &claim.body,
         )
         .map_err(internal)?;
-        if claim.kind == "work.renewed" {
+        if claim.kind.starts_with("work.") {
             project_mission_run_update(transaction, claim)?;
         }
     }
@@ -17673,7 +17678,9 @@ mod tests {
     fn simple_replication_rejects_structural_and_operation_claims() {
         assert!(Store::simple_replication_kind("harness.observed"));
         assert!(Store::simple_replication_kind("work.renewed"));
-        assert!(!Store::simple_replication_kind("work.claimed"));
+        assert!(Store::simple_replication_kind("work.claimed"));
+        assert!(Store::simple_replication_kind("work.progress"));
+        assert!(!Store::simple_replication_kind("work.unknown"));
         assert!(!Store::simple_replication_kind("mission.published"));
         let store = Store::open_memory("node").unwrap();
         assert!(store.project_replication_backlog().unwrap());
@@ -20076,11 +20083,15 @@ version 2
         controller.set_step_state(&step, "ready", None).unwrap();
 
         let worker = Store::open_memory("worker").unwrap();
-        worker
-            .import_replication("controller", &controller.export_replication(0).unwrap())
-            .unwrap();
+        receive_and_project(
+            &worker,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
         let remote = worker.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(remote.steps[0].status, "ready");
+        assert!(controller.project_replication_backlog().unwrap());
+        controller.bind_fleet(TEST_FLEET).unwrap();
         for action in ["claim", "complete"] {
             worker
                 .work_action(
@@ -20096,16 +20107,23 @@ version 2
                     },
                 )
                 .unwrap();
+            let exchange = exchange_from(&worker, &controller.replication_inventory().unwrap());
+            controller
+                .receive_replication_exchange("worker", TEST_FLEET, &exchange)
+                .unwrap();
+            controller.validate_replication_backlog().unwrap();
+            controller.apply_replication_repairs().unwrap();
+            {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                assert!(
+                    try_project_simple_replication_tx(&transaction).unwrap(),
+                    "a single routine work transition should use the bounded projection path"
+                );
+                transaction.rollback().unwrap();
+            }
+            assert!(controller.project_replication_backlog().unwrap());
         }
-
-        controller
-            .import_replication(
-                "worker",
-                &worker
-                    .export_replication_for_heads(&controller.replica_heads().unwrap())
-                    .unwrap(),
-            )
-            .unwrap();
         assert_eq!(
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
