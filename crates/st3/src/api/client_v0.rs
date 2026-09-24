@@ -334,7 +334,9 @@ fn mission_visualization(
     revision: &str,
     state: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let Some(mission) = store.mission_spec(mission_id, Some(revision))? else {
+    let Some(mission) =
+        store.mission_spec(mission_id.trim_start_matches("mission/"), Some(revision))?
+    else {
         return Ok(None);
     };
     let nodes = mission
@@ -382,6 +384,7 @@ fn mission_resources(
     store: &Store,
     snapshot_index: u64,
     history: bool,
+    selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
     for run in store.mission_runs()? {
@@ -403,6 +406,7 @@ fn mission_resources(
     let desired = store.desired_subjects()?;
     let mut values = missions
         .into_iter()
+        .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
         .map(|(mission, mut runs)| {
             runs.sort_by_key(|run| run.created_at_unix_ms);
             let definition = definitions.get(&mission);
@@ -425,6 +429,10 @@ fn mission_resources(
                     _ => "ready",
                 }
             };
+            let historical = matches!(state, "completed" | "failed" | "cancelled");
+            if !history && historical {
+                return Ok(None);
+            }
             let run_generations = runs
                 .iter()
                 .map(|run| (run.subject.clone(), Value::String(run.generation.clone())))
@@ -442,9 +450,12 @@ fn mission_resources(
                 .map(|run| run.updated_at_unix_ms)
                 .or_else(|| definition.map(|(_, updated_at)| *updated_at))
                 .expect("a mission resource has a definition or a run timestamp");
-            let visualization = mission_visualization(store, &mission, revision, state)?;
-            let historical = matches!(state, "completed" | "failed" | "cancelled");
-            Ok::<Value, anyhow::Error>(json!({
+            let visualization = if selected_id.is_some() {
+                mission_visualization(store, &mission, revision, state)?
+            } else {
+                None
+            };
+            Ok::<Option<Value>, anyhow::Error>(Some(json!({
                 "id": mission,
                 "kind": "mission",
                 "revision": revision,
@@ -461,12 +472,12 @@ fn mission_resources(
                     "actionable": !historical,
                     "reasons": if historical { vec![state] } else { Vec::<&str>::new() }
                 }
-            }))
+            })))
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if !history {
-        values.retain(|value| value["operational"]["actionable"] == true);
-    }
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     values.sort_by(|left, right| {
         right["updated_at"]
             .as_str()
@@ -882,7 +893,7 @@ pub(super) async fn missions(
         &state,
         &snapshot,
         "missions",
-        mission_resources(&state.store, snapshot.store_index, query.history)
+        mission_resources(&state.store, snapshot.store_index, query.history, None)
             .map_err(ApiError::internal)?,
         &query,
     )
@@ -897,7 +908,13 @@ pub(super) async fn mission_detail(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     client_detail(
-        mission_resources(&state.store, snapshot.store_index, true).map_err(ApiError::internal)?,
+        mission_resources(
+            &state.store,
+            snapshot.store_index,
+            true,
+            Some(&client_detail_id("mission", &id)),
+        )
+        .map_err(ApiError::internal)?,
         "mission",
         &id,
     )
@@ -2148,6 +2165,70 @@ fn terminal_live_session(
     })
 }
 
+// The gateway issues its own attachment so the capability remains bound to the
+// authenticated session here. The owner rechecks the runtime on every signed read.
+fn remote_terminal_live_session(
+    state: &AppState,
+    subject: &str,
+    expected_incarnation: &str,
+) -> Result<LiveSession, ApiError> {
+    let status = state
+        .store
+        .status(Some(subject))
+        .map_err(ApiError::internal)?;
+    let selected = status
+        .subjects
+        .first()
+        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
+    if !matches!(selected.reachability.as_str(), "reachable" | "local") {
+        return Err(stale("the terminal owner is not reachable"));
+    }
+    let origin = selected
+        .actual_origin
+        .as_deref()
+        .ok_or_else(|| stale("the terminal owner is unknown"))?;
+    if origin == state.store.origin() {
+        return terminal_live_session(state, subject, Some(expected_incarnation));
+    }
+    let owner_host_id = client_host_id(origin);
+    if state
+        .client_relay
+        .as_ref()
+        .is_none_or(|relay| !relay.has_peer(&owner_host_id))
+    {
+        return Err(remote_unavailable(&owner_host_id));
+    }
+    let actual = selected
+        .actual
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("the terminal has no runtime"))?;
+    let fields = actual.get("fields").unwrap_or(actual);
+    if fields.get("status").and_then(Value::as_str) != Some("running") {
+        return Err(ApiError::not_found("the terminal is not running"));
+    }
+    let incarnation = fields
+        .get("incarnation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::not_found("the terminal has no incarnation"))?;
+    if incarnation != expected_incarnation {
+        return Err(stale("the terminal incarnation fence is stale"));
+    }
+    let runtime_id = fields
+        .get("runtime_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::not_found("the terminal has no runtime ID"))?;
+    Ok(LiveSession {
+        runtime_id: runtime_id.into(),
+        incarnation_id: incarnation.into(),
+        owner_host_id,
+        terminal: fields
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        driver: None,
+    })
+}
+
 fn bounded_terminal_line(text: &str) -> (String, bool) {
     if text.len() <= TERMINAL_MAX_LINE_BYTES {
         return (text.to_owned(), false);
@@ -2299,10 +2380,20 @@ pub(super) async fn terminal_stream(
             details: Box::default(),
         });
     }
-    let live = terminal_live_session(&state, &subject, query.incarnation.as_deref())?;
+    let live = match query.incarnation.as_deref() {
+        Some(incarnation) => remote_terminal_live_session(&state, &subject, incarnation)?,
+        None => terminal_live_session(&state, &subject, None)?,
+    };
     if !live.terminal {
         return Err(validation(
             "the requested runtime does not expose a terminal",
+        ));
+    }
+    if live.owner_host_id != client_host_id(&state.node)
+        && !session.authority_actor.starts_with("person/")
+    {
+        return Err(forbidden(
+            "remote terminal stream requires a concrete person",
         ));
     }
     let expected_incarnation = live.incarnation_id;
@@ -2313,11 +2404,113 @@ pub(super) async fn terminal_stream(
         &expected_incarnation,
         stream_capability,
     )?;
+    if live.owner_host_id != client_host_id(&state.node) {
+        let owner = live.owner_host_id;
+        let authority_actor = session.authority_actor;
+        return Ok(websocket
+            .protocols([TERMINAL_SUBPROTOCOL])
+            .on_upgrade(move |socket| {
+                remote_terminal_stream_socket(
+                    socket,
+                    state,
+                    id,
+                    owner,
+                    authority_actor,
+                    expected_incarnation,
+                    query.after,
+                )
+            }));
+    }
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
         .on_upgrade(move |socket| {
             terminal_stream_socket(socket, state, id, expected_incarnation, query.after)
         }))
+}
+
+async fn remote_terminal_stream_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    id: String,
+    owner: String,
+    authority_actor: String,
+    incarnation: String,
+    after: Option<u64>,
+) {
+    let Some(relay) = state.client_relay.as_ref() else {
+        close_terminal_stream(&mut socket, 1012, "terminal owner unavailable").await;
+        return;
+    };
+    let request = crate::peer::ClientReadRequest {
+        authority_actor,
+        request: crate::peer::ClientReadOperation::TerminalScreen {
+            terminal_id: client_detail_id("terminal", &id),
+        },
+    };
+    let screen = match relay.read(&owner, &request).await {
+        Ok(screen) if screen["runtime_incarnation"].as_str() == Some(incarnation.as_str()) => {
+            screen
+        }
+        _ => {
+            close_terminal_stream(&mut socket, 1012, "terminal incarnation changed").await;
+            return;
+        }
+    };
+    if !send_terminal_stream_value(
+        &mut socket,
+        &terminal_stream_envelope(&state, screen.clone()),
+    )
+    .await
+    {
+        close_terminal_stream(
+            &mut socket,
+            1009,
+            "terminal screen exceeds the client limit",
+        )
+        .await;
+        return;
+    }
+    // Match the owner-local stream's second fence check after writing the first message.
+    if relay.read(&owner, &request).await.map_or(true, |fresh| {
+        fresh["runtime_incarnation"].as_str() != Some(incarnation.as_str())
+    }) {
+        close_terminal_stream(&mut socket, 1012, "terminal incarnation replaced").await;
+        return;
+    }
+    let sequence = screen["next_sequence"].as_u64().unwrap_or_default();
+    let frames = if after == Some(sequence) {
+        Vec::new()
+    } else {
+        vec![json!({
+            "id": format!("terminal-frame/{}/{}", id.trim_start_matches("terminal/"), sequence),
+            "terminal_id": client_detail_id("terminal", &id),
+            "runtime_incarnation": incarnation,
+            "sequence": sequence,
+            "type": "resync",
+            "timestamp": client_timestamp(client_now_ms()),
+            "body": { "screen": screen }
+        })]
+    };
+    let page = terminal_stream_envelope(
+        &state,
+        json!({
+            "kind": "terminal-frame-page",
+            "terminal_id": client_detail_id("terminal", &id),
+            "runtime_incarnation": incarnation,
+            "frames": frames,
+            "resume_sequence": sequence.saturating_add(1),
+        }),
+    );
+    if !send_terminal_stream_value(&mut socket, &page).await {
+        close_terminal_stream(
+            &mut socket,
+            1009,
+            "terminal frame page exceeds the client limit",
+        )
+        .await;
+        return;
+    }
+    close_terminal_stream(&mut socket, 1000, "terminal snapshot complete").await;
 }
 
 fn terminal_attachment_subject(id: &str) -> Result<String, ApiError> {
@@ -2470,6 +2663,11 @@ fn terminal_attachment_response(
         .iter()
         .find(|claim| claim.kind == "custom.client.terminal-attached")
         .ok_or_else(|| ApiError::internal("the terminal attachment claim is missing"))?;
+    if attached.origin != state.store.origin() {
+        return Err(forbidden(
+            "the terminal attachment belongs to another gateway",
+        ));
+    }
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
     if field("session_actor").and_then(Value::as_str) != Some(session.actor.as_str()) {
         return Err(forbidden(
@@ -2479,10 +2677,13 @@ fn terminal_attachment_response(
     let owner_host_id = field("owner_host_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::internal("the terminal attachment has no owner host"))?;
-    if owner_host_id != client_host_id(&state.node) {
-        return Err(forbidden(format!(
-            "the terminal attachment is owned by `{owner_host_id}`; use that host's client gateway"
-        )));
+    if owner_host_id != client_host_id(&state.node)
+        && state
+            .client_relay
+            .as_ref()
+            .is_none_or(|relay| !relay.has_peer(owner_host_id))
+    {
+        return Err(remote_unavailable(owner_host_id));
     }
     let latest = claims
         .last()
@@ -2546,7 +2747,7 @@ fn create_terminal_attachment(
         .runtime_incarnation
         .as_deref()
         .ok_or_else(|| validation("terminal attach requires a runtime incarnation fence"))?;
-    let live = terminal_live_session(state, &terminal_subject(&target), Some(incarnation))?;
+    let live = remote_terminal_live_session(state, &terminal_subject(&target), incarnation)?;
     if !live.terminal {
         return Err(validation("terminal attach requires a terminal runtime"));
     }
@@ -2653,9 +2854,17 @@ fn consume_terminal_attachment(
         .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
     let valid = latest.id == attached.id
+        && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
-        && field("owner_host_id").and_then(Value::as_str)
-            == Some(client_host_id(&state.node).as_str())
+        && field("owner_host_id")
+            .and_then(Value::as_str)
+            .is_some_and(|owner| {
+                owner == client_host_id(&state.node)
+                    || state
+                        .client_relay
+                        .as_ref()
+                        .is_some_and(|relay| relay.has_peer(owner))
+            })
         && field("terminal_id").and_then(Value::as_str) == Some(terminal_id)
         && field("runtime_incarnation").and_then(Value::as_str) == Some(incarnation)
         && field("expires_at_unix_ms")
@@ -2707,6 +2916,11 @@ fn detach_terminal_attachment(
                 "terminal attachment `{attachment_id}` does not exist"
             ))
         })?;
+    if attached.origin != state.store.origin() {
+        return Err(forbidden(
+            "the terminal attachment belongs to another gateway",
+        ));
+    }
     let session_actor = attached
         .body
         .pointer("/fields/session_actor")
@@ -3795,10 +4009,55 @@ pub(super) async fn action(
         result["snapshot_id"] = Value::String(new_client_snapshot(&state).id);
         return Ok(Json(result));
     }
+    if matches!(
+        request.action_type.as_str(),
+        "terminal.input" | "terminal.resize"
+    ) {
+        let terminal_id = parameter_string(&request.parameters, "terminal_id")?;
+        let incarnation = request
+            .fence
+            .runtime_incarnation
+            .as_deref()
+            .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
+        let live =
+            remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
+        if live.owner_host_id != client_host_id(&state.node) {
+            validate_fence(&state, &snapshot, &request.fence)?;
+            let expected_sequence = request
+                .fence
+                .terminal_sequence
+                .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+            let relay = state
+                .client_relay
+                .as_ref()
+                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+            let mut value = relay
+                .read(
+                    &live.owner_host_id,
+                    &crate::peer::ClientReadRequest {
+                        authority_actor: session.authority_actor.clone(),
+                        request: crate::peer::ClientReadOperation::TerminalControl {
+                            action_id: request.id.clone(),
+                            idempotency_key: request.idempotency_key.clone(),
+                            action_type: request.action_type.clone(),
+                            terminal_id: client_detail_id("terminal", &terminal_id),
+                            runtime_incarnation: incarnation.into(),
+                            expected_sequence,
+                            parameters: request.parameters.clone(),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+            value["snapshot_id"] = Value::String(new_client_snapshot(&state).id);
+            return Ok(Json(value));
+        }
+    }
     let mut reconciled_attachment = None;
     let fence_result = (|| {
         validate_fence(&state, &snapshot, &request.fence)?;
         if request.action_type.starts_with("terminal.")
+            && request.action_type != "terminal.detach"
             && request.fence.terminal_sequence
                 != Some(state.store.index().map_err(ApiError::internal)?)
         {
@@ -3816,6 +4075,39 @@ pub(super) async fn action(
         }
     }
     let terminal_attachment = if request.action_type == "terminal.attach" {
+        let target = parameter_string(&request.parameters, "target_id")?;
+        let incarnation = request
+            .fence
+            .runtime_incarnation
+            .as_deref()
+            .ok_or_else(|| validation("terminal attach requires an incarnation fence"))?;
+        let live = remote_terminal_live_session(&state, &terminal_subject(&target), incarnation)?;
+        if live.owner_host_id != client_host_id(&state.node) && reconciled_attachment.is_none() {
+            if !session.authority_actor.starts_with("person/") {
+                return Err(forbidden(
+                    "remote terminal attach requires a concrete person",
+                ));
+            }
+            let relay = state
+                .client_relay
+                .as_ref()
+                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+            let screen = relay
+                .read(
+                    &live.owner_host_id,
+                    &crate::peer::ClientReadRequest {
+                        authority_actor: session.authority_actor.clone(),
+                        request: crate::peer::ClientReadOperation::TerminalScreen {
+                            terminal_id: client_detail_id("terminal", &target),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+            if screen["runtime_incarnation"].as_str() != Some(incarnation) {
+                return Err(stale("the terminal incarnation fence is stale"));
+            }
+        }
         Some(if let Some(existing) = reconciled_attachment {
             existing
         } else {
@@ -3967,7 +4259,7 @@ mission "example/zero-run" state="ready" {
             .unwrap();
 
         let resources =
-            mission_resources(&state.store, state.store.index().unwrap(), true).unwrap();
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
         let mission = resources
             .iter()
             .find(|value| value["id"] == "mission/example/zero-run")
@@ -3975,9 +4267,22 @@ mission "example/zero-run" state="ready" {
         assert_eq!(mission["state"], "ready");
         assert_eq!(mission["runs"], json!([]));
         assert_eq!(mission["operational"]["actionable"], true);
+        assert!(mission["visualization"].is_null());
         assert_eq!(
             mission["mission_revision"],
             intent.missions["example/zero-run"].revision
+        );
+        let details = mission_resources(
+            &state.store,
+            state.store.index().unwrap(),
+            true,
+            Some("mission/example/zero-run"),
+        )
+        .unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(
+            details[0]["visualization"]["mission"],
+            "mission/example/zero-run"
         );
     }
 
@@ -5442,7 +5747,7 @@ mission "example/zero-run" state="ready" {
         let owner_root = tempfile::tempdir().unwrap();
         let follower_root = tempfile::tempdir().unwrap();
         let owner = test_state_named(owner_root.path(), "owner-node");
-        let follower = test_state_named(follower_root.path(), "follower-node");
+        let mut follower = test_state_named(follower_root.path(), "follower-node");
         let subject = "agent/fleet-terminal";
         let runtime = |status: &str, incarnation: &str, key: &str| ClaimInput {
             subject: subject.into(),
@@ -5516,6 +5821,80 @@ mission "example/zero-run" state="ready" {
         let error =
             terminal_screen_value(&follower, subject, Some("same-runtime-id:i1")).unwrap_err();
         assert_eq!(error.code, "runtime-not-local");
+
+        let secret = follower_root.path().join("fleet-secret");
+        std::fs::write(&secret, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        follower.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+            node: "follower-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "owner-node".into(),
+                url: "http://127.0.0.1:9".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let paired = ClientSession {
+            actor: "person/nathan/session/device-one".into(),
+            authority_actor: "person/nathan".into(),
+            transport: "paired",
+            scopes: ["terminal.read".into()].into_iter().collect(),
+        };
+        let mut remote_request = request.clone();
+        remote_request.idempotency_key = "fleet-terminal-attach-device-one".into();
+        let remote =
+            create_terminal_attachment(&follower, &paired, &remote_request, "remote-digest")
+                .unwrap();
+        assert_eq!(remote["owner_host_id"], "host/owner-node");
+        let remote_capability = remote["stream_capability"].as_str().unwrap();
+        assert_ne!(remote_capability, capability);
+        let another_device = ClientSession {
+            actor: "person/nathan/session/device-two".into(),
+            ..paired.clone()
+        };
+        assert_eq!(
+            consume_terminal_attachment(
+                &follower,
+                &another_device,
+                "terminal/agent/fleet-terminal",
+                "same-runtime-id:i1",
+                Some(remote_capability)
+            )
+            .unwrap_err()
+            .code,
+            "forbidden"
+        );
+        assert_eq!(
+            consume_terminal_attachment(
+                &follower,
+                &paired,
+                "terminal/agent/fleet-terminal",
+                "same-runtime-id:i1",
+                Some(capability)
+            )
+            .unwrap_err()
+            .code,
+            "forbidden"
+        );
+        consume_terminal_attachment(
+            &follower,
+            &paired,
+            "terminal/agent/fleet-terminal",
+            "same-runtime-id:i1",
+            Some(remote_capability),
+        )
+        .unwrap();
+        assert_eq!(
+            terminal_attachment_response(
+                &follower,
+                &paired,
+                remote["attachment_id"].as_str().unwrap()
+            )
+            .unwrap()["state"],
+            "consumed"
+        );
 
         owner
             .store

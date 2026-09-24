@@ -202,6 +202,15 @@ pub enum ClientReadOperation {
     TerminalScreen {
         terminal_id: String,
     },
+    TerminalControl {
+        action_id: String,
+        idempotency_key: String,
+        action_type: String,
+        terminal_id: String,
+        runtime_incarnation: String,
+        expected_sequence: u64,
+        parameters: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -230,8 +239,8 @@ impl std::fmt::Display for ClientReadRejected {
 
 impl std::error::Error for ClientReadRejected {}
 
-/// A paired gateway uses this only for bounded owner-local client reads. The peer worker
-/// authenticates both ends and the owner daemon rechecks the requested resource locally.
+/// A paired gateway uses this for bounded owner-local client operations. The peer worker
+/// authenticates both ends and the owner daemon rechecks the requested resource and fences.
 #[derive(Clone)]
 pub struct ClientRelay {
     node: String,
@@ -241,6 +250,12 @@ pub struct ClientRelay {
 }
 
 impl ClientRelay {
+    pub fn has_peer(&self, host_id: &str) -> bool {
+        host_id
+            .strip_prefix("host/")
+            .is_some_and(|name| self.peers.iter().any(|peer| peer.name == name))
+    }
+
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
         let (Some(fleet), Some(secret)) = (
             config.fleet_id.as_deref(),
@@ -582,6 +597,68 @@ async fn receive_client_read(
                 let value = client.terminal_screen(&terminal_id).await?.value;
                 Ok(serde_json::to_value(value)?)
             }
+            ClientReadOperation::TerminalControl {
+                action_id,
+                idempotency_key,
+                action_type,
+                terminal_id,
+                runtime_incarnation,
+                expected_sequence,
+                parameters,
+            } => {
+                anyhow::ensure!(
+                    matches!(action_type.as_str(), "terminal.input" | "terminal.resize"),
+                    "the terminal control action is invalid"
+                );
+                let screen = client.terminal_screen(&terminal_id).await?;
+                if screen.value.runtime_incarnation != runtime_incarnation
+                    || screen.value.next_sequence != expected_sequence
+                {
+                    return Err(ClientReadRejected {
+                        code: "stale-fence".into(),
+                        status: StatusCode::CONFLICT.as_u16(),
+                        message: "the terminal control fence is stale".into(),
+                    }
+                    .into());
+                }
+                let fence = st3_client::Fence {
+                    snapshot_id: screen.snapshot.id,
+                    subject_revisions: Default::default(),
+                    mission_generation: None,
+                    step_definition: None,
+                    attempt: None,
+                    readiness_epoch: None,
+                    runtime_incarnation: Some(runtime_incarnation),
+                    terminal_sequence: Some(screen.value.next_sequence),
+                    preview_token: None,
+                };
+                let result = match action_type.as_str() {
+                    "terminal.input" => {
+                        let parameters: st3_client::TerminalInputParameters =
+                            serde_json::from_value(parameters)?;
+                        anyhow::ensure!(
+                            parameters.terminal_id == terminal_id,
+                            "the terminal control target changed"
+                        );
+                        client
+                            .terminal_input(action_id, idempotency_key, fence, parameters)
+                            .await?
+                    }
+                    "terminal.resize" => {
+                        let parameters: st3_client::TerminalResizeParameters =
+                            serde_json::from_value(parameters)?;
+                        anyhow::ensure!(
+                            parameters.terminal_id == terminal_id,
+                            "the terminal control target changed"
+                        );
+                        client
+                            .terminal_resize(action_id, idempotency_key, fence, parameters)
+                            .await?
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(serde_json::to_value(result.value)?)
+            }
         }
     }
     .await;
@@ -603,30 +680,39 @@ async fn receive_client_read(
         )
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Err(error) => {
-            let (status, code, message) = match error.downcast_ref::<st3_client::ClientError>() {
-                Some(st3_client::ClientError::Api(code, message, _)) => {
-                    let status = match code {
-                        st3_client::ErrorCode::PageCursorExpired
-                        | st3_client::ErrorCode::CursorGap => StatusCode::GONE,
-                        st3_client::ErrorCode::NotFound => StatusCode::NOT_FOUND,
-                        st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
-                        _ => StatusCode::UNPROCESSABLE_ENTITY,
-                    };
+            let (status, code, message) =
+                if let Some(rejected) = error.downcast_ref::<ClientReadRejected>() {
                     (
-                        status,
-                        serde_json::to_value(code)
-                            .ok()
-                            .and_then(|value| value.as_str().map(str::to_owned))
-                            .unwrap_or_else(|| "remote-unavailable".into()),
-                        message.clone(),
+                        StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
+                        rejected.code.clone(),
+                        rejected.message.clone(),
                     )
-                }
-                _ => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "remote-unavailable".into(),
-                    format!("fleet client read from {sender} failed"),
-                ),
-            };
+                } else {
+                    match error.downcast_ref::<st3_client::ClientError>() {
+                        Some(st3_client::ClientError::Api(code, message, _)) => {
+                            let status = match code {
+                                st3_client::ErrorCode::PageCursorExpired
+                                | st3_client::ErrorCode::CursorGap => StatusCode::GONE,
+                                st3_client::ErrorCode::NotFound => StatusCode::NOT_FOUND,
+                                st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
+                                _ => StatusCode::UNPROCESSABLE_ENTITY,
+                            };
+                            (
+                                status,
+                                serde_json::to_value(code)
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_owned))
+                                    .unwrap_or_else(|| "remote-unavailable".into()),
+                                message.clone(),
+                            )
+                        }
+                        _ => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "remote-unavailable".into(),
+                            format!("fleet client read from {sender} failed"),
+                        ),
+                    }
+                };
             signed_client_read_failure(&state, &request_digest, status, &code, &message)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }

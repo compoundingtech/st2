@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -588,6 +588,41 @@ fn discover_opencode_sessions(home: &Path) -> Result<Vec<SessionMetadata>> {
 
 fn read_metadata(driver: ExternalDriver, path: &Path) -> Result<Option<SessionMetadata>> {
     let file_metadata = fs::metadata(path)?;
+    let modified = file_metadata.modified().unwrap_or(UNIX_EPOCH);
+    let length = file_metadata.len();
+    // Discovery revisits the same transcript files on every client refresh. Their
+    // opening metadata is immutable for almost all of those visits, while parsing
+    // hundreds of JSONL headers repeatedly dominates the idle daemon's CPU.
+    static METADATA_CACHE: OnceLock<
+        Mutex<HashMap<PathBuf, (ExternalDriver, u64, SystemTime, Option<SessionMetadata>)>>,
+    > = OnceLock::new();
+    let cache = METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((cached_driver, cached_length, cached_modified, cached)) = cache
+        .lock()
+        .expect("external session metadata cache mutex poisoned")
+        .get(path)
+        && *cached_driver == driver
+        && *cached_length == length
+        && *cached_modified == modified
+    {
+        return Ok(cached.clone());
+    }
+    let parsed = parse_metadata(driver, path, &file_metadata)?;
+    let mut cache = cache
+        .lock()
+        .expect("external session metadata cache mutex poisoned");
+    if cache.len() >= MAX_DISCOVERED_FILES && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_owned(), (driver, length, modified, parsed.clone()));
+    Ok(parsed)
+}
+
+fn parse_metadata(
+    driver: ExternalDriver,
+    path: &Path,
+    file_metadata: &fs::Metadata,
+) -> Result<Option<SessionMetadata>> {
     let updated_at_unix_ms = system_time_ms(file_metadata.modified().unwrap_or(UNIX_EPOCH));
     let file = File::open(path)?;
     let mut native_id = None;
@@ -1417,6 +1452,45 @@ fn digest(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_cache_refreshes_after_a_transcript_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"first\"}}\n",
+        )
+        .unwrap();
+        let first = read_metadata(ExternalDriver::Codex, &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.native_id, "first");
+        assert_eq!(
+            read_metadata(ExternalDriver::Claude, &path)
+                .unwrap()
+                .unwrap()
+                .native_id,
+            "session"
+        );
+        assert_eq!(
+            read_metadata(ExternalDriver::Codex, &path)
+                .unwrap()
+                .unwrap()
+                .revision,
+            first.revision
+        );
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"second-longer\"}}\n",
+        )
+        .unwrap();
+        let second = read_metadata(ExternalDriver::Codex, &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.native_id, "second-longer");
+        assert_ne!(second.revision, first.revision);
+    }
 
     #[test]
     fn bound_claude_transcript_resolves_without_a_fleetwide_discovery() {

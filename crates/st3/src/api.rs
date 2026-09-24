@@ -1248,12 +1248,113 @@ fn managed_session_owner_at(
 }
 
 fn client_session_resources(
-    store: &Store,
+    store: &Arc<Store>,
     history: bool,
     at: &str,
     snapshot_index: u64,
     native_session_home: Option<&Path>,
 ) -> anyhow::Result<Vec<Value>> {
+    type ManagedSessions = (Arc<Store>, u64, bool, Vec<Value>, BTreeSet<String>);
+    static MANAGED_CACHE: OnceLock<Mutex<Option<ManagedSessions>>> = OnceLock::new();
+    let cache = MANAGED_CACHE.get_or_init(|| Mutex::new(None));
+    let cached = cache
+        .lock()
+        .expect("managed session cache mutex poisoned")
+        .as_ref()
+        .filter(|(cached_store, index, all, _, _)| {
+            Arc::ptr_eq(cached_store, store) && *index == snapshot_index && *all == history
+        })
+        .map(|(_, _, _, sessions, managed)| (sessions.clone(), managed.clone()));
+    let (mut sessions, managed_native_sessions) = if let Some(cached) = cached {
+        cached
+    } else {
+        let fresh = managed_session_resources(store, history, at, snapshot_index)?;
+        *cache.lock().expect("managed session cache mutex poisoned") = Some((
+            store.clone(),
+            snapshot_index,
+            history,
+            fresh.0.clone(),
+            fresh.1.clone(),
+        ));
+        fresh
+    };
+    let mut external = crate::external_sessions::discover(native_session_home, history)?;
+    external
+        .sessions
+        .retain(|session| !managed_native_sessions.contains(&session.native_id));
+    for session in external.sessions {
+        let running = session.process.is_some();
+        let process = session.process.as_ref().map(|process| {
+            json!({
+                "pid": process.pid,
+                "started_at": crate::external_sessions::timestamp(process.started_at_unix_ms),
+                "fingerprint": process.fingerprint,
+                "exact_session": process.exact_session
+            })
+        });
+        sessions.push(json!({
+            "id": session.id,
+            "kind": "session",
+            "revision": session.revision,
+            "updated_at": crate::external_sessions::timestamp(session.updated_at_unix_ms),
+            "owner_id": format!("external-session/{}/{}", session.driver.as_str(), session.native_id),
+            "state": if running { "running" } else { "completed" },
+            "started_at": crate::external_sessions::timestamp(session.started_at_unix_ms),
+            "ended_at": if running { None } else { Some(crate::external_sessions::timestamp(session.updated_at_unix_ms)) },
+            "timeline_cursor": format!("timeline-cursor/{}/latest", session.id.trim_start_matches("session/")),
+            "usage": null,
+            "managed": false,
+            "driver": session.driver.as_str(),
+            "native_session_id": session.native_id,
+            "workspace": session.cwd.map(|path| path.display().to_string()),
+            "title": session.title,
+            "importable": true,
+            "import_reason": null,
+            "process": process
+        }));
+    }
+    for unresolved in external.unresolved_processes {
+        sessions.push(json!({
+            "id": unresolved.id,
+            "kind": "session",
+            "revision": unresolved.revision,
+            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+            "state": "running",
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "ended_at": null,
+            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+            "usage": null,
+            "managed": false,
+            "driver": unresolved.driver.as_str(),
+            "native_session_id": null,
+            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+            "title": null,
+            "importable": false,
+            "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+            "process": {
+                "pid": unresolved.process.pid,
+                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+                "fingerprint": unresolved.process.fingerprint,
+                "exact_session": false
+            }
+        }));
+    }
+    sessions.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .cmp(&left["updated_at"].as_str())
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    Ok(sessions)
+}
+
+fn managed_session_resources(
+    store: &Store,
+    history: bool,
+    at: &str,
+    snapshot_index: u64,
+) -> anyhow::Result<(Vec<Value>, BTreeSet<String>)> {
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let mut sessions = Vec::new();
     for subject in status
@@ -1365,75 +1466,7 @@ fn client_session_resources(
                 .map(str::to_owned)
         })
         .collect::<BTreeSet<_>>();
-    let mut external = crate::external_sessions::discover(native_session_home, history)?;
-    external
-        .sessions
-        .retain(|session| !managed_native_sessions.contains(&session.native_id));
-    for session in external.sessions {
-        let running = session.process.is_some();
-        let process = session.process.as_ref().map(|process| {
-            json!({
-                "pid": process.pid,
-                "started_at": crate::external_sessions::timestamp(process.started_at_unix_ms),
-                "fingerprint": process.fingerprint,
-                "exact_session": process.exact_session
-            })
-        });
-        sessions.push(json!({
-            "id": session.id,
-            "kind": "session",
-            "revision": session.revision,
-            "updated_at": crate::external_sessions::timestamp(session.updated_at_unix_ms),
-            "owner_id": format!("external-session/{}/{}", session.driver.as_str(), session.native_id),
-            "state": if running { "running" } else { "completed" },
-            "started_at": crate::external_sessions::timestamp(session.started_at_unix_ms),
-            "ended_at": if running { None } else { Some(crate::external_sessions::timestamp(session.updated_at_unix_ms)) },
-            "timeline_cursor": format!("timeline-cursor/{}/latest", session.id.trim_start_matches("session/")),
-            "usage": null,
-            "managed": false,
-            "driver": session.driver.as_str(),
-            "native_session_id": session.native_id,
-            "workspace": session.cwd.map(|path| path.display().to_string()),
-            "title": session.title,
-            "importable": true,
-            "import_reason": null,
-            "process": process
-        }));
-    }
-    for unresolved in external.unresolved_processes {
-        sessions.push(json!({
-            "id": unresolved.id,
-            "kind": "session",
-            "revision": unresolved.revision,
-            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
-            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
-            "state": "running",
-            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-            "ended_at": null,
-            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
-            "usage": null,
-            "managed": false,
-            "driver": unresolved.driver.as_str(),
-            "native_session_id": null,
-            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
-            "title": null,
-            "importable": false,
-            "import_reason": "the running harness does not expose an exact native session ID; select a saved session and explicitly confirm this PID before takeover",
-            "process": {
-                "pid": unresolved.process.pid,
-                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-                "fingerprint": unresolved.process.fingerprint,
-                "exact_session": false
-            }
-        }));
-    }
-    sessions.sort_by(|left, right| {
-        right["updated_at"]
-            .as_str()
-            .cmp(&left["updated_at"].as_str())
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
-    Ok(sessions)
+    Ok((sessions, managed_native_sessions))
 }
 
 fn snapshot_time_ms(timestamp: &str) -> u128 {
@@ -2265,9 +2298,7 @@ fn remote_unavailable(host: &str) -> ApiError {
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "remote-unavailable".into(),
-        message: format!(
-            "owner {host} is temporarily unavailable; cached conversation remains usable"
-        ),
+        message: format!("owner {host} is temporarily unavailable; cached data remains usable"),
         details: Box::default(),
     }
 }
@@ -2278,7 +2309,13 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     };
     if !matches!(
         rejected.code.as_str(),
-        "page-cursor-expired" | "cursor-gap" | "not-found" | "stale-fence"
+        "page-cursor-expired"
+            | "cursor-gap"
+            | "not-found"
+            | "stale-fence"
+            | "validation-failed"
+            | "forbidden"
+            | "idempotency-conflict"
     ) {
         return remote_unavailable(host);
     }
@@ -7508,6 +7545,14 @@ mod tests {
         let error = remote_read_error("host/owner", rejected.into());
         assert_eq!(error.status, StatusCode::GONE);
         assert_eq!(error.code, "page-cursor-expired");
+        let rejected = crate::peer::ClientReadRejected {
+            code: "validation-failed".into(),
+            status: 422,
+            message: "remote terminal input is invalid".into(),
+        };
+        let terminal_error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(terminal_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(terminal_error.code, "validation-failed");
         let unavailable = remote_read_error("host/owner", anyhow::anyhow!("transport down"));
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code, "remote-unavailable");
@@ -7527,6 +7572,42 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: PlannerSpec::default(),
+        }
+    }
+
+    #[test]
+    fn managed_session_cache_tracks_a_new_runtime_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/cache-test";
+        for incarnation in ["first", "second"] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("runtime_id".into(), Value::String("cache-runtime".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let snapshot = new_client_snapshot(&state);
+            let sessions = client_session_resources(
+                &state.store,
+                false,
+                &snapshot.created_at,
+                snapshot.store_index,
+                None,
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0]["revision"], incarnation);
         }
     }
 
