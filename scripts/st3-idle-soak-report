@@ -10,14 +10,15 @@ DURATION=${ST3_IDLE_REPORT_DURATION_SECONDS:-86400}
 MAX_GAP=${ST3_IDLE_REPORT_MAX_GAP_SECONDS:-180}
 MIN_SAMPLES=${ST3_IDLE_REPORT_MIN_SAMPLES:-1200}
 MIN_QUIET=${ST3_IDLE_REPORT_MIN_QUIET:-60}
-for value in "$NOW" "$DURATION" "$MAX_GAP" "$MIN_SAMPLES" "$MIN_QUIET"; do
+MIN_QUIET_SECONDS=${ST3_IDLE_REPORT_MIN_QUIET_SECONDS:-45}
+for value in "$NOW" "$DURATION" "$MAX_GAP" "$MIN_SAMPLES" "$MIN_QUIET" "$MIN_QUIET_SECONDS"; do
   [[ $value =~ ^[0-9]+$ ]] || { echo 'invalid numeric idle report setting' >&2; exit 2; }
 done
 [[ -r $LOG ]] || { echo "idle evidence log is unavailable: $LOG" >&2; exit 1; }
 
 report=$("$JQ_BIN" -sc --argjson now "$NOW" --argjson duration "$DURATION" \
   --argjson max_gap "$MAX_GAP" --argjson min_samples "$MIN_SAMPLES" \
-  --argjson min_quiet "$MIN_QUIET" '
+  --argjson min_quiet "$MIN_QUIET" --argjson min_quiet_seconds "$MIN_QUIET_SECONDS" '
   def average: if length == 0 then null else add / length end;
   def median: if length == 0 then null else sort | .[length / 2 | floor] end;
   . as $all | ($now - $duration) as $start |
@@ -29,7 +30,7 @@ report=$("$JQ_BIN" -sc --argjson now "$NOW" --argjson duration "$DURATION" \
     ([$rows[] | select(.error == null)]) as $valid |
     ([range(1; $valid | length) as $i | $valid[$i - 1] as $a | $valid[$i] as $b |
       select($a.pid == $b.pid and $a.graph_index == $b.graph_index
-        and ($b.at - $a.at) > 0 and ($b.at - $a.at) <= $max_gap) |
+        and ($b.at - $a.at) >= $min_quiet_seconds and ($b.at - $a.at) <= $max_gap) |
       {cpu: (100 * ($b.cpu_seconds - $a.cpu_seconds) / ($b.at - $a.at)),
        wakeups: (($b.context_switches - $a.context_switches) / ($b.at - $a.at))}]) as $quiet |
     ([$valid[] | select(.at <= $start + 3600) | .rss_kib] | average) as $rss_first |
