@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 : "${ST3_BIN:?set ST3_BIN to the installed st3 executable on this host}"
 JQ_BIN=${ST3_SOAK_JQ_BIN:-$(command -v jq)}
-person=${ST3_SOAK_PERSON:-person/nathan}
 host=${ST3_SOAK_HOST:-$(/bin/hostname)}
 
 if [[ $(/usr/bin/uname -s) == Linux ]]; then
@@ -31,9 +30,13 @@ else
   [[ $raw =~ ^[0-9]+$ ]] && switches=$raw
 fi
 
-now_json=$("$ST3_BIN" now --as "$person" --json)
+activity_json=$("$ST3_BIN" activity --limit 200 --json)
 replication_json=$("$ST3_BIN" replication status --json)
-graph_index=$("$JQ_BIN" -er '.snapshot.store_index' <<<"$now_json")
+graph_index=$("$JQ_BIN" -er '.snapshot.store_index' <<<"$activity_json")
+material_index=$("$JQ_BIN" -er '[.value.items[] |
+  select(.body.change != "harness.usage" and .body.change != "harness.observed"
+    and .body.change != "work.renewed" and .body.change != "replication.heartbeat") |
+  .sequence] | max // 0' <<<"$activity_json")
 pending=$("$JQ_BIN" -er '.pending_records' <<<"$replication_json")
 received=$("$JQ_BIN" -er '.received_envelopes' <<<"$replication_json")
 peer_status=$("$JQ_BIN" -er '.peers[0].status' <<<"$replication_json")
@@ -43,10 +46,12 @@ peer_last_success_ms=$("$JQ_BIN" -er '.peers[0].last_success_at_unix_ms' <<<"$re
   --arg host "$host" --argjson at "$(/bin/date -u +%s)" --argjson pid "$pid" \
   --argjson cpu_seconds "$cpu_seconds" --argjson rss_kib "$rss_kib" \
   --argjson context_switches "$switches" \
-  --argjson graph_index "$graph_index" --argjson pending "$pending" \
+  --argjson graph_index "$graph_index" --argjson material_index "$material_index" \
+  --argjson pending "$pending" \
   --argjson received "$received" --arg peer_status "$peer_status" \
   --argjson peer_error "$peer_error" --argjson peer_last_success_ms "$peer_last_success_ms" \
   '{at:$at,host:$host,pid:$pid,cpu_seconds:$cpu_seconds,rss_kib:$rss_kib,
-    context_switches:$context_switches,graph_index:$graph_index,pending:$pending,
+    context_switches:$context_switches,graph_index:$graph_index,
+    material_index:$material_index,pending:$pending,
     received:$received,peer_status:$peer_status,peer_error:$peer_error,
     peer_last_success_ms:$peer_last_success_ms}'

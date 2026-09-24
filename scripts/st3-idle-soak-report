@@ -25,11 +25,13 @@ report=$("$JQ_BIN" -sc --argjson now "$NOW" --argjson duration "$DURATION" \
   def analyze($host; $cpu_limit):
     ([$all[] | select(.host == $host and .at >= $start and .at <= $now)] | sort_by(.at)) as $rows |
     ([$rows[] | select(.error != null or .peer_status != "up" or .peer_error != false
-      or .pending != 0 or .context_switches == null
+      or .pending != 0 or .context_switches == null or .material_index == null
       or .peer_last_success_ms == null or (.at * 1000 - .peer_last_success_ms) > 120000)]) as $bad |
     ([$rows[] | select(.error == null)]) as $valid |
     ([range(1; $valid | length) as $i | $valid[$i - 1] as $a | $valid[$i] as $b |
-      select($a.pid == $b.pid and $a.graph_index == $b.graph_index
+      select($a.pid == $b.pid and $a.material_index == $b.material_index
+        and $b.graph_index >= $a.graph_index
+        and ($b.graph_index - $a.graph_index) <= 200
         and ($b.at - $a.at) >= $min_quiet_seconds and ($b.at - $a.at) <= $max_gap) |
       {cpu: (100 * ($b.cpu_seconds - $a.cpu_seconds) / ($b.at - $a.at)),
        wakeups: (($b.context_switches - $a.context_switches) / ($b.at - $a.at))}]) as $quiet |
