@@ -7882,11 +7882,15 @@ impl Store {
             digest: replication_inventory_digest(&envelopes),
             envelopes,
         };
+        // Envelope hashes already commit the complete payload (and chain metadata). The
+        // inventory digest therefore commits the authority log without hex-encoding and hashing
+        // every payload again on each graph change.
+        let authority_digest = inventory.digest.clone();
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             inventory,
-            authority_digest: authority_digest(&connection)?,
+            authority_digest,
             graph_digest: graph_digest(&connection)?,
         });
         *self
@@ -8421,7 +8425,7 @@ impl Store {
         fleet_id: Option<&str>,
         configured_peers: &[String],
     ) -> Result<ReplicationStatus> {
-        let _ = self.replication_inventory()?;
+        let snapshot = self.replication_snapshot()?;
         let connection = self.readers.get();
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
@@ -8468,7 +8472,7 @@ impl Store {
         Ok(ReplicationStatus {
             configured,
             fleet_id: fleet_id.map(str::to_owned),
-            authority_digest: authority_digest(&connection)?,
+            authority_digest: snapshot.authority_digest.clone(),
             graph_digest: graph_digest(&connection)?,
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
@@ -13618,17 +13622,6 @@ fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn authority_digest(connection: &Connection) -> Result<String> {
-    digest_queries(
-        connection,
-        &[(
-            "envelopes",
-            "SELECT json_array(writer, sequence, envelope_hash, previous_hash, hex(payload))
-             FROM replica_envelopes ORDER BY writer, sequence, envelope_hash",
-        )],
-    )
-}
-
 fn graph_digest(connection: &Connection) -> Result<String> {
     digest_queries(
         connection,
@@ -13721,6 +13714,13 @@ fn unchanged_replication_snapshot_reuses_inventory() {
     let first = store.replication_snapshot().unwrap();
     let second = store.replication_snapshot().unwrap();
     assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.authority_digest, first.inventory.digest);
+    let first_hash = replica_envelope_hash("node", 1, None, 1, b"first");
+    let second_hash = replica_envelope_hash("node", 1, None, 1, b"second");
+    assert_ne!(
+        first_hash, second_hash,
+        "the inventory must commit payload bytes"
+    );
 }
 
 fn collect_referenced_blobs(
