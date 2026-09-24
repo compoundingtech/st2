@@ -474,9 +474,7 @@ async fn response_envelope(
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
             let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
-            let snapshot = cursor_snapshot
-                .flatten()
-                .unwrap_or_else(|| new_client_snapshot(&auth_state));
+            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
             (authentication, snapshot)
         })
         .await;
@@ -627,6 +625,18 @@ fn client_snapshot_time(snapshot: &ClientSnapshot) -> u128 {
 fn new_client_snapshot(state: &AppState) -> ClientSnapshot {
     let store_index = state.store.index().unwrap_or_default();
     client_snapshot_at(state, store_index)
+}
+
+fn client_request_snapshot(
+    state: &AppState,
+    cursor_snapshot: Option<ClientSnapshot>,
+) -> ClientSnapshot {
+    // A relayed timeline cursor belongs to its owner host. Only that host can
+    // validate its snapshot index and page cache; the gateway still needs a
+    // local snapshot to resolve the current session owner and authenticate.
+    cursor_snapshot
+        .filter(|snapshot| snapshot.host_id == client_host_id(&state.node))
+        .unwrap_or_else(|| new_client_snapshot(state))
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
@@ -7635,6 +7645,24 @@ mod tests {
         let unavailable = remote_read_error("host/owner", anyhow::anyhow!("transport down"));
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code, "remote-unavailable");
+    }
+
+    #[test]
+    fn remote_timeline_cursor_keeps_its_owner_snapshot_out_of_gateway_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = state(root.path());
+        let local = new_client_snapshot(&gateway);
+        let mut owner = local.clone();
+        owner.id = "snapshot/owner/9000/ahead".into();
+        owner.host_id = "host/owner".into();
+        owner.store_index = 9000;
+
+        let admitted = client_request_snapshot(&gateway, Some(owner));
+        assert_eq!(admitted.id, local.id);
+        assert_eq!(admitted.store_index, local.store_index);
+        let admitted_local = client_request_snapshot(&gateway, Some(local.clone()));
+        assert_eq!(admitted_local.id, local.id);
+        assert_eq!(admitted_local.store_index, local.store_index);
     }
 
     fn state(root: &Path) -> AppState {
