@@ -206,32 +206,42 @@ export default function App() {
   const timelineUnresolved = timelineSession ? isUnresolved(timelineSession) : false;
   useEffect(() => {
     if (!client || !sessionId || timelineUnresolved) { setTimeline([]); return; }
-    if (status !== 'online') return;
+    if (status !== 'online' || active !== 'Chat' || !chatDetailOpen) return;
+    const timelineClient = client;
     let live = true;
-    void (async () => {
+    let polling = false;
+    let lastRevision = '';
+    async function poll() {
+      if (polling || !live) return;
+      polling = true;
       for (let attempt = 0; attempt < 4 && live; attempt++) {
         try {
           let cursor: string | undefined;
           let entries: TimelineEntry[] = [];
           for (let page = 0; page < 5; page++) {
-            const result = await client.timelineList(sessionId, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30), cursor });
+            const result = await timelineClient.timelineList(sessionId, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30), cursor });
             entries = entries.concat(result.value.items);
             if (!result.value.page.has_more || !result.value.page.next_cursor) break;
             cursor = result.value.page.next_cursor;
           }
-          if (live) setTimeline(recentTimeline(entries));
-          return;
+          const recent = recentTimeline(entries);
+          const revision = recent.map(entry => `${entry.id}:${entry.revision}`).join('|');
+          if (live && revision !== lastRevision) { lastRevision = revision; setTimeline(recent); }
+          break;
         } catch (error) {
           if (!isSnapshotChurn(error)) {
             if (live && error instanceof ClientError && error.status >= 400 && error.status < 500) setError(errorText(error));
-            return;
+            break;
           }
           if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
         }
       }
-    })();
-    return () => { live = false; };
-  }, [client, sessionId, status, caps, timelineUnresolved]);
+      polling = false;
+    }
+    void poll();
+    const timer = setInterval(() => void poll(), 5_000);
+    return () => { live = false; clearInterval(timer); };
+  }, [client, sessionId, status, caps, timelineUnresolved, active, chatDetailOpen]);
   useEffect(() => {
     if (!client || !terminalId || !chatDetailOpen || active !== 'Chat') return;
     let live = true, polling = false, unavailable = false;

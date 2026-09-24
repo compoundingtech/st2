@@ -372,6 +372,24 @@ pub fn run_observe(
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    if event == "SessionStart" {
+        if let (Ok(incarnation), Some(native_id)) = (
+            std::env::var(SESSION_ENV),
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            if !incarnation.is_empty() && !native_id.is_empty() {
+                if let Err(error) =
+                    write_native_session_binding(&agent_dir, &incarnation, native_id)
+                {
+                    tracing::warn!(
+                        "st2 claude-observe: native session binding write failed: {error:#}"
+                    );
+                }
+            }
+        }
+    }
     let timeline_incarnation = std::env::var(SESSION_ENV)
         .ok()
         .filter(|token| !token.is_empty())
@@ -424,6 +442,22 @@ pub fn run_observe(
     // with a live state: the wrapper's `ended` carries this same token and is the session's last
     // word. (`false` = suppressed; the hook has nothing else to do with it.)
     writer.observe_unless_ended(observation).map(|_wrote| ())
+}
+
+fn write_native_session_binding(
+    agent_dir: &Path,
+    incarnation: &str,
+    native_id: &str,
+) -> Result<()> {
+    harness_state::write_json_atomic(
+        &agent_dir.join("claude-native-session"),
+        &serde_json::json!({
+            "incarnation": incarnation,
+            "native_session_id": native_id,
+        }),
+        agent_dir,
+        ".claude-native-session",
+    )
 }
 
 /// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes
@@ -862,6 +896,18 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+
+    #[test]
+    fn native_session_binding_is_atomic_and_names_the_exact_provider_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        write_native_session_binding(root.path(), "wrapper-current", "native-current").unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("claude-native-session")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["incarnation"], "wrapper-current");
+        assert_eq!(binding["native_session_id"], "native-current");
+    }
 
     #[test]
     fn st3_development_channel_merges_an_authored_mcp_configuration() {

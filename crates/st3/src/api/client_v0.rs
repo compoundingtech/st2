@@ -1288,6 +1288,61 @@ fn managed_codex_transcript(
         }))
 }
 
+fn managed_claude_transcript(
+    state: &AppState,
+    owner: &str,
+    incarnation: &str,
+) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    let Some(home) = state.native_session_home.as_deref() else {
+        return Ok(None);
+    };
+    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
+    let directory = state
+        .state_dir
+        .join("drivers")
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+        .join("catalog")
+        .join("agents")
+        .join(st2::run::detect_host())
+        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
+    // Only the current wrapper's SessionStart hook may bind a Claude transcript.
+    // A previous provider's session-id file can survive a restart, so neither
+    // its presence nor the newest transcript in a workspace is sufficient.
+    let Ok(binding) = std::fs::read(directory.join("claude-native-session")) else {
+        return Ok(None);
+    };
+    let Ok(binding) = serde_json::from_slice::<Value>(&binding) else {
+        return Ok(None);
+    };
+    let (Some(provider_incarnation), Some(native_id)) = (
+        binding["incarnation"].as_str(),
+        binding["native_session_id"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    let observed = state
+        .store
+        .latest_claim(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+        .is_some_and(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["driver"] == "claude"
+                && fields["incarnation_id"] == incarnation
+                && fields["evidence_incarnation"] == provider_incarnation
+        });
+    if !observed {
+        return Ok(None);
+    }
+    Ok(crate::external_sessions::discover(Some(home), true)
+        .map_err(ApiError::internal)?
+        .sessions
+        .into_iter()
+        .find(|session| {
+            session.driver == crate::external_sessions::ExternalDriver::Claude
+                && session.native_id == native_id
+        }))
+}
+
 pub(super) fn timeline_value(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -1334,10 +1389,12 @@ pub(super) fn timeline_value(
         .as_str()
         .ok_or_else(|| ApiError::internal("a session resource has no owner"))?;
     let incarnation = resource["runtime_incarnation"].as_str();
-    if let Some(incarnation) = incarnation
-        && let Some(external) = managed_codex_transcript(state, owner, incarnation)?
-    {
-        return native_timeline_page(state, snapshot, &session_id, query, &external);
+    if let Some(incarnation) = incarnation {
+        if let Some(external) = managed_codex_transcript(state, owner, incarnation)?
+            .or(managed_claude_transcript(state, owner, incarnation)?)
+        {
+            return native_timeline_page(state, snapshot, &session_id, query, &external);
+        }
     }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
     let attribution = timeline_attribution(owner, &desired);
@@ -4478,6 +4535,88 @@ mission "example/zero-run" state="ready" {
         .unwrap();
         assert!(
             managed_codex_transcript(&state, owner, incarnation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_claude_session_uses_only_current_wrapper_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let native_id = "11111111-1111-4111-8111-111111111111";
+        let transcript = home.join(format!(".claude/projects/-test/{native_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"assistant","sessionId":native_id,"timestamp":"2026-09-24T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Current Claude answer"}]}})),
+        ).unwrap();
+        let mut state = test_state_named(root.path(), "managed-claude-test");
+        state.native_session_home = Some(home);
+        let owner = "agent/managed-claude";
+        let incarnation = "native-pty:current";
+        let provider_incarnation = "provider-current";
+        let identity = "managed-claude";
+        let directory = state
+            .state_dir
+            .join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+            .join("catalog/agents")
+            .join(st2::run::detect_host())
+            .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("claude-native-session"),
+            serde_json::to_vec(
+                &json!({"incarnation":provider_incarnation,"native_session_id":native_id}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "harness.observed".into(),
+                actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("claude".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    (
+                        "evidence_incarnation".into(),
+                        Value::String(provider_incarnation.into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let exact = super::managed_claude_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap();
+        let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
+        assert!(
+            timeline
+                .iter()
+                .any(|entry| entry["body"]["text"] == "Current Claude answer")
+        );
+        assert!(
+            super::managed_claude_transcript(&state, owner, "native-pty:old")
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(
+            directory.join("claude-native-session"),
+            serde_json::to_vec(
+                &json!({"incarnation":"provider-old","native_session_id":native_id}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            super::managed_claude_transcript(&state, owner, incarnation)
                 .unwrap()
                 .is_none()
         );

@@ -178,6 +178,16 @@ impl Writer {
             serde_json::to_vec(&body)?.len() <= MAX_BODY_BYTES,
             "normalized harness timeline body exceeds {MAX_BODY_BYTES} bytes"
         );
+        // Channel state can be restated at every wake. Repeating an unchanged
+        // status is not a conversation event, and otherwise crowds actual chat
+        // out of bounded timeline pages while needlessly replicating claims.
+        if entry_type == EntryType::Status
+            && record.operations.last().is_some_and(|entry| {
+                entry.entry_type == EntryType::Status.as_str() && entry.body == body
+            })
+        {
+            return Ok(());
+        }
         let prior = record
             .operations
             .iter()
@@ -1007,6 +1017,36 @@ fn compact_to_bounds(record: &mut Record) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_channel_state_does_not_crowd_conversation_out_of_a_bounded_page() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(temporary.path(), "claude", "inc-current");
+        for index in 0..200 {
+            observe_channel_frame(
+                &mut writer,
+                &json!({"type":"state","state":"active","id":index}),
+            )
+            .unwrap();
+        }
+        let record = read(&timeline_path(temporary.path())).unwrap();
+        assert_eq!(record.operations.len(), 1);
+        observe_channel_frame(
+            &mut writer,
+            &json!({"type":"state","state":"idle","id":201}),
+        )
+        .unwrap();
+        observe_channel_frame(
+            &mut writer,
+            &json!({"type":"state","state":"active","id":202}),
+        )
+        .unwrap();
+        let record = read(&timeline_path(temporary.path())).unwrap();
+        assert_eq!(record.operations.len(), 3);
+        assert_eq!(record.operations[0].body["status"], "running");
+        assert_eq!(record.operations[1].body["status"], "waiting");
+        assert_eq!(record.operations[2].body["status"], "running");
+    }
 
     #[test]
     fn operations_are_stable_revisable_bounded_and_redacted() {
