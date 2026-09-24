@@ -39,9 +39,10 @@ use st3_client::{
     ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
-    TargetParameters as ClientTargetParameters, TerminalScreen as ClientTerminalScreen,
-    TimelineBody as ClientTimelineBody, TimelineEntry as ClientTimelineEntry,
-    TimelinePage as ClientTimelinePage,
+    TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
+    TerminalInputParameters as ClientTerminalInputParameters,
+    TerminalScreen as ClientTerminalScreen, TimelineBody as ClientTimelineBody,
+    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
 };
 use tokio::sync::{Notify, watch};
 
@@ -497,6 +498,14 @@ enum PtyCommand {
     Peek(PtySubjectArgs),
     /// Read a terminal screen through the client gateway, including a remote fleet host.
     Screen(PtyScreenArgs),
+    /// Create a short-lived client attachment and show its stream details.
+    AttachInfo(PtyScreenArgs),
+    /// Read one bounded terminal frame batch with an attachment capability.
+    Frames(PtyFramesArgs),
+    /// Send input through the client gateway to a local or remote terminal.
+    InputClient(PtyClientInputArgs),
+    /// End a client attachment by its exact attachment ID.
+    DetachClient(PtyClientDetachArgs),
     /// Send explicit text or a named key to one running terminal.
     Send(PtySendArgs),
     /// Deliver one supported Unix signal to a terminal member.
@@ -512,6 +521,41 @@ struct PtySubjectArgs {
 struct PtyScreenArgs {
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
+}
+
+#[derive(Args)]
+struct PtyFramesArgs {
+    subject: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
+    /// The stream capability from `terminals attach-info`; can be set through the environment.
+    #[arg(long, env = "ST3_TERMINAL_CAPABILITY")]
+    capability: String,
+    #[arg(long)]
+    incarnation: Option<String>,
+    #[arg(long)]
+    after: Option<u64>,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=30_000))]
+    wait_ms: u64,
+}
+
+#[derive(Args)]
+struct PtyClientInputArgs {
+    subject: String,
+    value: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
+    #[arg(long, conflicts_with = "key")]
+    raw: bool,
+    #[arg(long, conflicts_with = "raw")]
+    key: bool,
+}
+
+#[derive(Args)]
+struct PtyClientDetachArgs {
+    attachment: String,
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
 }
@@ -2356,6 +2400,131 @@ async fn run_pty(
                 print!("{}", render_terminal_screen(&response.value));
                 Ok(())
             }
+        }
+        PtyCommand::AttachInfo(args) => {
+            let person = configured_human(
+                args.person.as_deref(),
+                configured_person,
+                "terminals attach-info",
+            )?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let screen = generated.terminal_screen(&args.subject).await?;
+            let capabilities = generated.capabilities().await?;
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let response = generated
+                .terminal_attach(
+                    format!("action/{nonce}"),
+                    format!("terminal-attach:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        runtime_incarnation: Some(screen.value.runtime_incarnation),
+                        terminal_sequence: Some(capabilities.snapshot.store_index),
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: screen.value.terminal_id,
+                        ..ClientTargetParameters::default()
+                    },
+                )
+                .await?;
+            print_client_value(&response, json_output)
+        }
+        PtyCommand::Frames(args) => {
+            let person = configured_human(
+                args.person.as_deref(),
+                configured_person,
+                "terminals frames",
+            )?;
+            let batch = generated_client(endpoint, Some(&person))?
+                .terminal_frames(
+                    &args.subject,
+                    args.after,
+                    args.incarnation.as_deref(),
+                    &args.capability,
+                    Some(args.wait_ms),
+                )
+                .await?;
+            if json_output {
+                print_value(
+                    &json!({ "screen": batch.screen, "frames": batch.frames }),
+                    true,
+                )
+            } else {
+                print!("{}", render_terminal_screen(&batch.screen.value));
+                if let Some(frames) = batch.frames {
+                    println!("Resume after sequence {}", frames.value.resume_sequence);
+                    for frame in frames.value.frames {
+                        println!("{} {} {}", frame.sequence, frame.timestamp, frame.body);
+                    }
+                }
+                Ok(())
+            }
+        }
+        PtyCommand::InputClient(args) => {
+            let person = configured_human(
+                args.person.as_deref(),
+                configured_person,
+                "terminals input-client",
+            )?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let screen = generated.terminal_screen(&args.subject).await?;
+            let capabilities = generated.capabilities().await?;
+            let mode = if args.raw {
+                ClientTerminalInputMode::Raw
+            } else if args.key {
+                ClientTerminalInputMode::Key
+            } else {
+                ClientTerminalInputMode::Line
+            };
+            let value = if args.raw {
+                base64::engine::general_purpose::STANDARD.encode(args.value.as_bytes())
+            } else {
+                args.value
+            };
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let response = generated
+                .terminal_input(
+                    format!("action/{nonce}"),
+                    format!("terminal-input:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        runtime_incarnation: Some(screen.value.runtime_incarnation),
+                        terminal_sequence: Some(screen.value.next_sequence),
+                        ..ClientFence::default()
+                    },
+                    ClientTerminalInputParameters {
+                        terminal_id: screen.value.terminal_id,
+                        mode,
+                        value,
+                    },
+                )
+                .await?;
+            print_client_value(&response, json_output)
+        }
+        PtyCommand::DetachClient(args) => {
+            let person = configured_human(
+                args.person.as_deref(),
+                configured_person,
+                "terminals detach-client",
+            )?;
+            let generated = generated_client(endpoint, Some(&person))?;
+            let capabilities = generated.capabilities().await?;
+            let nonce = uuid::Uuid::now_v7().simple().to_string();
+            let response = generated
+                .terminal_detach(
+                    format!("action/{nonce}"),
+                    format!("terminal-detach:{nonce}"),
+                    ClientFence {
+                        snapshot_id: capabilities.snapshot.id,
+                        ..ClientFence::default()
+                    },
+                    ClientTargetParameters {
+                        target_id: args.attachment,
+                        ..ClientTargetParameters::default()
+                    },
+                )
+                .await?;
+            print_client_value(&response, json_output)
         }
         PtyCommand::Send(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -8272,6 +8441,77 @@ mod tests {
             render_terminal_screen(&response.value),
             "$ cargo build\nFinished\n$ \n"
         );
+    }
+
+    #[test]
+    fn client_terminal_lifecycle_commands_parse_without_changing_local_attach() {
+        let attach = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "attach-info",
+            "terminal/agent/fleet/app-web/standing/app-web",
+        ])
+        .unwrap();
+        assert!(matches!(
+            attach.command,
+            Command::Terminals {
+                command: PtyCommand::AttachInfo(_)
+            }
+        ));
+
+        let frames = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "frames",
+            "terminal/agent/fleet/app-web/standing/app-web",
+            "--capability",
+            "test-capability",
+            "--incarnation",
+            "runtime-1",
+            "--after",
+            "41",
+            "--wait-ms",
+            "5000",
+        ])
+        .unwrap();
+        let Command::Terminals {
+            command: PtyCommand::Frames(args),
+        } = frames.command
+        else {
+            panic!("frames did not parse");
+        };
+        assert_eq!(args.after, Some(41));
+        assert_eq!(args.wait_ms, 5000);
+
+        let input = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "input-client",
+            "terminal/agent/fleet/app-web/standing/app-web",
+            "hello",
+            "--key",
+        ])
+        .unwrap();
+        assert!(matches!(
+            input.command,
+            Command::Terminals {
+                command: PtyCommand::InputClient(PtyClientInputArgs { key: true, .. })
+            }
+        ));
+
+        let detach = Cli::try_parse_from([
+            "st3",
+            "terminals",
+            "detach-client",
+            "terminal-attachment/example",
+        ])
+        .unwrap();
+        assert!(matches!(
+            detach.command,
+            Command::Terminals {
+                command: PtyCommand::DetachClient(_)
+            }
+        ));
     }
 
     #[test]
