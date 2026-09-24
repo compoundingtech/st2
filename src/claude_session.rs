@@ -130,7 +130,7 @@ fn prepare_st3_channel_argv(
     identity: &str,
     argv: Vec<String>,
 ) -> Result<Vec<String>> {
-    let argv = bind_st3_mcp_config_values(argv)?;
+    let argv = merge_claude_json_settings(bind_st3_mcp_config_values(argv)?)?;
     if !requires_st3_channel(&argv) {
         return Ok(argv);
     }
@@ -145,6 +145,68 @@ fn prepare_st3_channel_argv(
                 .context("resolving the st3 executable for the Claude development channel")?;
             development_st3_channel_argv(argv, &executable, catalog_root, identity)
         }
+    }
+}
+
+fn merge_claude_json_settings(argv: Vec<String>) -> Result<Vec<String>> {
+    let mut output = Vec::with_capacity(argv.len());
+    let mut merged = None::<serde_json::Value>;
+    let mut insertion = None::<usize>;
+    let mut index = 0;
+    while index < argv.len() {
+        let (raw, consumed) = if argv[index] == "--settings" {
+            (
+                argv.get(index + 1)
+                    .context("the Claude --settings option has no value")?
+                    .as_str(),
+                2,
+            )
+        } else if let Some(raw) = argv[index].strip_prefix("--settings=") {
+            (raw, 1)
+        } else {
+            output.push(argv[index].clone());
+            index += 1;
+            continue;
+        };
+        if let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(raw) {
+            if let Some(existing) = &mut merged {
+                merge_settings_value(existing, value);
+            } else {
+                insertion = Some(output.len());
+                merged = Some(value);
+            }
+        } else {
+            // Claude also accepts settings file paths. Preserve those verbatim;
+            // only JSON sources can be safely consolidated here.
+            output.extend(argv[index..index + consumed].iter().cloned());
+        }
+        index += consumed;
+    }
+    if let (Some(position), Some(value)) = (insertion, merged) {
+        output.splice(position..position, ["--settings".into(), value.to_string()]);
+    }
+    Ok(output)
+}
+
+fn merge_settings_value(base: &mut serde_json::Value, later: serde_json::Value) {
+    match (base, later) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(later)) => {
+            for (key, value) in later {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_settings_value(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (serde_json::Value::Array(base), serde_json::Value::Array(later)) => {
+            for value in later {
+                if !base.contains(&value) {
+                    base.push(value);
+                }
+            }
+        }
+        (base, later) => *base = later,
     }
 }
 
@@ -896,6 +958,30 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+
+    #[test]
+    fn duplicate_json_settings_keep_lifecycle_hooks_and_authored_plugins() {
+        let argv = vec![
+            "claude".into(),
+            "--settings".into(),
+            serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{"command":"observe"}]}]}})
+                .to_string(),
+            "--model".into(),
+            "opus".into(),
+            "--settings".into(),
+            serde_json::json!({"enabledPlugins":{"st3-channel@st3":true}}).to_string(),
+        ];
+        let merged = merge_claude_json_settings(argv).unwrap();
+        assert_eq!(merged.iter().filter(|arg| *arg == "--settings").count(), 1);
+        let position = merged.iter().position(|arg| arg == "--settings").unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&merged[position + 1]).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "observe"
+        );
+        assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], true);
+        assert_eq!(merge_claude_json_settings(merged.clone()).unwrap(), merged);
+    }
 
     #[test]
     fn native_session_binding_is_atomic_and_names_the_exact_provider_incarnation() {
