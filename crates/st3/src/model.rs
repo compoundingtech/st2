@@ -1500,8 +1500,11 @@ pub struct MessageView {
     pub to: String,
     pub content: String,
     pub status: String,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub in_reply_to: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
     pub created_index: u64,
 }
@@ -1512,6 +1515,34 @@ pub struct MessagePage {
     pub has_more: bool,
     pub next_cursor: Option<String>,
     pub limit: usize,
+}
+
+#[cfg(test)]
+mod message_view_compatibility_tests {
+    use super::MessageView;
+    use serde_json::json;
+
+    #[test]
+    fn reads_older_optional_fields_and_newer_unknown_fields_without_losing_large_indices() {
+        let view: MessageView = serde_json::from_value(json!({
+            "subject": "message/compat",
+            "from": "agent/sender",
+            "to": "agent/receiver",
+            "content": "hello",
+            "status": "sent",
+            "created_index": u64::MAX,
+            "future_server_field": { "enabled": true }
+        }))
+        .unwrap();
+        assert_eq!(view.created_index, u64::MAX);
+        assert_eq!(view.title, None);
+        assert_eq!(view.in_reply_to, None);
+        assert!(view.tags.is_empty());
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["created_index"],
+            json!(u64::MAX)
+        );
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
