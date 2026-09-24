@@ -8,6 +8,7 @@ import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTim
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, offlinePresentation, PROJECTION_CACHE_KEY, type Data, type MachineView } from './projectionCache';
 import { listCollectionPages, type CollectionResult } from './collectionPages';
 import { agentLabel, agentTree } from './agentTree';
+import { projectionEventsRequireRefresh } from './projectionRefresh';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -69,12 +70,16 @@ export default function App() {
   const [terminalId, setTerminalId] = useState(''), [screen, setScreen] = useState<TerminalScreen | null>(null), [terminalIssue, setTerminalIssue] = useState('');
   const [reviewLaunch, setReviewLaunch] = useState(''), [variants, setVariants] = useState<LaunchVariant[]>([]);
   const [selectedMissionId, setSelectedMissionId] = useState(''), [showSystemMissions, setShowSystemMissions] = useState(false), [showPlanner, setShowPlanner] = useState(false);
+  const [missionDetailView, setMissionDetailView] = useState<Mission | null>(null);
+  const missionDetailCache = useRef(new Map<string, Mission>());
+  const selectedMissionRevision = data.missions.find(m => m.id === selectedMissionId)?.revision;
   const [title, setTitle] = useState(''), [request, setRequest] = useState(''), [workspace, setWorkspace] = useState('');
   const [provider, setProvider] = useState<'codex' | 'claude' | 'pi' | 'omp' | 'opencode'>('codex');
   const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [feedback, setFeedback] = useState('');
   const refreshing = useRef(false), snapshotRetry = useRef(0);
   const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
+  const projectionEventCursor = useRef<string | null>(null), projectionValidated = useRef(false);
   const cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, TimelineEntry[]>()), draftCache = useRef(new Map<string, string>());
   const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
@@ -138,7 +143,7 @@ export default function App() {
     return () => subscription.remove();
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (checkChanges = false) => {
     if (!client || !credential) { setStatus('setup'); return; }
     if (refreshing.current) return;
     refreshing.current = true;
@@ -146,8 +151,24 @@ export default function App() {
     setStatus(s => s === 'online' ? s : 'connecting');
     try {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
+      if (checkChanges && firstDataShown.current && projectionValidated.current && cachedActor.current === capability.value.session_actor) {
+        if (cachedIndex.current === capability.snapshot.store_index) { setSnapshot(capability.snapshot); setStatus('online'); setError(''); return; }
+        if (projectionEventCursor.current) {
+          try {
+            let cursor = projectionEventCursor.current, relevant = false, exhausted = false;
+            for (let page = 0; page < 5; page++) {
+              const events = await client.eventsList({ after: cursor, limit: 100 });
+              cursor = events.value.resume_cursor;
+              relevant ||= projectionEventsRequireRefresh(events.value.items);
+              if (!events.value.has_more) { exhausted = true; break; }
+            }
+            if (exhausted && !relevant) { projectionEventCursor.current = cursor; cachedIndex.current = capability.snapshot.store_index; setSnapshot(capability.snapshot); setStatus('online'); setError(''); return; }
+          } catch { /* a cursor gap or network error calls for a full resync */ }
+        }
+      }
       if (cachedActor.current && cachedActor.current !== capability.value.session_actor) {
         cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0;
+        projectionEventCursor.current = null; projectionValidated.current = false;
         setData(emptyData); setTruncated({}); setHasSynced(false); firstDataShown.current = false; setCachedHostId(''); setSnapshot(null); setStatus('connecting');
         void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
       }
@@ -194,6 +215,9 @@ export default function App() {
         const encoded = encodeProjectionCache(url, actor, firstSnapshot.host_id, index, fresh, now, truncatedKeys);
         if (encoded) { cachedActor.current = actor; cachedIndex.current = index; cacheSavedAt.current = now; void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => { cacheSavedAt.current = 0; }); }
       }
+      cachedActor.current = actor; cachedIndex.current = index;
+      projectionEventCursor.current = capability.value.event_cursor;
+      projectionValidated.current = true;
       snapshotRetry.current = 0; setHasSynced(true); setStatus('online'); setError('');
     } catch (e) {
       if (generation !== cacheGeneration.current) return;
@@ -208,8 +232,21 @@ export default function App() {
     } finally { refreshing.current = false; }
   }, [client, credential, url]);
   useEffect(() => { void refresh(); }, [refresh]);
-  useEffect(() => { if (status === 'setup') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15000); return () => clearInterval(timer); }, [refresh, status]);
+  useEffect(() => { if (status === 'setup') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(true); }, 15000); return () => clearInterval(timer); }, [refresh, status]);
   useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
+  useEffect(() => {
+    if (active !== 'Control' || !selectedMissionId || !client || status !== 'online') return;
+    let live = true;
+    setMissionDetailView(missionDetailCache.current.get(selectedMissionId) ?? null);
+    void client.missionsGet(selectedMissionId).then(result => {
+      if (!live || result.value.kind !== 'mission') return;
+      missionDetailCache.current.delete(selectedMissionId);
+      missionDetailCache.current.set(selectedMissionId, result.value);
+      while (missionDetailCache.current.size > 12) missionDetailCache.current.delete(missionDetailCache.current.keys().next().value!);
+      setMissionDetailView(result.value);
+    }).catch(() => { /* retain the list projection or cached detail while offline */ });
+    return () => { live = false; };
+  }, [active, selectedMissionId, selectedMissionRevision, client, status]);
   const timelineSession = data.sessions.find(s => s.id === sessionId) ?? historicalSessions.find(s => s.id === sessionId);
   const timelineUnresolved = timelineSession ? isUnresolved(timelineSession) : false;
   useEffect(() => {
@@ -301,7 +338,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; projectionValidated.current = false; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
@@ -336,7 +373,7 @@ export default function App() {
   function selectSession(id: string) { if (sessionId && chatDetailOpen) chatScrollCache.current.set(sessionId, currentScrollY.current); while (chatScrollCache.current.size > 24) chatScrollCache.current.delete(chatScrollCache.current.keys().next().value!); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
   const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
   const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
-  const selectedMission = visibleMissions.find(m => m.id === selectedMissionId);
+  const selectedMission = missionDetailView?.id === selectedMissionId ? missionDetailView : visibleMissions.find(m => m.id === selectedMissionId);
 
   return <SafeAreaView style={styles.page}>
     <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? offlinePresentation(hasSynced).title : 'Pair this device'}</Text></View>
