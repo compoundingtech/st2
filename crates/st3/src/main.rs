@@ -6574,10 +6574,6 @@ fn timeline_claim_fields(
             Value::String(runtime_incarnation.into()),
         ),
         (
-            "evidence_incarnation".into(),
-            Value::String(operation.incarnation_id),
-        ),
-        (
             "observed_at_unix_ms".into(),
             Value::from(operation.observed_at_unix_ms),
         ),
@@ -8892,7 +8888,7 @@ mission "review" state="ready" {
             "runtime-current",
         );
         assert_eq!(fields["incarnation_id"], "runtime-current");
-        assert_eq!(fields["evidence_incarnation"], "provider-current");
+        assert!(fields.get("evidence_incarnation").is_none());
         assert_eq!(fields["body"]["text"], "answer");
     }
 
