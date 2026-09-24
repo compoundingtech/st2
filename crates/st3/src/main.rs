@@ -39,8 +39,9 @@ use st3_client::{
     ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
-    TargetParameters as ClientTargetParameters, TimelineBody as ClientTimelineBody,
-    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
+    TargetParameters as ClientTargetParameters, TerminalScreen as ClientTerminalScreen,
+    TimelineBody as ClientTimelineBody, TimelineEntry as ClientTimelineEntry,
+    TimelinePage as ClientTimelinePage,
 };
 use tokio::sync::{Notify, watch};
 
@@ -494,6 +495,8 @@ enum PtyCommand {
     Attach(PtyAttachArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
+    /// Read a terminal screen through the client gateway, including a remote fleet host.
+    Screen(PtyScreenArgs),
     /// Send explicit text or a named key to one running terminal.
     Send(PtySendArgs),
     /// Deliver one supported Unix signal to a terminal member.
@@ -503,6 +506,14 @@ enum PtyCommand {
 #[derive(Args)]
 struct PtySubjectArgs {
     subject: String,
+}
+
+#[derive(Args)]
+struct PtyScreenArgs {
+    subject: String,
+    /// Use this concrete person instead of the person configured for trusted local commands.
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
 }
 
 #[derive(Args)]
@@ -1368,7 +1379,16 @@ async fn run(cli: Cli) -> Result<()> {
             run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
         }
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
-        Command::Terminals { command } => run_pty(&client, &endpoint, command, cli.json).await,
+        Command::Terminals { command } => {
+            run_pty(
+                &client,
+                &endpoint,
+                config.person.as_deref(),
+                command,
+                cli.json,
+            )
+            .await
+        }
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
@@ -2281,6 +2301,7 @@ async fn publish_text(
 async fn run_pty(
     client: &Client,
     endpoint: &Endpoint,
+    configured_person: Option<&str>,
     command: PtyCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -2317,6 +2338,22 @@ async fn run_pty(
                 print_value(&screen, true)
             } else {
                 print!("{}", screen.screen);
+                Ok(())
+            }
+        }
+        PtyCommand::Screen(args) => {
+            let person = configured_human(
+                args.person.as_deref(),
+                configured_person,
+                "terminals screen",
+            )?;
+            let response = generated_client(endpoint, Some(&person))?
+                .terminal_screen(&args.subject)
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                print!("{}", render_terminal_screen(&response.value));
                 Ok(())
             }
         }
@@ -2363,6 +2400,15 @@ async fn run_pty(
             print_value(&response, json_output)
         }
     }
+}
+
+fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
+    let mut output = String::new();
+    for line in &screen.lines {
+        output.push_str(&line.text);
+        output.push('\n');
+    }
+    output
 }
 
 async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<()> {
@@ -8188,6 +8234,44 @@ mod tests {
             panic!("the terminal list command did not parse");
         };
         assert!(all);
+    }
+
+    #[test]
+    fn terminal_screen_accepts_a_remote_owner_subject_and_person() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "--json",
+            "terminals",
+            "screen",
+            "terminal/agent/fleet/app-web/standing/app-web",
+            "--as",
+            "person/nathan",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Command::Terminals {
+            command: PtyCommand::Screen(args),
+        } = cli.command
+        else {
+            panic!("the terminal screen command did not parse");
+        };
+        assert_eq!(
+            args.subject,
+            "terminal/agent/fleet/app-web/standing/app-web"
+        );
+        assert_eq!(args.person.as_deref(), Some("person/nathan"));
+    }
+
+    #[test]
+    fn terminal_screen_renderer_preserves_each_terminal_row() {
+        let response: ClientEnvelope<ClientTerminalScreen> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/terminal-screen.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            render_terminal_screen(&response.value),
+            "$ cargo build\nFinished\n$ \n"
+        );
     }
 
     #[test]
