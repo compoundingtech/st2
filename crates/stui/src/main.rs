@@ -84,6 +84,7 @@ enum Update {
     Model(Box<Model>),
     Timeline(String, Vec<st3_client::TimelineEntry>, bool),
     TimelineInvalidated(String),
+    TimelineCursorGap,
     Error(String),
 }
 struct App {
@@ -103,6 +104,7 @@ struct App {
     timeline_requested: Option<String>,
     timeline_cache: BTreeMap<String, (Vec<st3_client::TimelineEntry>, bool)>,
     chat_scroll_cache: BTreeMap<String, u16>,
+    chat_draft_cache: BTreeMap<String, String>,
     last_timeline: Instant,
     last_terminal: Instant,
 }
@@ -125,6 +127,7 @@ impl App {
             timeline_requested: None,
             timeline_cache: BTreeMap::new(),
             chat_scroll_cache: BTreeMap::new(),
+            chat_draft_cache: BTreeMap::new(),
             last_timeline: Instant::now(),
             last_terminal: Instant::now(),
         }
@@ -139,11 +142,43 @@ impl App {
             }
         }
     }
+    fn invalidate_timelines(&mut self) {
+        self.timeline_cache.clear();
+        self.model.timeline.clear();
+        self.model.timeline_truncated = false;
+        self.timeline_requested = None;
+        self.last_timeline = Instant::now() - Duration::from_secs(10);
+    }
     fn restore_chat_scroll(&mut self) {
         self.scroll[1] = self
             .selected_session_id()
             .and_then(|id| self.chat_scroll_cache.get(&id).copied())
             .unwrap_or_default();
+    }
+    fn chat_draft_key(&self) -> Option<String> {
+        self.selected_session_id()
+            .or_else(|| self.peer().map(|peer| peer.header.id.clone()))
+    }
+    fn start_chat_composer(&mut self) {
+        self.input = self
+            .chat_draft_key()
+            .and_then(|key| self.chat_draft_cache.get(&key).cloned())
+            .unwrap_or_default();
+        self.mode = Mode::Chat;
+    }
+    fn remember_chat_draft(&mut self) {
+        if let Some(key) = self.chat_draft_key() {
+            if self.input.is_empty() {
+                self.chat_draft_cache.remove(&key);
+            } else {
+                self.chat_draft_cache.insert(key, self.input.clone());
+                while self.chat_draft_cache.len() > 32 {
+                    if let Some(oldest) = self.chat_draft_cache.keys().next().cloned() {
+                        self.chat_draft_cache.remove(&oldest);
+                    }
+                }
+            }
+        }
     }
     fn peer(&self) -> Option<&st3_client::Agent> {
         self.agent_tree()
@@ -905,6 +940,9 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
     if app.mode != Mode::Normal {
         match key.code {
             KeyCode::Esc => {
+                if app.mode == Mode::Chat {
+                    app.remember_chat_draft();
+                }
                 app.mode = Mode::Normal;
                 app.input.clear();
             }
@@ -936,22 +974,34 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                                 ..Default::default()
                             };
                             let (id, idem) = action_pair();
-                            client
+                            if let Err(error) = client
                                 .message_send(
                                     id,
                                     idem,
                                     fence,
                                     MessageSendParameters {
                                         to: peer.header.id.clone(),
-                                        content: value,
+                                        content: value.clone(),
                                         title: None,
                                         in_reply_to: None,
                                         session_id: peer.current_session_id.clone(),
                                         tags: vec![],
                                     },
                                 )
-                                .await?;
-                            app.model.reload(client).await?;
+                                .await
+                            {
+                                app.input = value;
+                                app.remember_chat_draft();
+                                app.model.status = format!("Send failed: {error}");
+                                app.dirty = true;
+                                return Ok(false);
+                            }
+                            if let Some(key) = app.chat_draft_key() {
+                                app.chat_draft_cache.remove(&key);
+                            }
+                            if let Err(error) = app.model.reload(client).await {
+                                app.model.status = format!("Sent; refresh failed: {error}");
+                            }
                         }
                         app.mode = Mode::Normal;
                     }
@@ -1073,8 +1123,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             if !app.live_ready {
                 app.model.status = "Reconnect before composing".into();
             } else if app.peer().is_some() {
-                app.mode = Mode::Chat;
-                app.input.clear();
+                app.start_chat_composer();
             } else {
                 app.model.status = "Undeclared sessions are read-only".into();
             }
@@ -1169,7 +1218,10 @@ fn main() -> Result<()> {
         let mut was_offline = false;
         loop {
             let mut changed = match model.sync(&background_client).await {
-                Ok((changed, invalidated_sessions)) => {
+                Ok((changed, invalidated_sessions, cursor_gap)) => {
+                    if cursor_gap && background_updates.send(Update::TimelineCursorGap).is_err() {
+                        return;
+                    }
                     for id in invalidated_sessions {
                         if background_updates
                             .send(Update::TimelineInvalidated(id))
@@ -1266,6 +1318,7 @@ fn main() -> Result<()> {
                     } else {
                         app.timeline_cache.clear();
                         app.chat_scroll_cache.clear();
+                        app.chat_draft_cache.clear();
                         app.timeline_requested = None;
                     }
                     app.model = *model;
@@ -1294,6 +1347,10 @@ fn main() -> Result<()> {
                     if app.selected_session_id().as_deref() == Some(&id) {
                         app.last_timeline = Instant::now() - Duration::from_secs(10);
                     }
+                }
+                Update::TimelineCursorGap => {
+                    app.invalidate_timelines();
+                    app.dirty = true;
                 }
                 Update::Error(error) => {
                     if error.starts_with("Sync:") || error.starts_with("Initial load:") {
@@ -1544,5 +1601,27 @@ mod tests {
         app.selected[1] = 0;
         app.restore_chat_scroll();
         assert_eq!(app.scroll[1], 18);
+        app.input = "unfinished alpha".into();
+        app.remember_chat_draft();
+        app.input.clear();
+        app.selected[1] = 1;
+        app.start_chat_composer();
+        assert!(app.input.is_empty());
+        app.input = "unfinished beta".into();
+        app.remember_chat_draft();
+        app.selected[1] = 0;
+        app.start_chat_composer();
+        assert_eq!(app.input, "unfinished alpha");
+        assert_eq!(app.chat_draft_cache.len(), 2);
+        app.timeline_cache
+            .insert("session/alpha".into(), (Vec::new(), true));
+        app.model.timeline_truncated = true;
+        app.timeline_requested = Some("session/alpha".into());
+        app.invalidate_timelines();
+        assert!(app.timeline_cache.is_empty());
+        assert!(!app.model.timeline_truncated);
+        assert_eq!(app.timeline_requested, None);
+        assert_eq!(app.chat_draft_cache.len(), 2);
+        assert_eq!(app.chat_scroll_cache.get("session/alpha"), Some(&18));
     }
 }

@@ -127,7 +127,7 @@ impl Model {
         Ok(())
     }
 
-    pub async fn sync(&mut self, client: &Client) -> Result<(bool, Vec<String>)> {
+    pub async fn sync(&mut self, client: &Client) -> Result<(bool, Vec<String>, bool)> {
         let response = client
             .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(15_000))
             .await;
@@ -141,7 +141,7 @@ impl Model {
                 self.recent_events.clear();
                 self.reload(client).await?;
                 self.status = "Resynchronized after cursor gap".into();
-                return Ok((true, Vec::new()));
+                return Ok((true, Vec::new(), true));
             }
             Err(error) => return Err(error.into()),
         };
@@ -149,7 +149,7 @@ impl Model {
         if changed {
             self.reload(client).await?;
         }
-        Ok((changed, invalidated_sessions))
+        Ok((changed, invalidated_sessions, false))
     }
 
     /// Native harnesses may start outside st3, so no graph event announces them.

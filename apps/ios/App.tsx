@@ -9,6 +9,7 @@ import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, off
 import { listCollectionPages, type CollectionResult } from './collectionPages';
 import { agentLabel, agentTree } from './agentTree';
 import { tabsChangedByProjectionEvents } from './projectionRefresh';
+import { rememberBounded } from './boundedCache';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -158,6 +159,8 @@ export default function App() {
         cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0;
         projectionEventCursor.current = null; lastNativeRefreshAt.current = 0;
         dirtyProjectionTabs.current.clear();
+        conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear();
+        setTimeline([]); setComposer(''); setSessionId(''); setChatDetailOpen(false); setMissionDetailView(null);
         setData(emptyData); setTruncated({}); setHasSynced(false); firstDataShown.current = false; setCachedHostId(''); setSnapshot(null); setStatus('connecting');
         void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
       }
@@ -265,9 +268,7 @@ export default function App() {
     setMissionDetailView(missionDetailCache.current.get(selectedMissionId) ?? null);
     void client.missionsGet(selectedMissionId).then(result => {
       if (!live || result.value.kind !== 'mission') return;
-      missionDetailCache.current.delete(selectedMissionId);
-      missionDetailCache.current.set(selectedMissionId, result.value);
-      while (missionDetailCache.current.size > 12) missionDetailCache.current.delete(missionDetailCache.current.keys().next().value!);
+      rememberBounded(missionDetailCache.current, selectedMissionId, result.value, 12);
       setMissionDetailView(result.value);
     }).catch(() => { /* retain the list projection or cached detail while offline */ });
     return () => { live = false; };
@@ -300,9 +301,7 @@ export default function App() {
           const revision = recent.map(entry => `${entry.id}:${entry.revision}`).join('|');
           if (live && revision !== lastRevision) {
             lastRevision = revision;
-            conversationCache.current.delete(sessionId);
-            conversationCache.current.set(sessionId, recent);
-            while (conversationCache.current.size > 24) conversationCache.current.delete(conversationCache.current.keys().next().value!);
+            rememberBounded(conversationCache.current, sessionId, recent, 24);
             setTimeline(recent);
           }
           break;
@@ -395,7 +394,7 @@ export default function App() {
   const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
   const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
-  function selectSession(id: string) { if (sessionId && chatDetailOpen) chatScrollCache.current.set(sessionId, currentScrollY.current); while (chatScrollCache.current.size > 24) chatScrollCache.current.delete(chatScrollCache.current.keys().next().value!); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
+  function selectSession(id: string) { if (sessionId && chatDetailOpen) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
   const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
   const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
   const selectedMission = missionDetailView?.id === selectedMissionId ? missionDetailView : visibleMissions.find(m => m.id === selectedMissionId);
@@ -403,7 +402,7 @@ export default function App() {
   return <SafeAreaView style={styles.page}>
     <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? offlinePresentation(hasSynced).title : 'Pair this device'}</Text></View>
     {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}{busy ? <ActivityIndicator color="#67d6c5" /> : null}
-    <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) chatScrollCache.current.set(sessionId, currentScrollY.current); }}>
+    <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); }}>
       {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only Tailscale HTTPS gateway. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
         <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://your-tailnet-host" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} /><Button label="Save gateway" onPress={() => void saveUrl()} />
         {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : !hasSynced && status !== 'online' ? <>
@@ -445,7 +444,7 @@ export default function App() {
             {isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session history.</Text> : null}
             {conversationEntries.map(e => <Card key={e.id} title={e.role === 'assistant' ? 'Agent' : e.role === 'user' ? 'You' : e.role} detail={timelineText(e.body) ?? ''} />)}
             {!conversationEntries.length ? sessionMessages.map(m => <Card key={m.id} title={m.from} detail={m.content} />) : null}
-            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={text => { draftCache.current.set(sessionId, text); setComposer(text); }} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
+            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={text => { if (text) rememberBounded(draftCache.current, sessionId, text, 24); else draftCache.current.delete(sessionId); setComposer(text); }} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
           </>}
         </> : <>
           <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Declared agents across the fleet; undeclared sessions discovered on this gateway.</Text>
