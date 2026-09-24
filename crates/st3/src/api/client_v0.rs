@@ -1333,14 +1333,12 @@ fn managed_claude_transcript(
     if !observed {
         return Ok(None);
     }
-    Ok(crate::external_sessions::discover(Some(home), true)
-        .map_err(ApiError::internal)?
-        .sessions
-        .into_iter()
-        .find(|session| {
-            session.driver == crate::external_sessions::ExternalDriver::Claude
-                && session.native_id == native_id
-        }))
+    crate::external_sessions::find_bound_transcript(
+        home,
+        crate::external_sessions::ExternalDriver::Claude,
+        native_id,
+    )
+    .map_err(ApiError::internal)
 }
 
 pub(super) fn timeline_value(
@@ -1368,27 +1366,19 @@ pub(super) fn timeline_value(
             "page": page.page
         })));
     }
-    if let Some(external) =
-        crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
-            .map_err(ApiError::internal)?
-    {
+    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+        .map_err(ApiError::internal)?;
+    let Some((owner, incarnation, _)) = managed else {
+        let external =
+            crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("session `{session_id}` does not exist"))
+                })?;
         return native_timeline_page(state, snapshot, &session_id, query, &external);
-    }
-    let resource = client_session_resources(
-        &state.store,
-        true,
-        &snapshot.created_at,
-        snapshot.store_index,
-        state.native_session_home.as_deref(),
-    )
-    .map_err(ApiError::internal)?
-    .into_iter()
-    .find(|item| item["id"] == session_id)
-    .ok_or_else(|| ApiError::not_found(format!("session `{session_id}` does not exist")))?;
-    let owner = resource["owner_id"]
-        .as_str()
-        .ok_or_else(|| ApiError::internal("a session resource has no owner"))?;
-    let incarnation = resource["runtime_incarnation"].as_str();
+    };
+    let owner = owner.as_str();
+    let incarnation = incarnation.as_deref();
     if let Some(incarnation) = incarnation {
         if let Some(external) = managed_codex_transcript(state, owner, incarnation)?
             .or(managed_claude_transcript(state, owner, incarnation)?)

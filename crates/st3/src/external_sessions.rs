@@ -206,10 +206,56 @@ fn filter_discovery(mut discovery: ExternalDiscovery, include_history: bool) -> 
 }
 
 pub(crate) fn find(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
+    if !id.starts_with("session/external-") {
+        return Ok(None);
+    }
     Ok(discover(home, true)?
         .sessions
         .into_iter()
         .find(|item| item.id == id))
+}
+
+/// Resolve an already-bound managed transcript without inventorying every native session
+/// and process on the machine. The native ID comes from the wrapper binding, not a client.
+pub(crate) fn find_bound_transcript(
+    home: &Path,
+    driver: ExternalDriver,
+    native_id: &str,
+) -> Result<Option<ExternalSession>> {
+    let root = match driver {
+        ExternalDriver::Codex => home.join(".codex/sessions"),
+        ExternalDriver::Claude => home.join(".claude/projects"),
+        _ => return Ok(None),
+    };
+    let filename = format!("{native_id}.jsonl");
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() || entry.file_name() != std::ffi::OsStr::new(&filename) {
+            continue;
+        }
+        let Some(metadata) = read_metadata(driver, entry.path())? else {
+            continue;
+        };
+        if metadata.native_id != native_id {
+            continue;
+        }
+        return Ok(Some(ExternalSession {
+            id: external_session_id(driver, native_id),
+            revision: metadata.revision,
+            driver,
+            native_id: metadata.native_id,
+            transcript: metadata.transcript,
+            cwd: metadata.cwd,
+            title: metadata.title,
+            started_at_unix_ms: metadata.started_at_unix_ms,
+            updated_at_unix_ms: metadata.updated_at_unix_ms,
+            process: None,
+        }));
+    }
+    Ok(None)
 }
 
 pub(crate) fn find_fresh(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
@@ -1371,6 +1417,29 @@ fn digest(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_claude_transcript_resolves_without_a_fleetwide_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/example");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("bound-id.jsonl"),
+            r#"{"sessionId":"bound-id","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{"content":"hello"}}"#,
+        )
+        .unwrap();
+        let session = find_bound_transcript(home.path(), ExternalDriver::Claude, "bound-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.native_id, "bound-id");
+        assert_eq!(session.driver, ExternalDriver::Claude);
+        assert!(session.transcript.ends_with("bound-id.jsonl"));
+        assert!(
+            find_bound_transcript(home.path(), ExternalDriver::Claude, "other-id")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn path_executable(name: &str) -> PathBuf {

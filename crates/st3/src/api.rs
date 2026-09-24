@@ -1212,6 +1212,41 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+fn managed_session_owner_at(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
+    for subject in status.subjects {
+        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+            continue;
+        }
+        let fields = subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual));
+        let incarnation = fields
+            .and_then(|fields| fields.get("incarnation_id"))
+            .and_then(Value::as_str)
+            .or(subject.projection.runtime_incarnation.as_deref());
+        let runtime = fields
+            .and_then(|fields| fields.get("runtime_id"))
+            .and_then(Value::as_str);
+        let Some(identity) = incarnation.or(runtime) else {
+            continue;
+        };
+        if managed_session_id(&subject.subject, identity) == session_id {
+            return Ok(Some((
+                subject.subject,
+                incarnation.map(str::to_owned),
+                subject.actual_origin,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn client_session_resources(
     store: &Store,
     history: bool,
@@ -2175,29 +2210,11 @@ async fn client_sessions_detail(
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
         let session_id = client_detail_id("session", id);
-        let session_resource = client_session_resources(
-            &state.store,
-            true,
-            &snapshot.created_at,
-            snapshot.store_index,
-            state.native_session_home.as_deref(),
-        )
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|item| item["id"] == session_id);
-        if let Some(owner) = session_resource
-            .as_ref()
-            .and_then(|item| item["owner_id"].as_str())
-            && owner.starts_with("agent/")
-        {
-            let owner_status = state
-                .store
-                .status(Some(owner))
-                .map_err(ApiError::internal)?;
-            let remote_host = owner_status
-                .subjects
-                .first()
-                .and_then(|subject| subject.actual_origin.as_deref())
+        let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+            .map_err(ApiError::internal)?;
+        if let Some((_, _, origin)) = managed {
+            let remote_host = origin
+                .as_deref()
                 .filter(|origin| *origin != state.store.origin())
                 .map(client_host_id);
             if let Some(remote_host) = remote_host {
