@@ -24,7 +24,10 @@ function Card({ title, detail, children }: { title: string; detail?: string; chi
 }
 export default function App() {
   const [order, setOrder] = useState<Tab[]>([...tabs]);
-  const [active, setActive] = useState<Tab>('Now');
+  const [active, setActive] = useState<Tab>(() => {
+    const testTab = process.env.EXPO_PUBLIC_ST3_TEST_TAB;
+    return __DEV__ && tabs.includes(testTab as Tab) ? testTab as Tab : 'Now';
+  });
   const [url, setUrl] = useState(''), [urlDraft, setUrlDraft] = useState('');
   const [credential, setCredential] = useState<string | null>(null);
   const [pairingId, setPairingId] = useState(''), [pairingCode, setPairingCode] = useState('');
