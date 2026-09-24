@@ -144,9 +144,8 @@ impl App {
     }
     fn invalidate_timelines(&mut self) {
         self.timeline_cache.clear();
-        self.model.timeline.clear();
-        self.model.timeline_truncated = false;
-        self.timeline_requested = None;
+        // Keep the selected conversation visible while the fresh page loads.
+        // A later selection still starts from an empty cache, never from this view.
         self.last_timeline = Instant::now() - Duration::from_secs(10);
     }
     fn restore_chat_scroll(&mut self) {
@@ -1619,8 +1618,8 @@ mod tests {
         app.timeline_requested = Some("session/alpha".into());
         app.invalidate_timelines();
         assert!(app.timeline_cache.is_empty());
-        assert!(!app.model.timeline_truncated);
-        assert_eq!(app.timeline_requested, None);
+        assert!(app.model.timeline_truncated);
+        assert_eq!(app.timeline_requested.as_deref(), Some("session/alpha"));
         assert_eq!(app.chat_draft_cache.len(), 2);
         assert_eq!(app.chat_scroll_cache.get("session/alpha"), Some(&18));
     }
