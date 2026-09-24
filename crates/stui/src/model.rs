@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use st3_client::{
     Agent, Attention, Client, ClientError, Device, Envelope, ErrorCode, EventPage, EventType,
     Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Session, Snapshot,
@@ -11,7 +12,7 @@ use st3_client::{
 const PAGE_SIZE: usize = 50;
 const MAX_PAGES: usize = 4;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Collection {
     pub items: Vec<Resource>,
     pub snapshot: Option<Snapshot>,
@@ -38,7 +39,7 @@ impl Collection {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Model {
     pub now: Collection,
     pub messages: Collection,
@@ -59,7 +60,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub async fn load(client: &Client) -> Result<Self> {
+    pub async fn bootstrap(client: &Client) -> Result<Self> {
         let capabilities = client
             .capabilities()
             .await
@@ -70,21 +71,44 @@ impl Model {
             actor: capabilities.session_actor,
             ..Self::default()
         };
-        model.reload(client).await?;
+        let (now, agents, sessions, messages) = tokio::try_join!(
+            read_pages(client, Kind::Now),
+            read_pages(client, Kind::Agents),
+            read_pages(client, Kind::Sessions),
+            read_pages(client, Kind::Messages),
+        )?;
+        model.now = now;
+        model.agents = agents;
+        model.sessions = sessions;
+        model.messages = messages;
+        model.status = "Connected · loading details…".into();
         Ok(model)
     }
 
     pub async fn reload(&mut self, client: &Client) -> Result<()> {
-        let now = read_pages(client, Kind::Now).await?;
-        let messages = read_pages(client, Kind::Messages).await?;
-        let launches = read_pages(client, Kind::Launches).await?;
-        let missions = read_pages(client, Kind::Missions).await?;
-        let work = read_pages(client, Kind::Work).await?;
-        let agents = read_pages(client, Kind::Agents).await?;
-        let sessions = read_pages(client, Kind::Sessions).await?;
-        let runtimes = read_pages(client, Kind::Runtimes).await?;
-        let machines = read_pages(client, Kind::Machines).await?;
-        let devices = read_pages(client, Kind::Devices).await?;
+        let (
+            now,
+            messages,
+            launches,
+            missions,
+            work,
+            agents,
+            sessions,
+            runtimes,
+            machines,
+            devices,
+        ) = tokio::try_join!(
+            read_pages(client, Kind::Now),
+            read_pages(client, Kind::Messages),
+            read_pages(client, Kind::Launches),
+            read_pages(client, Kind::Missions),
+            read_pages(client, Kind::Work),
+            read_pages(client, Kind::Agents),
+            read_pages(client, Kind::Sessions),
+            read_pages(client, Kind::Runtimes),
+            read_pages(client, Kind::Machines),
+            read_pages(client, Kind::Devices),
+        )?;
         (
             self.now,
             self.messages,
@@ -166,6 +190,24 @@ impl Model {
     }
 
     pub async fn load_timeline(&mut self, client: &Client, session_id: &str) -> Result<()> {
+        for attempt in 0..3 {
+            match self.load_timeline_once(client, session_id).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < 2
+                        && error.downcast_ref::<ClientError>().is_some_and(|error| {
+                            matches!(error, ClientError::Api(ErrorCode::PageCursorExpired, _, _))
+                        }) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded timeline retry returns from every attempt")
+    }
+
+    async fn load_timeline_once(&mut self, client: &Client, session_id: &str) -> Result<()> {
         self.timeline.clear();
         self.timeline_truncated = false;
         let mut cursor = None;
@@ -176,17 +218,18 @@ impl Model {
                 .value;
             self.timeline.extend(page.items);
             if !page.page.has_more {
-                return Ok(());
+                break;
             }
             if page_index + 1 == MAX_PAGES {
                 self.timeline_truncated = true;
-                return Ok(());
+                break;
             }
             cursor = page.page.next_cursor;
             if cursor.is_none() {
                 anyhow::bail!("timeline page omitted continuation cursor");
             }
         }
+        self.timeline.sort_by_key(|entry| entry.sequence);
         Ok(())
     }
 
@@ -282,6 +325,24 @@ enum Kind {
 }
 
 async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
+    for attempt in 0..3 {
+        match read_pages_once(client, kind).await {
+            Ok(collection) => return Ok(collection),
+            Err(error)
+                if attempt < 2
+                    && error.downcast_ref::<ClientError>().is_some_and(|error| {
+                        matches!(error, ClientError::Api(ErrorCode::PageCursorExpired, _, _))
+                    }) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded page retry returns from every attempt")
+}
+
+async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
     let mut result = Collection::default();
     let mut cursor = None;
     for page_index in 0..MAX_PAGES {
@@ -290,7 +351,7 @@ async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
         }: Envelope<Page> = match kind {
             Kind::Now => {
                 client
-                    .now_list(cursor.as_deref(), Some(PAGE_SIZE), false)
+                    .attention_list(cursor.as_deref(), Some(PAGE_SIZE), false)
                     .await?
             }
             Kind::Messages => {
@@ -379,6 +440,46 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a live local st3 daemon"]
+    async fn live_full_snapshot_latency() {
+        let path =
+            st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(Into::into))
+                .unwrap();
+        let actor =
+            std::env::var("ST3_PERSON").expect("ST3_PERSON selects the person for this live test");
+        let client = Client::unix_as(path, actor);
+        let started = std::time::Instant::now();
+        let mut model = Model::bootstrap(&client).await.unwrap();
+        model.reload(&client).await.unwrap();
+        eprintln!(
+            "full snapshot: {:?}, agents: {}, sessions: {}",
+            started.elapsed(),
+            model.agents().count(),
+            model.sessions.items.len()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live local st3 daemon"]
+    async fn live_bootstrap_latency() {
+        let path =
+            st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(Into::into))
+                .unwrap();
+        let actor =
+            std::env::var("ST3_PERSON").expect("ST3_PERSON selects the person for this live test");
+        let client = Client::unix_as(path, actor);
+        let started = std::time::Instant::now();
+        let model = Model::bootstrap(&client).await.unwrap();
+        eprintln!(
+            "bootstrap: {:?}, agents: {}",
+            started.elapsed(),
+            model.agents().count()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
 
     #[test]
     fn fixture_only_routes_person_attention_to_now() {

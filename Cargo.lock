@@ -3352,6 +3352,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "ratatui",
+ "serde",
  "serde_json",
  "signal-hook",
  "st3-client",

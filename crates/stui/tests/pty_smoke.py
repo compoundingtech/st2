@@ -8,20 +8,30 @@ The script reports only checks and byte counts; it never prints terminal content
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
+import threading
 import time
 
 
-def run_case(binary: str, ending: str) -> None:
+def plain(output: bytes) -> bytes:
+    return re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", output)
+
+
+def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
+    if endpoint:
+        env["ST3_ENDPOINT"] = endpoint
     if ending == "panic":
         env["STUI_TEST_PANIC_AFTER_ENTER"] = "1"
     proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
@@ -39,24 +49,29 @@ def run_case(binary: str, ending: str) -> None:
                     break
         return bytes(output)
 
-    initial = bytearray()
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        initial.extend(collect(1))
-        ready = b"\x1b[?1049h" in initial if ending == "panic" else all(
-            label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")
-        )
-        if ready:
-            break
-        if proc.poll() is not None:
-            break
+    def wait_for(marker: bytes, timeout: float) -> tuple[bytes, float]:
+        started = time.monotonic()
+        output = bytearray()
+        while time.monotonic() - started < timeout:
+            ready, _, _ = select.select([master], [], [], 0.02)
+            if ready:
+                try:
+                    output.extend(os.read(master, 65536))
+                except OSError:
+                    break
+                if marker in (output if marker.startswith(b"\x1b") else plain(output)):
+                    break
+        return bytes(output), time.monotonic() - started
+
+    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else b"Smalltalk", 2)
+    assert first_frame < 1, f"first frame took {first_frame:.3f}s"
     if ending != "panic":
-        assert all(label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")), "missing live views"
-        os.write(master, b"2341")
-        changed = collect(4)
-        assert changed, "keyboard navigation did not redraw"
-        idle = collect(3)
-        assert not idle, f"idle redraw emitted {len(idle)} bytes"
+        for key in (b"2", b"3", b"4", b"1"):
+            os.write(master, key)
+            changed, latency = wait_for(b"", 1)
+            assert changed, f"{key!r} did not redraw"
+            assert latency < 0.5, f"{key!r} navigation took {latency:.3f}s"
+        collect(1)  # A live background snapshot may redraw after navigation.
         if ending == "normal":
             os.write(master, b"q")
         else:
@@ -71,10 +86,41 @@ def run_case(binary: str, ending: str) -> None:
     os.close(master)
     assert b"\x1b[?1049l" in initial + final, f"{ending}: alternate screen was not restored"
     assert (proc.returncode == 0) == (ending != "panic"), f"{ending}: unexpected exit {proc.returncode}"
-    print(f"{ending}: restoration OK" if ending == "panic" else f"{ending}: views, keyboard, idle, restoration OK")
+    print(f"{ending}: restoration OK" if ending == "panic" else f"{ending}: first frame {first_frame:.3f}s, keys <0.5s, restoration OK")
+
+
+def delayed_getter_case(binary: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="stui-delay-") as directory:
+        endpoint = os.path.join(directory, "slow.sock")
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(endpoint)
+        server.listen(5)
+        server.settimeout(0.2)
+        stopping = threading.Event()
+
+        def serve() -> None:
+            while not stopping.is_set():
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                # Keep the shared getter outstanding while the TUI handles keys.
+                threading.Thread(target=lambda connection=connection: (time.sleep(5), connection.close()), daemon=True).start()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            run_case(binary, "normal", endpoint)
+        finally:
+            stopping.set()
+            server.close()
+            thread.join(timeout=1)
 
 
 if __name__ == "__main__":
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
     for case in ("normal", "signal", "panic"):
         run_case(binary, case)
+    delayed_getter_case(binary)

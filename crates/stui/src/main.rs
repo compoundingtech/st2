@@ -1,3 +1,4 @@
+mod cache;
 mod model;
 
 use anyhow::{Context, Result};
@@ -16,11 +17,12 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
-    Client, Fence, LaunchCreateParameters, LaunchTarget, MessageSendParameters, TargetParameters,
-    TerminalInputMode, TerminalInputParameters, TerminalScreen,
+    Client, ClientError, ErrorCode, Fence, LaunchCreateParameters, LaunchTarget,
+    MessageSendParameters, TargetParameters, TerminalInputMode, TerminalInputParameters,
+    TerminalScreen,
 };
 use std::{
     io::{self, IsTerminal, Stdout},
@@ -28,6 +30,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -71,10 +74,15 @@ enum Mode {
     Workspace,
 }
 struct Attached {
-    runtime_id: String,
     terminal_id: String,
     attachment_id: String,
     screen: TerminalScreen,
+}
+enum Update {
+    Partial(Box<Model>),
+    Model(Box<Model>),
+    Timeline(String, Vec<st3_client::TimelineEntry>, bool),
+    Error(String),
 }
 struct App {
     model: Model,
@@ -87,9 +95,10 @@ struct App {
     launch: [String; 4],
     attached: Option<Attached>,
     return_focused: bool,
+    live_ready: bool,
     dirty: bool,
-    last_sync: Instant,
-    last_external_scan: Instant,
+    timeline_requested: Option<String>,
+    last_timeline: Instant,
     last_terminal: Instant,
 }
 impl App {
@@ -105,9 +114,10 @@ impl App {
             launch: Default::default(),
             attached: None,
             return_focused: false,
+            live_ready: false,
             dirty: true,
-            last_sync: Instant::now(),
-            last_external_scan: Instant::now(),
+            timeline_requested: None,
+            last_timeline: Instant::now(),
             last_terminal: Instant::now(),
         }
     }
@@ -120,20 +130,42 @@ impl App {
     }
     fn selected_session_id(&self) -> Option<String> {
         self.peer()
-            .and_then(|peer| peer.current_session_id.clone())
+            .and_then(|peer| {
+                peer.current_session_id.clone().or_else(|| {
+                    self.model
+                        .sessions
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            st3_client::Resource::Session(session)
+                                if session.owner_id == peer.header.id
+                                    && session.state == "running" =>
+                            {
+                                Some(session.header.id.clone())
+                            }
+                            _ => None,
+                        })
+                })
+            })
             .or_else(|| {
                 self.undeclared_session()
                     .map(|session| session.header.id.clone())
             })
     }
     fn runtime(&self) -> Option<&st3_client::Runtime> {
-        self.model.runtimes().nth(self.selected[2])
+        let peer = self.peer()?;
+        self.model
+            .runtimes()
+            .find(|runtime| runtime.owner_id == peer.header.id && runtime.terminal_id.is_some())
     }
     fn count(&self) -> usize {
-        match self.tab {
+        self.count_for(self.tab)
+    }
+    fn count_for(&self, tab: usize) -> usize {
+        match tab {
             0 => self.model.attention().count(),
             1 => self.model.agents().count() + self.model.undeclared_sessions().count(),
-            2 => self.model.runtimes().count(),
+            2 => self.model.missions().count(),
             _ => self.model.machines().count(),
         }
     }
@@ -243,8 +275,8 @@ impl App {
                     .collect(),
                 2 => self
                     .model
-                    .runtimes()
-                    .map(|v| format!("{} {}", v.owner_id, v.state))
+                    .missions()
+                    .map(|v| format!("{}  ·  {}", v.title, v.state))
                     .collect(),
                 _ => self
                     .model
@@ -252,25 +284,31 @@ impl App {
                     .map(|v| format!("{} {}", v.name, v.state))
                     .collect(),
             };
-            let lines = list
+            let entries = list
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    format!(
-                        "{} {v}",
+                    ListItem::new(format!("{v}\n")).style(Style::default().fg(
                         if i == self.selected[self.tab] {
-                            '›'
+                            Color::White
                         } else {
-                            ' '
-                        }
-                    )
+                            Color::Gray
+                        },
+                    ))
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            frame.render_widget(
-                Paragraph::new(if lines.is_empty() { "No items" } else { &lines })
-                    .block(Block::default().title("Browse").borders(Borders::ALL)),
+                .collect::<Vec<_>>();
+            let mut state = ListState::default().with_selected(Some(self.selected[self.tab]));
+            frame.render_stateful_widget(
+                List::new(if entries.is_empty() {
+                    vec![ListItem::new("No items")]
+                } else {
+                    entries
+                })
+                .block(Block::default().title(" Browse ").borders(Borders::ALL))
+                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+                .highlight_symbol("› "),
                 columns[0],
+                &mut state,
             );
         }
         let mut lines = Vec::new();
@@ -293,24 +331,55 @@ impl App {
             }
             1 => {
                 if let Some(peer) = self.peer() {
-                    lines.push(format!("{} · {}", peer.name, peer.state));
+                    lines.push(format!("AGENT  /  {}", peer.name));
+                    lines.push(String::new());
+                    lines.push(format!("{}  ·  {}", peer.state, peer.reachability));
+                    if let Some(driver) = &peer.driver {
+                        lines.push(format!("Harness: {driver}"));
+                    }
                     lines.push(format!(
                         "Current session: {}",
-                        peer.current_session_id.as_deref().unwrap_or("none")
+                        self.selected_session_id().as_deref().unwrap_or("none")
                     ));
-                    lines.push("── Conversation ──".into());
+                    if let Some(work) = self
+                        .model
+                        .work()
+                        .find(|work| work.claimant.as_deref() == Some(&peer.header.id))
+                    {
+                        lines.push(String::new());
+                        lines.push("MISSION".into());
+                        lines.push(format!("  {}  ·  {}", work.path, work.state));
+                        lines.push(format!("  {}", work.mission_run_id));
+                    }
+                    lines.push(String::new());
+                    lines.push("RECENT MESSAGES".into());
                     for message in self
                         .model
-                        .messages(peer.current_session_id.as_deref(), &peer.header.id)
+                        .messages(self.selected_session_id().as_deref(), &peer.header.id)
+                        .take(4)
                     {
                         lines.push(format!(
-                            "{}: {}",
+                            "  {}: {}",
                             message.from,
                             message.content.replace('\n', " ⏎ ")
                         ));
+                        lines.push(String::new());
                     }
-                    lines.push("── Session history ──".into());
-                    lines.extend(self.model.timeline.iter().map(timeline_line));
+                    lines.push("CONVERSATION".into());
+                    for entry in self
+                        .model
+                        .timeline
+                        .iter()
+                        .rev()
+                        .filter(|entry| matches!(entry.body, st3_client::TimelineBody::Content(_)))
+                        .take(12)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        lines.push(format!("  {}", timeline_line(entry)));
+                        lines.push(String::new());
+                    }
                     if self.model.timeline_truncated || self.model.messages.truncated {
                         lines.push("[More history beyond bounded view]".into());
                     }
@@ -353,47 +422,71 @@ impl App {
                 }
             }
             2 => {
-                lines.push("Mission progress".into());
-                for v in self.model.missions() {
-                    lines.push(format!("{} · {}", v.title, v.state));
+                lines.push("CONTROL  /  MISSIONS".into());
+                lines.push(String::new());
+                if let Some(mission) = self.model.missions().nth(self.selected[2]) {
+                    lines.push(mission.title.clone());
+                    lines.push(format!("State: {}", mission.state));
+                    lines.push(format!("Runs: {}", mission.runs.len()));
+                    lines.push(String::new());
+                    lines.push("CURRENT STEPS".into());
+                    let steps = self
+                        .model
+                        .work()
+                        .filter(|work| mission.runs.contains(&work.mission_run_id));
+                    let mut count = 0;
+                    for step in steps {
+                        if matches!(step.state.as_str(), "completed" | "cancelled") {
+                            continue;
+                        }
+                        lines.push(format!(
+                            "  {:<12} {}  ·  attempt {}",
+                            step.state, step.path, step.attempt
+                        ));
+                        if let Some(claimant) = &step.claimant {
+                            lines.push(format!("    {claimant}"));
+                        }
+                        count += 1;
+                    }
+                    if count == 0 {
+                        lines.push("  No active steps.".into());
+                    }
+                } else {
+                    lines.push("No current missions.".into());
                 }
-                for v in self.model.work() {
-                    lines.push(format!(
-                        "  {} · {} · attempt {}",
-                        v.path, v.state, v.attempt
-                    ));
+                lines.push(String::new());
+                lines.push("PLANNER LAUNCHES".into());
+                for launch in self.model.launches().take(4) {
+                    lines.push(format!("  {}  ·  {}", launch.title, launch.phase));
                 }
-                lines.push("── Terminals and launches ──".into());
-                if let Some(v) = self.runtime() {
-                    lines.push(format!(
-                        "{} · {} · terminal {}",
-                        v.owner_id,
-                        v.state,
-                        v.terminal_id.as_deref().unwrap_or("none")
-                    ));
-                }
-                for v in self.model.launches() {
-                    lines.push(format!("{} · {}", v.title, v.phase));
-                }
-                lines.push("Enter attaches to selected terminal; c creates a launch.".into());
+                lines.push(String::new());
+                lines.push("Press c to create a mission launch.".into());
                 if self.model.work.truncated {
                     lines.push("[More progress beyond bounded view]".into());
                 }
             }
             _ => {
-                lines.push("Machines".into());
-                for v in self.model.machines() {
+                lines.push("FLEET  /  MACHINES".into());
+                lines.push(String::new());
+                if let Some(machine) = self.model.machines().nth(self.selected[3]) {
+                    lines.push(format!("{}  ·  {}", machine.name, machine.state));
+                    lines.push(format!("Capacity: {}", machine.capacity.state));
                     lines.push(format!(
-                        "{} · {} · capacity {} · {} runtimes",
-                        v.name, v.state, v.capacity.state, v.occupancy.running_runtimes
+                        "Running runtimes: {}",
+                        machine.occupancy.running_runtimes
                     ));
-                    for t in &v.transports {
-                        lines.push(format!("  {} {}", t.protocol, t.status));
+                    lines.push(String::new());
+                    lines.push("CONNECTIVITY".into());
+                    for transport in &machine.transports {
+                        lines.push(format!("  {:<18} {}", transport.protocol, transport.status));
                     }
+                } else {
+                    lines.push("No machines in the current snapshot.".into());
                 }
-                lines.push("── Paired devices ──".into());
+                lines.push(String::new());
+                lines.push("YOU & DEVICES".into());
                 for v in self.model.devices() {
-                    lines.push(format!("{} · {} · {}", v.header.id, v.person_id, v.state));
+                    lines.push(format!("  {}  ·  {}", v.person_id, v.state));
                 }
                 let gateway = self
                     .model
@@ -402,7 +495,8 @@ impl App {
                     .as_ref()
                     .map(|s| s.host_id.as_str())
                     .unwrap_or("connected machine");
-                lines.push(format!("── Undeclared sessions on {gateway} ──"));
+                lines.push(String::new());
+                lines.push(format!("UNDECLARED ON {gateway}"));
                 for session in self.model.undeclared_sessions() {
                     let driver = session
                         .extra
@@ -415,7 +509,7 @@ impl App {
                         .and_then(serde_json::Value::as_str)
                         .is_some();
                     lines.push(format!(
-                        "{driver} · {} · {}",
+                        "  {driver}  ·  {}  ·  {}",
                         if exact {
                             "native session"
                         } else {
@@ -424,7 +518,8 @@ impl App {
                         session.header.id
                     ));
                 }
-                lines.push("Discovery is local to this connected machine.".into());
+                lines.push(String::new());
+                lines.push("Discovery is local to the connected gateway.".into());
                 if self.model.machines.truncated || self.model.devices.truncated {
                     lines.push("[More fleet items beyond bounded view]".into());
                 }
@@ -439,8 +534,13 @@ impl App {
         );
         let footer = match self.mode {
             Mode::Normal => format!(
-                "{} · 1–4 views · ↑↓ select · s sidebar · Enter open · c compose/create · q quit",
-                self.model.status
+                "{}  ·  1–4 views  ·  ↑↓ select  ·  s sidebar  ·  {}  ·  q quit",
+                self.model.status,
+                match self.tab {
+                    1 => "Enter terminal / c message",
+                    2 => "c new mission",
+                    _ => "",
+                }
             ),
             Mode::Chat => format!("Message: {}█ · Enter send · Esc cancel", self.input),
             Mode::Title => format!("Launch title: {}█", self.input),
@@ -477,6 +577,8 @@ fn key_input(key: KeyEvent) -> Option<String> {
 
 async fn attach(app: &mut App, client: &Client) -> Result<()> {
     let Some(runtime) = app.runtime() else {
+        app.model.status = "No controllable terminal for selected agent".into();
+        app.dirty = true;
         return Ok(());
     };
     let Some(terminal_id) = runtime.terminal_id.clone() else {
@@ -520,7 +622,6 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         client.terminal_screen(&terminal_id).await?.value
     };
     app.attached = Some(Attached {
-        runtime_id,
         terminal_id,
         attachment_id: attachment.attachment_id,
         screen,
@@ -529,29 +630,49 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
     Ok(())
 }
 async fn detach(app: &mut App, client: &Client) -> Result<()> {
-    let Some(attached) = app.attached.take() else {
+    let Some(attached) = app.attached.as_ref() else {
         return Ok(());
     };
-    let fence = app
-        .model
-        .runtimes
-        .fence(&attached.runtime_id)
-        .context("runtime fence unavailable")?;
-    let (id, key) = action_pair();
-    client
-        .terminal_detach(
-            id,
-            key,
-            fence,
-            TargetParameters {
-                target_id: attached.attachment_id,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let terminal_id = attached.terminal_id.clone();
+    let attachment_id = attached.attachment_id.clone();
+    let incarnation = attached.screen.runtime_incarnation.clone();
+    for attempt in 0..3 {
+        let fence = terminal_fence(client, &terminal_id, &incarnation).await?;
+        let (id, key) = action_pair();
+        match client
+            .terminal_detach(
+                id,
+                key,
+                fence,
+                TargetParameters {
+                    target_id: attachment_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    app.attached = None;
     app.return_focused = false;
     app.dirty = true;
     Ok(())
+}
+async fn terminal_fence(client: &Client, terminal_id: &str, incarnation: &str) -> Result<Fence> {
+    let screen = client.terminal_screen(terminal_id).await?;
+    anyhow::ensure!(
+        screen.value.runtime_incarnation == incarnation,
+        "terminal incarnation changed; reattach before sending input"
+    );
+    Ok(Fence {
+        snapshot_id: screen.snapshot.id,
+        runtime_incarnation: Some(incarnation.to_owned()),
+        terminal_sequence: Some(screen.snapshot.store_index),
+        ..Fence::default()
+    })
 }
 async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<bool> {
     if key.kind != KeyEventKind::Press {
@@ -567,24 +688,32 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             return Ok(false);
         }
         if let Some(value) = key_input(key) {
-            let fence = app
-                .model
-                .runtimes
-                .fence(&attached.runtime_id)
-                .context("runtime fence unavailable")?;
-            let (id, idem) = action_pair();
-            client
-                .terminal_input(
-                    id,
-                    idem,
-                    fence,
-                    TerminalInputParameters {
-                        terminal_id: attached.terminal_id.clone(),
-                        mode: TerminalInputMode::Key,
-                        value,
-                    },
+            for attempt in 0..3 {
+                let fence = terminal_fence(
+                    client,
+                    &attached.terminal_id,
+                    &attached.screen.runtime_incarnation,
                 )
                 .await?;
+                let (id, idem) = action_pair();
+                match client
+                    .terminal_input(
+                        id,
+                        idem,
+                        fence,
+                        TerminalInputParameters {
+                            terminal_id: attached.terminal_id.clone(),
+                            mode: TerminalInputMode::Key,
+                            value: value.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         return Ok(false);
     }
@@ -602,6 +731,12 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 match app.mode {
                     Mode::Chat => {
                         if !value.trim().is_empty() {
+                            if !app.live_ready {
+                                app.input = value;
+                                app.model.status = "Reconnect before sending".into();
+                                app.dirty = true;
+                                return Ok(false);
+                            }
                             let peer = app.peer().context("no selected agent")?;
                             let fence = Fence {
                                 snapshot_id: app
@@ -649,6 +784,12 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                         app.mode = Mode::Workspace;
                     }
                     Mode::Workspace => {
+                        if !app.live_ready {
+                            app.input = value;
+                            app.model.status = "Reconnect before creating a launch".into();
+                            app.dirty = true;
+                            return Ok(false);
+                        }
                         app.launch[3] = value;
                         let fence = Fence {
                             snapshot_id: app
@@ -716,7 +857,9 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         KeyCode::PageUp => app.scroll[app.tab] = app.scroll[app.tab].saturating_sub(10),
         KeyCode::PageDown => app.scroll[app.tab] = app.scroll[app.tab].saturating_add(10),
         KeyCode::Char('c') if app.tab == 1 => {
-            if app.peer().is_some() {
+            if !app.live_ready {
+                app.model.status = "Reconnect before composing".into();
+            } else if app.peer().is_some() {
                 app.mode = Mode::Chat;
                 app.input.clear();
             } else {
@@ -724,23 +867,21 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             }
         }
         KeyCode::Char('c') if app.tab == 2 => {
-            app.mode = Mode::Title;
-            app.input.clear();
+            if app.live_ready {
+                app.mode = Mode::Title;
+                app.input.clear();
+            } else {
+                app.model.status = "Reconnect before creating a launch".into();
+            }
         }
-        KeyCode::Enter if app.tab == 2 => attach(app, client).await?,
         KeyCode::Enter if app.tab == 1 => {
-            if let Some(id) = app.selected_session_id() {
-                app.model.load_timeline(client, &id).await?;
+            if app.live_ready {
+                attach(app, client).await?;
+            } else {
+                app.model.status = "Reconnect before attaching a terminal".into();
             }
         }
         _ => {}
-    }
-    if app.tab == 1 {
-        if let Some(id) = app.selected_session_id() {
-            app.model.load_timeline(client, &id).await?;
-        } else {
-            app.model.timeline.clear();
-        }
     }
     app.dirty = true;
     Ok(false)
@@ -760,20 +901,212 @@ fn main() -> Result<()> {
     }
     let path =
         st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(PathBuf::from))?;
-    let client = match std::env::var("ST3_PERSON") {
-        Ok(person) => Client::unix_as(&path, person),
-        Err(_) => Client::unix(&path),
+    let person = std::env::var("ST3_PERSON").ok();
+    let cache_path = person
+        .as_deref()
+        .and_then(|actor| cache::path(&path, actor));
+    let client = match person.as_deref() {
+        Some(person) => Client::unix_as(&path, person),
+        None => Client::unix(&path),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let mut app = App::new(runtime.block_on(Model::load(&client))?);
+    let (updates, incoming) = mpsc::channel::<Update>();
+    let background_client = client.clone();
+    let background_updates = updates.clone();
+    let background_cache_path = cache_path.clone();
+    let background_actor = person.clone();
+    runtime.spawn(async move {
+        let mut model = loop {
+            match Model::bootstrap(&background_client).await {
+                Ok(model) => break model,
+                Err(error) => {
+                    if background_updates
+                        .send(Update::Error(format!("Initial load: {error}")))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
+        let _ = background_updates.send(Update::Partial(Box::new(model.clone())));
+        loop {
+            match model.reload(&background_client).await {
+                Ok(()) => break,
+                Err(error) => {
+                    if background_updates
+                        .send(Update::Error(format!("Initial details: {error}")))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        if let (Some(path), Some(actor)) = (&background_cache_path, &background_actor) {
+            let _ = cache::save(path, actor, &model);
+        }
+        let _ = background_updates.send(Update::Model(Box::new(model.clone())));
+        let mut last_external_scan = Instant::now();
+        let mut last_cache_save = Instant::now();
+        let mut was_offline = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut changed = match model.sync(&background_client).await {
+                Ok(changed) => {
+                    let recovered = was_offline;
+                    was_offline = false;
+                    if recovered {
+                        model.status = "Connected".into();
+                    }
+                    changed || recovered
+                }
+                Err(error) => {
+                    was_offline = true;
+                    if background_updates
+                        .send(Update::Error(format!("Sync: {error}")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    false
+                }
+            };
+            if last_external_scan.elapsed() >= Duration::from_secs(15) {
+                match model.refresh_sessions(&background_client).await {
+                    Ok(sessions_changed) => changed |= sessions_changed,
+                    Err(error) => {
+                        if background_updates
+                            .send(Update::Error(format!("Session discovery: {error}")))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                last_external_scan = Instant::now();
+            }
+            if changed && last_cache_save.elapsed() >= Duration::from_secs(60) {
+                if let (Some(path), Some(actor)) = (&background_cache_path, &background_actor) {
+                    let _ = cache::save(path, actor, &model);
+                }
+                last_cache_save = Instant::now();
+            }
+            if changed
+                && background_updates
+                    .send(Update::Model(Box::new(model.clone())))
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut app = App::new(Model::default());
+    app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;
     #[cfg(debug_assertions)]
     if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
         panic!("terminal restoration probe");
     }
+    guard.terminal.draw(|frame| app.render(frame))?;
+    app.dirty = false;
+    if let (Some(path), Some(actor)) = (&cache_path, &person)
+        && let Some(cached) = cache::load(path, actor)
+    {
+        app.model = cached;
+        app.dirty = true;
+    }
     while !stopping.load(Ordering::Relaxed) {
+        while let Ok(update) = incoming.try_recv() {
+            match update {
+                Update::Partial(model) => {
+                    if !app.live_ready {
+                        if app.model.status.starts_with("Cached") && app.model.actor == model.actor
+                        {
+                            app.model.now = model.now;
+                            app.model.agents = model.agents;
+                            app.model.sessions = model.sessions;
+                            app.model.messages = model.messages;
+                            app.model.status = "Cached · loading details…".into();
+                        } else {
+                            app.model = *model;
+                        }
+                        app.dirty = true;
+                    }
+                }
+                Update::Model(mut model) => {
+                    if app.model.actor == model.actor {
+                        model.timeline = std::mem::take(&mut app.model.timeline);
+                        model.timeline_truncated = app.model.timeline_truncated;
+                    }
+                    app.model = *model;
+                    app.live_ready = true;
+                    for tab in 0..4 {
+                        app.selected[tab] =
+                            app.selected[tab].min(app.count_for(tab).saturating_sub(1));
+                    }
+                    app.dirty = true;
+                }
+                Update::Timeline(id, timeline, truncated)
+                    if app.selected_session_id().as_deref() == Some(&id) =>
+                {
+                    app.model.timeline = timeline;
+                    app.model.timeline_truncated = truncated;
+                    app.dirty = true;
+                }
+                Update::Timeline(_, _, _) => {}
+                Update::Error(error) => {
+                    if error.starts_with("Sync:") || error.starts_with("Initial load:") {
+                        app.live_ready = false;
+                    }
+                    if app.model.status != error {
+                        app.model.status = error;
+                        app.dirty = true;
+                    }
+                }
+            }
+        }
+        if app.tab == 1 {
+            let selected_id = app.selected_session_id();
+            if selected_id != app.timeline_requested
+                || app.last_timeline.elapsed() >= Duration::from_secs(10)
+            {
+                if selected_id != app.timeline_requested {
+                    app.model.timeline.clear();
+                    app.model.timeline_truncated = false;
+                    app.dirty = true;
+                }
+                app.timeline_requested = selected_id.clone();
+                app.last_timeline = Instant::now();
+                if let Some(id) = selected_id {
+                    let timeline_client = client.clone();
+                    let timeline_updates = updates.clone();
+                    runtime.spawn(async move {
+                        let mut model = Model::default();
+                        match model.load_timeline(&timeline_client, &id).await {
+                            Ok(()) => {
+                                let _ = timeline_updates.send(Update::Timeline(
+                                    id,
+                                    model.timeline,
+                                    model.timeline_truncated,
+                                ));
+                            }
+                            Err(error) => {
+                                let _ = timeline_updates
+                                    .send(Update::Error(format!("Conversation: {error}")));
+                            }
+                        }
+                    });
+                } else {
+                    app.model.timeline.clear();
+                    app.dirty = true;
+                }
+            }
+        }
         if app.dirty {
             guard.terminal.draw(|frame| app.render(frame))?;
             app.dirty = false;
@@ -799,45 +1132,6 @@ fn main() -> Result<()> {
                 Event::Resize(_, _) => app.dirty = true,
                 _ => {}
             }
-        }
-        if app.last_sync.elapsed() >= Duration::from_secs(2) {
-            match runtime.block_on(app.model.sync(&client)) {
-                Ok(changed) => {
-                    if changed
-                        && app.tab == 1
-                        && let Some(id) = app.selected_session_id()
-                    {
-                        let _ = runtime.block_on(app.model.load_timeline(&client, &id));
-                    }
-                    app.dirty |= changed;
-                }
-                Err(error) => {
-                    let status = format!("Sync: {error}");
-                    if app.model.status != status {
-                        app.model.status = status;
-                        app.dirty = true;
-                    }
-                }
-            }
-            app.last_sync = Instant::now();
-        }
-        if app.last_external_scan.elapsed() >= Duration::from_secs(15) {
-            match runtime.block_on(app.model.refresh_sessions(&client)) {
-                Ok(changed) => {
-                    let count =
-                        app.model.agents().count() + app.model.undeclared_sessions().count();
-                    app.selected[1] = app.selected[1].min(count.saturating_sub(1));
-                    app.dirty |= changed;
-                }
-                Err(error) => {
-                    let status = format!("Session discovery: {error}");
-                    if app.model.status != status {
-                        app.model.status = status;
-                        app.dirty = true;
-                    }
-                }
-            }
-            app.last_external_scan = Instant::now();
         }
         if let Some(attached) = app.attached.as_mut()
             && app.last_terminal.elapsed() >= Duration::from_millis(400)
@@ -908,7 +1202,21 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(content.contains("Undeclared") || content.contains("undeclared"));
+            assert!(content.to_lowercase().contains("undeclared"));
         }
+    }
+
+    #[test]
+    fn chat_finds_running_session_when_agent_field_is_absent() {
+        let agent: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/cos","revision":"one","updated_at":"2026-09-24T09:00:00Z","name":"cos","state":"running","reachability":"reachable"}"#).unwrap();
+        let session: st3_client::Resource = serde_json::from_str(r#"{"kind":"session","id":"session/cos-current","revision":"one","updated_at":"2026-09-24T09:00:00Z","owner_id":"agent/cos","state":"running","started_at":"2026-09-24T08:00:00Z","ended_at":null,"timeline_cursor":"cursor/one"}"#).unwrap();
+        let mut model = Model::default();
+        model.agents.items.push(agent);
+        model.sessions.items.push(session);
+        let app = App::new(model);
+        assert_eq!(
+            app.selected_session_id().as_deref(),
+            Some("session/cos-current")
+        );
     }
 }
