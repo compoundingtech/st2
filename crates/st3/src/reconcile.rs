@@ -7173,6 +7173,9 @@ fn work_wake_deadline(
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
                 && wake.acknowledged_by.is_none()
                 && wake.failure.is_none()
+                // Reconciliation records exhaustion after the final attempt;
+                // an expired retry deadline cannot do any further work.
+                && wake.attempts < WORK_WAKE_MAX_ATTEMPTS
         })
         .map(|wake| {
             wake.last_attempt_at_unix_ms
@@ -14020,6 +14023,17 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
                 2_000
             ),
             Some(1_000 + WORK_WAKE_RETRY_MS)
+        );
+        let mut exhausted = work[0].clone();
+        exhausted.wake.as_mut().unwrap().attempts = WORK_WAKE_MAX_ATTEMPTS;
+        assert_eq!(
+            work_wake_deadline(
+                &[exhausted],
+                &BTreeSet::from(["agent/remote.worker".into()]),
+                2_000 + WORK_WAKE_RETRY_MS
+            ),
+            None,
+            "an exhausted wake must not keep the daemon in a busy retry loop"
         );
     }
 }
