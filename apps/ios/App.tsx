@@ -7,6 +7,7 @@ import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities,
 import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionDetail, sessionLabel, timelineText, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, offlinePresentation, PROJECTION_CACHE_KEY, type Data, type MachineView } from './projectionCache';
 import { listCollectionPages, type CollectionResult } from './collectionPages';
+import { agentTree } from './agentTree';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -153,7 +154,7 @@ export default function App() {
           attention: items(attentionFirst.value, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'),
           sessions: items(sessionsFirst.value, 'session') as SessionView[],
         };
-        const incomplete: Array<keyof Data> = ['messages', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'];
+        const incomplete: Array<keyof Data> = ['messages', 'agents', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'];
         if (attentionFirst.value.page.has_more) incomplete.push('attention');
         if (sessionsFirst.value.page.has_more) incomplete.push('sessions');
         setData(initial); setTruncated(Object.fromEntries(incomplete.map(key => [key, true])));
@@ -165,6 +166,7 @@ export default function App() {
       const [collections, sessions] = await Promise.all([Promise.all([
         listCollectionPages(options => client.attentionList(options), limit, 10),
         listCollectionPages(options => client.messagesList(options), limit),
+        listCollectionPages(options => client.agentsList(options), limit),
         listCollectionPages(options => client.missionsList(options), limit),
         listCollectionPages(options => client.launchesList(options), limit),
         listCollectionPages(options => client.machinesList(options), limit),
@@ -173,11 +175,11 @@ export default function App() {
         listCollectionPages(options => client.workList(options), limit),
       ]), listSessionPages(options => client.sessionsList(options), limit)]);
       if (generation !== cacheGeneration.current) return;
-      const [attention, messages, missions, launches, machines, devices, runtimes, work] = collections;
+      const [attention, messages, agents, missions, launches, machines, devices, runtimes, work] = collections;
       const firstSnapshot = attention.pages[0].snapshot;
       setCaps(capability.value); setSnapshot(firstSnapshot);
-      const fresh: Data = { attention: collectionItems(attention, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'), messages: collectionItems(messages, 'message'), missions: collectionItems(missions, 'mission'), launches: collectionItems(launches, 'launch'), machines: machines.pages.flatMap(page => page.value.items.filter(i => (i as unknown as { kind: string }).kind === 'machine')) as unknown as MachineView[], devices: collectionItems(devices, 'device'), sessions, runtimes: collectionItems(runtimes, 'runtime'), work: collectionItems(work, 'work') };
-      const truncatedKeys: Array<keyof Data> = (['attention', 'messages', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'] as const).filter((_, index) => collections[index].truncated);
+      const fresh: Data = { attention: collectionItems(attention, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'), messages: collectionItems(messages, 'message'), agents: collectionItems(agents, 'agent'), missions: collectionItems(missions, 'mission'), launches: collectionItems(launches, 'launch'), machines: machines.pages.flatMap(page => page.value.items.filter(i => (i as unknown as { kind: string }).kind === 'machine')) as unknown as MachineView[], devices: collectionItems(devices, 'device'), sessions, runtimes: collectionItems(runtimes, 'runtime'), work: collectionItems(work, 'work') };
+      const truncatedKeys: Array<keyof Data> = (['attention', 'messages', 'agents', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'] as const).filter((_, index) => collections[index].truncated);
       setData(fresh); setTruncated(Object.fromEntries(truncatedKeys.map(key => [key, true]))); setCachedHostId(firstSnapshot.host_id);
       const now = Date.now(), index = firstSnapshot.store_index, actor = capability.value.session_actor;
       if (cachedActor.current !== actor || cachedIndex.current !== index || now - cacheSavedAt.current > 5 * 60 * 1000) {
@@ -278,6 +280,9 @@ export default function App() {
   const sourceHost = data.machines.find(m => m.id === gatewayMachineId)?.name ?? knownHostId?.replace(/^host\//, '') ?? 'connected gateway host';
   const undeclaredSessions = currentSessions.filter(isUnmanaged);
   const managedSessions = currentSessions.filter(s => !isUnmanaged(s));
+  const declaredAgentRows = agentTree(data.agents);
+  const representedSessions = new Set(declaredAgentRows.flatMap(({ agent }) => managedSessions.filter(s => s.id === agent.current_session_id || s.owner_id === agent.id).map(s => s.id)));
+  const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
   const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
   const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
@@ -317,7 +322,13 @@ export default function App() {
         </> : <>
           <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text>
           <Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}
-          <Text style={styles.section}>Declared agents</Text>{managedSessions.map(sessionChoice)}{!managedSessions.length ? <Text style={styles.muted}>No running declared agents.</Text> : null}
+          <Text style={styles.section}>Declared agents</Text>{truncated.agents ? <Text style={styles.warning}>More agents exist beyond this view.</Text> : null}
+          {declaredAgentRows.map(({ agent, depth }) => {
+            const session = managedSessions.find(s => s.id === agent.current_session_id) ?? managedSessions.find(s => s.owner_id === agent.id);
+            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) { setSessionId(session.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); } }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agent.name}</Text><Text style={styles.small}>{agent.state}{agent.owner_run_id ? ` · ${agent.owner_run_id}` : ''}{session ? ` · ${session.state} session` : ' · no current session'}</Text></Pressable>;
+          })}
+          {unmatchedDeclaredSessions.length ? <><Text style={styles.section}>Other declared sessions</Text>{unmatchedDeclaredSessions.map(sessionChoice)}</> : null}
+          {!declaredAgentRows.length && !managedSessions.length ? <Text style={styles.muted}>No declared agents are visible.</Text> : null}
           <Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}
         </> : null}
         {active === 'Control' ? selectedMission ? <>

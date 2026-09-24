@@ -21,7 +21,7 @@ assert.equal(hydrateProjectionForPairedDevice(encoded, gateway, true, now)?.data
 assert.equal(decodeProjectionCache(encoded, 'https://other.invalid', now), null);
 assert.equal(decodeProjectionCache(encoded, gateway, now + 8 * 24 * 60 * 60 * 1000), null);
 assert.equal(decodeProjectionCache(encoded, gateway, now - 6 * 60 * 1000), null);
-assert.equal(decodeProjectionCache(encoded.replace('"version":1', '"version":2'), gateway, now), null);
+assert.equal(decodeProjectionCache(encoded.replace('"version":2', '"version":1'), gateway, now), null);
 assert.equal(decodeProjectionCache('{bad json', gateway, now), null);
 assert.equal(decodeProjectionCache(encoded.replace('"kind":"session"', '"kind":"terminal-attachment"'), gateway, now), null);
 assert.equal(offlinePresentation(false).title, 'Offline');
