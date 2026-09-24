@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, sessionLabel } from './sessionView.ts';
+import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionLabel, timelineText } from './sessionView.ts';
 
 const managed = { id: 'session/managed', kind: 'session', owner_id: 'agent/one', state: 'running' };
 const exact = { id: 'session/exact', kind: 'session', owner_id: 'external-session/codex/one', state: 'running', managed: false, driver: 'codex', native_session_id: 'one' };
@@ -41,3 +41,6 @@ const restarted = await listSessionPages(async options => {
 assert.equal(firstPages, 2);
 assert.equal(secondPages, 2);
 assert.deepEqual(restarted.map(session => session.id), ['session/managed', 'session/exact']);
+assert.deepEqual(recentTimeline([{ sequence: 9 }, { sequence: 10 }, { sequence: 1 }], 2).map(entry => entry.sequence), [9, 10]);
+assert.equal(timelineText({ media_type: 'text/plain', text: 'Hello' }), 'Hello');
+assert.equal(timelineText({ message_id: 'metadata-only' }), null);

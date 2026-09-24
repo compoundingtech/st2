@@ -24,6 +24,16 @@ export function isSnapshotChurn(error: unknown): boolean {
     && 'code' in error.response && error.response.code === 'page-cursor-expired';
 }
 
+export function recentTimeline<T extends { sequence: number }>(entries: T[], limit = 100): T[] {
+  return [...entries].sort((a, b) => a.sequence - b.sequence).slice(-limit);
+}
+
+export function timelineText(body: unknown): string | null {
+  if (typeof body === 'string') return body;
+  if (typeof body === 'object' && body !== null && 'text' in body && typeof body.text === 'string') return body.text;
+  return null;
+}
+
 export function sessionLabel(session: SessionView, sourceHost: string): string {
   if (!isUnmanaged(session)) return `Declared · ${session.owner_id}`;
   const driver = session.driver ?? 'Native harness';

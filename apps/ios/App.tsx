@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Device, type Launch, type LaunchVariant, type Message, type Mission, type Page, type Resource, type Runtime, type Snapshot, type TerminalScreen, type TimelineEntry, type Work } from '../../clients/typescript/st3-client';
-import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, sessionDetail, sessionLabel, type SessionView } from './sessionView';
+import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionDetail, sessionLabel, timelineText, type SessionView } from './sessionView';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -43,6 +43,7 @@ export default function App() {
   const [hasSynced, setHasSynced] = useState(false);
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [sessionId, setSessionId] = useState(''), [timeline, setTimeline] = useState<TimelineEntry[]>([]), [composer, setComposer] = useState('');
+  const [chatDetailOpen, setChatDetailOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false), [historicalSessions, setHistoricalSessions] = useState<SessionView[]>([]), [historyBusy, setHistoryBusy] = useState(false);
   const [terminalId, setTerminalId] = useState(''), [screen, setScreen] = useState<TerminalScreen | null>(null);
   const [reviewLaunch, setReviewLaunch] = useState(''), [variants, setVariants] = useState<LaunchVariant[]>([]);
@@ -128,7 +129,7 @@ export default function App() {
             if (!result.value.page.has_more || !result.value.page.next_cursor) break;
             cursor = result.value.page.next_cursor;
           }
-          if (live) setTimeline(entries.slice(-100));
+          if (live) setTimeline(recentTimeline(entries));
           return;
         } catch (error) {
           if (!isSnapshotChurn(error)) {
@@ -180,7 +181,8 @@ export default function App() {
   const undeclaredSessions = currentSessions.filter(isUnmanaged);
   const managedSessions = currentSessions.filter(s => !isUnmanaged(s));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
-  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setTimeline([]); setScreen(null); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
+  const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
+  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => { setSessionId(s.id); setTimeline([]); setScreen(null); setChatDetailOpen(true); }} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
 
   return <SafeAreaView style={styles.page}>
     <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? hasSynced ? 'Offline · showing last data' : 'Offline · reconnecting' : 'Pair this device'}</Text></View>
@@ -195,7 +197,27 @@ export default function App() {
       </> : <>
         {status === 'offline' ? <Button label="Reconnect" onPress={() => void refresh()} /> : null}
         {active === 'Now' ? <><Text style={styles.title}>Needs your attention</Text><Text style={styles.muted}>{data.attention.length ? `${data.attention.length} actionable items` : 'Nothing needs your attention.'}</Text>{data.attention.map(a => <Card key={a.id} title={a.title} detail={`${a.priority} · ${a.detail}`}><Text style={styles.small}>{a.attention_kind} · {a.source_id}</Text>{a.actions.includes('attention.resolve') ? <Button label="Resolve" disabled={busy} onPress={() => Alert.alert('Resolve attention?', a.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void resolve(a) }])} /> : null}</Card>)}<Button label="Refresh" onPress={() => void refresh()} /></> : null}
-        {active === 'Chat' ? <><Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text><Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}<Text style={styles.section}>Declared agents</Text>{managedSessions.map(sessionChoice)}{!managedSessions.length ? <Text style={styles.muted}>No running declared agents.</Text> : null}<Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}{selectedSession ? <><Text style={styles.section}>Session history</Text>{isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session ID or session history.</Text> : null}{timeline.map(e => <Card key={e.id} title={`${e.role} · ${e.type}`} detail={JSON.stringify(e.body).slice(0, 800)} />)}{sessionMessages.map(m => <Card key={m.id} title={m.from} detail={m.content} />)}{!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><Text style={styles.section}>Terminals</Text>{data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label={`${r.runtime_id} · ${r.state}`} onPress={() => void showTerminal(r.terminal_id!)} />)}{screen && terminalId ? <Card title={`Terminal ${terminalId}`} detail={screen.lines.map(line => line.text).join('\n')} /> : null}<TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={setComposer} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}</> : null}</> : null}
+        {active === 'Chat' ? chatDetailOpen && selectedSession ? <>
+          <Button label="← Agents" onPress={() => { setChatDetailOpen(false); setScreen(null); }} />
+          <Text style={styles.section}>{sessionLabel(selectedSession, sourceHost)}</Text>
+          <Text style={styles.muted}>{sessionDetail(selectedSession)}</Text>
+          {screen && terminalId ? <>
+            <Button label="← Conversation" onPress={() => { setScreen(null); setTerminalId(''); }} />
+            <Card title="Terminal · read-only" detail={screen.lines.map(line => line.text).join('\n')} />
+          </> : <>
+            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label="View terminal" disabled={status !== 'online'} onPress={() => void showTerminal(r.terminal_id!)} />) : null}
+            <Text style={styles.section}>Conversation</Text>
+            {isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session history.</Text> : null}
+            {conversationEntries.map(e => <Card key={e.id} title={e.role === 'assistant' ? 'Agent' : e.role === 'user' ? 'You' : e.role} detail={timelineText(e.body) ?? ''} />)}
+            {!conversationEntries.length ? sessionMessages.map(m => <Card key={m.id} title={m.from} detail={m.content} />) : null}
+            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={setComposer} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
+          </>}
+        </> : <>
+          <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Running sessions from this gateway.</Text>
+          <Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}
+          <Text style={styles.section}>Declared agents</Text>{managedSessions.map(sessionChoice)}{!managedSessions.length ? <Text style={styles.muted}>No running declared agents.</Text> : null}
+          <Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}
+        </> : null}
         {active === 'Control' ? <>
           <Text style={styles.title}>Control</Text>
           <Text style={styles.section}>Missions</Text>
