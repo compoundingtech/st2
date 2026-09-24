@@ -882,9 +882,13 @@ Terminal control is reserved for diagnosed emergency recovery against an exact c
 incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
-current harness incarnation. Delivery is acknowledged by a new working turn or by claiming the
-step. An unacknowledged delivery is retried after 15 seconds, at most three times. Exhaustion writes
-a `work-wake-exhausted` harness diagnostic naming the step, incarnation, and attempt count.
+current harness incarnation. Each agent has one work seat across mission runs: a claimed,
+working, or verifying step occupies it. Ready steps wait in creation order, with the subject as a
+stable tie breaker. Only the first ready step is woken when the seat is free. Queued steps do not
+consume wake attempts or arm retry timers while the agent is busy. Delivery is acknowledged by a
+new working turn or by claiming the step. An unacknowledged delivery is retried after 15 seconds,
+at most three times. Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step,
+incarnation, and attempt count.
 
 `st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
 An operator can request another delivery through the same driver path with:

@@ -154,7 +154,11 @@ impl Model {
 
     /// Native harnesses may start outside st3, so no graph event announces them.
     pub async fn refresh_sessions(&mut self, client: &Client) -> Result<bool> {
-        let next = read_pages(client, Kind::Sessions).await?;
+        let native = read_pages(client, Kind::NativeSessions).await?;
+        let mut next = self.sessions.clone();
+        next.items.retain(|item| !matches!(item, Resource::Session(session) if session.extra.get("managed") == Some(&serde_json::Value::Bool(false))));
+        next.items.extend(native.items);
+        next.truncated |= native.truncated;
         let changed =
             self.sessions.items != next.items || self.sessions.truncated != next.truncated;
         self.sessions = next;
@@ -326,6 +330,7 @@ enum Kind {
     Work,
     Agents,
     Sessions,
+    NativeSessions,
     Runtimes,
     Machines,
     Devices,
@@ -389,6 +394,11 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
             Kind::Sessions => {
                 client
                     .sessions_list(cursor.as_deref(), Some(PAGE_SIZE), false)
+                    .await?
+            }
+            Kind::NativeSessions => {
+                client
+                    .sessions_list_native(cursor.as_deref(), Some(PAGE_SIZE), false)
                     .await?
             }
             Kind::Runtimes => {

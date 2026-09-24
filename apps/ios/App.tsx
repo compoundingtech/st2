@@ -80,7 +80,7 @@ export default function App() {
   const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const projectionEventCursor = useRef<string | null>(null);
-  const lastFullRefreshAt = useRef(0);
+  const lastNativeRefreshAt = useRef(0);
   const cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, TimelineEntry[]>()), draftCache = useRef(new Map<string, string>());
   const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
@@ -154,7 +154,7 @@ export default function App() {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
       if (cachedActor.current && cachedActor.current !== capability.value.session_actor) {
         cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0;
-        projectionEventCursor.current = null; lastFullRefreshAt.current = 0;
+        projectionEventCursor.current = null; lastNativeRefreshAt.current = 0;
         setData(emptyData); setTruncated({}); setHasSynced(false); firstDataShown.current = false; setCachedHostId(''); setSnapshot(null); setStatus('connecting');
         void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
       }
@@ -203,7 +203,7 @@ export default function App() {
       }
       cachedActor.current = actor; cachedIndex.current = index;
       projectionEventCursor.current = capability.value.event_cursor;
-      lastFullRefreshAt.current = Date.now();
+      lastNativeRefreshAt.current = Date.now();
       snapshotRetry.current = 0; setHasSynced(true); setStatus('online'); setError('');
     } catch (e) {
       if (generation !== cacheGeneration.current) return;
@@ -217,6 +217,14 @@ export default function App() {
       }
     } finally { refreshing.current = false; }
   }, [client, credential, url]);
+  const refreshNativeSessions = useCallback(async () => {
+    if (!client || refreshing.current) return;
+    const generation = cacheGeneration.current;
+    const native = await listSessionPages(options => client.sessionsList({ ...options, native_only: true }), Math.min(caps?.limits.max_page_items ?? 30, 30));
+    if (generation !== cacheGeneration.current) return;
+    setData(previous => ({ ...previous, sessions: [...previous.sessions.filter(session => !isUnmanaged(session)), ...native] }));
+    lastNativeRefreshAt.current = Date.now();
+  }, [client, caps?.limits.max_page_items]);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
     if (!client || status !== 'online') return;
@@ -228,7 +236,8 @@ export default function App() {
           const result = await client!.eventsList({ after: projectionEventCursor.current, limit: 100, wait_ms: 30_000 });
           if (!live) return;
           projectionEventCursor.current = result.value.resume_cursor;
-          if (projectionEventsRequireRefresh(result.value.items) || Date.now() - lastFullRefreshAt.current >= 30_000) await refresh();
+          if (projectionEventsRequireRefresh(result.value.items)) await refresh();
+          else if (Date.now() - lastNativeRefreshAt.current >= 30_000) await refreshNativeSessions();
         } catch {
           if (!live) return;
           await refresh(); // cursor gaps and lost connections both require a bounded resync
@@ -238,7 +247,7 @@ export default function App() {
     }
     void followProjectionChanges();
     return () => { live = false; };
-  }, [client, refresh, status]);
+  }, [client, refresh, refreshNativeSessions, status]);
   useEffect(() => { if (status !== 'offline') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15_000); return () => clearInterval(timer); }, [refresh, status]);
   useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
   useEffect(() => {
@@ -345,7 +354,7 @@ export default function App() {
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
   function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; lastFullRefreshAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
+  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; lastNativeRefreshAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');

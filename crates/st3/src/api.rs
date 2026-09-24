@@ -1253,6 +1253,7 @@ fn client_session_resources(
     at: &str,
     snapshot_index: u64,
     native_session_home: Option<&Path>,
+    native_only: bool,
 ) -> anyhow::Result<Vec<Value>> {
     type ManagedSessions = (Arc<Store>, u64, bool, Vec<Value>, BTreeSet<String>);
     static MANAGED_CACHE: OnceLock<Mutex<Option<ManagedSessions>>> = OnceLock::new();
@@ -1265,7 +1266,12 @@ fn client_session_resources(
             Arc::ptr_eq(cached_store, store) && *index == snapshot_index && *all == history
         })
         .map(|(_, _, _, sessions, managed)| (sessions.clone(), managed.clone()));
-    let (mut sessions, managed_native_sessions) = if let Some(cached) = cached {
+    let (mut sessions, managed_native_sessions) = if native_only {
+        (
+            Vec::new(),
+            managed_native_session_ids(store, snapshot_index)?,
+        )
+    } else if let Some(cached) = cached {
         cached
     } else {
         let fresh = managed_session_resources(store, history, at, snapshot_index)?;
@@ -1447,7 +1453,15 @@ fn managed_session_resources(
             "operational": subject.projection
         }));
     }
-    let managed_native_sessions = store
+    let managed_native_sessions = managed_native_session_ids(store, snapshot_index)?;
+    Ok((sessions, managed_native_sessions))
+}
+
+fn managed_native_session_ids(
+    store: &Store,
+    snapshot_index: u64,
+) -> anyhow::Result<BTreeSet<String>> {
+    Ok(store
         .claims_for_kind_at(
             "harness.session-file",
             snapshot_index.checked_add(1),
@@ -1465,8 +1479,7 @@ fn managed_session_resources(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .collect::<BTreeSet<_>>();
-    Ok((sessions, managed_native_sessions))
+        .collect::<BTreeSet<_>>())
 }
 
 fn snapshot_time_ms(timestamp: &str) -> u128 {
@@ -2220,14 +2233,23 @@ async fn client_sessions(
     if query.cursor.is_some() {
         return client_page(&state, &snapshot, "sessions", Vec::new(), &query).map(Json);
     }
-    let mut items = client_session_resources(
-        &state.store,
-        query.history,
-        &snapshot.created_at,
-        snapshot.store_index,
-        state.native_session_home.as_deref(),
-    )
-    .map_err(ApiError::internal)?;
+    let store = state.store.clone();
+    let history = query.history;
+    let created_at = snapshot.created_at.clone();
+    let snapshot_index = snapshot.store_index;
+    let native_session_home = state.native_session_home.clone();
+    let native_only = query.native_only;
+    let mut items = blocking_store(move || {
+        client_session_resources(
+            &store,
+            history,
+            &created_at,
+            snapshot_index,
+            native_session_home.as_deref(),
+            native_only,
+        )
+    })
+    .await?;
     if query.native_only {
         items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
     }
@@ -2287,6 +2309,7 @@ async fn client_sessions_detail(
             &snapshot.created_at,
             snapshot.store_index,
             state.native_session_home.as_deref(),
+            false,
         )
         .map_err(ApiError::internal)?,
         "session",
@@ -7604,6 +7627,7 @@ mod tests {
                 &snapshot.created_at,
                 snapshot.store_index,
                 None,
+                false,
             )
             .unwrap();
             assert_eq!(sessions.len(), 1);

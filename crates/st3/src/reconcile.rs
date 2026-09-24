@@ -518,13 +518,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                         ("reason".into(), Value::String(error.to_string())),
                     ]),
                 )?;
-                HashMap::new()
+                // An unavailable snapshot is unknown, not an empty runtime set.
+                // Treating it as empty could finish run cleanup while a PTY lives.
+                self.arm_restart("runtime-snapshot", now_ms().saturating_add(1_000));
+                return Ok(());
             }
         };
 
         let active = desired.iter().collect::<Vec<_>>();
         let mut unavailable_workspaces = BTreeSet::new();
         for subject in &active {
+            if subject.kind == "stop" {
+                continue;
+            }
             let Some(member) = subject
                 .member
                 .as_ref()
@@ -1128,9 +1134,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.signal_changed();
         }
 
+        let next_wake = next_work_wake_for_agent(agent, &work);
         for step in work
             .iter()
-            .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
+            .filter(|step| Some(step.subject.as_str()) == next_wake)
         {
             let tag_value = format!(
                 "{}@{}@{}@{}",
@@ -1243,13 +1250,21 @@ impl<R: RuntimeControl> Reconciler<R> {
         ptys: &HashMap<String, RuntimeObservation>,
     ) -> Result<()> {
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
+            // A stop-only declaration with no observed runtime is already satisfied.
+            // Project that fact so the declaring step can complete.
+            if subject.kind == "stop" && subject.member.is_none() {
+                self.record_once(
+                    &subject.subject,
+                    "runtime.observed",
+                    BTreeMap::from([
+                        ("status".into(), Value::String("absent".into())),
+                        ("reachability".into(), Value::String("reachable".into())),
+                    ]),
+                )?;
+            }
             return Ok(());
         };
         let fields = actual.get("fields").unwrap_or(&actual);
-        let status = fields.get("status").and_then(Value::as_str);
-        if matches!(status, Some("stopped" | "absent")) {
-            return Ok(());
-        }
         let Some(runtime_id) = fields.get("runtime_id").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -1262,6 +1277,24 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             self.runtime.observe_exec(runtime_id)?
         };
+        // A stopped projection is only a record of the last observation. The same
+        // runtime ID can be live again (or a stop can have raced with a restart),
+        // so fence the observed process before allowing run cleanup to finish.
+        if let Some(observation) = observation.as_ref().filter(|item| item.status == "running") {
+            let mut observed_fields = BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("runtime_id".into(), Value::String(runtime_id.into())),
+                ("terminal".into(), Value::Bool(terminal)),
+                ("reachability".into(), Value::String("reachable".into())),
+            ]);
+            if let Some(incarnation) = &observation.incarnation_id {
+                observed_fields.insert("incarnation_id".into(), Value::String(incarnation.clone()));
+            }
+            if let Some(timeout) = fields.get("shutdown_timeout_ms") {
+                observed_fields.insert("shutdown_timeout_ms".into(), timeout.clone());
+            }
+            self.record_once(&subject.subject, "runtime.observed", observed_fields)?;
+        }
         let incarnation = observation
             .as_ref()
             .and_then(|value| value.incarnation_id.as_deref())
@@ -2389,9 +2422,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect::<Vec<_>>();
         let mut live = Vec::new();
         for subject in &owned {
-            let status = self
-                .store
-                .latest_actual_value(&subject.subject)?
+            let actual = self.store.latest_actual_value(&subject.subject)?;
+            // A stop declaration for a runtime that never existed has no process
+            // to await. Otherwise cleanup can remain pending forever.
+            if subject.kind == "stop" && actual.is_none() {
+                continue;
+            }
+            let status = actual
                 .as_ref()
                 .and_then(|actual| actual_field(actual, "status"))
                 .and_then(Value::as_str)
@@ -7179,7 +7216,11 @@ fn work_wake_deadline(
                 .as_ref()
                 .is_some_and(|assignee| local_agents.contains(assignee))
         })
-        .filter(|step| step.status == "ready" && should_notify_work_message(step, work))
+        .filter(|step| {
+            step.assigned_to.as_deref().is_some_and(|agent| {
+                next_work_wake_for_agent(agent, work) == Some(step.subject.as_str())
+            })
+        })
         .filter_map(|step| step.wake.as_ref())
         .filter(|wake| {
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
@@ -7194,6 +7235,30 @@ fn work_wake_deadline(
                 .map_or(now, |last| last.saturating_add(WORK_WAKE_RETRY_MS))
         })
         .min()
+}
+
+/// A maintained harness has one work seat. A claimed step occupies it, while
+/// ready steps from all runs wait in one stable, oldest-first queue.
+fn next_work_wake_for_agent<'a>(agent: &str, work: &'a [StepRunView]) -> Option<&'a str> {
+    if work.iter().any(|step| {
+        matches!(step.status.as_str(), "claimed" | "working" | "verifying")
+            && (step.claimant.as_deref() == Some(agent)
+                || step.assigned_to.as_deref() == Some(agent))
+    }) {
+        return None;
+    }
+    work.iter()
+        .filter(|step| {
+            step.status == "ready"
+                && step.assigned_to.as_deref() == Some(agent)
+                && should_notify_work_message(step, work)
+        })
+        .min_by(|left, right| {
+            left.created_at_unix_ms
+                .cmp(&right.created_at_unix_ms)
+                .then_with(|| left.subject.cmp(&right.subject))
+        })
+        .map(|step| step.subject.as_str())
 }
 
 fn should_notify_work_message(
@@ -7490,6 +7555,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRuntime {
+        snapshot_error: Mutex<bool>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
         logs: Mutex<HashMap<String, String>>,
@@ -7505,6 +7571,9 @@ mod tests {
 
     impl RuntimeControl for FakeRuntime {
         fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+            if *self.snapshot_error.lock().unwrap() {
+                anyhow::bail!("the PTY snapshot is unavailable")
+            }
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
@@ -11057,6 +11126,95 @@ mission "scheduled-cycle" state="ready" {
         );
     }
 
+    #[test]
+    fn an_expired_run_cancels_ready_work_before_cleanup() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+mission "ready-deadline" state="ready" timeout="1ms" {
+  goal "Expire while assigned work is ready."
+  step "work" { assigned-to "agent/absent" }
+}
+"#,
+            "ready-deadline-source",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "ready-deadline".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "ready-deadline-run".into(),
+            })
+            .unwrap();
+        store
+            .set_step_state(&run.steps[0].subject, "ready", None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.status, "failed");
+        assert_eq!(current.phase, "terminal");
+        assert_eq!(current.steps[0].status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_wait_for_a_stop_target_that_never_started() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+mission "absent-stop" state="ready" {
+  goal "Finish with an absent stop target."
+  completion { when "all-steps-exhausted" }
+  step "work" { agentless }
+  finally { step "stop" { agentless; stop "agent/absent" } }
+}
+"#,
+            "absent-stop-source",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "absent-stop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "absent-stop-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..100 {
+            reconciler.reconcile_once().unwrap();
+            if store.mission_run(&run.id).unwrap().unwrap().phase == "terminal" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.status, "completed");
+        assert_eq!(current.phase, "terminal");
+    }
+
     #[tokio::test]
     async fn the_daemon_wakes_at_a_mission_deadline_and_finishes_eval_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -12449,6 +12607,24 @@ version 2
             incarnation_id: Some("direct-terminal-incarnation".into()),
         });
         reconciler.reconcile_once().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: format!("agent/{}/worker", run.id),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("stopped".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String(member.runtime_id.clone()),
+                    ),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("stale-stopped-worker".into()),
+            })
+            .unwrap();
 
         assert!(
             store
@@ -12471,10 +12647,23 @@ version 2
                 )
         );
 
+        *runtime.snapshot_error.lock().unwrap() = true;
+        reconciler.reconcile_once().unwrap();
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        *runtime.snapshot_error.lock().unwrap() = false;
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             runtime.stops.lock().unwrap().as_slice(),
             &[member.runtime_id]
+        );
+        let actual = store
+            .latest_actual_value(&format!("agent/{}/worker", run.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual_field(&actual, "status").and_then(Value::as_str),
+            Some("running"),
+            "a live incarnation must displace the stale stopped projection"
         );
     }
 
@@ -13828,6 +14017,87 @@ mission "ios-proof-blocked" state="ready" {
         assert!(should_notify_work_message(&parent, &work));
         assert!(!should_notify_work_message(&inherited, &work));
         assert!(should_notify_work_message(&reassigned, &work));
+        assert_eq!(
+            next_work_wake_for_agent("agent/builder", &work),
+            Some(parent.subject.as_str())
+        );
+        assert_eq!(
+            next_work_wake_for_agent("agent/reviewer", &work),
+            Some(reassigned.subject.as_str())
+        );
+    }
+
+    #[test]
+    fn busy_agent_keeps_cross_run_work_queued_without_wake_deadline() {
+        let mut first = StepRunView {
+            subject: "step-run/older/work".into(),
+            run: "mission-run/older".into(),
+            generation: "run-generation/older".into(),
+            step: "work".into(),
+            queue: None,
+            queue_position: None,
+            definition_hash: "definition".into(),
+            status: "ready".into(),
+            attempt: 1,
+            assigned_to: Some("agent/worker".into()),
+            available_to: Vec::new(),
+            agentless: false,
+            title: None,
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            under: Vec::new(),
+            worker_reported: false,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            execution_started_at_unix_ms: None,
+            execution_elapsed_ms: 0,
+            timeout_ms: None,
+            ready_age_ms: None,
+            wake: Some(crate::model::WorkWakeView {
+                assignee: "agent/worker".into(),
+                assignee_state: "working".into(),
+                incarnation_id: "worker-one".into(),
+                attempts: 1,
+                last_attempt_at_unix_ms: Some(1_000),
+                acknowledged_by: None,
+                failure: None,
+            }),
+            readiness_epoch: 1,
+            blocked_reason: None,
+            blockers: Vec::new(),
+            not_before_unix_ms: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        };
+        let mut second = first.clone();
+        second.subject = "step-run/newer/work".into();
+        second.run = "mission-run/newer".into();
+        second.created_at_unix_ms = 20;
+        let mut active = first.clone();
+        active.subject = "step-run/active/work".into();
+        active.run = "mission-run/active".into();
+        active.status = "working".into();
+        active.claimant = Some("agent/worker".into());
+        active.wake = None;
+
+        let ready = vec![second.clone(), first.clone()];
+        assert_eq!(
+            next_work_wake_for_agent("agent/worker", &ready),
+            Some(first.subject.as_str())
+        );
+        assert_eq!(
+            work_wake_deadline(&ready, &BTreeSet::from(["agent/worker".into()]), 2_000),
+            Some(1_000 + WORK_WAKE_RETRY_MS)
+        );
+
+        first.wake.as_mut().unwrap().assignee_state = "working".into();
+        let busy = vec![second, first, active];
+        assert_eq!(next_work_wake_for_agent("agent/worker", &busy), None);
+        assert_eq!(
+            work_wake_deadline(&busy, &BTreeSet::from(["agent/worker".into()]), 2_000),
+            None
+        );
     }
 
     #[test]

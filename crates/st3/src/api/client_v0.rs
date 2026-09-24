@@ -237,26 +237,33 @@ pub(super) fn authenticate(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?;
     let digest = credential_digest(credential);
-    let page = state
+    let pairings = state
         .store
-        .claims_page(None, None, 0, None, true, 10_000)
+        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
         .map_err(ApiError::internal)?;
-    let paired = page.claims.iter().find(|claim| {
-        claim.kind == "custom.client.pairing-completed"
-            && claim
-                .body
-                .pointer("/fields/credential_hash")
-                .and_then(Value::as_str)
-                == Some(digest.as_str())
+    let paired = pairings.claims.iter().find(|claim| {
+        claim
+            .body
+            .pointer("/fields/credential_hash")
+            .and_then(Value::as_str)
+            == Some(digest.as_str())
     });
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let revoked = page.claims.iter().any(|claim| {
-        claim.subject == paired.subject
-            && claim.kind == "custom.client.pairing-revoked"
-            && claim.store_index > paired.store_index
-    });
+    let revoked = state
+        .store
+        .claims_for_subject_kind_at(
+            &paired.subject,
+            "custom.client.pairing-revoked",
+            None,
+            true,
+            1,
+        )
+        .map_err(ApiError::internal)?
+        .claims
+        .first()
+        .is_some_and(|claim| claim.store_index > paired.store_index);
     let expires_at = paired
         .body
         .pointer("/fields/expires_at_unix_ms")
@@ -889,15 +896,13 @@ pub(super) async fn missions(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
-    client_page(
-        &state,
-        &snapshot,
-        "missions",
-        mission_resources(&state.store, snapshot.store_index, query.history, None)
-            .map_err(ApiError::internal)?,
-        &query,
-    )
-    .map(Json)
+    let store = state.store.clone();
+    let snapshot_index = snapshot.store_index;
+    let history = query.history;
+    let items =
+        super::blocking_store(move || mission_resources(&store, snapshot_index, history, None))
+            .await?;
+    client_page(&state, &snapshot, "missions", items, &query).map(Json)
 }
 
 pub(super) async fn mission_detail(
@@ -907,17 +912,14 @@ pub(super) async fn mission_detail(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        mission_resources(
-            &state.store,
-            snapshot.store_index,
-            true,
-            Some(&client_detail_id("mission", &id)),
-        )
-        .map_err(ApiError::internal)?,
-        "mission",
-        &id,
-    )
+    let store = state.store.clone();
+    let snapshot_index = snapshot.store_index;
+    let selected = client_detail_id("mission", &id);
+    let items = super::blocking_store(move || {
+        mission_resources(&store, snapshot_index, true, Some(&selected))
+    })
+    .await?;
+    client_detail(items, "mission", &id)
 }
 
 pub(super) async fn runtimes(
@@ -1901,6 +1903,9 @@ pub(super) async fn events(
     validate_event_cursor(&state.node, query.after.is_some(), after, oldest, newest)?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.unwrap_or(0).min(30_000));
+    // Subscribe before the first store read. An event between reading an empty
+    // page and subscribing must wake this long poll, not wait for another event.
+    let mut changed = state.event_notify.subscribe();
     let records = loop {
         let records = if query.after.is_some() {
             state
@@ -1913,12 +1918,11 @@ pub(super) async fn events(
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
             break records;
         }
-        let mut changed = state.event_notify.subscribe();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if tokio::time::timeout(remaining, changed.changed())
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio::time::timeout(remaining, changed.changed()).await,
+            Ok(Ok(()))
+        ) {
             break Vec::new();
         }
     };
@@ -3894,18 +3898,17 @@ async fn dispatch_action(
             let device = parameter_string(p, "target_id")?;
             let claims = state
                 .store
-                .claims_page(None, None, 0, None, true, 10_000)
+                .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
                 .map_err(ApiError::internal)?;
             let paired = claims
                 .claims
                 .iter()
                 .find(|claim| {
-                    claim.kind == "custom.client.pairing-completed"
-                        && claim
-                            .body
-                            .pointer("/fields/device_id")
-                            .and_then(Value::as_str)
-                            == Some(device.as_str())
+                    claim
+                        .body
+                        .pointer("/fields/device_id")
+                        .and_then(Value::as_str)
+                        == Some(device.as_str())
                 })
                 .ok_or_else(|| {
                     ApiError::not_found(format!("paired device `{device}` does not exist"))
@@ -4605,6 +4608,51 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn client_event_long_poll_wakes_for_a_new_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "wait-node");
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            events(
+                State(waiter_state),
+                Extension(ClientSession::local(None).unwrap()),
+                Query(EventsQuery {
+                    after: Some("event-cursor/wait-node/0".into()),
+                    limit: Some(10),
+                    wait_ms: Some(1_000),
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/wake".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("person/nathan".into())),
+                    ("to".into(), Value::String("agent/worker".into())),
+                    ("content".into(), Value::String("wake".into())),
+                    ("status".into(), Value::String("sent".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("client-event-wake".into()),
+            })
+            .unwrap();
+        signal_changed(&state);
+        let page = tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("the client event long poll did not wake")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn current_agent_session_fences_composer_messages_and_timeline_history() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "session-message-node");
@@ -4645,6 +4693,7 @@ mission "example/zero-run" state="ready" {
             &snapshot.created_at,
             snapshot.store_index,
             state.native_session_home.as_deref(),
+            false,
         )
         .unwrap();
         let agent = agents.iter().find(|agent| agent["id"] == subject).unwrap();
@@ -5179,6 +5228,7 @@ mission "example/zero-run" state="ready" {
             &snapshot.created_at,
             snapshot.store_index,
             state.native_session_home.as_deref(),
+            false,
         )
         .unwrap()[0]["id"]
             .as_str()
@@ -5347,6 +5397,7 @@ mission "example/zero-run" state="ready" {
             &snapshot.created_at,
             snapshot.store_index,
             state.native_session_home.as_deref(),
+            false,
         )
         .unwrap()[0]["id"]
             .as_str()

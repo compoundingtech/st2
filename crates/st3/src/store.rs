@@ -3611,6 +3611,17 @@ impl Store {
             &[],
             None,
         )?;
+        if phase.starts_with("cleanup-") {
+            terminalize_run_steps_tx(
+                &transaction,
+                &self.origin,
+                run,
+                reason.unwrap_or("the mission run entered cleanup"),
+                Some("daemon/runtime"),
+                None,
+                now,
+            )?;
+        }
         if target_is_terminal {
             cancel_descendant_mission_runs_tx(
                 &transaction,
