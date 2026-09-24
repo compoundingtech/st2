@@ -8,8 +8,8 @@ assert.equal(isUnmanaged(managed), false);
 assert.equal(isUnmanaged(exact), true);
 assert.equal(isUnresolved(exact), false);
 assert.equal(isUnresolved(unresolved), true);
-assert.match(sessionLabel(exact, 'gateway-host'), /Unmanaged.*codex session.*gateway-host/);
-assert.match(sessionLabel(unresolved, 'gateway-host'), /Unmanaged.*unresolved claude process.*gateway-host/);
+assert.match(sessionLabel(exact, 'gateway-host'), /Undeclared.*codex session.*gateway-host/);
+assert.match(sessionLabel(unresolved, 'gateway-host'), /Undeclared.*unresolved claude process.*gateway-host/);
 
 const calls = [];
 const sessions = await listSessionPages(async options => {

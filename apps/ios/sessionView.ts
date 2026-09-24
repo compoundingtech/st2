@@ -19,10 +19,10 @@ export function isUnresolved(session: SessionView): boolean {
 }
 
 export function sessionLabel(session: SessionView, sourceHost: string): string {
-  if (!isUnmanaged(session)) return `Managed · ${session.owner_id}`;
+  if (!isUnmanaged(session)) return `Declared · ${session.owner_id}`;
   const driver = session.driver ?? 'Native harness';
-  if (isUnresolved(session)) return `Unmanaged · unresolved ${driver} process · ${sourceHost}`;
-  return `Unmanaged · ${driver} session · ${sourceHost}`;
+  if (isUnresolved(session)) return `Undeclared · unresolved ${driver} process · ${sourceHost}`;
+  return `Undeclared · ${driver} session · ${sourceHost}`;
 }
 
 export function sessionDetail(session: SessionView): string {
