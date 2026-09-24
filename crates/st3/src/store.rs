@@ -14275,28 +14275,35 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .map_err(internal)?;
     drop(statement);
 
-    let mut renewed_subjects = BTreeSet::new();
+    let mut work_claims = claims
+        .iter()
+        .filter(|claim| claim.kind.starts_with("work."))
+        .collect::<Vec<_>>();
+    work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
     for claim in &claims {
         if !Store::simple_replication_kind(&claim.kind) || claim.body.get("_operation").is_some() {
             return Ok(false);
         }
-        if claim.kind.starts_with("work.") {
-            let previous: Option<String> = transaction
+    }
+    let mut latest_work_by_subject = BTreeMap::new();
+    for claim in &work_claims {
+        let previous = if let Some(previous) = latest_work_by_subject.get(&claim.subject) {
+            Some(*previous)
+        } else {
+            transaction
                 .query_row(
                     "SELECT updated_at_unix_ms FROM step_runs WHERE subject=?1",
                     [&claim.subject],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(internal)?;
-            if !renewed_subjects.insert(&claim.subject)
-                || previous
-                    .and_then(|value| value.parse::<u128>().ok())
-                    .is_none_or(|value| claim.accepted_at_unix_ms <= value)
-            {
-                return Ok(false);
-            }
+                .map_err(internal)?
+                .and_then(|value: String| value.parse::<u128>().ok())
+        };
+        if previous.is_none_or(|value| claim.accepted_at_unix_ms <= value) {
+            return Ok(false);
         }
+        latest_work_by_subject.insert(&claim.subject, claim.accepted_at_unix_ms);
     }
     for claim in &claims {
         insert_event(
@@ -14307,9 +14314,9 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             &claim.body,
         )
         .map_err(internal)?;
-        if claim.kind.starts_with("work.") {
-            project_mission_run_update(transaction, claim)?;
-        }
+    }
+    for claim in work_claims {
+        project_mission_run_update(transaction, claim)?;
     }
     Ok(true)
 }
@@ -15181,7 +15188,9 @@ fn project_run_generation_created(
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("replicated generation");
-    let current = match mission_run_view_tx(transaction, run_id) {
+    // Generation replay needs effective predecessor step state, not presentation-only
+    // wake history. Avoid scanning every sent message for every carried step.
+    let current = match mission_run_view_for_projection_tx(transaction, run_id) {
         Ok(current) => current,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
         Err(error) => return Err(internal(error)),
@@ -17264,6 +17273,31 @@ fn mission_run_view_for_reconcile_tx(
     run_id: &str,
 ) -> rusqlite::Result<MissionRunView> {
     mission_run_view_with_enrichment_tx(connection, run_id, false)
+}
+
+/// Replay only needs effective predecessor states and run variables. Presentation
+/// enrichment re-parses the complete mission and wake history for every step.
+fn mission_run_view_for_projection_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<MissionRunView> {
+    let mut view = mission_run_header_tx(connection, run_id)?;
+    let mut statement = connection.prepare(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
+    )?;
+    view.steps = statement
+        .query_map(
+            [generation_id_from_subject(&view.generation)],
+            step_run_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let snapshot_unix_ms = now_ms();
+    for step in &mut view.steps {
+        apply_effective_step_state(connection, step, snapshot_unix_ms)?;
+    }
+    Ok(view)
 }
 
 fn mission_run_view_with_enrichment_tx(
