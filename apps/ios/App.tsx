@@ -100,6 +100,11 @@ export default function App() {
         if (tabs.includes(tab as Tab)) setActive(tab as Tab);
         return;
       }
+      if (parsed.hostname === 'mission') {
+        const id = parsed.searchParams.get('id');
+        if (id?.startsWith('mission/')) { setSelectedMissionId(id); setActive('Control'); }
+        return;
+      }
       if (handled) return;
       if (parsed.hostname !== 'pair') return;
       const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
