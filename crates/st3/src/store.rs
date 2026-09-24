@@ -14554,6 +14554,55 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
     {
         project_mission_run_update(transaction, claim)?;
     }
+    reconcile_carried_steps_tx(transaction, &claims)?;
+    Ok(())
+}
+
+fn reconcile_carried_steps_tx(
+    transaction: &Transaction<'_>,
+    claims: &[ClaimRecord],
+) -> Result<(), St3Error> {
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.kind == "step-run.carried")
+    {
+        // A replay may be repairing an existing projection. A later step claim
+        // owns its state; otherwise the carried claim is the last direct state
+        // observation for this successor step.
+        let later_step_claim = transaction
+            .query_row(
+                "SELECT 1 FROM claims WHERE subject=?1 AND kind<>'step-run.carried' LIMIT 1",
+                [&claim.subject],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some();
+        if later_step_claim || step_owner_is_terminal_tx(transaction, &claim.subject)? {
+            continue;
+        }
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let Some(status) = fields.get("status").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
+            continue;
+        };
+        let worker_reported = fields
+            .get("worker_reported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        transaction
+            .execute(
+                "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
+                    blocked_reason=CASE WHEN status=?2 THEN blocked_reason ELSE NULL END,
+                    not_before_unix_ms=CASE WHEN status=?2 THEN not_before_unix_ms ELSE NULL END,
+                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL
+                 WHERE subject=?1 AND status<>?2",
+                params![claim.subject, status, attempt, worker_reported],
+            )
+            .map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -15166,14 +15215,43 @@ fn project_run_generation_created(
             .contains(step.path.as_str())
             .then(|| current.steps.iter().find(|old| old.step == step.path))
             .flatten();
-        let status = carried
-            .map(|old| match old.status.as_str() {
-                "claimed" | "working" | "verifying" => "ready",
-                status => status,
+        // The predecessor is already terminal when its successor is replayed.
+        // Its projected step may have been cancelled after the carried claim was
+        // written, so use that claim as the authority for the successor state.
+        let carried_body = transaction
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND batch_id=?2 AND kind='step-run.carried'",
+                params![subject, claim.batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .map(|body| serde_json::from_str::<Value>(&body).map_err(internal))
+            .transpose()?;
+        let carried_fields = carried_body
+            .as_ref()
+            .map(|body| body.get("fields").unwrap_or(body));
+        let status = carried_fields
+            .and_then(|fields| fields.get("status"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                carried.map(|old| match old.status.as_str() {
+                    "claimed" | "working" | "verifying" => "ready",
+                    status => status,
+                })
             })
             .unwrap_or("pending");
-        let attempt = carried.map(|old| old.attempt).unwrap_or(1);
-        let worker_reported = carried.is_some_and(|old| old.worker_reported && status != "ready");
+        let attempt = carried_fields
+            .and_then(|fields| fields.get("attempt"))
+            .and_then(Value::as_u64)
+            .and_then(|attempt| u32::try_from(attempt).ok())
+            .or_else(|| carried.map(|old| old.attempt))
+            .unwrap_or(1);
+        let worker_reported = carried_fields
+            .and_then(|fields| fields.get("worker_reported"))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| carried.is_some_and(|old| old.worker_reported && status != "ready"));
+        let matching_predecessor = carried.filter(|old| old.status == status);
         let mut step_variables = variables.clone();
         step_variables.insert("ST_STEP".into(), step.path.clone());
         step_variables.insert("ST_STEP_RUN".into(), subject.clone());
@@ -15197,7 +15275,7 @@ fn project_run_generation_created(
             .execute(
                 "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, carried.and_then(|old| old.blocked_reason.as_deref()), carried.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints],
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, matching_predecessor.and_then(|old| old.blocked_reason.as_deref()), matching_predecessor.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints],
             )
             .map_err(internal)?;
     }
@@ -20043,6 +20121,7 @@ version 2
       goal {goal:?}
     }}
     step "stable" {{ goal "Carry stable work." }}
+    step "waiting" {{ goal "Carry pending work." }}
   }}
 
 "#
@@ -20132,6 +20211,60 @@ version 2
                 .unwrap()
                 .status,
             "completed"
+        );
+        assert_eq!(
+            revised
+                .steps
+                .iter()
+                .find(|step| step.step == "waiting")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            replicated
+                .steps
+                .iter()
+                .find(|step| step.step == "waiting")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        {
+            let mut connection = target.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE step_runs SET status='cancelled', blocked_reason='the owning run generation was superseded'
+                     WHERE subject=?1",
+                    [format!("step-run/{}/waiting", revised.generation)],
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            project_replicated_mission_runs(&transaction).unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            target
+                .mission_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .steps
+                .iter()
+                .find(|step| step.step == "waiting")
+                .unwrap()
+                .status,
+            "pending",
+            "a replay repairs an old carried step projection"
+        );
+        assert_eq!(
+            source
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            target
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap()
+                .graph_digest
         );
     }
 
