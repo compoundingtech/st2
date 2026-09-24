@@ -2,7 +2,7 @@ import type { Agent } from '../../clients/typescript/st3-client';
 
 export type AgentRow = { agent: Agent; depth: number };
 
-export function agentTree(agents: Agent[]): AgentRow[] {
+export function agentTree(agents: Agent[] = []): AgentRow[] {
   const ids = new Set(agents.map(agent => agent.id));
   const rows: AgentRow[] = [];
   const seen = new Set<string>();
