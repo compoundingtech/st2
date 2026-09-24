@@ -6379,6 +6379,7 @@ async fn run_st2_native_driver(
     let mut ready = false;
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
+    let mut delivery = NativeDeliverySupervisor::default();
     loop {
         tokio::select! {
             result = &mut task => {
@@ -6522,7 +6523,7 @@ async fn run_st2_native_driver(
                     )
                     .await?;
                     if driver == "claude" {
-                        forward_projected_messages(
+                        supervise_native_delivery(
                             client,
                             subject,
                             &inbox,
@@ -6532,10 +6533,12 @@ async fn run_st2_native_driver(
                                 agent_dir: &agent_dir,
                                 incarnation: &incarnation,
                             },
+                            &incarnation,
+                            &mut delivery,
                         )
-                        .await?;
+                        .await;
                     } else if driver == "opencode" {
-                        forward_projected_messages(
+                        supervise_native_delivery(
                             client,
                             subject,
                             &inbox,
@@ -6546,8 +6549,10 @@ async fn run_st2_native_driver(
                                 identity: &identity,
                                 runtime_id: &runtime_id,
                             },
+                            &incarnation,
+                            &mut delivery,
                         )
-                        .await?;
+                        .await;
                     }
                     Ok(())
                 }.await;
@@ -7243,6 +7248,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     let mut published_timeline = BTreeSet::new();
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
+    let mut delivery = NativeDeliverySupervisor::default();
     loop {
         tokio::select! {
             result = &mut task => return result?,
@@ -7265,7 +7271,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         }).await?;
                         ready = true;
                     }
-                    forward_projected_messages(
+                    supervise_native_delivery(
                         client,
                         subject,
                         &inbox,
@@ -7276,8 +7282,10 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                             identity: &identity,
                             runtime_id: &runtime_id,
                         },
+                        &incarnation,
+                        &mut delivery,
                     )
-                    .await?;
+                    .await;
                     if let Some(observed) = st2::harness_state::read(
                         &st2::harness_state::harness_state_path(&agent_dir),
                         None,
@@ -7483,6 +7491,9 @@ fn tolerate_driver_api_outage(
         message.contains("connect to the st3 API")
             || message.contains("incomplete HTTP response")
             || message.contains("retry the command")
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(serde_json::Error::is_eof)
             || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
                 matches!(
                     error.kind(),
@@ -7571,6 +7582,179 @@ fn unix_minute() -> Result<u64> {
 
 fn current_unix_ms() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+}
+
+/// Native delivery is a supervised part of the driver, not a reason to terminate the provider.
+/// Each attempt rereads graph message state, so a failed page or receipt is replayed safely.
+struct NativeDeliverySupervisor {
+    episode: u64,
+    failures: u32,
+    retry_after: Option<Instant>,
+    degraded_recorded: bool,
+    last_warning: Option<Instant>,
+}
+
+impl Default for NativeDeliverySupervisor {
+    fn default() -> Self {
+        Self {
+            episode: 0,
+            failures: 0,
+            retry_after: None,
+            degraded_recorded: false,
+            last_warning: None,
+        }
+    }
+}
+
+impl NativeDeliverySupervisor {
+    fn ready(&self) -> bool {
+        self.retry_after
+            .is_none_or(|retry_after| Instant::now() >= retry_after)
+    }
+
+    fn failed(&mut self) -> Duration {
+        if self.failures == 0 {
+            self.episode = self.episode.saturating_add(1);
+        }
+        self.failures = self.failures.saturating_add(1);
+        let shift = self.failures.saturating_sub(1).min(5);
+        let backoff = Duration::from_secs((1_u64 << shift).min(30));
+        self.retry_after = Some(Instant::now() + backoff);
+        backoff
+    }
+
+    fn recovered(&mut self) {
+        self.failures = 0;
+        self.retry_after = None;
+        self.degraded_recorded = false;
+        self.last_warning = None;
+    }
+}
+
+async fn record_native_delivery_diagnostic(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    transport: &str,
+    episode: u64,
+    recovered: bool,
+) -> Result<()> {
+    let (code, status, severity, reason) = if recovered {
+        (
+            "native-delivery-recovered",
+            "recovered",
+            "info",
+            "Native conversation delivery recovered and resumed replay from durable graph state.",
+        )
+    } else {
+        (
+            "native-delivery-degraded",
+            "waiting",
+            "warning",
+            "Native conversation delivery failed; the driver remains online and will retry with bounded backoff.",
+        )
+    };
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String(severity.into())),
+                    ("status".into(), Value::String(status.into())),
+                    ("code".into(), Value::String(code.into())),
+                    ("reason".into(), Value::String(reason.into())),
+                    ("transport".into(), Value::String(transport.into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "{code}:{subject}:{incarnation}:{transport}:{episode}"
+                )),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_native_delivery(
+    client: &Client,
+    subject: &str,
+    inbox: &Path,
+    archive: &Path,
+    transport: &str,
+    receipts: NativeDeliveryReceipts<'_>,
+    incarnation: &str,
+    supervisor: &mut NativeDeliverySupervisor,
+) {
+    if !supervisor.ready() {
+        return;
+    }
+    match forward_projected_messages(client, subject, inbox, archive, transport, receipts).await {
+        Ok(()) => {
+            if supervisor.failures == 0 {
+                return;
+            }
+            // If the API was unavailable during the failure, publish both transitions now.
+            if !supervisor.degraded_recorded {
+                supervisor.degraded_recorded = record_native_delivery_diagnostic(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    supervisor.episode,
+                    false,
+                )
+                .await
+                .is_ok();
+            }
+            if supervisor.degraded_recorded
+                && record_native_delivery_diagnostic(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    supervisor.episode,
+                    true,
+                )
+                .await
+                .is_ok()
+            {
+                eprintln!("info: `{subject}` native conversation delivery recovered");
+                supervisor.recovered();
+            }
+        }
+        Err(error) => {
+            let backoff = supervisor.failed();
+            let now = Instant::now();
+            if supervisor
+                .last_warning
+                .is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10))
+            {
+                eprintln!(
+                    "warning: `{subject}` native conversation delivery failed; retrying in {}s: {error:#}",
+                    backoff.as_secs()
+                );
+                supervisor.last_warning = Some(now);
+            }
+            if !supervisor.degraded_recorded {
+                supervisor.degraded_recorded = record_native_delivery_diagnostic(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    supervisor.episode,
+                    false,
+                )
+                .await
+                .is_ok();
+            }
+        }
+    }
 }
 
 async fn forward_projected_messages(
@@ -7871,6 +8055,7 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn agent_card_shows_current_and_next_work_ids() {
@@ -9661,6 +9846,104 @@ mission "review" state="ready" {
         assert_eq!(st2::message::list_dir(&archive).unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_malformed_message_page_degrades_and_recovers_without_ending_delivery() {
+        use axum::{Json, Router, response::IntoResponse as _, routing::get};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let get_calls = calls.clone();
+        let post_observed = observed.clone();
+        let app = Router::new()
+            .route(
+                "/v1/messages/page",
+                get(move || {
+                    let calls = get_calls.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::response::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::from("{\"api_version\":\"st3.v1\",\"value\":\""))
+                                .unwrap()
+                        } else {
+                            Json(serde_json::json!({
+                                "api_version": "st3.v1",
+                                "value": {"items": [], "has_more": false, "next_cursor": null, "limit": 100}
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/claims",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let observed = post_observed.clone();
+                    async move {
+                        observed.lock().unwrap().push(
+                            body["fields"]["code"].as_str().unwrap().to_owned(),
+                        );
+                        Json(serde_json::json!({
+                            "api_version": "st3.v1",
+                            "value": {
+                                "id":"claim/test", "store_index":1, "batch_id":"batch/test",
+                                "subject":"agent/test", "kind":"harness.diagnostic", "origin":"test",
+                                "actor":"agent/test", "body":{}, "predecessors":[],
+                                "accepted_at_unix_ms":1
+                            }
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let mut supervisor = NativeDeliverySupervisor::default();
+
+        supervise_native_delivery(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+            "one",
+            &mut supervisor,
+        )
+        .await;
+        assert_eq!(supervisor.failures, 1);
+        assert!(!supervisor.ready());
+        supervisor.retry_after = None;
+        supervise_native_delivery(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+            "one",
+            &mut supervisor,
+        )
+        .await;
+        assert_eq!(supervisor.failures, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["native-delivery-degraded", "native-delivery-recovered"]
+        );
+        server.abort();
+    }
+
     #[test]
     fn mission_follow_stops_for_completed_and_standing_runs() {
         assert!(mission_run_follow_succeeded("completed"));
@@ -9675,6 +9958,19 @@ mission "review" state="ready" {
         tolerate_driver_api_outage(
             "agent/run/worker",
             anyhow::anyhow!("incomplete HTTP response"),
+            &mut last_warning,
+        )
+        .unwrap();
+        assert!(last_warning.is_some());
+    }
+
+    #[test]
+    fn a_runtime_driver_retries_a_truncated_json_envelope() {
+        let mut last_warning = None;
+        let parse_error = serde_json::from_str::<Value>("\"").unwrap_err();
+        tolerate_driver_api_outage(
+            "agent/run/worker",
+            anyhow::Error::new(parse_error).context("decode the st3 API response envelope"),
             &mut last_warning,
         )
         .unwrap();

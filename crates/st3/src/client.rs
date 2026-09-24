@@ -521,6 +521,19 @@ async fn unix_request(
         .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
     {
         body = decode_chunked(&body)?;
+    } else if let Some(length) = header.lines().find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+    }) {
+        anyhow::ensure!(
+            body.len() >= length,
+            "the st3 API returned an incomplete HTTP response: expected {length} body bytes, received {}",
+            body.len()
+        );
+        body.truncate(length);
     }
     if !(200..300).contains(&status) {
         return Err(api_error(status, &body));
@@ -770,6 +783,35 @@ mod tests {
         assert!(error.contains("request and response"));
         assert!(error.contains("retry the command"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_short_unix_response_reports_incomplete_body_before_json_decode() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"api_version\":\"st3.v1\"",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let error = Client::unix(&socket)
+            .get::<Value>("/v1/messages/page")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete HTTP response"), "{error}");
+        assert!(error.contains("expected 100 body bytes"), "{error}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
