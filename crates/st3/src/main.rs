@@ -7583,7 +7583,7 @@ async fn forward_projected_messages(
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
-    let mut closed = BTreeSet::new();
+    let mut consumed_by_recipient = BTreeSet::new();
     let stage_runtime_id = match receipts {
         NativeDeliveryReceipts::Codex { runtime_id, .. }
         | NativeDeliveryReceipts::OpenCode { runtime_id, .. } => Some(runtime_id),
@@ -7609,8 +7609,8 @@ async fn forward_projected_messages(
     loop {
         let page = message_page(client, Some(subject), true, cursor.as_deref()).await?;
         for message in page.items {
-            if message.status == "closed" {
-                closed.insert(message.subject);
+            if matches!(message.status.as_str(), "read" | "closed") {
+                consumed_by_recipient.insert(message.subject);
                 continue;
             }
             if !matches!(message.status.as_str(), "sent" | "staged") {
@@ -7679,7 +7679,7 @@ async fn forward_projected_messages(
             None => break,
         }
     }
-    sync_closed_projected_messages(inbox, archive, &closed)?;
+    sync_consumed_projected_messages(inbox, archive, &consumed_by_recipient)?;
     Ok(())
 }
 
@@ -7732,19 +7732,19 @@ fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> boo
     consumed.contains(filename)
 }
 
-fn sync_closed_projected_messages(
+fn sync_consumed_projected_messages(
     inbox: &Path,
     archive: &Path,
-    closed: &BTreeSet<String>,
+    consumed_by_recipient: &BTreeSet<String>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
     for message in st2::message::list_dir(inbox)? {
-        let is_closed = message
+        let is_consumed = message
             .tags
             .iter()
             .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
-            .any(|subject| closed.contains(subject));
-        if is_closed {
+            .any(|subject| consumed_by_recipient.contains(subject));
+        if is_consumed {
             st2::message::archive_msg(inbox, archive, &message.filename)?;
         }
     }
@@ -9621,10 +9621,44 @@ mission "review" state="ready" {
         )
         .unwrap();
         let closed = BTreeSet::from(["message/kickoff/run-1".into()]);
-        sync_closed_projected_messages(&inbox, &archive, &closed).unwrap();
+        sync_consumed_projected_messages(&inbox, &archive, &closed).unwrap();
 
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
+    }
+
+    #[test]
+    fn a_graph_read_releases_the_native_delivery_fifo() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let old = st2::message::send_to_inbox(
+            &inbox,
+            "requester",
+            Some("Already read"),
+            None,
+            &["st3-message:message/old".into()],
+            "The recipient read this through the graph.",
+        )
+        .unwrap();
+        let next = st2::message::send_to_inbox(
+            &inbox,
+            "requester",
+            Some("Still staged"),
+            None,
+            &["st3-message:message/next".into()],
+            "This still needs native delivery.",
+        )
+        .unwrap();
+        sync_consumed_projected_messages(&inbox, &archive, &BTreeSet::from(["message/old".into()]))
+            .unwrap();
+        sync_consumed_projected_messages(&inbox, &archive, &BTreeSet::from(["message/old".into()]))
+            .unwrap();
+
+        assert!(!inbox.join(&old).exists());
+        assert!(archive.join(old).is_file());
+        assert!(inbox.join(next).is_file());
+        assert_eq!(st2::message::list_dir(&archive).unwrap().len(), 1);
     }
 
     #[test]
