@@ -966,6 +966,7 @@ After=network.target\n\
 [Service]\n\
 Type=simple\n\
 ExecStart={exec_start}\n\
+Environment=MALLOC_ARENA_MAX=2\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
 Nice=0\n\
@@ -1005,6 +1006,7 @@ After=network.target\n\
 [Service]\n\
 Type=simple\n\
 ExecStart={exec_start}\n\
+Environment=MALLOC_ARENA_MAX=2\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
 Nice=0\n\
@@ -1137,6 +1139,7 @@ mod tests {
         assert!(unit.contains("--client-gateway-socket /run/user/1000/st3-client.sock"));
         assert!(unit.contains("--peer node-b=http://127.0.0.1:31314"));
         assert!(unit.contains("MemoryMax=1024M"));
+        assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("Nice=0"));
         assert!(unit.contains("CPUWeight=100"));
@@ -1146,6 +1149,7 @@ mod tests {
         assert!(replication.contains("Nice=0"));
         assert!(replication.contains("CPUWeight=100"));
         assert!(replication.contains("KillMode=control-group"));
+        assert!(replication.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(replication.contains("--fleet-id 1f91ca65-7793-48cc-866e-ac15690130e1"));
         assert!(replication.contains("--shared-secret-file /var/lib/st3/fleet.secret"));
         Ok(())
