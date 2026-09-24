@@ -221,7 +221,7 @@ Authority: [05-harness-state requirements OHS-R11–OHS-R15](05-harness-state/re
 
 ### diagnostic stage
 
-One closed native-driver boundary at which a diagnostic is observed:
+One closed native-driver boundary at which a diagnostic is observed: launch,
 version gate, API gate, event stream, state seed, delivery, or read-back. A
 stage owns its bounded reasons and sources; a reason paired with another stage
 is unknown evidence rather than a best-effort match.

@@ -19,6 +19,7 @@ const FUTURE_SKEW_MS: u64 = 60_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Stage {
+    Launch,
     VersionGate,
     ApiGate,
     Sse,
@@ -31,7 +32,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Launch,
         Self::VersionGate,
         Self::ApiGate,
         Self::Sse,
@@ -43,6 +45,7 @@ impl Stage {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Launch => "launch",
             Self::VersionGate => "versionGate",
             Self::ApiGate => "apiGate",
             Self::Sse => "sse",
@@ -61,13 +64,14 @@ impl Stage {
     /// outrank both rather than hide behind them.
     const fn index(self) -> Option<usize> {
         match self {
-            Self::VersionGate => Some(0),
-            Self::ApiGate => Some(1),
-            Self::Sse => Some(2),
-            Self::Seed => Some(3),
-            Self::ProviderAuth => Some(4),
-            Self::Delivery => Some(5),
-            Self::ReadBack => Some(6),
+            Self::Launch => Some(0),
+            Self::VersionGate => Some(1),
+            Self::ApiGate => Some(2),
+            Self::Sse => Some(3),
+            Self::Seed => Some(4),
+            Self::ProviderAuth => Some(5),
+            Self::Delivery => Some(6),
+            Self::ReadBack => Some(7),
             Self::Unknown => None,
         }
     }
@@ -102,6 +106,7 @@ impl Driver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Reason {
+    LaunchConfigurationRejected,
     VersionProbeFailed,
     UnsupportedVersion,
     ApiUnavailable,
@@ -127,7 +132,8 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
+        Self::LaunchConfigurationRejected,
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -152,6 +158,7 @@ impl Reason {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::LaunchConfigurationRejected => "launchConfigurationRejected",
             Self::VersionProbeFailed => "versionProbeFailed",
             Self::UnsupportedVersion => "unsupportedVersion",
             Self::ApiUnavailable => "apiUnavailable",
@@ -178,6 +185,7 @@ impl Reason {
 
     pub const fn stage(self) -> Stage {
         match self {
+            Self::LaunchConfigurationRejected => Stage::Launch,
             Self::VersionProbeFailed | Self::UnsupportedVersion => Stage::VersionGate,
             Self::ApiUnavailable | Self::IncompatibleApi => Stage::ApiGate,
             Self::SseConnectFailed | Self::SseDisconnected | Self::UnknownEvent => Stage::Sse,
@@ -198,6 +206,7 @@ impl Reason {
 
     const fn accepts_source(self, source: Source) -> bool {
         match self {
+            Self::LaunchConfigurationRejected => matches!(source, Source::ProcessExit),
             Self::VersionProbeFailed | Self::UnsupportedVersion => {
                 matches!(source, Source::VersionProbe)
             }
@@ -237,6 +246,7 @@ impl Reason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Source {
+    ProcessExit,
     VersionProbe,
     OpenApiDocument,
     EventStream,
@@ -251,7 +261,8 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::ProcessExit,
         Self::VersionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
@@ -265,6 +276,7 @@ impl Source {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProcessExit => "processExit",
             Self::VersionProbe => "versionProbe",
             Self::OpenApiDocument => "openApiDocument",
             Self::EventStream => "eventStream",
@@ -383,6 +395,9 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             "correct the writer clock or restart the seat after clock recovery"
         }
         Observed::Failure(failure) => match failure.stage {
+            Stage::Launch => {
+                "repair the rejected declared launch arguments; the seat is running with a known-safe fallback"
+            }
             Stage::VersionGate => "install a supported producer version and restart the seat",
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
@@ -484,7 +499,7 @@ pub struct Publisher {
     driver: Driver,
     producer_version: Option<String>,
     support: Support,
-    failures: [Option<Record>; 7],
+    failures: [Option<Record>; 8],
 }
 
 impl Publisher {
@@ -742,6 +757,33 @@ mod tests {
             assert_eq!(wire, serde_json::Value::String(source.as_str().to_string()));
             assert_ne!(source.as_str(), "unknown");
         }
+    }
+
+    #[test]
+    fn degraded_launch_is_visible_until_an_exact_launch_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::new(
+            tmp.path(),
+            Driver::Codex,
+            Some("0.156.0".into()),
+            Support::Supported,
+        );
+        publisher.publish(
+            Stage::Launch,
+            Reason::LaunchConfigurationRejected,
+            Source::ProcessExit,
+        );
+
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!("degraded launch did not publish a visible diagnostic")
+        };
+        assert_eq!(failure.stage, Stage::Launch);
+        assert_eq!(failure.reason, Reason::LaunchConfigurationRejected);
+        assert_eq!(failure.source, Source::ProcessExit);
+        assert!(repair_text(&Observed::Failure(failure)).contains("known-safe fallback"));
+
+        publisher.clear(Stage::Launch);
+        assert_eq!(read(&path(tmp.path())), Observed::Absent);
     }
 
     #[test]

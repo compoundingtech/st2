@@ -10,6 +10,7 @@
 //! active turn.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::net::Shutdown;
@@ -18,6 +19,8 @@ use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -109,6 +112,21 @@ const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
 const TRANSCRIPT_DISCOVERY_FILE_LIMIT: usize = 10_000;
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
 const SOCKET_PATH_BUDGET: usize = 96;
+
+#[derive(Debug)]
+struct AppServerExitedBeforeControl(ExitStatus);
+
+impl fmt::Display for AppServerExitedBeforeControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Codex app-server exited before control connected: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AppServerExitedBeforeControl {}
 
 struct WrapperDiagnostics {
     file: File,
@@ -595,6 +613,8 @@ struct CodexInboxDelivery {
     /// credential — because every earlier boundary is already fail-closed at admission: an
     /// incompatible protocol refuses the launch instead of degrading into an observation.
     diagnostics: driver_diagnostic::Publisher,
+    safe_fallback_active: Arc<AtomicBool>,
+    safe_fallback_diagnostic_published: bool,
 }
 
 impl CodexInboxDelivery {
@@ -602,6 +622,7 @@ impl CodexInboxDelivery {
         config: CodexDeliveryConfig,
         ledger_path: PathBuf,
         runtime: CodexRuntime,
+        safe_fallback_active: Arc<AtomicBool>,
     ) -> Result<Self> {
         fs::create_dir_all(&config.inbox).with_context(|| {
             format!(
@@ -677,12 +698,24 @@ impl CodexInboxDelivery {
             crate::harness_timeline::Writer::new(&config.agent_dir, "codex", runtime.incarnation());
         // The record belongs to this incarnation: the protocol gate already admitted the version
         // it names, so `support` is a measured fact rather than a probe result.
-        let diagnostics = driver_diagnostic::Publisher::new(
+        let mut diagnostics = driver_diagnostic::Publisher::new(
             &config.agent_dir,
             driver_diagnostic::Driver::Codex,
             config.producer_version.clone(),
             driver_diagnostic::Support::Supported,
         );
+        let safe_fallback_diagnostic_published = safe_fallback_active.load(Ordering::SeqCst);
+        if safe_fallback_diagnostic_published {
+            diagnostics.publish(
+                driver_diagnostic::Stage::Launch,
+                driver_diagnostic::Reason::LaunchConfigurationRejected,
+                driver_diagnostic::Source::ProcessExit,
+            );
+        } else {
+            // A later exact-config boot is the recovery boundary for a predecessor that had to
+            // come up degraded. Do not leave that old advisory attached to the healthy session.
+            diagnostics.clear(driver_diagnostic::Stage::Launch);
+        }
         Ok(Self {
             config,
             runtime,
@@ -708,7 +741,23 @@ impl CodexInboxDelivery {
             context,
             timeline,
             diagnostics,
+            safe_fallback_active,
+            safe_fallback_diagnostic_published,
         })
+    }
+
+    fn sync_safe_fallback_diagnostic(&mut self) {
+        if self.safe_fallback_diagnostic_published
+            || !self.safe_fallback_active.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        self.diagnostics.publish(
+            driver_diagnostic::Stage::Launch,
+            driver_diagnostic::Reason::LaunchConfigurationRejected,
+            driver_diagnostic::Source::ProcessExit,
+        );
+        self.safe_fallback_diagnostic_published = true;
     }
 
     /// Publish the generic observed-harness-state projection of a control-state change. Best-effort
@@ -2208,6 +2257,19 @@ fn run_controlled_owned(
     secure_dir(socket_dir)?;
     prepare_socket_for_launch(&socket_path)?;
 
+    let endpoint = format!("unix://{}", socket_path.display());
+    let prepared =
+        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref());
+    let safe_fallback_active = Arc::new(AtomicBool::new(false));
+    if prepared.safe_fallback {
+        record_safe_fallback(
+            diagnostics,
+            &safe_fallback_active,
+            "declaredArgumentsRejectedBeforeSpawn",
+            &prepared.declared_options,
+        )?;
+    }
+
     // Publish a new incarnation only after this process holds the owner lock and has proved that no
     // older daemon is live. A rejected second owner must not invalidate the first owner's binding.
     let runtime = CodexRuntime::fresh(identity, runtime_id)?;
@@ -2225,9 +2287,11 @@ fn run_controlled_owned(
         .append(true)
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
-    let endpoint = format!("unix://{}", socket_path.display());
-    let mut server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
-    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..])? {
+    let mut server_args = prepared.server_args;
+    if !prepared.safe_fallback
+        && resume_thread.is_some()
+        && authored_bypasses_hook_trust(&codex_argv[1..])?
+    {
         let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
         if let Some(projection) = preflight_hook_trust(
             &codex_argv[0],
@@ -2240,16 +2304,12 @@ fn run_controlled_owned(
             insert_app_server_config_override(&mut server_args, projection.override_value)?;
         }
     }
-    diagnostics.record("appServerStarting", json!({}))?;
-    let mut server_command = Command::new(&codex_argv[0]);
-    server_command
-        .args(server_args)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    let mut server = spawn_process_group(&mut server_command, Some(&socket_path))
-        .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
-    let result = diagnostics
+    diagnostics.record(
+        "appServerStarting",
+        json!({ "safeFallback": prepared.safe_fallback }),
+    )?;
+    let mut server = spawn_controlled_app_server(&codex_argv[0], &server_args, &socket_path, &log)?;
+    let mut result = diagnostics
         .record("appServerStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
             run_connected(
@@ -2258,11 +2318,59 @@ fn run_controlled_owned(
                 state_dir,
                 &runtime,
                 &codex_argv,
-                resume_thread.as_deref(),
-                delivery,
+                prepared.tui_args.clone(),
+                prepared.safe_tui_args.clone(),
+                prepared.expected_resume.clone(),
+                safe_fallback_active.clone(),
+                prepared.declared_options.clone(),
+                delivery.clone(),
                 diagnostics,
             )
         });
+    if !prepared.safe_fallback
+        && result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<AppServerExitedBeforeControl>()
+                .is_some()
+        })
+    {
+        server.terminate();
+        prepare_socket_for_launch(&socket_path)?;
+        record_safe_fallback(
+            diagnostics,
+            &safe_fallback_active,
+            "declaredAppServerExitedBeforeControl",
+            &prepared.declared_options,
+        )?;
+        diagnostics.record("safeFallbackAppServerStarting", json!({}))?;
+        server = spawn_controlled_app_server(
+            &codex_argv[0],
+            &safe_controlled_app_server_args(&endpoint),
+            &socket_path,
+            &log,
+        )?;
+        result = diagnostics
+            .record(
+                "safeFallbackAppServerStarted",
+                json!({ "pid": server.id() }),
+            )
+            .and_then(|_| {
+                run_connected(
+                    server.child_mut(),
+                    &socket_path,
+                    state_dir,
+                    &runtime,
+                    &codex_argv,
+                    prepared.safe_tui_args.clone(),
+                    prepared.safe_tui_args.clone(),
+                    resume_thread.clone(),
+                    safe_fallback_active.clone(),
+                    prepared.declared_options.clone(),
+                    delivery,
+                    diagnostics,
+                )
+            });
+    }
     server.terminate();
     result
 }
@@ -2309,23 +2417,56 @@ fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn spawn_controlled_app_server(
+    codex: &str,
+    args: &[String],
+    socket_path: &Path,
+    log: &File,
+) -> Result<OwnedProcessGroup> {
+    let mut command = Command::new(codex);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?);
+    spawn_process_group(&mut command, Some(socket_path))
+        .with_context(|| format!("starting {codex} app-server"))
+}
+
+fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<Child> {
+    Command::new(codex)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+}
+
+fn claim_safe_fallback_attempt(attempted: &mut bool) -> bool {
+    if *attempted {
+        return false;
+    }
+    *attempted = true;
+    true
+}
+
 fn run_connected(
     server: &mut Child,
     socket_path: &Path,
     state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
-    resume_thread: Option<&str>,
+    mut tui_args: Vec<String>,
+    safe_tui_args: Vec<String>,
+    expected_resume: Option<String>,
+    safe_fallback_active: Arc<AtomicBool>,
+    declared_options: Vec<String>,
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
     // detached app-server included); re-installing here would RESET a stop flag raised during
     // startup, so this function only relies on it.
-    let endpoint = format!("unix://{}", socket_path.display());
-    let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
-    let expected_resume =
-        expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
     diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
     // A stop during startup ends the launch before anything was observed: no TUI exists, the
     // caller reaps the app-server, and this session leaves no record — its predecessor's ages
@@ -2366,6 +2507,7 @@ fn run_connected(
     };
     let harness_agent_dir = delivery.agent_dir.clone();
     let harness_identity = delivery.identity.clone();
+    let fallback_for_reader = safe_fallback_active.clone();
     let event_thread = thread::spawn(move || {
         let resume = expected_resume
             .as_deref()
@@ -2382,6 +2524,7 @@ fn run_connected(
             &runtime_for_reader,
             resume,
             Some(delivery),
+            fallback_for_reader,
             events_tx,
         )
     });
@@ -2391,14 +2534,7 @@ fn run_connected(
     // its own resume. Only after that typed observation may control send its redundant resume.
     // Insert the remote endpoint as a global Codex option and preserve every authored argument
     // after the provider executable.
-    let mut tui_command = Command::new(&codex_argv[0]);
-    tui_command.args(tui_args);
-    let mut tui = match tui_command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+    let mut tui = match spawn_controlled_tui(&codex_argv[0], &tui_args) {
         Ok(tui) => tui,
         Err(error) => {
             drop(resume_ready_tx);
@@ -2429,21 +2565,53 @@ fn run_connected(
         }
     };
     let result = (|| -> Result<TuiEnd> {
-        diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
-        if let Some(ready) = resume_ready_tx.take() {
-            ready
-                .send(())
-                .context("starting Codex control resume after the TUI launched")?;
-        }
-        diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
-            BindingWait::Bound => {
-                diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-                monitor_bound_tui(&mut tui, &events_rx)
+        let mut fallback_attempted = safe_fallback_active.load(Ordering::SeqCst);
+        loop {
+            diagnostics.record(
+                "tuiStarted",
+                json!({
+                    "pid": tui.id(),
+                    "safeFallback": safe_fallback_active.load(Ordering::SeqCst),
+                }),
+            )?;
+            if let Some(ready) = resume_ready_tx.take() {
+                ready
+                    .send(())
+                    .context("starting Codex control resume after the TUI launched")?;
             }
-            BindingWait::Stopped => {
-                terminate_child(&mut tui);
-                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
+            diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+            match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+                BindingWait::Bound => {
+                    diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+                    return monitor_bound_tui(&mut tui, &events_rx);
+                }
+                BindingWait::Stopped => {
+                    terminate_child(&mut tui);
+                    return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+                }
+                BindingWait::TuiExited(status)
+                    if claim_safe_fallback_attempt(&mut fallback_attempted) =>
+                {
+                    record_safe_fallback(
+                        diagnostics,
+                        &safe_fallback_active,
+                        "declaredTuiExitedBeforeThreadBinding",
+                        &declared_options,
+                    )?;
+                    diagnostics.record(
+                        "safeFallbackRetryStarting",
+                        json!({ "previousExit": status.to_string() }),
+                    )?;
+                    tui_args.clone_from(&safe_tui_args);
+                    tui = spawn_controlled_tui(&codex_argv[0], &tui_args).with_context(|| {
+                        format!("starting known-safe fallback {} TUI", codex_argv[0])
+                    })?;
+                }
+                BindingWait::TuiExited(status) => {
+                    anyhow::bail!(
+                        "controlled Codex TUI exited before thread binding after known-safe fallback: {status}"
+                    );
+                }
             }
         }
     })();
@@ -2513,6 +2681,157 @@ fn describe_tui_exit(status: Option<ExitStatus>) -> String {
 /// server process. Passing them only to the remote TUI silently creates two different effective
 /// configurations. TUI-only policy, model, workspace, authentication, and prompt arguments stay
 /// on the TUI command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedControlledLaunch {
+    server_args: Vec<String>,
+    tui_args: Vec<String>,
+    safe_tui_args: Vec<String>,
+    expected_resume: Option<String>,
+    declared_options: Vec<String>,
+    safe_fallback: bool,
+}
+
+fn prepare_controlled_launch_args(
+    endpoint: &str,
+    authored_args: &[String],
+    resume_thread: Option<&str>,
+) -> PreparedControlledLaunch {
+    let declared_options = declared_option_names(authored_args);
+    let exact = controlled_app_server_args(endpoint, authored_args).and_then(|server_args| {
+        Ok((
+            server_args,
+            controlled_tui_args(endpoint, authored_args, resume_thread)?,
+            expected_resume_thread(authored_args, resume_thread)?.map(str::to_owned),
+        ))
+    });
+    match exact {
+        Ok((server_args, tui_args, expected_resume)) => PreparedControlledLaunch {
+            server_args,
+            tui_args,
+            safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+            expected_resume,
+            declared_options,
+            safe_fallback: false,
+        },
+        Err(_) => PreparedControlledLaunch {
+            server_args: safe_controlled_app_server_args(endpoint),
+            tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+            safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+            expected_resume: resume_thread.map(str::to_owned),
+            declared_options,
+            safe_fallback: true,
+        },
+    }
+}
+
+fn safe_controlled_app_server_args(endpoint: &str) -> Vec<String> {
+    vec![
+        "app-server".to_string(),
+        "--listen".to_string(),
+        endpoint.to_string(),
+    ]
+}
+
+fn safe_controlled_tui_args(endpoint: &str, resume_thread: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--remote".to_string(), endpoint.to_string()];
+    if let Some(thread_id) = resume_thread {
+        args.extend(["resume".to_string(), thread_id.to_string()]);
+    }
+    args
+}
+
+fn declared_option_names(authored_args: &[String]) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut index = 0;
+    while index < authored_args.len() {
+        let argument = authored_args[index].as_str();
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        let option = diagnostic_option_name(argument);
+        if !options.contains(&option) {
+            options.push(option);
+        }
+        let exact_value_option = matches!(
+            argument,
+            "-c" | "--config"
+                | "--enable"
+                | "--disable"
+                | "--remote-auth-token-env"
+                | "-m"
+                | "--model"
+                | "--local-provider"
+                | "-p"
+                | "--profile"
+                | "-s"
+                | "--sandbox"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "-a"
+                | "--ask-for-approval"
+        );
+        let known_flag = matches!(
+            argument,
+            "--strict-config"
+                | "--oss"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+                | "--search"
+                | "--no-alt-screen"
+                | "-h"
+                | "--help"
+                | "-V"
+                | "--version"
+        );
+        index += if exact_value_option { 2 } else { 1 };
+        if !exact_value_option
+            && !known_flag
+            && !argument.contains('=')
+            && !argument.starts_with("-c")
+            && !argument.starts_with("-m")
+            && !argument.starts_with("-p")
+            && !argument.starts_with("-s")
+            && !argument.starts_with("-C")
+            && !argument.starts_with("-a")
+        {
+            // This is the rejected unknown option. Stop before a following token that might be
+            // its secret value rather than another option.
+            break;
+        }
+    }
+    options
+}
+
+fn record_safe_fallback(
+    diagnostics: &mut WrapperDiagnostics,
+    active: &AtomicBool,
+    cause: &str,
+    declared_options: &[String],
+) -> Result<()> {
+    if active.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    diagnostics.record(
+        "safeFallbackActivated",
+        json!({
+            "cause": cause,
+            "declaredOptions": declared_options,
+            "mode": "minimalRemoteTui",
+            "requestedPolicyApplied": false,
+        }),
+    )?;
+    eprintln!(
+        "st2 codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
+        if declared_options.is_empty() {
+            "none".to_string()
+        } else {
+            declared_options.join(", ")
+        }
+    );
+    Ok(())
+}
+
 fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Result<Vec<String>> {
     let boundary = interactive_root_prefix_end(authored_args)?;
     let mut args = vec!["app-server".to_string()];
@@ -2827,12 +3146,45 @@ fn controlled_tui_args(
         return Ok(args);
     };
     args.push("resume".to_string());
-    // Codex models these flags on the `resume` command as well as the root command. Keep them
-    // before SESSION_ID so clap does not treat a following flag as the optional prompt.
-    args.extend_from_slice(&authored_args[..insertion]);
+    // A remote task owns its permission policy. Codex 0.156 rejects attempts to override that
+    // policy while resuming, so automatic resume preserves every non-permission global option but
+    // omits permission and hook-trust overrides. Hook trust is projected through the typed
+    // app-server preflight above; the task's existing approvals/sandbox policy remains provider
+    // owned. Fresh launches and explicit authored resume/fork commands remain byte-for-byte exact.
+    args.extend(resume_compatible_root_args(&authored_args[..insertion]));
     args.push(thread_id.to_string());
     args.extend_from_slice(&authored_args[insertion..]);
     Ok(args)
+}
+
+fn resume_compatible_root_args(authored_prefix: &[String]) -> Vec<String> {
+    let mut compatible = Vec::with_capacity(authored_prefix.len());
+    let mut index = 0;
+    while index < authored_prefix.len() {
+        let argument = authored_prefix[index].as_str();
+        if matches!(
+            argument,
+            "--dangerously-bypass-approvals-and-sandbox" | "--dangerously-bypass-hook-trust"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(argument, "-s" | "--sandbox" | "-a" | "--ask-for-approval") {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--sandbox=")
+            || argument.starts_with("--ask-for-approval=")
+            || (argument.starts_with("-s") && argument.len() > 2)
+            || (argument.starts_with("-a") && argument.len() > 2)
+        {
+            index += 1;
+            continue;
+        }
+        compatible.push(authored_prefix[index].clone());
+        index += 1;
+    }
+    compatible
 }
 
 /// A saved binding constrains the watcher only when st2 inserted that resume selection.
@@ -2989,7 +3341,7 @@ fn connect_control(
             Ok(stream) => return Ok(Some(stream)),
             Err(error) if Instant::now() < deadline => {
                 if let Some(status) = server.try_wait()? {
-                    anyhow::bail!("Codex app-server exited before control connected: {status}");
+                    return Err(AppServerExitedBeforeControl(status).into());
                 }
                 if error.kind() != std::io::ErrorKind::NotFound
                     && error.kind() != std::io::ErrorKind::ConnectionRefused
@@ -3196,6 +3548,7 @@ fn pump_control(
     runtime: &CodexRuntime,
     resume: Option<ControlResume<'_>>,
     delivery: Option<CodexDeliveryConfig>,
+    safe_fallback_active: Arc<AtomicBool>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
@@ -3214,7 +3567,12 @@ fn pump_control(
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
-                CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
+                CodexInboxDelivery::new(
+                    config,
+                    delivery_ledger_path.clone(),
+                    runtime.clone(),
+                    safe_fallback_active.clone(),
+                )
             })
             .transpose()
             .context("initializing Codex inbox delivery")?;
@@ -3245,6 +3603,9 @@ fn pump_control(
             subscription_pending = true;
         }
         loop {
+            if let Some(delivery) = delivery.as_mut() {
+                delivery.sync_safe_fallback_diagnostic();
+            }
             if !peer_closed
                 && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))
             {
@@ -3698,6 +4059,7 @@ fn binding_candidate(message: &Value) -> Result<Option<&str>> {
 enum BindingWait {
     Bound,
     Stopped,
+    TuiExited(ExitStatus),
 }
 
 fn wait_for_binding(
@@ -3712,7 +4074,7 @@ fn wait_for_binding(
             return Ok(BindingWait::Stopped);
         }
         if let Some(status) = tui.try_wait()? {
-            anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
+            return Ok(BindingWait::TuiExited(status));
         }
         let wait = deadline
             .saturating_duration_since(Instant::now())

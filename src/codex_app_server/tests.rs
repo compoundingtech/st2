@@ -1115,6 +1115,7 @@ fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDeliver
         config,
         root.join("state").join(delivery_ledger::LEDGER_FILE),
         CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap()
     .without_snapshot_requirement()
@@ -2431,6 +2432,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
             &runtime_for_pump,
             None,
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2518,6 +2520,7 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
             &runtime,
             None,
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2622,6 +2625,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
             &runtime_for_pump,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2763,6 +2767,7 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2899,6 +2904,7 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
             }),
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2976,6 +2982,7 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
                 tui_loaded_timeout: Duration::from_millis(50),
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -3072,6 +3079,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -3249,6 +3257,7 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
         config,
         tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
         runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
@@ -3300,6 +3309,7 @@ fn idle_delivery_retries_snapshot_errors_with_fresh_ids_then_falls_back() {
         config,
         tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
         runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
@@ -3351,6 +3361,7 @@ fn idle_delivery_expires_missing_snapshot_responses_and_ignores_late_ids() {
         config,
         tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
         runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
@@ -3492,6 +3503,7 @@ fn a_successful_snapshot_without_turn_allows_transcript_recovery_and_steer() {
         config,
         tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
         runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
@@ -4732,6 +4744,67 @@ fn controlled_tui_resumes_a_prior_binding_without_overriding_authored_selection(
         expected_resume_thread(&authored, Some("thread-prior")).unwrap(),
         Some("thread-prior")
     );
+}
+
+#[test]
+fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact() {
+    let authored = vec![
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        "--dangerously-bypass-hook-trust".into(),
+        "--sandbox".into(),
+        "workspace-write".into(),
+        "--ask-for-approval=never".into(),
+        "--model".into(),
+        "gpt-test".into(),
+        "boot".into(),
+    ];
+
+    let mut fresh = vec!["--remote".to_string(), "unix:///server.sock".to_string()];
+    fresh.extend(authored.clone());
+    assert_eq!(
+        controlled_tui_args("unix:///server.sock", &authored, None).unwrap(),
+        fresh,
+        "an ordinary accepted launch must preserve the exact declaration"
+    );
+    assert_eq!(
+        controlled_tui_args("unix:///server.sock", &authored, Some("thread-prior")).unwrap(),
+        [
+            "--remote",
+            "unix:///server.sock",
+            "resume",
+            "--model",
+            "gpt-test",
+            "thread-prior",
+            "boot",
+        ],
+        "remote resume must not send provider-rejected permission overrides"
+    );
+}
+
+#[test]
+fn rejected_declared_option_selects_one_minimal_safe_fallback_without_leaking_its_value() {
+    let prepared = prepare_controlled_launch_args(
+        "unix:///server.sock",
+        &["--future-token=do-not-log-this".into(), "boot".into()],
+        Some("thread-prior"),
+    );
+
+    assert!(prepared.safe_fallback);
+    assert_eq!(prepared.declared_options, ["--future-token"]);
+    assert!(!format!("{prepared:?}").contains("do-not-log-this"));
+    assert_eq!(
+        prepared.server_args,
+        ["app-server", "--listen", "unix:///server.sock"]
+    );
+    assert_eq!(
+        prepared.tui_args,
+        ["--remote", "unix:///server.sock", "resume", "thread-prior"]
+    );
+    assert_eq!(prepared.expected_resume.as_deref(), Some("thread-prior"));
+
+    let mut attempted = false;
+    assert!(claim_safe_fallback_attempt(&mut attempted));
+    assert!(!claim_safe_fallback_attempt(&mut attempted));
 }
 
 #[test]

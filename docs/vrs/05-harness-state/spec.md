@@ -400,7 +400,7 @@ observed.
 ## Native driver diagnostic snapshot (OHS-R11–OHS-R16)
 
 ```text
-version gate -> API gate -> SSE -> seed -> provider auth -> delivery -> read-back
+launch -> version gate -> API gate -> SSE -> seed -> provider auth -> delivery -> read-back
       \______________ typed failure/recovery transitions ______________/
                                 |
                                 v
@@ -441,6 +441,7 @@ The closed stage/reason/source matrix is:
 
 | Stage | Reasons | Sources |
 | --- | --- | --- |
+| `launch` | `launchConfigurationRejected` | `processExit` |
 | `versionGate` | `versionProbeFailed`, `unsupportedVersion` | `versionProbe` |
 | `apiGate` | `apiUnavailable`, `incompatibleApi` | `openApiDocument` |
 | `sse` | `sseConnectFailed`, `sseDisconnected`, `unknownEvent` | `eventStream` |
@@ -475,13 +476,17 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude, Codex, and omp publish exactly one of those stages — `providerAuth` —
-from their own typed turn-failure signal, and nothing else: every earlier
-boundary is already fail-closed at admission for them (an incompatible Codex
-protocol refuses the launch rather than degrading into an observation, an
-unadmitted omp MINOR refuses it too under OMP-R05, and st2 gates no Claude
-version at all). Every edge comes from the signal that ends a turn, so no
-driver reads provider prose to decide this:
+Claude and omp publish exactly one of those stages — `providerAuth` — from
+their own typed turn-failure signal. Codex additionally publishes `launch` /
+`launchConfigurationRejected` / `processExit` when a declared-argument
+rejection forces its one bounded known-safe boot fallback, and clears it on the
+next exact-config boot. The wrapper's owner-only diagnostic names only option
+names, never their values, while the typed record exposes degraded mode to
+roster and Doctor. Other earlier boundaries remain fail-closed at admission
+(an incompatible Codex protocol refuses the launch, an unadmitted omp MINOR
+refuses it under OMP-R05, and st2 gates no Claude version at all). Provider-auth
+edges come from the signal that ends a turn, so no driver reads provider prose
+to decide them:
 
 | Driver | Rejection | Recovery | `producerVersion` / `support` |
 | --- | --- | --- | --- |
