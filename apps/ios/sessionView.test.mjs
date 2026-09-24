@@ -19,3 +19,9 @@ const sessions = await listSessionPages(async options => {
 assert.deepEqual(sessions.map(session => session.id), ['session/managed', 'session/exact', 'session/process']);
 assert.deepEqual(calls, [{ limit: 2, cursor: undefined, history: false }, { limit: 2, cursor: 'next', history: false }]);
 await assert.rejects(listSessionPages(async () => ({ value: { items: [], page: { has_more: true, next_cursor: 'same' } } }), 2), /did not advance/);
+let boundedCalls = 0;
+await listSessionPages(async () => {
+  boundedCalls++;
+  return { value: { items: [exact], page: { has_more: true, next_cursor: `page-${boundedCalls}` } } };
+}, 2);
+assert.equal(boundedCalls, 5);

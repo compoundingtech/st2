@@ -38,7 +38,7 @@ export async function listSessionPages(
   const sessions: SessionView[] = [];
   const seen = new Set<string>();
   let cursor: string | undefined;
-  do {
+  for (let pageNumber = 0; pageNumber < 5; pageNumber++) {
     const page = (await list({ limit, cursor, history })).value;
     sessions.push(...page.items.filter((item): item is Session => item.kind === 'session'));
     if (!page.page.has_more) break;
@@ -46,6 +46,6 @@ export async function listSessionPages(
     if (!next || seen.has(next)) throw new Error('Session pagination did not advance.');
     seen.add(next);
     cursor = next;
-  } while (true);
+  }
   return sessions;
 }
