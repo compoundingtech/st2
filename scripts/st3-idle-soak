@@ -13,21 +13,29 @@ REMOTE_SAMPLE="$(/usr/bin/dirname "$ST3_SOAK_SILBER_BIN")/st3-idle-sample"
 /usr/bin/mkdir -p "$STATE_DIR"
 
 record() {
-  local host=$1 result
+  local host=$1 result failure
   if [[ $host == hetz ]]; then
-    if result=$(ST3_BIN="$ST3_BIN" ST3_SOAK_HOST=hetz "$TIMEOUT_BIN" -k 5s 30s "$LOCAL_SAMPLE" 2>/dev/null) &&
-      "$JQ_BIN" -e '.host == "hetz" and .peer_status == "up"' <<<"$result" >/dev/null; then
-      /usr/bin/printf '%s\n' "$result" >>"$STATE_DIR/events.jsonl"
-      return
+    if result=$(ST3_BIN="$ST3_BIN" ST3_SOAK_HOST=hetz "$TIMEOUT_BIN" -k 5s 30s "$LOCAL_SAMPLE" 2>/dev/null); then
+      failure=invalid-local-sample
+    else
+      failure="local-exit-$?"
+      result=
     fi
   elif result=$("$TIMEOUT_BIN" -k 5s 45s "$FABRIC_BIN" exec silber -- /usr/bin/env \
-    "ST3_BIN=$ST3_SOAK_SILBER_BIN" ST3_SOAK_HOST=silber "$REMOTE_SAMPLE" 2>/dev/null) &&
-    "$JQ_BIN" -e '.host == "silber" and .peer_status == "up"' <<<"$result" >/dev/null; then
+    "ST3_BIN=$ST3_SOAK_SILBER_BIN" ST3_SOAK_HOST=silber "$REMOTE_SAMPLE" 2>/dev/null); then
+    failure=invalid-remote-sample
+  else
+    failure="remote-exit-$?"
+    result=
+  fi
+  if [[ -n ${result:-} ]] &&
+    "$JQ_BIN" -e --arg host "$host" '.host == $host and (.peer_status | type == "string")' \
+      <<<"$result" >/dev/null 2>&1; then
     /usr/bin/printf '%s\n' "$result" >>"$STATE_DIR/events.jsonl"
     return
   fi
-  "$JQ_BIN" -nc --arg host "$host" --argjson at "$(/bin/date -u +%s)" \
-    '{at:$at,host:$host,error:"sample-or-peer-failed"}' >>"$STATE_DIR/events.jsonl"
+  "$JQ_BIN" -nc --arg host "$host" --argjson at "$(/bin/date -u +%s)" --arg error "$failure" \
+    '{at:$at,host:$host,error:$error}' >>"$STATE_DIR/events.jsonl"
 }
 
 while true; do
