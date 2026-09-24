@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, AppState, Linking, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
@@ -42,6 +42,7 @@ export default function App() {
   const [title, setTitle] = useState(''), [request, setRequest] = useState(''), [workspace, setWorkspace] = useState('');
   const [provider, setProvider] = useState<'codex' | 'claude' | 'pi' | 'omp' | 'opencode'>('codex');
   const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [feedback, setFeedback] = useState('');
+  const refreshing = useRef(false), snapshotRetry = useRef(0);
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined }) : null, [url, credential]);
 
   useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY)]).then(([u, o, c]) => {
@@ -80,14 +81,23 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     if (!client || !credential) { setStatus('setup'); return; }
+    if (refreshing.current) return;
+    refreshing.current = true;
     setStatus(s => s === 'online' ? s : 'connecting');
     try {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
       const [pages, sessions] = await Promise.all([Promise.all([client.attentionList({ limit }), client.messagesList({ limit }), client.missionsList({ limit }), client.launchesList({ limit }), client.machinesList({ limit }), client.devicesList({ limit }), client.runtimesList({ limit }), client.workList({ limit })]), listSessionPages(options => client.sessionsList(options), limit)]);
       setCaps(capability.value); setSnapshot(pages[0].snapshot);
       setData({ attention: items(pages[0].value, 'attention').filter(a => a.state === 'open' && a.actions.length > 0 && a.attention_kind !== 'unread-message'), messages: items(pages[1].value, 'message'), missions: items(pages[2].value, 'mission'), launches: items(pages[3].value, 'launch'), machines: pages[4].value.items.filter(i => (i as unknown as { kind: string }).kind === 'machine') as unknown as MachineView[], devices: items(pages[5].value, 'device'), sessions, runtimes: items(pages[6].value, 'runtime'), work: items(pages[7].value, 'work') });
-      setStatus('online'); setError('');
-    } catch (e) { setStatus('offline'); setError(errorText(e)); }
+      snapshotRetry.current = 0; setStatus('online'); setError('');
+    } catch (e) {
+      if (e instanceof ClientError && e.response.code === 'page-cursor-expired') {
+        const delay = Math.min(2000, 200 * 2 ** Math.min(snapshotRetry.current++, 4));
+        setStatus(s => s === 'online' ? s : 'connecting');
+        setError('Data changed during refresh; retrying.');
+        if (AppState.currentState === 'active') setTimeout(() => { void refresh(); }, delay);
+      } else { setStatus('offline'); setError(errorText(e)); }
+    } finally { refreshing.current = false; }
   }, [client, credential]);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { if (status !== 'online') return; const timer = setInterval(() => { if (AppState.currentState === 'active') void refresh(); }, 15000); return () => clearInterval(timer); }, [refresh, status]);
