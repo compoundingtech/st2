@@ -8060,24 +8060,21 @@ impl Store {
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms, payload
-             FROM replica_envelopes
-             WHERE receipt_state='pending'
-                OR EXISTS (
-                    SELECT 1 FROM replica_records
-                    WHERE replica_records.writer=replica_envelopes.writer
-                      AND replica_records.sequence=replica_envelopes.sequence
-                      AND replica_records.envelope_hash=replica_envelopes.envelope_hash
-                      AND (
-                          replica_records.state='unknown'
-                          OR (
-                              replica_records.state='invalid'
-                              AND replica_records.error_code='invalid-replicated-claim'
-                              AND replica_records.error_message LIKE '%violates unknown-claim-field:%'
-                          )
-                      )
-                )
-             ORDER BY writer, sequence, envelope_hash",
+            "WITH retry_ids AS (
+                 SELECT writer, sequence, envelope_hash FROM replica_envelopes
+                 WHERE receipt_state='pending'
+                 UNION
+                 SELECT writer, sequence, envelope_hash FROM replica_records
+                 WHERE state='unknown'
+                    OR (state='invalid' AND error_code='invalid-replicated-claim'
+                        AND error_message LIKE '%violates unknown-claim-field:%')
+             )
+             SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                    envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
+             FROM retry_ids JOIN replica_envelopes AS envelopes
+               ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
+              AND envelopes.envelope_hash=retry_ids.envelope_hash
+             ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
         )?;
         let envelopes = statement
             .query_map([], |row| {
