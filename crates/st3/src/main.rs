@@ -5948,9 +5948,14 @@ async fn read_message_after_lifecycle(
     archive: bool,
 ) -> Result<MessageView> {
     let message = read_message(client, reference).await?;
-    accept_message(client, &message, actor).await?;
+    let actor = normalize_message_subject(actor);
+    if actor == message.from && actor != message.to {
+        anyhow::ensure!(!archive, "a sender cannot archive the recipient's message");
+        return Ok(message);
+    }
+    accept_message(client, &message, &actor).await?;
     if archive {
-        close_message(client, reference, actor).await?;
+        close_message(client, reference, &actor).await?;
     }
     // Lifecycle writes are synchronous, so refetching makes JSON and other machine-readable
     // output describe the state that this command actually committed instead of its input state.

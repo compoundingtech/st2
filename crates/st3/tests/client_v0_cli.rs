@@ -190,6 +190,37 @@ async fn conversations_cli_handles_multiple_message_pages_and_exact_reads() {
 
     let listed = value(&run_cli(&socket, &["conversations", "ls", "agent/receiver"]).await);
     assert_eq!(listed.as_array().unwrap().len(), 205);
+    let sender_copy = value(
+        &run_cli(
+            &socket,
+            &[
+                "conversations",
+                "read",
+                "message/page-203",
+                "--as",
+                "agent/sender",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(sender_copy["status"], "sent");
+    let sender_archive = run_cli(
+        &socket,
+        &[
+            "conversations",
+            "read",
+            "message/page-203",
+            "--as",
+            "agent/sender",
+            "--archive",
+        ],
+    )
+    .await;
+    assert!(!sender_archive.status.success());
+    assert_eq!(
+        value(&run_cli(&socket, &["conversations", "thread", "message/page-203"]).await)[0]["status"],
+        "sent"
+    );
     let thread = value(&run_cli(&socket, &["conversations", "thread", "message/page-204"]).await);
     assert_eq!(thread.as_array().unwrap().len(), 2);
     let read = value(
