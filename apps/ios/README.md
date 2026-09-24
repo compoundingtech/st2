@@ -12,6 +12,10 @@ Now shows open actionable attention except transcript unread markers. Chat reads
 
 ## Build locally
 
-From this directory run `npm ci`, `npm run typecheck`, `npm run export:ios`, then `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods and build the generated workspace in Release. A device build requires local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
+From this directory run `npm ci`, `npm run typecheck`, then `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods and open the generated `ios/SmalltalkStarter.xcworkspace` in Xcode. For daily development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
+
+For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
+
+The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
