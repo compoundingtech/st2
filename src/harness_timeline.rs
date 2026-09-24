@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -459,6 +459,87 @@ pub fn observe_claude(writer: &mut Writer, event: &str, payload: &Value) -> Resu
         "Stop" => writer.append(format!("claude:{session}:stop:{}", source_id(payload, "stop")), Role::System, EntryType::Status, json!({"status": "completed"}), true)?,
         "StopFailure" => writer.append(format!("claude:{session}:failure:{}", source_id(payload, "failure")), Role::System, EntryType::Error, json!({"code": "harness-error", "message": safe_summary(payload), "retryable": false, "details": {}}), true)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// Claude's Stop hook has the exact native transcript path, while its event
+/// payload does not contain the assistant's answer. Publish a small recent
+/// answer window only at turn boundaries; never poll the growing transcript.
+pub fn observe_claude_stop_transcript(
+    writer: &mut Writer,
+    payload: &Value,
+    home: &Path,
+) -> Result<()> {
+    let (Some(session_id), Some(transcript)) = (
+        payload.get("session_id").and_then(Value::as_str),
+        payload.get("transcript_path").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    let allowed = home.join(".claude/projects").canonicalize()?;
+    let transcript = Path::new(transcript).canonicalize()?;
+    anyhow::ensure!(
+        transcript.starts_with(&allowed)
+            && transcript
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            && transcript
+                .file_stem()
+                .is_some_and(|stem| stem == session_id),
+        "Claude Stop transcript is not the exact session beneath the native projects directory"
+    );
+    let mut file = fs::File::open(&transcript)?;
+    let start = file.metadata()?.len().saturating_sub(2 * 1024 * 1024);
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut partial = String::new();
+        reader.read_line(&mut partial)?;
+    }
+    let mut answers = BTreeMap::<String, (usize, String)>::new();
+    for (index, line) in reader.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+            continue;
+        };
+        if value["type"] != "assistant"
+            || value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != session_id)
+        {
+            continue;
+        }
+        let Some(message_id) = value
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("uuid").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let text = value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            answers.insert(message_id.to_owned(), (index, text));
+        }
+    }
+    let mut answers = answers.into_iter().collect::<Vec<_>>();
+    answers.sort_by_key(|(_, (index, _))| *index);
+    for (message_id, (_, text)) in answers.into_iter().rev().take(8).rev() {
+        writer.append(
+            format!("claude:{session_id}:{message_id}:answer"),
+            Role::Assistant,
+            EntryType::Content,
+            json!({"media_type":"text/plain","text":text}),
+            true,
+        )?;
     }
     Ok(())
 }
@@ -1017,6 +1098,35 @@ fn compact_to_bounds(record: &mut Record) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_stop_publishes_bounded_assistant_text_from_only_its_exact_transcript() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let projects = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("native-current.jsonl");
+        fs::write(&transcript, format!("{}\n{}\n{}\n",
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"answer-1","content":[{"type":"text","text":"draft"}]}}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"answer-1","content":[{"type":"text","text":"Final answer"}]}}),
+            json!({"type":"assistant","sessionId":"another-session","message":{"id":"foreign","content":[{"type":"text","text":"Foreign answer"}]}}),
+        )).unwrap();
+        let agent = temporary.path().join("agent");
+        let mut writer = Writer::new(&agent, "claude", "inc-current");
+        let payload = json!({"session_id":"native-current","transcript_path":transcript});
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        let record = read(&timeline_path(&agent)).unwrap();
+        let content = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "content")
+            .collect::<Vec<_>>();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].body["text"], "Final answer");
+        let wrong = json!({"session_id":"different","transcript_path":transcript});
+        assert!(observe_claude_stop_transcript(&mut writer, &wrong, &home).is_err());
+    }
 
     #[test]
     fn unchanged_channel_state_does_not_crowd_conversation_out_of_a_bounded_page() {

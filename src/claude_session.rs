@@ -464,6 +464,17 @@ pub fn run_observe(
         // must not hold up the hook process Claude is waiting on.
         tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
     }
+    if event == "Stop" {
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Err(error) = crate::harness_timeline::observe_claude_stop_transcript(
+                &mut timeline,
+                &payload,
+                Path::new(&home),
+            ) {
+                tracing::warn!("st2 claude-observe: native answer publication failed: {error:#}");
+            }
+        }
+    }
     // The numeric axis is independent of the categorical one and is applied first, because the
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
