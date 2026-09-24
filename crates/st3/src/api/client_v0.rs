@@ -1267,10 +1267,9 @@ fn managed_codex_transcript(
     }
     let observed = state
         .store
-        .claims_for(owner, Some("harness.observed"))
+        .latest_claim(owner, Some("harness.observed"))
         .map_err(ApiError::internal)?
-        .into_iter()
-        .any(|claim| {
+        .is_some_and(|claim| {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
             fields["driver"] == "codex"
                 && fields["incarnation_id"] == incarnation

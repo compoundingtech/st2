@@ -1085,6 +1085,10 @@ fn normalize_codex(
     }
     match payload["type"].as_str() {
         Some("message") => {
+            // Provider bootstrap instructions are not a visible chat turn.
+            if !matches!(payload["role"].as_str(), Some("user" | "assistant")) {
+                return;
+            }
             let role = normalized_role(payload["role"].as_str());
             let message_id = payload["id"]
                 .as_str()
@@ -1104,7 +1108,7 @@ fn normalize_codex(
                 }
             }
         }
-        Some("function_call") => push_tool_call(
+        Some("function_call" | "custom_tool_call") => push_tool_call(
             items,
             sequence,
             &timestamp,
@@ -1112,10 +1116,11 @@ fn normalize_codex(
             payload["name"].as_str().unwrap_or("tool"),
             payload
                 .get("arguments")
+                .or_else(|| payload.get("input"))
                 .cloned()
                 .unwrap_or_else(|| json!({})),
         ),
-        Some("function_call_output") => push_tool_result(
+        Some("function_call_output" | "custom_tool_call_output") => push_tool_result(
             items,
             sequence,
             &timestamp,
@@ -1425,6 +1430,49 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "tool_result" && item["body"]["call_id"] == "c1")
         );
+    }
+
+    #[test]
+    fn current_codex_custom_tools_are_visible_but_bootstrap_prompts_are_not() {
+        let session = ExternalSession {
+            id: "session/external-current-codex".into(),
+            revision: "revision".into(),
+            driver: ExternalDriver::Codex,
+            native_id: "native".into(),
+            transcript: PathBuf::new(),
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        };
+        let mut items = Vec::new();
+        for (sequence, payload) in [
+            (
+                16,
+                json!({"type":"message","role":"developer","id":"hidden","content":[{"type":"input_text","text":"private bootstrap"}]}),
+            ),
+            (
+                32,
+                json!({"type":"custom_tool_call","call_id":"call-one","name":"exec","input":"const task = 1;"}),
+            ),
+            (
+                48,
+                json!({"type":"custom_tool_call_output","call_id":"call-one","output":[{"type":"input_text","text":"done"}]}),
+            ),
+        ] {
+            normalize_codex(
+                &json!({"type":"response_item","timestamp":"2026-09-24T12:00:00Z","payload":payload}),
+                sequence,
+                &session,
+                &mut items,
+            );
+        }
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "tool_call");
+        assert_eq!(items[0]["body"]["call_id"], "call-one");
+        assert_eq!(items[1]["type"], "tool_result");
+        assert_eq!(items[1]["body"]["content"][0]["text"], "done");
     }
 
     #[test]
