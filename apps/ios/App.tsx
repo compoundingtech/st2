@@ -123,6 +123,21 @@ export default function App() {
         if (id?.startsWith('mission/')) { setSelectedMissionId(id); setActive('Control'); }
         return;
       }
+      if (parsed.hostname === 'session') {
+        const id = parsed.searchParams.get('id');
+        const terminal = parsed.searchParams.get('terminal');
+        if (id?.startsWith('session/')) {
+          setSessionId(id);
+          setTimeline(conversationCache.current.get(id) ?? []);
+          setComposer(draftCache.current.get(id) ?? '');
+          setTerminalId(terminal?.startsWith('terminal/') ? terminal : '');
+          setScreen(null);
+          setTerminalIssue('');
+          setChatDetailOpen(true);
+          setActive('Chat');
+        }
+        return;
+      }
       if (handled) return;
       if (parsed.hostname !== 'pair') return;
       const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
