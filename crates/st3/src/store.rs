@@ -16122,14 +16122,20 @@ fn enrich_step_wake_at(
     let current_incarnation_key =
         hex::encode(Sha256::digest(current_incarnation_id.as_bytes()))[..12].to_owned();
     let mut attempts = Vec::new();
+    let wake_tag_prefix = format!(
+        "st3-work:{}@{}@{}@",
+        view.subject, view.attempt, view.readiness_epoch
+    );
     let mut statement = connection.prepare(
         "SELECT body, accepted_at_unix_ms FROM claims
          WHERE kind='message.sent' AND accepted_at_unix_ms<=?1
+           AND instr(body, ?2)>0
          ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, id",
     )?;
-    let rows = statement.query_map([snapshot_unix_ms.to_string()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement.query_map(
+        params![snapshot_unix_ms.to_string(), wake_tag_prefix],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
     for row in rows {
         let (body, accepted) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
