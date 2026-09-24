@@ -982,16 +982,10 @@ pub(super) async fn now(
         }
         items.extend(work);
     }
-    items.extend(
-        operation_resources(&state, &snapshot.created_at)?
-            .into_iter()
-            .filter(|item| item["severity"] != "info"),
-    );
     let priority = |item: &Value| match item["kind"].as_str() {
         Some("attention") => 0,
         Some("work") => 1,
-        Some("operation") => 2,
-        _ => 3,
+        _ => 2,
     };
     items.sort_by(|left, right| {
         priority(left)

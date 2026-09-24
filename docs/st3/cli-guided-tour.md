@@ -49,6 +49,8 @@ st3 now --as person/nathan
 st3 now --as person/nathan --json
 ```
 
+The default lists human attention only. Mission work is in `work ls` and Control; an explicit
+`--owner-run` opts it into this combined view. Fleet diagnostics are in `doctor` and Operations.
 Check whether the default is calm, current, and actionable. `--all`, `--owner-run`, `--cursor`, and
 `--limit` must make sense from help alone.
 
