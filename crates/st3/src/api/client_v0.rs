@@ -1198,6 +1198,97 @@ fn normalized_timeline_usage_body(
     Value::Object(body)
 }
 
+fn native_timeline_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session_id: &str,
+    query: &ClientListQuery,
+    external: &crate::external_sessions::ExternalSession,
+) -> Result<Json<Value>, ApiError> {
+    let mut items =
+        crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
+    items.reverse();
+    let mut page = client_page(
+        state,
+        snapshot,
+        &format!("timeline/{session_id}"),
+        items,
+        query,
+    )?;
+    page.items.reverse();
+    Ok(Json(json!({
+        "kind": "timeline-page",
+        "session_id": session_id,
+        "items": page.items,
+        "page": page.page
+    })))
+}
+
+fn managed_codex_transcript(
+    state: &AppState,
+    owner: &str,
+    incarnation: &str,
+) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    let Some(home) = state.native_session_home.as_deref() else {
+        return Ok(None);
+    };
+    // The wrapper owns this path; never resolve a path from client input. A reused
+    // driver directory is only authoritative when its runtime and a durable
+    // observation both name the same exact provider incarnation.
+    let directory = state
+        .state_dir
+        .join("drivers")
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+        .join("state");
+    let Ok(runtime) = std::fs::read(directory.join("runtime.json")) else {
+        return Ok(None);
+    };
+    let Ok(binding) = std::fs::read(directory.join("binding.json")) else {
+        return Ok(None);
+    };
+    let (Ok(runtime), Ok(binding)) = (
+        serde_json::from_slice::<Value>(&runtime),
+        serde_json::from_slice::<Value>(&binding),
+    ) else {
+        return Ok(None);
+    };
+    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
+    let Some(provider_incarnation) = runtime["incarnation"].as_str() else {
+        return Ok(None);
+    };
+    let Some(native_id) = binding["threadId"].as_str() else {
+        return Ok(None);
+    };
+    if runtime["agent"] != identity
+        || binding["agent"] != identity
+        || binding["runtimeIncarnation"] != provider_incarnation
+    {
+        return Ok(None);
+    }
+    let observed = state
+        .store
+        .claims_for(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .any(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["driver"] == "codex"
+                && fields["incarnation_id"] == incarnation
+                && fields["evidence_incarnation"] == provider_incarnation
+        });
+    if !observed {
+        return Ok(None);
+    }
+    Ok(crate::external_sessions::discover(Some(home), true)
+        .map_err(ApiError::internal)?
+        .sessions
+        .into_iter()
+        .find(|session| {
+            session.driver == crate::external_sessions::ExternalDriver::Codex
+                && session.native_id == native_id
+        }))
+}
+
 pub(super) fn timeline_value(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -1227,23 +1318,7 @@ pub(super) fn timeline_value(
         crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
             .map_err(ApiError::internal)?
     {
-        let mut items =
-            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)?;
-        items.reverse();
-        let mut page = client_page(
-            state,
-            snapshot,
-            &format!("timeline/{session_id}"),
-            items,
-            query,
-        )?;
-        page.items.reverse();
-        return Ok(Json(json!({
-            "kind": "timeline-page",
-            "session_id": session_id,
-            "items": page.items,
-            "page": page.page
-        })));
+        return native_timeline_page(state, snapshot, &session_id, query, &external);
     }
     let resource = client_session_resources(
         &state.store,
@@ -1260,6 +1335,11 @@ pub(super) fn timeline_value(
         .as_str()
         .ok_or_else(|| ApiError::internal("a session resource has no owner"))?;
     let incarnation = resource["runtime_incarnation"].as_str();
+    if let Some(incarnation) = incarnation
+        && let Some(external) = managed_codex_transcript(state, owner, incarnation)?
+    {
+        return native_timeline_page(state, snapshot, &session_id, query, &external);
+    }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
     let attribution = timeline_attribution(owner, &desired);
     let before = snapshot.store_index.checked_add(1);
@@ -4293,6 +4373,115 @@ mission "example/zero-run" state="ready" {
             .filter_map(|item| item["body"]["text"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(text, vec!["current composer message"]);
+    }
+
+    #[test]
+    fn managed_codex_session_renders_its_exact_native_chat_not_only_status() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transcript = home.join(".codex/sessions/2026/09/24/managed.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let owner = "agent/managed-codex";
+        let incarnation = "native-pty:one";
+        let provider_incarnation = "provider-one";
+        let native_id = "native-managed-codex-test";
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","timestamp":"2026-09-24T12:00:00Z","payload":{"id":native_id,"cwd":root.path(),"source":"test"}}),
+                json!({"type":"response_item","timestamp":"2026-09-24T12:00:01Z","payload":{"type":"message","role":"assistant","id":"answer","content":[{"type":"output_text","text":"Exact managed transcript"}]}}),
+            ),
+        )
+        .unwrap();
+        let mut state = test_state_named(root.path(), "managed-codex-test");
+        state.native_session_home = Some(home);
+        let directory = state
+            .state_dir
+            .join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+            .join("state");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("runtime.json"),
+            serde_json::to_vec(
+                &json!({"agent":"managed-codex","incarnation":provider_incarnation}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("binding.json"),
+            serde_json::to_vec(&json!({"agent":"managed-codex","runtimeIncarnation":provider_incarnation,"threadId":native_id})).unwrap(),
+        )
+        .unwrap();
+        for (kind, fields) in [
+            (
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("managed-codex-pty".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+            ),
+            (
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    (
+                        "evidence_incarnation".into(),
+                        Value::String(provider_incarnation.into()),
+                    ),
+                ]),
+            ),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session_id = super::managed_session_id(owner, incarnation);
+        let timeline = timeline_value(
+            &state,
+            &snapshot,
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(timeline["items"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "content" && item["body"]["text"] == "Exact managed transcript"
+        }));
+        std::fs::write(
+            directory.join("binding.json"),
+            serde_json::to_vec(
+                &json!({"agent":"managed-codex","runtimeIncarnation":"other","threadId":native_id}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            managed_codex_transcript(&state, owner, incarnation)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
