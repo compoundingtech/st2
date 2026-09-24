@@ -2655,6 +2655,20 @@ impl Store {
             .collect()
     }
 
+    /// Lightweight run headers for collection projections that do not render steps.
+    /// Unlike `mission_runs`, this avoids per-step queue and loop history scans.
+    pub fn mission_run_headers(&self) -> Result<Vec<MissionRunView>> {
+        let connection = self.readers.get();
+        let mut statement =
+            connection.prepare("SELECT id FROM mission_runs ORDER BY created_at_unix_ms, id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| mission_run_header_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
     pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -16945,7 +16959,43 @@ fn mission_run_view_with_enrichment_tx(
     run_id: &str,
     presentation: bool,
 ) -> rusqlite::Result<MissionRunView> {
-    let mut view = connection.query_row(
+    let mut view = mission_run_header_tx(connection, run_id)?;
+    let mut statement = connection.prepare(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
+    )?;
+    view.steps = statement
+        .query_map(
+            [generation_id_from_subject(&view.generation)],
+            step_run_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    for step in &mut view.steps {
+        if presentation {
+            enrich_step_queue(connection, step)?;
+        } else {
+            enrich_step_queue_for_reconcile_at(connection, step, now_ms())?;
+            let (started, elapsed) = step_execution_timing_at(
+                connection,
+                &step.subject,
+                step.attempt,
+                now_ms(),
+                matches!(step.status.as_str(), "claimed" | "working"),
+            )?;
+            step.execution_started_at_unix_ms = started;
+            step.execution_elapsed_ms = elapsed;
+        }
+    }
+    view.loops = loop_run_views_tx(connection, &view)?;
+    Ok(view)
+}
+
+fn mission_run_header_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<MissionRunView> {
+    connection.query_row(
         "SELECT mission_runs.id, mission_runs.mission_id, mission_runs.initial_revision,
                 mission_runs.current_generation_id, run_generations.revision,
                 mission_runs.root_revision, mission_runs.root_run_id, mission_runs.parent_step_run,
@@ -16989,36 +17039,7 @@ fn mission_run_view_with_enrichment_tx(
                 loops: Vec::new(),
             })
         },
-    )?;
-    let mut statement = connection.prepare(
-        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
-         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
-    )?;
-    view.steps = statement
-        .query_map(
-            [generation_id_from_subject(&view.generation)],
-            step_run_from_row,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    for step in &mut view.steps {
-        if presentation {
-            enrich_step_queue(connection, step)?;
-        } else {
-            enrich_step_queue_for_reconcile_at(connection, step, now_ms())?;
-            let (started, elapsed) = step_execution_timing_at(
-                connection,
-                &step.subject,
-                step.attempt,
-                now_ms(),
-                matches!(step.status.as_str(), "claimed" | "working"),
-            )?;
-            step.execution_started_at_unix_ms = started;
-            step.execution_elapsed_ms = elapsed;
-        }
-    }
-    view.loops = loop_run_views_tx(connection, &view)?;
-    Ok(view)
+    )
 }
 
 fn loop_run_views_tx(
@@ -17527,6 +17548,14 @@ mission "origin-owned" state="ready" {
         );
         let evaluation = store.active_mission_runs_for_origin("node").unwrap();
         let presentation = store.mission_run(&run.id).unwrap().unwrap();
+        let headers = store.mission_run_headers().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].subject, presentation.subject);
+        assert_eq!(headers[0].mission, presentation.mission);
+        assert_eq!(headers[0].generation, presentation.generation);
+        assert_eq!(headers[0].revision, presentation.revision);
+        assert_eq!(headers[0].status, presentation.status);
+        assert!(headers[0].steps.is_empty());
         assert_eq!(evaluation[0].steps.len(), 1);
         assert_eq!(evaluation[0].steps[0].status, presentation.steps[0].status);
         assert_eq!(

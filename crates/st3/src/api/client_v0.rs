@@ -394,7 +394,7 @@ fn mission_resources(
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
-    for run in store.mission_runs()? {
+    for run in store.mission_run_headers()? {
         missions.entry(run.mission.clone()).or_default().push(run);
     }
     let definitions = store
