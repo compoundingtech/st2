@@ -8141,10 +8141,12 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
-            rebuild_operations_tx(&transaction).map_err(internal)?;
-            project_replicated_base_claims(&transaction)?;
-            project_replicated_mission_runs(&transaction)?;
-            rebuild_planning_tx(&transaction).map_err(internal)?;
+            if !try_project_simple_replication_tx(&transaction)? {
+                rebuild_operations_tx(&transaction).map_err(internal)?;
+                project_replicated_base_claims(&transaction)?;
+                project_replicated_mission_runs(&transaction)?;
+                rebuild_planning_tx(&transaction).map_err(internal)?;
+            }
             Ok(())
         })();
         match result {
@@ -8171,6 +8173,34 @@ impl Store {
                 Ok(false)
             }
         }
+    }
+
+    /// Common heartbeat, conversation, and lease-renewal envelopes do not require replaying
+    /// every historical mission and claim. Keep the full replay for all other kinds, stale
+    /// projections, operation metadata, and ambiguous renewal ordering.
+    fn simple_replication_kind(kind: &str) -> bool {
+        matches!(
+            kind,
+            "message.closed"
+                | "message.delivered"
+                | "message.read"
+                | "message.sent"
+                | "message.staged"
+                | "harness.diagnostic"
+                | "harness.observed"
+                | "harness.session-file"
+                | "harness.timeline"
+                | "harness.usage"
+                | "runtime.observed"
+                | "runtime.readiness-deadline-reached"
+                | "runtime.reconcile-decision"
+                | "runtime.restart-window-reset"
+                | "daemon.diagnostic"
+                | "daemon.started"
+                | "transport.observed"
+                | "render.applied"
+                | "work.renewed"
+        )
     }
 
     /// A quiet peer wake does not need to replay the entire graph. A stale or
@@ -14209,6 +14239,76 @@ fn validate_replicated_claim(
     Ok(ReplicatedClaimAdmission::Valid)
 }
 
+/// The graph projection normally replays all accepted claims. For event-only envelopes and
+/// strictly newer lease renewals, advance from the recorded healthy frontier instead.
+fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
+    let health: Option<(String, u64)> = transaction
+        .query_row(
+            "SELECT status, last_good_store_index FROM projection_health WHERE aggregate='graph'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some((status, frontier)) = health else {
+        return Ok(false);
+    };
+    if status != "healthy" || frontier > current_index_tx(transaction).map_err(internal)? {
+        return Ok(false);
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms
+             FROM claims WHERE store_index > ?1 ORDER BY store_index",
+        )
+        .map_err(internal)?;
+    let claims = statement
+        .query_map([frontier], claim_from_row)
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
+
+    let mut renewed_subjects = BTreeSet::new();
+    for claim in &claims {
+        if !Store::simple_replication_kind(&claim.kind) || claim.body.get("_operation").is_some() {
+            return Ok(false);
+        }
+        if claim.kind == "work.renewed" {
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT updated_at_unix_ms FROM step_runs WHERE subject=?1",
+                    [&claim.subject],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            if !renewed_subjects.insert(&claim.subject)
+                || previous
+                    .and_then(|value| value.parse::<u128>().ok())
+                    .is_none_or(|value| claim.accepted_at_unix_ms <= value)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    for claim in &claims {
+        insert_event(
+            transaction,
+            claim.store_index,
+            &claim.kind,
+            &claim.subject,
+            &claim.body,
+        )
+        .map_err(internal)?;
+        if claim.kind == "work.renewed" {
+            project_mission_run_update(transaction, claim)?;
+        }
+    }
+    Ok(true)
+}
+
 fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(
@@ -17449,6 +17549,63 @@ mod tests {
             )
             .unwrap();
         assert!(store.replication_projection_needs_recovery().unwrap());
+    }
+
+    #[test]
+    fn simple_replication_advances_events_without_full_replay() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        let claim = {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let claim = append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/node.test",
+                "harness.observed",
+                Some("agent/node.test"),
+                &json!({"fields": {"state": "ready"}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            transaction.commit().unwrap();
+            claim
+        };
+        let connection = store.connection.lock().unwrap();
+        let event_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE store_index=?1",
+                [claim.store_index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn simple_replication_rejects_structural_and_operation_claims() {
+        assert!(Store::simple_replication_kind("harness.observed"));
+        assert!(Store::simple_replication_kind("work.renewed"));
+        assert!(!Store::simple_replication_kind("work.claimed"));
+        assert!(!Store::simple_replication_kind("mission.published"));
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        append_claim_tx(
+            &transaction,
+            &store.origin,
+            "agent/node.test",
+            "harness.observed",
+            Some("agent/node.test"),
+            &json!({"fields": {"state": "ready"}, "_operation": {"id": "test"}}),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(!try_project_simple_replication_tx(&transaction).unwrap());
     }
 
     fn rewrite_envelope(
