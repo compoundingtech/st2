@@ -25,6 +25,7 @@ use st3_client::{
     TerminalScreen,
 };
 use std::{
+    collections::HashSet,
     io::{self, IsTerminal, Stdout},
     path::PathBuf,
     sync::{
@@ -90,6 +91,7 @@ struct App {
     selected: [usize; 4],
     scroll: [u16; 4],
     sidebar: bool,
+    show_system_missions: bool,
     mode: Mode,
     input: String,
     launch: [String; 4],
@@ -109,6 +111,7 @@ impl App {
             selected: [0; 4],
             scroll: [0; 4],
             sidebar: true,
+            show_system_missions: false,
             mode: Mode::Normal,
             input: String::new(),
             launch: Default::default(),
@@ -122,7 +125,51 @@ impl App {
         }
     }
     fn peer(&self) -> Option<&st3_client::Agent> {
-        self.model.agents().nth(self.selected[1])
+        self.agent_tree()
+            .get(self.selected[1])
+            .map(|(agent, _)| *agent)
+    }
+    fn agent_tree(&self) -> Vec<(&st3_client::Agent, usize)> {
+        let agents = self.model.agents().collect::<Vec<_>>();
+        let ids = agents
+            .iter()
+            .map(|a| a.header.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        fn add<'a>(
+            agent: &'a st3_client::Agent,
+            depth: usize,
+            agents: &[&'a st3_client::Agent],
+            seen: &mut HashSet<String>,
+            result: &mut Vec<(&'a st3_client::Agent, usize)>,
+        ) {
+            if !seen.insert(agent.header.id.clone()) {
+                return;
+            }
+            result.push((agent, depth));
+            for child in agents.iter().filter(|child| {
+                child
+                    .under
+                    .iter()
+                    .any(|parent| parent.agent_id == agent.header.id)
+            }) {
+                add(child, depth + 1, agents, seen, result);
+            }
+        }
+        for agent in &agents {
+            if !agent
+                .under
+                .iter()
+                .any(|parent| ids.contains(parent.agent_id.as_str()))
+            {
+                add(agent, 0, &agents, &mut seen, &mut result);
+            }
+        }
+        for agent in &agents {
+            add(agent, 0, &agents, &mut seen, &mut result);
+        }
+        result
     }
     fn undeclared_session(&self) -> Option<&st3_client::Session> {
         let index = self.selected[1].checked_sub(self.model.agents().count())?;
@@ -165,9 +212,44 @@ impl App {
         match tab {
             0 => self.model.attention().count(),
             1 => self.model.agents().count() + self.model.undeclared_sessions().count(),
-            2 => self.model.missions().count(),
+            2 => self.control_missions().len(),
             _ => self.model.machines().count(),
         }
+    }
+    fn mission_group(&self, mission: &st3_client::Mission) -> &'static str {
+        let steps = self
+            .model
+            .work()
+            .filter(|work| mission.runs.contains(&work.mission_run_id));
+        let states = steps.map(|work| work.state.as_str()).collect::<Vec<_>>();
+        if states.contains(&"blocked") {
+            "Blocked"
+        } else if states.contains(&"waiting") {
+            "Waiting"
+        } else if matches!(mission.state.as_str(), "running" | "standing") {
+            "Running"
+        } else if matches!(mission.state.as_str(), "ready" | "draft") {
+            "Drafts"
+        } else {
+            "Archive"
+        }
+    }
+    fn control_missions(&self) -> Vec<&st3_client::Mission> {
+        let mut missions = self
+            .model
+            .missions()
+            .filter(|mission| {
+                self.show_system_missions || !mission.header.id.starts_with("mission/__st3/")
+            })
+            .collect::<Vec<_>>();
+        missions.sort_by_key(|mission| match self.mission_group(mission) {
+            "Blocked" => 0,
+            "Waiting" => 1,
+            "Running" => 2,
+            "Drafts" => 3,
+            _ => 4,
+        });
+        missions
     }
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
@@ -261,9 +343,9 @@ impl App {
                     .map(|v| format!("{} {}", v.priority, v.title))
                     .collect(),
                 1 => self
-                    .model
-                    .agents()
-                    .map(|v| format!("{} {}", v.name, v.state))
+                    .agent_tree()
+                    .iter()
+                    .map(|(v, depth)| format!("{}{}  ·  {}", "  ".repeat(*depth), v.name, v.state))
                     .chain(self.model.undeclared_sessions().map(|v| {
                         let driver = v
                             .extra
@@ -274,9 +356,9 @@ impl App {
                     }))
                     .collect(),
                 2 => self
-                    .model
-                    .missions()
-                    .map(|v| format!("{}  ·  {}", v.title, v.state))
+                    .control_missions()
+                    .iter()
+                    .map(|v| format!("{}  ·  {}", mission_label(v), self.mission_group(v)))
                     .collect(),
                 _ => self
                     .model
@@ -424,12 +506,16 @@ impl App {
             2 => {
                 lines.push("CONTROL  /  MISSIONS".into());
                 lines.push(String::new());
-                if let Some(mission) = self.model.missions().nth(self.selected[2]) {
-                    lines.push(mission.title.clone());
-                    lines.push(format!("State: {}", mission.state));
-                    lines.push(format!("Runs: {}", mission.runs.len()));
+                if let Some(mission) = self.control_missions().get(self.selected[2]).copied() {
+                    lines.push(mission_label(mission));
+                    lines.push(format!(
+                        "{}  ·  {} runs",
+                        self.mission_group(mission),
+                        mission.runs.len()
+                    ));
+                    lines.push(mission.header.id.clone());
                     lines.push(String::new());
-                    lines.push("CURRENT STEPS".into());
+                    lines.push("CURRENT WORK".into());
                     let steps = self
                         .model
                         .work()
@@ -439,12 +525,15 @@ impl App {
                         if matches!(step.state.as_str(), "completed" | "cancelled") {
                             continue;
                         }
-                        lines.push(format!(
-                            "  {:<12} {}  ·  attempt {}",
-                            step.state, step.path, step.attempt
-                        ));
+                        lines.push(format!("  {}  ·  {}", step.path, step.state));
+                        if let Some(reason) = &step.blocked_reason {
+                            lines.push(format!("    Blocked: {reason}"));
+                        }
+                        if let Some(goal) = step.goals.first() {
+                            lines.push(format!("    Goal: {goal}"));
+                        }
                         if let Some(claimant) = &step.claimant {
-                            lines.push(format!("    {claimant}"));
+                            lines.push(format!("    Agent: {claimant}"));
                         }
                         count += 1;
                     }
@@ -455,12 +544,21 @@ impl App {
                     lines.push("No current missions.".into());
                 }
                 lines.push(String::new());
-                lines.push("PLANNER LAUNCHES".into());
-                for launch in self.model.launches().take(4) {
-                    lines.push(format!("  {}  ·  {}", launch.title, launch.phase));
+                if self.model.launches().next().is_some() {
+                    lines.push("PLANNER LAUNCHES".into());
+                    for launch in self.model.launches().take(4) {
+                        lines.push(format!("  {}  ·  {}", launch.title, launch.phase));
+                    }
                 }
                 lines.push(String::new());
-                lines.push("Press c to create a mission launch.".into());
+                lines.push(format!(
+                    "c create mission  ·  x {} system missions",
+                    if self.show_system_missions {
+                        "hide"
+                    } else {
+                        "show"
+                    }
+                ));
                 if self.model.work.truncated {
                     lines.push("[More progress beyond bounded view]".into());
                 }
@@ -555,6 +653,26 @@ impl App {
 fn action_pair() -> (String, String) {
     let id = format!("action/{}", uuid::Uuid::now_v7());
     (id.clone(), id)
+}
+fn mission_label(mission: &st3_client::Mission) -> String {
+    let slug = mission.title.rsplit('/').next().unwrap_or(&mission.title);
+    slug.split('-')
+        .map(|word| match word.to_ascii_lowercase().as_str() {
+            "tui" => "TUI".into(),
+            "ios" => "iOS".into(),
+            "st3" => "ST3".into(),
+            "api" => "API".into(),
+            "pty" => "PTY".into(),
+            _ => {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 fn key_input(key: KeyEvent) -> Option<String> {
     match key.code {
@@ -846,6 +964,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
         KeyCode::Char('s') => app.sidebar = !app.sidebar,
+        KeyCode::Char('x') if app.tab == 2 => {
+            app.show_system_missions = !app.show_system_missions;
+            app.selected[2] = app.selected[2].min(app.count_for(2).saturating_sub(1));
+        }
         KeyCode::Up => {
             app.selected[app.tab] = app.selected[app.tab].saturating_sub(1);
             app.scroll[app.tab] = 0;
@@ -1180,6 +1302,24 @@ mod tests {
             key_input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)).as_deref(),
             Some("C-x")
         );
+    }
+
+    #[test]
+    fn agent_relationships_render_as_a_tree_and_selection_tracks_it() {
+        let parent: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/root","revision":"one","updated_at":"2026-09-24T09:00:00Z","name":"Root","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
+        let child: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/child","revision":"one","updated_at":"2026-09-24T09:00:00Z","name":"Child","state":"running","reachability":"local","runtime_ids":[],"under":[{"agent_id":"agent/root","reason":"delegated"}]}"#).unwrap();
+        let mut model = Model::default();
+        model.agents.items.extend([child, parent]);
+        let mut app = App::new(model);
+        assert_eq!(
+            app.agent_tree()
+                .iter()
+                .map(|(agent, depth)| (agent.name.as_str(), *depth))
+                .collect::<Vec<_>>(),
+            vec![("Root", 0), ("Child", 1)]
+        );
+        app.selected[1] = 1;
+        assert_eq!(app.peer().unwrap().name, "Child");
     }
 
     #[test]

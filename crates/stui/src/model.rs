@@ -208,27 +208,14 @@ impl Model {
     }
 
     async fn load_timeline_once(&mut self, client: &Client, session_id: &str) -> Result<()> {
-        self.timeline.clear();
-        self.timeline_truncated = false;
-        let mut cursor = None;
-        for page_index in 0..MAX_PAGES {
-            let page = client
-                .timeline(session_id, cursor.as_deref(), Some(PAGE_SIZE))
-                .await?
-                .value;
-            self.timeline.extend(page.items);
-            if !page.page.has_more {
-                break;
-            }
-            if page_index + 1 == MAX_PAGES {
-                self.timeline_truncated = true;
-                break;
-            }
-            cursor = page.page.next_cursor;
-            if cursor.is_none() {
-                anyhow::bail!("timeline page omitted continuation cursor");
-            }
-        }
+        // The first page is the newest window. Fetch it alone for immediate conversation
+        // context; older history can be a deliberate follow-up without racing a busy cursor.
+        let page = client
+            .timeline(session_id, None, Some(PAGE_SIZE))
+            .await?
+            .value;
+        self.timeline = page.items;
+        self.timeline_truncated = page.page.has_more;
         self.timeline.sort_by_key(|entry| entry.sequence);
         Ok(())
     }
