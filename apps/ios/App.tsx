@@ -70,6 +70,7 @@ export default function App() {
       finally { setBusy(false); }
     }
     void Linking.getInitialURL().then(handleDevPairLink);
+    void handleDevPairLink(process.env.EXPO_PUBLIC_ST3_TEST_PAIR_LINK ?? null);
     const subscription = Linking.addEventListener('url', event => { void handleDevPairLink(event.url); });
     return () => subscription.remove();
   }, []);
