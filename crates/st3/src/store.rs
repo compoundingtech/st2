@@ -2670,7 +2670,11 @@ impl Store {
             .query_map([origin], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
+            // The reconciler only needs effective step state and definitions. The
+            // presentation view scans message history for each step's wake badge;
+            // doing that for every active run on every graph change is quadratic
+            // in fleet history and can saturate an otherwise idle daemon.
+            .map(|id| mission_run_view_for_reconcile_tx(&connection, &id).map_err(Into::into))
             .collect()
     }
 
@@ -16854,6 +16858,21 @@ fn cancel_descendant_mission_runs_tx(
 }
 
 fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<MissionRunView> {
+    mission_run_view_with_enrichment_tx(connection, run_id, true)
+}
+
+fn mission_run_view_for_reconcile_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<MissionRunView> {
+    mission_run_view_with_enrichment_tx(connection, run_id, false)
+}
+
+fn mission_run_view_with_enrichment_tx(
+    connection: &Connection,
+    run_id: &str,
+    presentation: bool,
+) -> rusqlite::Result<MissionRunView> {
     let mut view = connection.query_row(
         "SELECT mission_runs.id, mission_runs.mission_id, mission_runs.initial_revision,
                 mission_runs.current_generation_id, run_generations.revision,
@@ -16911,7 +16930,20 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
         )?
         .collect::<Result<Vec<_>, _>>()?;
     for step in &mut view.steps {
-        enrich_step_queue(connection, step)?;
+        if presentation {
+            enrich_step_queue(connection, step)?;
+        } else {
+            enrich_step_queue_for_reconcile_at(connection, step, now_ms())?;
+            let (started, elapsed) = step_execution_timing_at(
+                connection,
+                &step.subject,
+                step.attempt,
+                now_ms(),
+                matches!(step.status.as_str(), "claimed" | "working"),
+            )?;
+            step.execution_started_at_unix_ms = started;
+            step.execution_elapsed_ms = elapsed;
+        }
     }
     view.loops = loop_run_views_tx(connection, &view)?;
     Ok(view)
@@ -17395,6 +17427,7 @@ mod tests {
             r#"version 2
 mission "origin-owned" state="ready" {
   goal "Evaluate this run on exactly one origin."
+  step "work" { agentless }
 }
 "#,
             "publish-origin-owned",
@@ -17420,6 +17453,19 @@ mission "origin-owned" state="ready" {
                 .collect::<Vec<_>>(),
             [run.subject.as_str()]
         );
+        let evaluation = store.active_mission_runs_for_origin("node").unwrap();
+        let presentation = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(evaluation[0].steps.len(), 1);
+        assert_eq!(evaluation[0].steps[0].status, presentation.steps[0].status);
+        assert_eq!(
+            evaluation[0].steps[0].definition_hash,
+            presentation.steps[0].definition_hash
+        );
+        assert_eq!(
+            evaluation[0].steps[0].timeout_ms,
+            presentation.steps[0].timeout_ms
+        );
+        assert_eq!(evaluation[0].steps[0].queue, presentation.steps[0].queue);
         assert!(
             store
                 .active_mission_runs_for_origin("other")
