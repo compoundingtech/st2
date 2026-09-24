@@ -2730,12 +2730,16 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
         assert_eq!(subscribe["method"], "thread/resume");
         assert_eq!(subscribe["params"]["threadId"], "thread-prior");
+        assert_eq!(subscribe["params"]["approvalPolicy"], "never");
+        assert_eq!(subscribe["params"]["sandbox"], "danger-full-access");
         write_json_message(
             &mut websocket,
             &json!({
                 "id": CONTROL_SUBSCRIBE_REQUEST_ID,
                 "result": {
-                    "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } },
+                    "approvalPolicy": "never",
+                    "sandbox": { "type": "dangerFullAccess" }
                 }
             }),
         )
@@ -2765,6 +2769,11 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -2776,6 +2785,14 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         .unwrap();
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::ResumePermissionPolicyApplied(ResumePermissionOverrides {
+            approval_policy: Some(policy),
+            approvals_reviewer: None,
+            sandbox: Some(sandbox),
+        }) if policy == "never" && sandbox == "danger-full-access"
+    ));
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         ControlEvent::Bound
@@ -2793,6 +2810,132 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         .unwrap();
     assert!(state.subscribed());
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(loaded["method"], "thread/loaded/list");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                "result": { "data": ["thread-prior"] }
+            }),
+        )
+        .unwrap();
+
+        let declared = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(declared["method"], "thread/resume");
+        assert_eq!(declared["params"]["threadId"], "thread-prior");
+        assert_eq!(declared["params"]["approvalPolicy"], "never");
+        assert_eq!(declared["params"]["sandbox"], "danger-full-access");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "error": {
+                    "code": -32602,
+                    "message": "permission override rejected"
+                }
+            }),
+        )
+        .unwrap();
+
+        let fallback = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(fallback["method"], "thread/resume");
+        assert_eq!(fallback["params"], json!({ "threadId": "thread-prior" }));
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            poll_json_message(&mut websocket).unwrap(),
+            ControlRead::Timeout
+        ));
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+    let fallback_active = Arc::new(AtomicBool::new(false));
+    let fallback_for_pump = fallback_active.clone();
+    let runtime_for_pump = runtime.clone();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_path,
+            &control_state_path,
+            &runtime_for_pump,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: resume_ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
+            }),
+            None,
+            fallback_for_pump,
+            tx,
+        )
+    });
+    resume_ready_tx.send(()).unwrap();
+    acknowledge_tui_thread_loaded(&rx);
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::SafeFallbackActivated {
+            cause: "resumePermissionProjectionRejected",
+            ..
+        }
+    ));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::Bound
+    ));
+    assert!(fallback_active.load(Ordering::SeqCst));
+
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
 }
 
 /// A resumed thread still holds its context, and the app-server replays
@@ -2902,6 +3045,7 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
             }),
             Some(config),
             Arc::new(AtomicBool::new(false)),
@@ -2980,6 +3124,7 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: Duration::from_millis(50),
+                permission_overrides: None,
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -3077,6 +3222,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -4778,6 +4924,87 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
             "boot",
         ],
         "remote resume must not send provider-rejected permission overrides"
+    );
+
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &authored, Some("thread-prior"));
+    let permissions = prepared
+        .resume_permissions
+        .expect("automatic resume projects the declared permission policy through control");
+    assert_eq!(
+        permissions,
+        ResumePermissionOverrides {
+            approval_policy: Some("never".into()),
+            approvals_reviewer: None,
+            sandbox: Some("workspace-write".into()),
+        }
+    );
+    assert_eq!(
+        control_resume_request("thread-prior", Some(&permissions)),
+        json!({
+            "method": "thread/resume",
+            "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+            "params": {
+                "threadId": "thread-prior",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            }
+        })
+    );
+    assert!(resume_permission_overrides_applied(
+        &json!({
+            "result": {
+                "approvalPolicy": "never",
+                "sandbox": { "type": "workspaceWrite" }
+            }
+        }),
+        &permissions
+    ));
+    assert!(!resume_permission_overrides_applied(
+        &json!({
+            "result": {
+                "approvalPolicy": "on-request",
+                "sandbox": { "type": "workspaceWrite" }
+            }
+        }),
+        &permissions
+    ));
+
+    // This is the standing st3 seat's exact policy declaration. It is the regression that
+    // originally exposed Codex rejecting permission flags on automatic remote resume: the TUI
+    // argv must be compatible, while the redundant typed resume restores Full Access.
+    let standing_seat = vec![
+        "--model".into(),
+        "gpt-5.6-sol".into(),
+        "-c".into(),
+        "model_reasoning_effort=xhigh".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        "--dangerously-bypass-hook-trust".into(),
+        "boot".into(),
+    ];
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &standing_seat, Some("thread-prior"));
+    assert_eq!(
+        prepared.tui_args,
+        [
+            "--remote",
+            "unix:///server.sock",
+            "resume",
+            "--model",
+            "gpt-5.6-sol",
+            "-c",
+            "model_reasoning_effort=xhigh",
+            "thread-prior",
+            "boot",
+        ]
+    );
+    assert_eq!(
+        prepared.resume_permissions,
+        Some(ResumePermissionOverrides {
+            approval_policy: Some("never".into()),
+            approvals_reviewer: None,
+            sandbox: Some("danger-full-access".into()),
+        })
     );
 }
 

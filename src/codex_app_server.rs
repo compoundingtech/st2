@@ -2321,6 +2321,7 @@ fn run_controlled_owned(
                 prepared.tui_args.clone(),
                 prepared.safe_tui_args.clone(),
                 prepared.expected_resume.clone(),
+                prepared.resume_permissions.clone(),
                 safe_fallback_active.clone(),
                 prepared.declared_options.clone(),
                 delivery.clone(),
@@ -2364,6 +2365,7 @@ fn run_controlled_owned(
                     prepared.safe_tui_args.clone(),
                     prepared.safe_tui_args.clone(),
                     resume_thread.clone(),
+                    None,
                     safe_fallback_active.clone(),
                     prepared.declared_options.clone(),
                     delivery,
@@ -2459,6 +2461,7 @@ fn run_connected(
     mut tui_args: Vec<String>,
     safe_tui_args: Vec<String>,
     expected_resume: Option<String>,
+    resume_permissions: Option<ResumePermissionOverrides>,
     safe_fallback_active: Arc<AtomicBool>,
     declared_options: Vec<String>,
     delivery: CodexDeliveryConfig,
@@ -2516,6 +2519,7 @@ fn run_connected(
                 thread_id,
                 ready,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: resume_permissions,
             });
         pump_control(
             websocket,
@@ -2687,8 +2691,39 @@ struct PreparedControlledLaunch {
     tui_args: Vec<String>,
     safe_tui_args: Vec<String>,
     expected_resume: Option<String>,
+    resume_permissions: Option<ResumePermissionOverrides>,
     declared_options: Vec<String>,
     safe_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumePermissionOverrides {
+    approval_policy: Option<String>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+}
+
+impl ResumePermissionOverrides {
+    fn apply_to(&self, params: &mut serde_json::Map<String, Value>) {
+        if let Some(policy) = &self.approval_policy {
+            params.insert("approvalPolicy".into(), Value::String(policy.clone()));
+        }
+        if let Some(reviewer) = &self.approvals_reviewer {
+            params.insert("approvalsReviewer".into(), Value::String(reviewer.clone()));
+        }
+        if let Some(sandbox) = &self.sandbox {
+            params.insert("sandbox".into(), Value::String(sandbox.clone()));
+        }
+    }
+
+    fn diagnostic(&self, requested_policy_applied: bool) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "approvalsReviewer": self.approvals_reviewer,
+            "sandbox": self.sandbox,
+            "requestedPolicyApplied": requested_policy_applied,
+        })
+    }
 }
 
 fn prepare_controlled_launch_args(
@@ -2702,26 +2737,149 @@ fn prepare_controlled_launch_args(
             server_args,
             controlled_tui_args(endpoint, authored_args, resume_thread)?,
             expected_resume_thread(authored_args, resume_thread)?.map(str::to_owned),
+            automatic_resume_permission_overrides(authored_args, resume_thread)?,
         ))
     });
     match exact {
-        Ok((server_args, tui_args, expected_resume)) => PreparedControlledLaunch {
-            server_args,
-            tui_args,
-            safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
-            expected_resume,
-            declared_options,
-            safe_fallback: false,
-        },
+        Ok((server_args, tui_args, expected_resume, resume_permissions)) => {
+            PreparedControlledLaunch {
+                server_args,
+                tui_args,
+                safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+                expected_resume,
+                resume_permissions,
+                declared_options,
+                safe_fallback: false,
+            }
+        }
         Err(_) => PreparedControlledLaunch {
             server_args: safe_controlled_app_server_args(endpoint),
             tui_args: safe_controlled_tui_args(endpoint, resume_thread),
             safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
             expected_resume: resume_thread.map(str::to_owned),
+            resume_permissions: None,
             declared_options,
             safe_fallback: true,
         },
     }
+}
+
+fn automatic_resume_permission_overrides(
+    authored_args: &[String],
+    resume_thread: Option<&str>,
+) -> Result<Option<ResumePermissionOverrides>> {
+    if resume_thread.is_none() {
+        return Ok(None);
+    }
+    let Some(insertion) = resume_insertion_index(authored_args)? else {
+        return Ok(None);
+    };
+    let mut overrides = ResumePermissionOverrides {
+        approval_policy: None,
+        approvals_reviewer: None,
+        sandbox: None,
+    };
+    let mut index = 0;
+    while index < insertion {
+        let argument = authored_args[index].as_str();
+        match argument {
+            "--dangerously-bypass-approvals-and-sandbox" => {
+                overrides.approval_policy = Some("never".into());
+                overrides.sandbox = Some("danger-full-access".into());
+                index += 1;
+            }
+            "--approve-for-me" => {
+                overrides.approval_policy = Some("on-request".into());
+                overrides.approvals_reviewer = Some("auto_review".into());
+                overrides.sandbox = Some("workspace-write".into());
+                index += 1;
+            }
+            "-s" | "--sandbox" => {
+                let value = authored_args
+                    .get(index + 1)
+                    .context("Codex sandbox option has no value")?;
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.clone());
+                index += 2;
+            }
+            "-a" | "--ask-for-approval" => {
+                let value = authored_args
+                    .get(index + 1)
+                    .context("Codex approval option has no value")?;
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.clone());
+                index += 2;
+            }
+            _ if argument.starts_with("--sandbox=") => {
+                let value = argument.trim_start_matches("--sandbox=");
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("--ask-for-approval=") => {
+                let value = argument.trim_start_matches("--ask-for-approval=");
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("-s") && argument.len() > 2 => {
+                let value = &argument[2..];
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("-a") && argument.len() > 2 => {
+                let value = &argument[2..];
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.into());
+                index += 1;
+            }
+            _ => {
+                index += if matches!(
+                    argument,
+                    "-c" | "--config"
+                        | "--enable"
+                        | "--disable"
+                        | "--remote-auth-token-env"
+                        | "-m"
+                        | "--model"
+                        | "--local-provider"
+                        | "-p"
+                        | "--profile"
+                        | "-C"
+                        | "--cd"
+                        | "--add-dir"
+                ) {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    Ok((overrides.approval_policy.is_some()
+        || overrides.approvals_reviewer.is_some()
+        || overrides.sandbox.is_some())
+    .then_some(overrides))
+}
+
+fn validate_resume_sandbox(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            value,
+            "read-only" | "workspace-write" | "danger-full-access"
+        ),
+        "unsupported Codex sandbox mode '{value}'"
+    );
+    Ok(())
+}
+
+fn validate_resume_approval_policy(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(value, "on-request" | "never"),
+        "unsupported Codex approval policy '{value}'"
+    );
+    Ok(())
 }
 
 fn safe_controlled_app_server_args(endpoint: &str) -> Vec<String> {
@@ -2775,6 +2933,7 @@ fn declared_option_names(authored_args: &[String]) -> Vec<String> {
             argument,
             "--strict-config"
                 | "--oss"
+                | "--approve-for-me"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--dangerously-bypass-hook-trust"
                 | "--search"
@@ -3148,9 +3307,10 @@ fn controlled_tui_args(
     args.push("resume".to_string());
     // A remote task owns its permission policy. Codex 0.156 rejects attempts to override that
     // policy while resuming, so automatic resume preserves every non-permission global option but
-    // omits permission and hook-trust overrides. Hook trust is projected through the typed
-    // app-server preflight above; the task's existing approvals/sandbox policy remains provider
-    // owned. Fresh launches and explicit authored resume/fork commands remain byte-for-byte exact.
+    // omits permission and hook-trust overrides here. Hook trust is projected through the typed
+    // app-server preflight above, while the declared approval/sandbox policy is projected through
+    // this driver's typed control `thread/resume` after the owning TUI loads the thread. Fresh
+    // launches and explicit authored resume/fork commands remain byte-for-byte exact.
     args.extend(resume_compatible_root_args(&authored_args[..insertion]));
     args.push(thread_id.to_string());
     args.extend_from_slice(&authored_args[insertion..]);
@@ -3164,7 +3324,9 @@ fn resume_compatible_root_args(authored_prefix: &[String]) -> Vec<String> {
         let argument = authored_prefix[index].as_str();
         if matches!(
             argument,
-            "--dangerously-bypass-approvals-and-sandbox" | "--dangerously-bypass-hook-trust"
+            "--approve-for-me"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
         ) {
             index += 1;
             continue;
@@ -3237,6 +3399,7 @@ fn interactive_root_prefix_end(authored_args: &[String]) -> Result<usize> {
             argument,
             "--strict-config"
                 | "--oss"
+                | "--approve-for-me"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--dangerously-bypass-hook-trust"
                 | "--search"
@@ -3529,6 +3692,11 @@ fn wait_for_tui_loaded_thread(
 #[derive(Debug)]
 enum ControlEvent {
     TuiThreadLoaded(Sender<()>),
+    ResumePermissionPolicyApplied(ResumePermissionOverrides),
+    SafeFallbackActivated {
+        cause: &'static str,
+        permissions: ResumePermissionOverrides,
+    },
     Bound,
     Observed,
     Closed,
@@ -3539,6 +3707,55 @@ struct ControlResume<'a> {
     thread_id: &'a str,
     ready: Receiver<()>,
     tui_loaded_timeout: Duration,
+    permission_overrides: Option<ResumePermissionOverrides>,
+}
+
+fn control_resume_request(
+    thread_id: &str,
+    permission_overrides: Option<&ResumePermissionOverrides>,
+) -> Value {
+    let mut params =
+        serde_json::Map::from_iter([("threadId".into(), Value::String(thread_id.into()))]);
+    if let Some(permission_overrides) = permission_overrides {
+        permission_overrides.apply_to(&mut params);
+    }
+    json!({
+        "method": "thread/resume",
+        "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+        "params": params,
+    })
+}
+
+fn resume_permission_overrides_applied(
+    message: &Value,
+    expected: &ResumePermissionOverrides,
+) -> bool {
+    let sandbox = expected.sandbox.as_deref().map(|sandbox| match sandbox {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        "danger-full-access" => "dangerFullAccess",
+        _ => "",
+    });
+    expected.approval_policy.as_deref().is_none_or(|policy| {
+        message
+            .pointer("/result/approvalPolicy")
+            .and_then(Value::as_str)
+            == Some(policy)
+    }) && expected
+        .approvals_reviewer
+        .as_deref()
+        .is_none_or(|reviewer| {
+            message
+                .pointer("/result/approvalsReviewer")
+                .and_then(Value::as_str)
+                == Some(reviewer)
+        })
+        && sandbox.is_none_or(|sandbox| {
+            message
+                .pointer("/result/sandbox/type")
+                .and_then(Value::as_str)
+                == Some(sandbox)
+        })
 }
 
 fn pump_control(
@@ -3552,14 +3769,16 @@ fn pump_control(
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
-        let (expected_resume, resume_ready, tui_loaded_timeout) = match resume {
-            Some(resume) => (
-                Some(resume.thread_id),
-                Some(resume.ready),
-                resume.tui_loaded_timeout,
-            ),
-            None => (None, None, TUI_LOADED_TIMEOUT),
-        };
+        let (expected_resume, resume_ready, tui_loaded_timeout, mut resume_permissions) =
+            match resume {
+                Some(resume) => (
+                    Some(resume.thread_id),
+                    Some(resume.ready),
+                    resume.tui_loaded_timeout,
+                    resume.permission_overrides,
+                ),
+                None => (None, None, TUI_LOADED_TIMEOUT, None),
+            };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut last_transcript_turn_recovery = None;
@@ -3591,13 +3810,12 @@ fn pump_control(
             diagnostic_rx
                 .recv()
                 .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
+            if safe_fallback_active.load(Ordering::SeqCst) {
+                resume_permissions = None;
+            }
             write_json_message(
                 &mut websocket,
-                &json!({
-                    "method": "thread/resume",
-                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                    "params": { "threadId": thread_id }
-                }),
+                &control_resume_request(thread_id, resume_permissions.as_ref()),
             )
             .context("sending Codex thread resume request")?;
             subscription_pending = true;
@@ -3681,7 +3899,43 @@ fn pump_control(
                         subscription_pending,
                         "Codex control received an unexpected initial thread/resume response"
                     );
+                    if message.get("error").is_some()
+                        && let Some(rejected) = resume_permissions.take()
+                    {
+                        safe_fallback_active.store(true, Ordering::SeqCst);
+                        eprintln!(
+                            "st2 codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
+                        );
+                        let _ = events.send(ControlEvent::SafeFallbackActivated {
+                            cause: "resumePermissionProjectionRejected",
+                            permissions: rejected,
+                        });
+                        write_json_message(
+                            &mut websocket,
+                            &control_resume_request(thread_id, None),
+                        )
+                        .context(
+                            "retrying Codex thread resume without rejected permission policy",
+                        )?;
+                        continue;
+                    }
                     subscription_pending = false;
+                    if let Some(expected_permissions) = resume_permissions.take() {
+                        if resume_permission_overrides_applied(&message, &expected_permissions) {
+                            let _ = events.send(ControlEvent::ResumePermissionPolicyApplied(
+                                expected_permissions,
+                            ));
+                        } else {
+                            safe_fallback_active.store(true, Ordering::SeqCst);
+                            eprintln!(
+                                "st2 codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
+                            );
+                            let _ = events.send(ControlEvent::SafeFallbackActivated {
+                                cause: "resumePermissionProjectionMismatch",
+                                permissions: expected_permissions,
+                            });
+                        }
+                    }
                     let mut bound = CodexControlState::new(runtime, thread_id.to_string());
                     match bound
                         .accept_subscription(&message)
@@ -4090,6 +4344,23 @@ fn wait_for_binding(
                 diagnostics.record("tuiThreadLoaded", json!({ "pid": tui.id() }))?;
                 let _ = acknowledge.send(());
             }
+            Ok(ControlEvent::ResumePermissionPolicyApplied(permissions)) => {
+                diagnostics.record(
+                    "resumePermissionPolicyApplied",
+                    permissions.diagnostic(true),
+                )?;
+            }
+            Ok(ControlEvent::SafeFallbackActivated { cause, permissions }) => {
+                diagnostics.record(
+                    "safeFallbackActivated",
+                    json!({
+                        "cause": cause,
+                        "declaredPermissions": permissions.diagnostic(false),
+                        "mode": "minimalRemoteTui",
+                        "requestedPolicyApplied": false,
+                    }),
+                )?;
+            }
             Ok(ControlEvent::Bound) => return Ok(BindingWait::Bound),
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
@@ -4121,6 +4392,8 @@ fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
                 let _ = acknowledge.send(());
             }
+            Ok(ControlEvent::ResumePermissionPolicyApplied(_))
+            | Ok(ControlEvent::SafeFallbackActivated { .. }) => {}
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {

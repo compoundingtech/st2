@@ -236,6 +236,16 @@ mtime.
 
 Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
 
+### known-safe driver fallback
+
+A single bounded launch or resume retry that deliberately omits a rejected
+provider option so the agent remains reachable. It is degraded mode, not proof
+that the declaration took effect: the wrapper records the cause and the native
+driver diagnostic remains visible until a later exact-policy boot recovers it.
+
+Authority: [05-harness-state requirements OHS-R14](05-harness-state/requirements.md);
+[native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
+
 ### harness context record
 
 The driver-written numeric record of how full an agent's harness context window

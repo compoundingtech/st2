@@ -480,9 +480,18 @@ Claude and omp publish exactly one of those stages — `providerAuth` — from
 their own typed turn-failure signal. Codex additionally publishes `launch` /
 `launchConfigurationRejected` / `processExit` when a declared-argument
 rejection forces its one bounded known-safe boot fallback, and clears it on the
-next exact-config boot. The wrapper's owner-only diagnostic names only option
-names, never their values, while the typed record exposes degraded mode to
-roster and Doctor. Other earlier boundaries remain fail-closed at admission
+next exact-config boot. The wrapper's owner-only diagnostic names declared
+options but never their free-form values; only the closed approval, reviewer,
+and sandbox vocabulary used to verify a resume projection may appear as a
+value. The typed record exposes degraded mode to
+roster and Doctor. Automatic remote resume never forwards approval, sandbox,
+or hook-trust flags to the resume subcommand. Hook trust is projected during a
+typed preflight; approval and sandbox are projected in the driver's redundant
+typed `thread/resume` request after the TUI has loaded the bound thread. The
+driver verifies the response's effective policy. If the provider rejects that
+request, it retries `thread/resume` exactly once without permission overrides;
+if the response reports a different policy, it accepts the live conversation
+but marks the same known-safe degraded mode. Other earlier boundaries remain fail-closed at admission
 (an incompatible Codex protocol refuses the launch, an unadmitted omp MINOR
 refuses it under OMP-R05, and st2 gates no Claude version at all). Provider-auth
 edges come from the signal that ends a turn, so no driver reads provider prose
