@@ -43,7 +43,10 @@ def run_case(binary: str, ending: str) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         initial.extend(collect(1))
-        if ending == "panic" or all(label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")):
+        ready = b"\x1b[?1049h" in initial if ending == "panic" else all(
+            label in initial for label in (b"Now", b"Chat", b"Control", b"Fleet")
+        )
+        if ready:
             break
         if proc.poll() is not None:
             break
