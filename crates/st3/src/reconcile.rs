@@ -1188,6 +1188,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     let diagnostic_key =
                         format!("work-wake-exhausted:{agent}:{tag_value}:{attempt_count}");
                     if self.store.operation_claim(&diagnostic_key)?.is_none() {
+                        let evidence = work_wake_attempt_evidence(&self.store, &attempts)?;
                         self.store.append_claim(&ClaimInput {
                             subject: agent.into(),
                             kind: "harness.diagnostic".into(),
@@ -1201,10 +1202,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("step_run".into(), Value::String(step.subject.clone())),
                                 ("wake_attempts".into(), Value::from(attempt_count)),
                             ]),
-                            evidence: attempts
-                                .iter()
-                                .map(|(_, message)| message.subject.clone())
-                                .collect(),
+                            evidence,
                             expected_subject: None,
                             idempotency_key: Some(diagnostic_key),
                         })?;
@@ -7154,6 +7152,20 @@ fn message_sent_at(store: &Store, message: &MessageView) -> Option<u128> {
         .into_iter()
         .next()
         .map(|claim| claim.accepted_at_unix_ms)
+}
+
+fn work_wake_attempt_evidence(
+    store: &Store,
+    attempts: &[(u128, &MessageView)],
+) -> Result<Vec<String>> {
+    Ok(attempts
+        .iter()
+        .map(|(_, message)| store.latest_claim(&message.subject, Some("message.sent")))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .map(|claim| claim.id)
+        .collect())
 }
 
 fn work_wake_deadline(
@@ -13367,6 +13379,26 @@ mission "wake" state="ready" {
                 .await
                 .is_err()
         );
+        let sent_claim = store
+            .latest_claim(&wake.subject, Some("message.sent"))
+            .unwrap()
+            .unwrap();
+        let evidence = work_wake_attempt_evidence(&store, &[(now_ms(), &wake)]).unwrap();
+        assert_eq!(evidence, vec![sent_claim.id]);
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject,
+                kind: "harness.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("code".into(), Value::String("work-wake-exhausted".into())),
+                    ("status".into(), Value::String("failed".into())),
+                ]),
+                evidence,
+                expected_subject: None,
+                idempotency_key: Some("closed-wake-evidence".into()),
+            })
+            .unwrap();
     }
 
     #[test]
