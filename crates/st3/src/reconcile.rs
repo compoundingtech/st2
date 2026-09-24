@@ -2232,16 +2232,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if baseline_blocked {
                     changed |= self.store.set_step_state(&view.subject, "pending", None)?;
                 }
-                if !view.agentless
-                    && !view
+                let eligible_agent = || -> Result<bool> {
+                    Ok(view
                         .assigned_to
                         .iter()
                         .chain(view.available_to.iter())
                         .map(|agent| self.store.selected_desired_kind(agent))
                         .collect::<Result<Vec<_>>>()?
                         .iter()
-                        .any(|kind| kind.as_deref() == Some("agent"))
-                {
+                        .any(|kind| kind.as_deref() == Some("agent")))
+                };
+                let mut eligible = view.agentless || eligible_agent()?;
+                if !eligible {
+                    // A step can declare its own assigned agent. Create only that agent before
+                    // checking eligibility; other declarations still wait for active execution.
+                    changed |= self.materialize_step_declarations(run, &step, view, true)?;
+                    eligible = eligible_agent()?;
+                }
+                if !eligible {
                     let eligible = view
                         .assigned_to
                         .iter()
@@ -2282,7 +2290,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
-            changed |= self.materialize_step_declarations(run, &step, view)?;
+            changed |= self.materialize_step_declarations(run, &step, view, false)?;
             if let Some(reason) = self.step_declaration_failure(&view.subject)? {
                 changed |= self
                     .store
@@ -4850,6 +4858,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
+        assigned_agents_only: bool,
     ) -> Result<bool> {
         let Some(source) = &step.spec.declarations_kdl else {
             return Ok(false);
@@ -4857,6 +4866,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         let variables = run_variables(run, step, view);
         let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
+        if assigned_agents_only {
+            intent.subjects.retain(|subject, desired| {
+                desired.kind == "agent"
+                    && (view.assigned_to.as_deref() == Some(subject.as_str())
+                        || view.available_to.iter().any(|agent| agent == subject))
+            });
+            if intent.subjects.is_empty() {
+                return Ok(false);
+            }
+        }
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
             subject.owner_generation = Some(run.generation.clone());
@@ -9149,6 +9168,54 @@ version 2
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
+    }
+
+    #[test]
+    fn a_step_can_materialize_its_own_assigned_agent() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+
+mission "self-assigned" state="ready" {
+  goal "Bring up the judge before offering its work."
+  step "judge" {
+    assigned-to "agent/${ST_MISSION_RUN}/judge"
+    agent "judge" { workspace "/tmp"; command "true"; restart "never" }
+  }
+}
+"#,
+            "self-assigned-mission",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "self-assigned".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "self-assigned-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let judge = store.mission_run(&run.id).unwrap().unwrap().steps.remove(0);
+        assert_eq!(judge.status, "ready");
+        assert_eq!(
+            judge.assigned_to.as_deref(),
+            Some(format!("agent/{}/judge", run.id).as_str())
+        );
+        assert!(store.desired_subjects().unwrap().iter().any(|desired| {
+            desired.subject == format!("agent/{}/judge", run.id)
+                && desired.owner_step.as_deref() == Some(judge.subject.as_str())
+        }));
     }
 
     #[test]

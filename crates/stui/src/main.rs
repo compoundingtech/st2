@@ -446,15 +446,16 @@ impl App {
                         "Current session: {}",
                         self.selected_session_id().as_deref().unwrap_or("none")
                     ));
-                    if let Some(work) = self
-                        .model
-                        .work()
-                        .find(|work| work.claimant.as_deref() == Some(&peer.header.id))
-                    {
+                    if !peer.current_work_ids.is_empty() || peer.next_work_id.is_some() {
                         lines.push(String::new());
-                        lines.push("MISSION".into());
-                        lines.push(format!("  {}  ·  {}", work.path, work.state));
-                        lines.push(format!("  {}", work.mission_run_id));
+                        lines.push("MISSION WORK".into());
+                        for current in &peer.current_work_ids {
+                            lines.push(format!("  Current: {current}"));
+                        }
+                        if let Some(next) = &peer.next_work_id {
+                            lines.push(format!("  Next: {next}"));
+                            lines.push(format!("  {} ready across runs", peer.queued_work_count));
+                        }
                     }
                     lines.push(String::new());
                     lines.push("RECENT MESSAGES".into());
@@ -603,6 +604,23 @@ impl App {
                     }
                 } else {
                     lines.push("No machines in the current snapshot.".into());
+                }
+                lines.push(String::new());
+                lines.push("AGENT WORK".into());
+                for agent in self
+                    .model
+                    .agents()
+                    .filter(|agent| agent.active_work_count > 0 || agent.queued_work_count > 0)
+                {
+                    lines.push(format!(
+                        "  {}  ·  {} active · {} queued",
+                        agent_label(agent),
+                        agent.active_work_count,
+                        agent.queued_work_count
+                    ));
+                    if let Some(next) = &agent.next_work_id {
+                        lines.push(format!("    Next: {next}"));
+                    }
                 }
                 lines.push(String::new());
                 lines.push("YOU & DEVICES".into());
@@ -1434,6 +1452,34 @@ mod tests {
         app.selected[1] = 1;
         assert_eq!(app.peer().unwrap().name, "Child");
         assert_eq!(agent_label(app.peer().unwrap()), "Child");
+    }
+
+    #[test]
+    fn chat_and_fleet_show_agent_work_queue() {
+        let agent: st3_client::Resource = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/worker", "revision": "one",
+            "updated_at": "2026-09-24T09:00:00Z", "name": "Worker",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "current_work_ids": ["step-run/old/work"], "active_work_count": 1,
+            "next_work_id": "step-run/new/review", "queued_work_count": 2
+        }))
+        .unwrap();
+        let mut model = Model::default();
+        model.agents.items.push(agent);
+        let mut app = App::new(model);
+        let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
+        for (tab, expected) in [(1, "Next: step-run/new/review"), (3, "2 queued")] {
+            app.tab = tab;
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let rows = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rows.contains(expected), "tab {tab} did not show {expected}");
+        }
     }
 
     #[test]

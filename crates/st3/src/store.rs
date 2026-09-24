@@ -39,6 +39,17 @@ type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
 type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentWorkQueue {
+    pub current_work_ids: Vec<String>,
+    pub active_work_count: u64,
+    pub next_work_id: Option<String>,
+    pub upcoming_work_ids: Vec<String>,
+    pub queued_work_count: u64,
+}
+
+const AGENT_WORK_PREVIEW_LIMIT: usize = 5;
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
@@ -484,6 +495,14 @@ pub struct Store {
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<ReplicationSnapshot>>,
     origin: String,
+}
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
+        let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
+        hold();
+    }
 }
 
 #[derive(Clone)]
@@ -2855,6 +2874,51 @@ impl Store {
     /// are intentionally too expensive for the daemon's inner control loop.
     pub fn work_for_reconcile(&self, actor: &str) -> Result<Vec<StepRunView>> {
         self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)
+    }
+
+    /// One current-step scan for the whole roster. This avoids replaying wake
+    /// history or querying the step table separately for every agent card.
+    pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, status, assignee, lease_owner
+             FROM step_runs
+             WHERE agentless=0
+               AND status IN ('ready', 'claimed', 'working', 'verifying')
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+             ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut queues = BTreeMap::<String, AgentWorkQueue>::new();
+        for row in rows {
+            let (subject, status, assignee, claimant) = row?;
+            if status == "ready" {
+                if let Some(agent) = assignee {
+                    let queue = queues.entry(agent).or_default();
+                    queue.queued_work_count = queue.queued_work_count.saturating_add(1);
+                    if queue.next_work_id.is_none() {
+                        queue.next_work_id = Some(subject.clone());
+                    }
+                    if queue.upcoming_work_ids.len() < AGENT_WORK_PREVIEW_LIMIT {
+                        queue.upcoming_work_ids.push(subject);
+                    }
+                }
+            } else if let Some(agent) = claimant.or(assignee) {
+                let queue = queues.entry(agent).or_default();
+                queue.active_work_count = queue.active_work_count.saturating_add(1);
+                if queue.current_work_ids.len() < AGENT_WORK_PREVIEW_LIMIT {
+                    queue.current_work_ids.push(subject);
+                }
+            }
+        }
+        Ok(queues)
     }
 
     fn work_at_snapshot_internal(
@@ -11644,7 +11708,7 @@ fn current_harness_at(
         .query_row(
             "SELECT id, store_index, accepted_at_unix_ms FROM claims
              WHERE actor=?1 AND store_index>?2 AND store_index<=?3
-               AND kind IN ('work.claimed','work.renewed','work.progress')
+               AND kind IN ('work.claimed','work.progress')
                AND json_extract(body, '$.fields.claim_incarnation')=?4
              ORDER BY store_index DESC LIMIT 1",
             params![subject, runtime_index, at_index, incarnation_id],
@@ -13610,15 +13674,44 @@ fn digest_queries(connection: &Connection, queries: &[(&str, &str)]) -> Result<S
         digest.update(name.as_bytes());
         digest.update([0]);
         let mut statement = connection.prepare(query)?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let encoded: String = row.get(0)?;
+            digest.update((encoded.len() as u64).to_be_bytes());
+            digest.update(encoded.as_bytes());
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+#[cfg(test)]
+#[test]
+fn streamed_digest_matches_materialized_rows() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE digest_rows (value TEXT); INSERT INTO digest_rows VALUES ('one'), ('é'), ('');")
+        .unwrap();
+    let queries = &[("sample", "SELECT value FROM digest_rows ORDER BY rowid")];
+    let streamed = digest_queries(&connection, queries).unwrap();
+
+    let mut digest = Sha256::new();
+    digest.update(b"st3-logical-digest-v1\0");
+    for (name, query) in queries {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        let rows = connection
+            .prepare(query)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         for row in rows {
             digest.update((row.len() as u64).to_be_bytes());
             digest.update(row.as_bytes());
         }
     }
-    Ok(hex::encode(digest.finalize()))
+    assert_eq!(streamed, hex::encode(digest.finalize()));
 }
 
 fn collect_referenced_blobs(
@@ -21475,6 +21568,19 @@ version 2
             .subject;
         store.set_step_state(subject, "ready", None).unwrap();
         store.set_step_state(other, "ready", None).unwrap();
+        let queue = store
+            .agent_work_queues()
+            .unwrap()
+            .remove("agent/node.worker")
+            .unwrap();
+        assert_eq!(queue.active_work_count, 0);
+        assert_eq!(queue.queued_work_count, 2);
+        assert_eq!(
+            queue.next_work_id.as_deref(),
+            queue.upcoming_work_ids.first().map(String::as_str)
+        );
+        assert!(queue.upcoming_work_ids.contains(subject));
+        assert!(queue.upcoming_work_ids.contains(other));
         let request = |incarnation: &str, key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
@@ -21502,6 +21608,15 @@ version 2
         store
             .work_action(subject, "claim", &request("one", "claim-one"))
             .unwrap();
+        let queue = store
+            .agent_work_queues()
+            .unwrap()
+            .remove("agent/node.worker")
+            .unwrap();
+        assert_eq!(queue.current_work_ids, [subject.clone()]);
+        assert_eq!(queue.active_work_count, 1);
+        assert_eq!(queue.next_work_id.as_deref(), Some(other.as_str()));
+        assert_eq!(queue.queued_work_count, 1);
         let error = store
             .work_action(other, "claim", &request("one", "claim-independent"))
             .unwrap_err();
@@ -25283,6 +25398,85 @@ message "human-attention" {
         assert!(recovered.is_ready());
         assert_eq!(recovered.reason, None);
         assert_eq!(recovered.driver.as_deref(), Some("codex"));
+
+        // A lease renewal says only that the process is alive enough to extend its lease.
+        // It must not erase a newer observation that the harness is stuck in a command.
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("indeterminate".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("current".into())),
+                    ("reason".into(), Value::String("stale-command".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("activity-command-stale".into()),
+            })
+            .unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                "node",
+                "step-run/activity/work",
+                "work.renewed",
+                Some(subject),
+                &json!({"fields": {
+                    "status": "claimed",
+                    "attempt": 1,
+                    "readiness_epoch": 1,
+                    "claimant": subject,
+                    "claim_incarnation": "current",
+                    "claim_expires_at_unix_ms": now_ms().saturating_add(60_000),
+                    "worker_reported": false,
+                    "summary": null,
+                    "reason": null
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let renewed = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(renewed.state, "indeterminate");
+        assert_eq!(renewed.reason.as_deref(), Some("stale-command"));
+
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                "node",
+                "step-run/activity/work",
+                "work.progress",
+                Some(subject),
+                &json!({"fields": {
+                    "status": "working",
+                    "attempt": 1,
+                    "readiness_epoch": 1,
+                    "claimant": subject,
+                    "claim_incarnation": "current",
+                    "claim_expires_at_unix_ms": now_ms().saturating_add(60_000),
+                    "worker_reported": false,
+                    "summary": "command finished",
+                    "reason": null
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            store.current_harness(subject).unwrap().unwrap().state,
+            "working"
+        );
     }
 
     #[test]

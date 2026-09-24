@@ -462,6 +462,11 @@
             "harness_state": { "type": ["string", "null"] },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
+            "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "active_work_count": { "type": "integer", "minimum": 0 },
+            "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "queued_work_count": { "type": "integer", "minimum": 0 },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }

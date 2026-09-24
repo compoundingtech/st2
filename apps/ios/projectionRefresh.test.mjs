@@ -8,6 +8,7 @@ assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['agent/one'], body
 assert.equal(projectionEventsRequireRefresh([{ resource_ids: [], body: {} }]), true);
 assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['step-run/one'], body: { change: 'work.renewed' } }], 'Control'), false);
 assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['step-run/one'], body: { change: 'work.claimed' } }], 'Control'), true);
-assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['step-run/one'], body: { change: 'work.claimed' } }], 'Chat'), false);
+assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['step-run/one'], body: { change: 'work.claimed' } }], 'Chat'), true);
+assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['step-run/one'], body: { change: 'work.claimed' } }], 'Fleet'), true);
 assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['agent/one'], body: { change: 'harness.observed', state: 'idle' } }], 'Chat'), false);
 assert.equal(projectionEventsRequireRefresh([{ resource_ids: ['agent/one'], body: { change: 'harness.observed', state: 'failed' } }], 'Chat'), true);

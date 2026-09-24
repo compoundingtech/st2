@@ -4568,6 +4568,19 @@ fn render_client_agent(agent: &st3_client::Agent) -> String {
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
     }
+    for current in &agent.current_work_ids {
+        let _ = writeln!(output, "CURRENT WORK {current}");
+    }
+    if agent.active_work_count > agent.current_work_ids.len() as u64 {
+        let _ = writeln!(output, "ACTIVE WORK  {} total", agent.active_work_count);
+    }
+    if let Some(next) = &agent.next_work_id {
+        let _ = writeln!(output, "NEXT WORK    {next}");
+        let _ = writeln!(output, "QUEUED WORK  {} total", agent.queued_work_count);
+        for upcoming in agent.upcoming_work_ids.iter().skip(1) {
+            let _ = writeln!(output, "UPCOMING     {upcoming}");
+        }
+    }
     for runtime in &agent.runtime_ids {
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
@@ -4620,6 +4633,12 @@ fn render_client_agents(
                     "  incarnation {}",
                     agent.incarnation_id.as_deref().unwrap_or("-")
                 );
+                if let Some(current) = agent.current_work_ids.first() {
+                    let _ = writeln!(output, "  current {current}");
+                }
+                if let Some(next) = &agent.next_work_id {
+                    let _ = writeln!(output, "  next {next} ({} queued)", agent.queued_work_count);
+                }
             } else {
                 let _ = writeln!(
                     output,
@@ -7835,6 +7854,25 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_card_shows_current_and_next_work_ids() {
+        let resource: st3_client::Resource = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/worker", "revision": "one",
+            "updated_at": "2026-09-24T09:00:00Z", "name": "Worker",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "current_work_ids": ["step-run/older/work"], "active_work_count": 1,
+            "next_work_id": "step-run/newer/review",
+            "upcoming_work_ids": ["step-run/newer/review"], "queued_work_count": 1
+        }))
+        .unwrap();
+        let st3_client::Resource::Agent(agent) = resource else {
+            panic!("agent resource")
+        };
+        let card = render_client_agent(&agent);
+        assert!(card.contains("CURRENT WORK step-run/older/work"));
+        assert!(card.contains("NEXT WORK    step-run/newer/review"));
+    }
 
     #[tokio::test]
     async fn trace_after_index_reads_the_first_bounded_page() {

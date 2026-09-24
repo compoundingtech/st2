@@ -641,7 +641,11 @@ async fn concurrent_pairing_completion_mints_exactly_one_credential() {
     const CONTENDERS: usize = 16;
 
     let root = tempfile::tempdir().unwrap();
-    let state = test_state(root.path());
+    let mut state = test_state(root.path());
+    // Exercise the file-backed WAL store used by daemons. The shared-cache in-memory fixture
+    // has SQLite table-lock semantics that are deliberately different from production.
+    state.store =
+        Arc::new(Store::open(&root.path().join("pairing.sqlite"), "client-v0-baseline").unwrap());
     let local = st3::api::router(state.clone());
     let fabric = st3::api::fabric_router(state.clone());
     let (status, challenge) = client_post_json(

@@ -2069,25 +2069,27 @@ pub(super) async fn pairing_complete(
         ));
     }
     let pairing_id = client_detail_id("pairing", &id);
-    let claims = state
+    let subject = format!("custom/client/pairing-{id}");
+    let begun = state
         .store
-        .claims_page(None, None, 0, None, true, 10_000)
-        .map_err(ApiError::internal)?;
-    let begun = claims
+        .claims_for_subject_kind_at(&subject, "custom.client.pairing-begun", None, true, 1)
+        .map_err(ApiError::internal)?
         .claims
-        .iter()
+        .into_iter()
         .find(|claim| {
-            claim.kind == "custom.client.pairing-begun"
-                && claim
-                    .body
-                    .pointer("/fields/pairing_id")
-                    .and_then(Value::as_str)
-                    == Some(pairing_id.as_str())
+            claim
+                .body
+                .pointer("/fields/pairing_id")
+                .and_then(Value::as_str)
+                == Some(pairing_id.as_str())
         })
         .ok_or_else(|| ApiError::not_found(format!("pairing `{pairing_id}` does not exist")))?;
-    let used = claims.claims.iter().any(|claim| {
-        claim.subject == begun.subject && claim.kind == "custom.client.pairing-completed"
-    });
+    let used = !state
+        .store
+        .claims_for_subject_kind_at(&subject, "custom.client.pairing-completed", None, true, 1)
+        .map_err(ApiError::internal)?
+        .claims
+        .is_empty();
     let valid_code = begun
         .body
         .pointer("/fields/code_hash")

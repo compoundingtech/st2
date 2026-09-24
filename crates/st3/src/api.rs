@@ -444,13 +444,7 @@ async fn response_envelope(
         && !client_request
         && request.uri().path() != "/v1/health")
         .then(client_v0::fabric_boundary_forbidden);
-    let client_authentication = client_request
-        .then(|| client_v0::authenticate(&state, &request, transport.as_str()))
-        .transpose();
-    if let Ok(Some(session)) = &client_authentication {
-        request.extensions_mut().insert(session.clone());
-    }
-    let client_snapshot = client_request.then(|| {
+    let cursor_snapshot = client_request.then(|| {
         request
             .uri()
             .query()
@@ -466,8 +460,36 @@ async fn response_envelope(
             })
             .and_then(|cursor| decode_client_cursor(&cursor).ok())
             .map(|cursor| cursor.snapshot)
-            .unwrap_or_else(|| new_client_snapshot(&state))
     });
+    // Authentication can scan pairing claims, and creating a snapshot reads the store. Both
+    // must leave the async acceptor free to admit independent requests when SQLite is busy.
+    let (client_authentication, client_snapshot) = if client_request {
+        let mut auth_request = Request::builder()
+            .method(request.method().clone())
+            .uri(request.uri().clone())
+            .body(Body::empty())
+            .expect("the incoming request has a valid method and URI");
+        *auth_request.headers_mut() = request.headers().clone();
+        let auth_state = state.clone();
+        let transport = transport.as_str();
+        let admitted = tokio::task::spawn_blocking(move || {
+            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let snapshot = cursor_snapshot
+                .flatten()
+                .unwrap_or_else(|| new_client_snapshot(&auth_state));
+            (authentication, snapshot)
+        })
+        .await;
+        match admitted {
+            Ok((authentication, snapshot)) => (authentication.map(Some), Some(snapshot)),
+            Err(error) => (Err(ApiError::internal(error)), None),
+        }
+    } else {
+        (Ok(None), None)
+    };
+    if let Ok(Some(session)) = &client_authentication {
+        request.extensions_mut().insert(session.clone());
+    }
     if let Some(snapshot) = &client_snapshot {
         request.extensions_mut().insert(snapshot.clone());
     }
@@ -498,7 +520,17 @@ async fn response_envelope(
             "message": error.to_string(),
         }),
     };
-    let store_index = state.store.index().unwrap_or_default();
+    let store_index = if client_request {
+        client_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.store_index)
+            .unwrap_or_default()
+    } else {
+        let store = state.store.clone();
+        blocking_store(move || store.index())
+            .await
+            .unwrap_or_default()
+    };
     let request_id = if client_request {
         format!("request/{}", new_request_id())
     } else {
@@ -508,7 +540,7 @@ async fn response_envelope(
         json!({
             "api_version": CLIENT_API_VERSION,
             "request_id": request_id,
-            "snapshot": client_snapshot.unwrap_or_else(|| new_client_snapshot(&state)),
+            "snapshot": client_snapshot.expect("a successful client request has a snapshot"),
             "value": raw,
         })
     } else if client_request {
@@ -1052,6 +1084,7 @@ fn client_agent_resources(
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let work_queues = store.agent_work_queues()?;
     let mut agents = status
         .subjects
         .into_iter()
@@ -1163,6 +1196,10 @@ fn client_agent_resources(
                 .clone()
                 .or_else(|| subject.claims.last().cloned())
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
+            let queue = work_queues
+                .get(&subject.subject)
+                .cloned()
+                .unwrap_or_default();
             let value = json!({
                 "id": subject.subject,
                 "kind": "agent",
@@ -1177,6 +1214,11 @@ fn client_agent_resources(
                 "harness_state": harness_state,
                 "incarnation_id": incarnation_id,
                 "current_session_id": current_session_id,
+                "current_work_ids": queue.current_work_ids,
+                "active_work_count": queue.active_work_count,
+                "next_work_id": queue.next_work_id,
+                "upcoming_work_ids": queue.upcoming_work_ids,
+                "queued_work_count": queue.queued_work_count,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
@@ -7612,6 +7654,47 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_admission_does_not_block_the_async_runtime_when_store_reads_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state
+            .store
+            .put_document("doc/admission-probe", b"probe", &None, "admission-probe")
+            .unwrap();
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        let requests: Vec<_> = (0..8)
+            .map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move { get_request(app, "/v1/client/capabilities").await })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a blocked SQLite read must not pin the async request acceptor (elapsed {:?})",
+            started.elapsed()
+        );
+
+        for request in requests {
+            let (status, _) = request.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+        }
+        holder.join().unwrap();
+    }
+
     #[test]
     fn cached_page_cursor_survives_graph_change_and_stays_person_scoped() {
         let root = tempfile::tempdir().unwrap();
@@ -9987,6 +10070,7 @@ version 2
 mission "agent-health" state="ready" {
   goal "Exercise agent health projection."
   agent "worker" { workspace "/tmp"; harness "codex" {} }
+  step "queued" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -10015,6 +10099,8 @@ mission "agent-health" state="ready" {
             .unwrap();
         materialize_run_agents(&state, &run);
         let subject = format!("agent/{}/worker", run.id);
+        let queued = run.steps[0].subject.clone();
+        store.set_step_state(&queued, "ready", None).unwrap();
         store
             .append_claim(&ClaimInput {
                 subject: subject.clone(),
@@ -10036,6 +10122,9 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "starting");
+        assert_eq!(resources[0]["next_work_id"], queued);
+        assert_eq!(resources[0]["upcoming_work_ids"], json!([queued]));
+        assert_eq!(resources[0]["queued_work_count"], 1);
 
         store
             .append_claim(&ClaimInput {

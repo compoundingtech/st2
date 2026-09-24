@@ -136,6 +136,12 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
 
+Each agent resource includes `current_work_ids` and an ordered `upcoming_work_ids` preview across
+mission runs. `next_work_id` is the first ready item, even while another step occupies the agent's
+work seat. `active_work_count` and `queued_work_count` give complete counts; the ID lists include
+at most five items each. Ready work is ordered by step creation time and then subject ID. These
+fields describe the queue and do not imply that an active claim is making progress.
+
 ## Harness-neutral session timeline
 
 The timeline schema deliberately contains no Claude, Codex, Pi, OMP, or transcript-file types. A

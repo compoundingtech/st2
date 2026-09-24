@@ -486,6 +486,16 @@ pub struct Agent {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
+    pub current_work_ids: Vec<String>,
+    #[serde(default)]
+    pub active_work_count: u64,
+    #[serde(default)]
+    pub next_work_id: Option<String>,
+    #[serde(default)]
+    pub upcoming_work_ids: Vec<String>,
+    #[serde(default)]
+    pub queued_work_count: u64,
+    #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -102,6 +102,19 @@ fn generated_resource_union_decodes_all_kinds() {
         .unwrap();
     assert_eq!(work.blocked_reason, None);
     assert!(work.blockers.is_empty());
+    let agent = resources
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Agent(agent) => Some(agent),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(agent.current_work_ids, ["step-run/release/build"]);
+    assert_eq!(
+        agent.next_work_id.as_deref(),
+        Some("step-run/release/deploy")
+    );
+    assert_eq!(agent.queued_work_count, 1);
     let machine = resources
         .iter()
         .find_map(|resource| match resource {
