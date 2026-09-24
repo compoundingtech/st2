@@ -556,6 +556,9 @@ struct PtyClientInputArgs {
 #[derive(Args)]
 struct PtyClientDetachArgs {
     attachment: String,
+    /// Runtime incarnation returned by `terminals attach-info`.
+    #[arg(long)]
+    incarnation: String,
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
 }
@@ -2516,6 +2519,7 @@ async fn run_pty(
                     format!("terminal-detach:{nonce}"),
                     ClientFence {
                         snapshot_id: capabilities.snapshot.id,
+                        runtime_incarnation: Some(args.incarnation),
                         ..ClientFence::default()
                     },
                     ClientTargetParameters {
@@ -8504,6 +8508,8 @@ mod tests {
             "terminals",
             "detach-client",
             "terminal-attachment/example",
+            "--incarnation",
+            "runtime/example:1",
         ])
         .unwrap();
         assert!(matches!(

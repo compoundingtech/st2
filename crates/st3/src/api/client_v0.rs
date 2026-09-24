@@ -4232,6 +4232,65 @@ mod tests {
     }
 
     #[test]
+    fn paired_authentication_uses_pairing_claims_and_honors_revocation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "custom/client/pairing-auth-test";
+        let credential = "pairing-auth-test-secret";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    (
+                        "credential_hash".into(),
+                        Value::String(credential_digest(credential)),
+                    ),
+                    (
+                        "session_actor".into(),
+                        Value::String("client/test-session".into()),
+                    ),
+                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("scopes".into(), json!(["read.projections"])),
+                    (
+                        "expires_at_unix_ms".into(),
+                        json!(client_now_ms() as u64 + 60_000),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let request = Request::builder()
+            .uri("/v1/client/agents")
+            .header(AUTHORIZATION, format!("Bearer {credential}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            authenticate(&state, &request, "fabric-loopback")
+                .unwrap()
+                .actor,
+            "client/test-session"
+        );
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "custom.client.pairing-revoked".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(authenticate(&state, &request, "fabric-loopback").is_err());
+    }
+
+    #[test]
     fn mission_resources_include_published_definitions_without_runs() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "zero-run-node");
