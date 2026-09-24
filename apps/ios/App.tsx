@@ -320,7 +320,17 @@ export default function App() {
           <Text style={styles.section}>Declared agents</Text>{managedSessions.map(sessionChoice)}{!managedSessions.length ? <Text style={styles.muted}>No running declared agents.</Text> : null}
           <Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}
         </> : null}
-        {active === 'Control' ? <>
+        {active === 'Control' ? selectedMission ? <>
+          <Button label="← Missions" onPress={() => setSelectedMissionId('')} />
+          <Text style={styles.title}>{missionLabel(selectedMission)}</Text>
+          <Text style={styles.muted}>{missionGroup(selectedMission, data.work)} · {selectedMission.id}</Text>
+          <Card title="Work tree" detail={`${selectedMission.runs.length} runs · ${selectedMission.visualization?.nodes.filter(node => node.kind === 'step').length ?? 'unknown'} planned steps`}>
+            {data.work.filter(w => selectedMission.runs.includes(w.mission_run_id)).sort((a, b) => a.path.localeCompare(b.path)).map(w => <View key={w.id} style={{ marginLeft: Math.min(3, w.path.split('/').length - 1) * 14, marginTop: 10 }}><Text style={styles.cardTitle}>↳ {w.path.split('/').pop()} · {w.state}</Text>{w.blocked_reason ? <Text style={styles.warning}>Blocked: {w.blocked_reason}</Text> : null}{w.goals[0] ? <Text style={styles.muted}>Goal: {w.goals[0]}</Text> : null}{w.claimant ? <Text style={styles.small}>Agent: {w.claimant}</Text> : null}</View>)}
+            {selectedMission.visualization?.groups.filter(g => g.kind === 'nested-mission').map(g => <Text key={g.id} style={styles.muted}>↳ Nested mission: {g.members.join(', ')}</Text>)}
+            {!data.work.some(w => selectedMission.runs.includes(w.mission_run_id)) ? <Text style={styles.muted}>No current work is visible in this snapshot.</Text> : null}
+          </Card>
+          {truncated.work ? <Text style={styles.warning}>More work exists beyond this view; use the CLI for the complete tree.</Text> : null}
+        </> : <>
           <Text style={styles.title}>Control</Text>
           <Text style={styles.muted}>Missions grouped by what needs action. Select one to see its work tree and blockers.</Text>
           {truncated.missions || truncated.work ? <Text style={styles.warning}>This view is partial. Use the CLI for complete mission and work lists.</Text> : null}
@@ -329,11 +339,6 @@ export default function App() {
             return missions.length ? <View key={group}><Text style={styles.section}>{group} · {missions.length}</Text>{missions.map(m => <Pressable key={m.id} onPress={() => setSelectedMissionId(m.id)} style={[styles.choice, selectedMissionId === m.id && styles.selected]}><Text style={styles.cardTitle}>{missionLabel(m)}</Text><Text style={styles.small}>{missionDetail(m, data.work)}</Text></Pressable>)}</View> : null;
           })}
           <Button label={showSystemMissions ? 'Hide system missions' : 'Show system missions'} onPress={() => setShowSystemMissions(!showSystemMissions)} />
-          {selectedMission ? <Card title={missionLabel(selectedMission)} detail={`${missionGroup(selectedMission, data.work)} · ${selectedMission.id}`}>
-            <Text style={styles.section}>Work tree</Text>
-            {data.work.filter(w => selectedMission.runs.includes(w.mission_run_id)).sort((a, b) => a.path.localeCompare(b.path)).map(w => <View key={w.id} style={{ marginLeft: Math.min(3, w.path.split('/').length - 1) * 14, marginTop: 10 }}><Text style={styles.cardTitle}>↳ {w.path.split('/').pop()} · {w.state}</Text>{w.blocked_reason ? <Text style={styles.warning}>Blocked: {w.blocked_reason}</Text> : null}{w.goals[0] ? <Text style={styles.muted}>Goal: {w.goals[0]}</Text> : null}{w.claimant ? <Text style={styles.small}>Agent: {w.claimant}</Text> : null}</View>)}
-            {selectedMission.visualization?.groups.filter(g => g.kind === 'nested-mission').map(g => <Text key={g.id} style={styles.muted}>↳ Nested mission: {g.members.join(', ')}</Text>)}
-          </Card> : null}
           <Text style={styles.section}>Plan a mission</Text><Button label={showPlanner ? 'Hide planner' : 'New mission'} onPress={() => setShowPlanner(!showPlanner)} />
           {showPlanner ? <>
           <Text style={styles.muted}>Start a configurable planner. Review and approval stay in st3.</Text>
