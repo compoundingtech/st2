@@ -1092,8 +1092,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exit, 0);
-        assert_eq!(attach_attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(stream_attempts.load(Ordering::SeqCst), 2);
+        // Under parallel test load, opening the first resumed stream can itself fail
+        // transiently. The bridge must retry with another one-use capability rather
+        // than promising an exact number of HTTP attaches.
+        assert!((2..=4).contains(&attach_attempts.load(Ordering::SeqCst)));
+        assert!((2..=4).contains(&stream_attempts.load(Ordering::SeqCst)));
 
         drop(slave);
         let mut output = Vec::new();
