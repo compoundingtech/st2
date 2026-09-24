@@ -7,7 +7,7 @@ import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities,
 import { isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, recentTimeline, sessionDetail, sessionLabel, timelineText, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, offlinePresentation, PROJECTION_CACHE_KEY, type Data, type MachineView } from './projectionCache';
 import { listCollectionPages, type CollectionResult } from './collectionPages';
-import { agentTree } from './agentTree';
+import { agentLabel, agentTree } from './agentTree';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -274,6 +274,7 @@ export default function App() {
   async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { if (!isSnapshotChurn(e)) setError(errorText(e)); } finally { setHistoryBusy(false); } }
   function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
   const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
+  const selectedAgent = selectedSession ? data.agents?.find(agent => agent.id === selectedSession.owner_id) : undefined;
   const currentSessions = data.sessions.filter(s => s.state === 'running').sort((a, b) => Number(isUnmanaged(b)) - Number(isUnmanaged(a)));
   const knownHostId = snapshot?.host_id ?? cachedHostId;
   const gatewayMachineId = knownHostId ? `machine/${knownHostId.replace(/^host\//, '')}` : '';
@@ -304,7 +305,7 @@ export default function App() {
         {active === 'Now' ? <><Text style={styles.title}>Needs your attention</Text><Text style={styles.muted}>{data.attention.length ? `${data.attention.length} actionable items` : 'Nothing needs your attention.'}</Text>{truncated.attention ? <Text style={styles.warning}>More attention items exist beyond this view. Open the full inbox in the CLI to see them all.</Text> : null}{data.attention.map(a => <Card key={a.id} title={a.title} detail={`${a.priority} · ${a.detail}`}><Text style={styles.small}>{a.attention_kind} · {a.source_id}</Text>{a.actions.includes('attention.resolve') ? <Button label="Resolve" disabled={busy} onPress={() => Alert.alert('Resolve attention?', a.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void resolve(a) }])} /> : null}</Card>)}<Button label="Refresh" onPress={() => void refresh()} /></> : null}
         {active === 'Chat' ? chatDetailOpen && selectedSession ? <>
           <Button label="← Agents" onPress={() => { setChatDetailOpen(false); setTerminalId(''); setScreen(null); setTerminalIssue(''); }} />
-          <Text style={styles.section}>{sessionLabel(selectedSession, sourceHost)}</Text>
+          <Text style={styles.section}>{selectedAgent ? agentLabel(selectedAgent) : sessionLabel(selectedSession, sourceHost)}</Text>
           <Text style={styles.muted}>{sessionDetail(selectedSession)}</Text>
           {terminalId ? <>
             <Button label="← Conversation" onPress={() => { setScreen(null); setTerminalId(''); setTerminalIssue(''); }} />
@@ -325,7 +326,7 @@ export default function App() {
           <Text style={styles.section}>Declared agents</Text>{truncated.agents ? <Text style={styles.warning}>More agents exist beyond this view.</Text> : null}
           {declaredAgentRows.map(({ agent, depth }) => {
             const session = managedSessions.find(s => s.id === agent.current_session_id) ?? managedSessions.find(s => s.owner_id === agent.id);
-            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) { setSessionId(session.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); } }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agent.name}</Text><Text style={styles.small}>{agent.state}{agent.owner_run_id ? ` · ${agent.owner_run_id}` : ''}{session ? ` · ${session.state} session` : ' · no current session'}</Text></Pressable>;
+            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) { setSessionId(session.id); setTimeline([]); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); } }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agentLabel(agent)}</Text><Text style={styles.small}>{agent.state}{agent.owner_run_id ? ` · ${agent.owner_run_id.replace(/^mission-run\//, '')}` : ''}{session ? ` · ${session.state} session` : ' · no current session'}</Text></Pressable>;
           })}
           {unmatchedDeclaredSessions.length ? <><Text style={styles.section}>Other declared sessions</Text>{unmatchedDeclaredSessions.map(sessionChoice)}</> : null}
           {!declaredAgentRows.length && !managedSessions.length ? <Text style={styles.muted}>No declared agents are visible.</Text> : null}

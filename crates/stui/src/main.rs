@@ -345,7 +345,9 @@ impl App {
                 1 => self
                     .agent_tree()
                     .iter()
-                    .map(|(v, depth)| format!("{}{}  ·  {}", "  ".repeat(*depth), v.name, v.state))
+                    .map(|(v, depth)| {
+                        format!("{}{}  ·  {}", "  ".repeat(*depth), agent_label(v), v.state)
+                    })
                     .chain(self.model.undeclared_sessions().map(|v| {
                         let driver = v
                             .extra
@@ -663,6 +665,26 @@ fn mission_label(mission: &st3_client::Mission) -> String {
             "st3" => "ST3".into(),
             "api" => "API".into(),
             "pty" => "PTY".into(),
+            _ => {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn agent_label(agent: &st3_client::Agent) -> String {
+    let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
+    slug.split('-')
+        .map(|word| match word.to_ascii_lowercase().as_str() {
+            "st3" => "ST3".to_string(),
+            "cos" => "COS".to_string(),
+            "ios" => "iOS".to_string(),
+            "tui" => "TUI".to_string(),
+            "pty" => "PTY".to_string(),
             _ => {
                 let mut chars = word.chars();
                 chars
@@ -1320,6 +1342,7 @@ mod tests {
         );
         app.selected[1] = 1;
         assert_eq!(app.peer().unwrap().name, "Child");
+        assert_eq!(agent_label(app.peer().unwrap()), "Child");
     }
 
     #[test]
