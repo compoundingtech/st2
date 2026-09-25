@@ -38,6 +38,11 @@ preflight is currently healthy; it cannot pass the release gate.
 
 - `cargo test -p st3`, `cargo fmt --all -- --check`, both soak-report fixture
   tests, `cargo test -p stui`, and the TUI PTY smoke passed.
+- `nix build .#st3 --no-link` passed on the current source, including its
+  release-profile tests, and `checks.x86_64-linux.st3-help` passed for the
+  packaged commands. The packaged `st3`, `st`, and `st3-migrate` binaries ran
+  with this host's non-Nix allocator preload removed from their environment;
+  the inherited preload is not compatible with the Nix runtime.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
   daemon. All six iOS logic tests and the TypeScript typecheck passed. Prior
   signed Debug simulator and paired-gateway proofs remain the device evidence;
