@@ -760,20 +760,21 @@ impl App {
                     } else {
                         "ST3 MESSAGES".into()
                     });
-                    if conversation.is_empty() {
-                        if !recent.is_empty() {
-                        } else {
-                            lines.push(
-                                if self
-                                    .selected_session_id()
-                                    .is_some_and(|id| self.timeline_cache.contains_key(&id))
-                                {
-                                    "No conversation in recent timeline.".into()
-                                } else {
-                                    "Loading conversation…".into()
-                                },
-                            );
-                        }
+                    if conversation.is_empty() && recent.is_empty() {
+                        lines.push(
+                            if self.messages_requested.as_deref() == Some(peer.header.id.as_str())
+                                && self.model.messages.snapshot.is_none()
+                            {
+                                "Loading ST3 messages…".into()
+                            } else if self
+                                .selected_session_id()
+                                .is_some_and(|id| self.timeline_cache.contains_key(&id))
+                            {
+                                "No conversation in recent timeline.".into()
+                            } else {
+                                "Loading conversation…".into()
+                            },
+                        );
                     }
                     for message in &recent {
                         let cleaned = clean_message_text(&message.content);
@@ -2898,6 +2899,16 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("No conversation in recent timeline."));
+        app.messages_requested = Some("agent/app-apple".into());
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let loading = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(loading.contains("Loading ST3 messages…"));
     }
 
     #[test]
