@@ -59,8 +59,13 @@ probe() {
     recipient=$SILBER_RECIPIENT
     if ! response=$(/usr/bin/timeout 30s "$ST3_BIN" conversations send "$recipient" --from "$MONITOR" \
       --subject 'soak request' --body "Reply once with exact receipt token $token." --json); then
-      log "FAILED direction=$direction stage=send token=$token"
-      return 1
+      if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
+        response=$(/usr/bin/jq -nc --arg subject "$subject" '{subject:$subject}')
+        log "recovered direction=$direction stage=send-client-timeout subject=$subject token=$token"
+      else
+        log "FAILED direction=$direction stage=send token=$token"
+        return 1
+      fi
     fi
   elif [[ $direction == silber-to-hetz ]]; then
     recipient=$HETZ_RECIPIENT
@@ -80,7 +85,7 @@ probe() {
     return 2
   fi
   if ! subject=$(/usr/bin/jq -er '.subject' <<<"$response" 2>/dev/null); then
-    if [[ $direction == silber-to-hetz ]] && subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
+    if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
       log "recovered direction=$direction stage=send-response subject=$subject token=$token"
     else
       log "FAILED direction=$direction stage=send-response token=$token"
