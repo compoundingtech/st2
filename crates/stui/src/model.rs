@@ -10,7 +10,7 @@ use st3_client::{
 
 /// Each collection is deliberately capped. The UI shows a truncation marker when a cap is hit.
 const PAGE_SIZE: usize = 50;
-const MAX_PAGES: usize = 4;
+pub const MAX_PAGES: usize = 4;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Collection {
@@ -255,9 +255,17 @@ impl Model {
         (changed, invalidated_sessions)
     }
 
-    pub async fn load_timeline(&mut self, client: &Client, session_id: &str) -> Result<()> {
+    pub async fn load_timeline_with_pages(
+        &mut self,
+        client: &Client,
+        session_id: &str,
+        page_limit: usize,
+    ) -> Result<()> {
         for attempt in 0..3 {
-            match self.load_timeline_once(client, session_id).await {
+            match self
+                .load_timeline_once(client, session_id, page_limit)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if attempt < 2
@@ -273,11 +281,16 @@ impl Model {
         unreachable!("bounded timeline retry returns from every attempt")
     }
 
-    async fn load_timeline_once(&mut self, client: &Client, session_id: &str) -> Result<()> {
+    async fn load_timeline_once(
+        &mut self,
+        client: &Client,
+        session_id: &str,
+        page_limit: usize,
+    ) -> Result<()> {
         let mut cursor = None;
         let mut entries = Vec::new();
         let mut has_more = false;
-        for _ in 0..MAX_PAGES {
+        for _ in 0..page_limit.clamp(1, 32) {
             let page = client
                 .timeline(session_id, cursor.as_deref(), Some(PAGE_SIZE))
                 .await?
@@ -285,7 +298,9 @@ impl Model {
             has_more = page.page.has_more;
             cursor = page.page.next_cursor;
             entries.extend(page.items);
-            if !conversation_needs_older_page(&entries, has_more) {
+            if !has_more
+                || (page_limit <= MAX_PAGES && !conversation_needs_older_page(&entries, has_more))
+            {
                 break;
             }
             if cursor.is_none() {

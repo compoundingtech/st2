@@ -87,7 +87,7 @@ struct Attached {
 enum Update {
     Partial(Box<Model>),
     Model(Box<Model>),
-    Timeline(String, Vec<st3_client::TimelineEntry>, bool),
+    Timeline(String, Vec<st3_client::TimelineEntry>, bool, usize),
     Messages(String, model::Collection),
     TimelineInvalidated(String),
     TimelineCursorGap,
@@ -106,6 +106,15 @@ struct App {
     attached: Option<Attached>,
     return_focused: bool,
     selection_mode: bool,
+    selection_frame_drawn: bool,
+    history_open: bool,
+    history_scroll: u16,
+    history_max_scroll: Cell<u16>,
+    history_page_limit: usize,
+    timeline_requested_pages: usize,
+    select_control: Cell<Rect>,
+    history_control: Cell<Rect>,
+    history_load_control: Cell<Rect>,
     status_details: bool,
     pending_action: Option<(String, String)>,
     pending_reason: Option<String>,
@@ -139,6 +148,15 @@ impl App {
             attached: None,
             return_focused: false,
             selection_mode: false,
+            selection_frame_drawn: false,
+            history_open: false,
+            history_scroll: 0,
+            history_max_scroll: Cell::new(0),
+            history_page_limit: model::MAX_PAGES,
+            timeline_requested_pages: model::MAX_PAGES,
+            select_control: Cell::new(Rect::default()),
+            history_control: Cell::new(Rect::default()),
+            history_load_control: Cell::new(Rect::default()),
             status_details: false,
             pending_action: None,
             pending_reason: None,
@@ -385,20 +403,59 @@ impl App {
                 "○ Offline"
             };
             let state = if self.selection_mode {
-                format!("SELECT · {connection}")
+                "SELECT".to_owned()
             } else {
                 connection.to_owned()
             };
             let status_width = (state.chars().count() as u16 + 2).min(area.width);
+            let select_label = if self.selection_mode {
+                "v Return"
+            } else {
+                "Select text [v]"
+            };
+            let select_width =
+                (select_label.len() as u16 + 1).min(area.width.saturating_sub(status_width));
+            let history_label = if self.tab == 1 { "History [h]" } else { "" };
+            let history_width = (history_label.len() as u16 + 1)
+                .min(area.width.saturating_sub(status_width + select_width));
+            let tabs_width = area
+                .width
+                .saturating_sub(status_width + select_width + history_width);
             frame.render_widget(
                 Tabs::new(TABS.map(Line::from))
                     .select(self.tab)
                     .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
                     .divider("  ·  "),
                 Rect {
-                    width: area.width.saturating_sub(status_width),
+                    width: tabs_width,
                     ..chunks[0]
                 },
+            );
+            self.history_control.set(Rect {
+                x: area.x + tabs_width,
+                width: history_width,
+                ..chunks[0]
+            });
+            self.select_control.set(Rect {
+                x: area.x + tabs_width + history_width,
+                width: select_width,
+                ..chunks[0]
+            });
+            if history_width > 0 {
+                frame.render_widget(
+                    Paragraph::new(history_label).style(Style::default().fg(
+                        if self.history_open {
+                            Color::Yellow
+                        } else {
+                            Color::Cyan
+                        },
+                    )),
+                    self.history_control.get(),
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(select_label).style(Style::default().fg(Color::Cyan)),
+                self.select_control.get(),
             );
             frame.render_widget(
                 Paragraph::new(state).style(Style::default().fg(if self.live_ready {
@@ -457,13 +514,11 @@ impl App {
             );
             return;
         }
+        let history_width = history_width(self, area.width);
         let columns = Layout::horizontal([
-            Constraint::Length(if self.sidebar && area.width >= 66 {
-                area.width / 3
-            } else {
-                0
-            }),
+            Constraint::Length(sidebar_width(self, area.width)),
             Constraint::Min(1),
+            Constraint::Length(history_width),
         ])
         .split(chunks[1]);
         if columns[0].width > 0 {
@@ -683,25 +738,16 @@ impl App {
                     }
                     for message in recent {
                         let cleaned = clean_message_text(&message.content);
-                        lines.push(format!(
-                            "  {}: {}",
-                            message.from,
-                            if cleaned.is_empty() {
-                                message
-                                    .title
-                                    .as_deref()
-                                    .unwrap_or("(notification)")
-                                    .to_owned()
-                            } else {
-                                cleaned.replace('\n', " ⏎ ")
-                            }
-                        ));
+                        lines.push(format!("  {}:", message.from));
+                        let body = if cleaned.is_empty() {
+                            message.title.as_deref().unwrap_or("(notification)")
+                        } else {
+                            cleaned.as_str()
+                        };
+                        lines.extend(body.split('\n').map(|line| format!("    {line}")));
                         lines.push(String::new());
                     }
                     lines.push("CONVERSATION".into());
-                    if self.model.timeline_truncated || self.model.messages.truncated {
-                        lines.push("[More history beyond bounded view]".into());
-                    }
                     let conversation = self
                         .model
                         .timeline
@@ -774,9 +820,6 @@ impl App {
                         for line in timeline_line(entry).lines() {
                             lines.push(format!("  {line}"));
                         }
-                    }
-                    if self.model.timeline_truncated || self.model.sessions.truncated {
-                        lines.push("[More sessions or history beyond bounded view]".into());
                     }
                     lines.push(if session_is_importable(session) {
                         "m import session into st3 · confirmation stops the exact process and resumes it under st3".into()
@@ -977,18 +1020,79 @@ impl App {
             self.scroll[self.tab].min(max_scroll)
         };
         frame.render_widget(detail.scroll((scroll, 0)), columns[1]);
-        let footer = match self.mode {
-            Mode::Normal => format!(
-                "1–4 views · ↑↓ select · PgUp/PgDn scroll · v select text · i connection · {} · q quit",
-                match self.tab {
-                    1 if self.undeclared_session().is_some_and(session_is_importable) => {
-                        "m import / End newest"
-                    }
-                    1 => "Enter terminal / c message / End newest",
-                    2 => "c new mission",
-                    _ => "",
+        self.history_load_control.set(Rect::default());
+        if columns[2].width > 0 {
+            let all_content = self
+                .model
+                .timeline
+                .iter()
+                .filter(|entry| matches!(entry.body, st3_client::TimelineBody::Content(_)))
+                .collect::<Vec<_>>();
+            let older = all_content.len().saturating_sub(12);
+            let mut history = vec![format!("{} older messages", older)];
+            if self.model.timeline_truncated {
+                history.push(if self.history_page_limit < 32 {
+                    "o Load older pages".into()
+                } else {
+                    "History limit reached".into()
+                });
+            } else {
+                history.push("All available pages loaded".into());
+            }
+            history.push(String::new());
+            history.push(format!(
+                "Session: {}",
+                self.selected_session_id().as_deref().unwrap_or("none")
+            ));
+            history.push(String::new());
+            for entry in all_content.into_iter().take(older) {
+                history.extend(timeline_line(entry).lines().map(str::to_owned));
+                history.push(String::new());
+            }
+            let panel = Paragraph::new(history.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("History & details")
+                        .borders(Borders::ALL),
+                );
+            let visible = columns[2].height.saturating_sub(2) as usize;
+            let max_scroll = panel
+                .line_count(columns[2].width.saturating_sub(2))
+                .saturating_sub(2)
+                .saturating_sub(visible)
+                .min(u16::MAX as usize) as u16;
+            self.history_max_scroll.set(max_scroll);
+            if self.model.timeline_truncated
+                && self.history_page_limit < 32
+                && self.history_scroll == 0
+                && columns[2].height > 3
+            {
+                self.history_load_control.set(Rect {
+                    x: columns[2].x + 1,
+                    y: columns[2].y + 2,
+                    width: columns[2].width.saturating_sub(2),
+                    height: 1,
+                });
+            }
+            frame.render_widget(
+                panel.scroll((self.history_scroll.min(max_scroll), 0)),
+                columns[2],
+            );
+        }
+        let footer = if self.selection_mode {
+            "Drag to select text with your terminal · press v to return".to_owned()
+        } else {
+            match self.mode {
+            Mode::Normal => match self.tab {
+                0 => "↑↓/click cards · wheel/Pg scroll · choose action key · v select · q quit".into(),
+                1 if self.undeclared_session().is_some_and(session_is_importable) => {
+                    "↑↓/click agent · wheel/Pg scroll · h history · m import · v select · q quit".into()
                 }
-            ),
+                1 => "↑↓/click agent · wheel/Pg scroll · h history · c message · v select · q quit".into(),
+                2 => "↑↓/click mission · wheel/Pg scroll · c new mission · q quit".into(),
+                _ => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
+            },
             Mode::Confirm => self
                 .pending_action
                 .as_ref()
@@ -1006,6 +1110,7 @@ impl App {
             Mode::Request => format!("Request: {}█", self.input),
             Mode::Mission => format!("Mission ID: {}█", self.input),
             Mode::Workspace => format!("Workspace: {}█ · Enter create", self.input),
+        }
         };
         frame.render_widget(Paragraph::new(footer), chunks[2]);
     }
@@ -1176,12 +1281,79 @@ fn work_owner(model: &Model, work: &st3_client::Work) -> String {
     }
 }
 fn sidebar_item_at(app: &App, column: u16, row: u16, width: u16) -> Option<usize> {
-    if !app.sidebar || width < 66 || column >= width / 3 || row < 2 {
+    if column >= sidebar_width(app, width) || row < 2 {
         return None;
     }
-    let item_height = if matches!(app.tab, 0 | 2) { 3 } else { 2 };
+    // Text::raw uses str::lines, which drops the trailing newline appended in
+    // render. Now and Control have two real lines; Chat and Fleet have one.
+    let item_height = if matches!(app.tab, 0 | 2) { 2 } else { 1 };
     let index = app.sidebar_offsets[app.tab].get() + usize::from((row - 2) / item_height);
     (index < app.count()).then_some(index)
+}
+
+fn sidebar_width(app: &App, width: u16) -> u16 {
+    if app.sidebar && width >= 66 && !(app.tab == 1 && app.history_open && width < 110) {
+        width / 3
+    } else {
+        0
+    }
+}
+
+fn history_width(app: &App, width: u16) -> u16 {
+    if app.tab == 1 && app.history_open && width >= 60 {
+        (width / 4).max(22)
+    } else {
+        0
+    }
+}
+
+fn point_in(rect: Rect, column: u16, row: u16) -> bool {
+    rect.width > 0
+        && column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn toggle_text_selection(app: &mut App) -> Result<()> {
+    app.selection_mode = !app.selection_mode;
+    app.selection_frame_drawn = false;
+    if app.selection_mode {
+        execute!(io::stdout(), DisableMouseCapture)?;
+    } else {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    }
+    app.dirty = true;
+    Ok(())
+}
+
+fn load_older_history(app: &mut App) {
+    app.history_page_limit = (app.history_page_limit + 4).min(32);
+    app.last_timeline = Instant::now() - TIMELINE_REFRESH;
+    app.dirty = true;
+}
+
+fn scroll_detail(app: &mut App, up: bool) {
+    let tab = app.tab;
+    let current = if tab == 1 && app.scroll[tab] == u16::MAX {
+        app.chat_max_scroll.get()
+    } else {
+        app.scroll[tab]
+    };
+    let next = if up {
+        current.saturating_sub(3)
+    } else {
+        current.saturating_add(3)
+    };
+    app.scroll[tab] = if tab == 1 && next >= app.chat_max_scroll.get() {
+        u16::MAX
+    } else {
+        next
+    };
+    if tab == 1 {
+        app.remember_chat_scroll();
+    }
+    app.dirty = true;
 }
 fn age_label(then: &str, now: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(then).ok();
@@ -1723,6 +1895,14 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         }
         return Ok(false);
     }
+    if app.selection_mode {
+        match key.code {
+            KeyCode::Char('v') => toggle_text_selection(app)?,
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if app.mode == Mode::Confirm {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') => {
@@ -1931,13 +2111,13 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         }
         KeyCode::Char('s') => app.sidebar = !app.sidebar,
         KeyCode::Char('i') => app.status_details = !app.status_details,
-        KeyCode::Char('v') => {
-            app.selection_mode = !app.selection_mode;
-            if app.selection_mode {
-                execute!(io::stdout(), DisableMouseCapture)?;
-            } else {
-                execute!(io::stdout(), EnableMouseCapture)?;
-            }
+        KeyCode::Char('v') => toggle_text_selection(app)?,
+        KeyCode::Char('h') if app.tab == 1 => {
+            app.history_open = !app.history_open;
+            app.history_scroll = 0;
+        }
+        KeyCode::Char('o') if app.tab == 1 && app.history_open && app.model.timeline_truncated => {
+            load_older_history(app);
         }
         KeyCode::Char(c) if app.tab == 0 && "arjdm".contains(c) => {
             if let Some(attention) = app.model.attention().nth(app.selected[0]) {
@@ -2257,7 +2437,12 @@ fn main() -> Result<()> {
                     }
                     app.dirty = true;
                 }
-                Update::Timeline(id, timeline, truncated) => {
+                Update::Timeline(id, timeline, truncated, pages) => {
+                    if app.selected_session_id().as_deref() != Some(&id)
+                        || app.timeline_requested_pages != pages
+                    {
+                        continue;
+                    }
                     app.timeline_cache
                         .insert(id.clone(), (timeline.clone(), truncated));
                     while app.timeline_cache.len() > 32 {
@@ -2302,8 +2487,18 @@ fn main() -> Result<()> {
         }
         if app.tab == 1 {
             let selected_id = app.selected_session_id();
+            if selected_id != app.timeline_requested {
+                app.history_page_limit = model::MAX_PAGES;
+                app.history_scroll = 0;
+            }
+            let page_limit = if app.history_open {
+                app.history_page_limit
+            } else {
+                model::MAX_PAGES
+            };
             if selected_id != app.timeline_requested
                 || app.last_timeline.elapsed() >= TIMELINE_REFRESH
+                || page_limit != app.timeline_requested_pages
             {
                 if selected_id != app.timeline_requested {
                     let cached = selected_id
@@ -2314,18 +2509,23 @@ fn main() -> Result<()> {
                     app.dirty = true;
                 }
                 app.timeline_requested = selected_id.clone();
+                app.timeline_requested_pages = page_limit;
                 app.last_timeline = Instant::now();
                 if let Some(id) = selected_id {
                     let timeline_client = client.clone();
                     let timeline_updates = updates.clone();
                     runtime.spawn(async move {
                         let mut model = Model::default();
-                        match model.load_timeline(&timeline_client, &id).await {
+                        match model
+                            .load_timeline_with_pages(&timeline_client, &id, page_limit)
+                            .await
+                        {
                             Ok(()) => {
                                 let _ = timeline_updates.send(Update::Timeline(
                                     id,
                                     model.timeline,
                                     model.timeline_truncated,
+                                    page_limit,
                                 ));
                             }
                             Err(error) => {
@@ -2365,9 +2565,10 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if app.dirty {
+        if app.dirty && (!app.selection_mode || !app.selection_frame_drawn) {
             guard.terminal.draw(|frame| app.render(frame))?;
             app.dirty = false;
+            app.selection_frame_drawn = app.selection_mode;
         }
         if !poll_terminal()? {
             break;
@@ -2395,7 +2596,17 @@ fn main() -> Result<()> {
                         && app.attached.is_none()
                         && app.mode == Mode::Normal =>
                 {
-                    if let Some(index) =
+                    if point_in(app.select_control.get(), mouse.column, mouse.row) {
+                        if let Err(error) = toggle_text_selection(&mut app) {
+                            app.model.status = error.to_string();
+                        }
+                    } else if point_in(app.history_control.get(), mouse.column, mouse.row) {
+                        app.history_open = !app.history_open;
+                        app.history_scroll = 0;
+                        app.dirty = true;
+                    } else if point_in(app.history_load_control.get(), mouse.column, mouse.row) {
+                        load_older_history(&mut app);
+                    } else if let Some(index) =
                         sidebar_item_at(&app, mouse.column, mouse.row, guard.terminal.size()?.width)
                     {
                         if app.tab == 1 {
@@ -2408,6 +2619,45 @@ fn main() -> Result<()> {
                             app.scroll[app.tab] = 0;
                         }
                         app.dirty = true;
+                    }
+                }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) && app.attached.is_none()
+                        && app.mode == Mode::Normal =>
+                {
+                    let size = guard.terminal.size()?;
+                    let sidebar_width = sidebar_width(&app, size.width);
+                    let history_width = history_width(&app, size.width);
+                    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                    if mouse.row > 0 && mouse.row < size.height.saturating_sub(1) {
+                        if mouse.column < sidebar_width {
+                            if app.tab == 1 {
+                                app.remember_chat_scroll();
+                            }
+                            app.selected[app.tab] = if up {
+                                app.selected[app.tab].saturating_sub(1)
+                            } else {
+                                (app.selected[app.tab] + 1).min(app.count().saturating_sub(1))
+                            };
+                            if app.tab == 1 {
+                                app.restore_chat_scroll();
+                            }
+                            app.dirty = true;
+                        } else if history_width > 0 && mouse.column >= size.width - history_width {
+                            app.history_scroll = if up {
+                                app.history_scroll.saturating_sub(3)
+                            } else {
+                                app.history_scroll
+                                    .saturating_add(3)
+                                    .min(app.history_max_scroll.get())
+                            };
+                            app.dirty = true;
+                        } else {
+                            scroll_detail(&mut app, up);
+                        }
                     }
                 }
                 Event::Resize(_, _) => app.dirty = true,
@@ -2520,7 +2770,7 @@ mod tests {
         assert!(device_label(&device).contains("iphone-15"));
     }
     #[test]
-    fn regression_history_marker_precedes_visible_conversation() {
+    fn regression_history_is_an_explicit_control_not_inline_chat_text() {
         let mut model = Model::default();
         model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/cos","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"cos","state":"running","reachability":"reachable"}"#).unwrap());
         model.timeline_truncated = true;
@@ -2536,10 +2786,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(
-            content.find("[More history beyond bounded view]").unwrap()
-                < content.find("Visible newest message").unwrap()
-        );
+        assert!(content.contains("Visible newest message"));
+        assert!(!content.contains("[More history beyond bounded view]"));
+        assert!(content.contains("History"));
     }
     #[test]
     fn regression_status_only_timeline_has_an_explanation() {
@@ -2559,6 +2808,26 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("No conversation in recent timeline."));
+    }
+    #[test]
+    fn recent_message_preserves_line_breaks_without_return_glyphs() {
+        let mut model = Model::default();
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable"}"#).unwrap());
+        model.messages.items.push(serde_json::from_str(r#"{"kind":"message","id":"message/two-lines","revision":"one","updated_at":"2026-09-25T08:00:00Z","from":"agent/cos","to":"agent/st3","title":null,"content":"first line\nsecond line","state":"closed","sent_at":"2026-09-25T08:00:00Z","in_reply_to":null,"session_id":null}"#).unwrap());
+        let mut app = App::new(model);
+        app.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("first line"));
+        assert!(content.contains("second line"));
+        assert!(!content.contains('⏎'));
     }
     #[test]
     fn all_views_render_at_normal_and_narrow_width() {
@@ -2954,16 +3223,60 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Message 20"));
         assert_eq!(sidebar_item_at(&app, 2, 2, 90), Some(0));
-        assert_eq!(sidebar_item_at(&app, 2, 4, 90), Some(1));
-        assert_eq!(sidebar_item_at(&app, 2, 4, 60), None);
+        // Ratatui discards the trailing newline in each Chat item, so the
+        // second rendered row is row 3, not row 4.
+        assert_eq!(sidebar_item_at(&app, 2, 3, 90), Some(1));
+        assert_eq!(sidebar_item_at(&app, 2, 3, 60), None);
+        app.selected[1] = sidebar_item_at(&app, 2, 3, 90).unwrap();
+        assert_eq!(app.peer().unwrap().header.id, "agent/beta");
+        app.selected[1] = 0;
         app.sidebar_offsets[1].set(1);
         assert_eq!(sidebar_item_at(&app, 2, 2, 90), Some(1));
+        let normal_header = (0..90)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(normal_header.contains("Select text"));
         app.selection_mode = true;
         terminal.draw(|frame| app.render(frame)).unwrap();
         let header = (0..90)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect::<String>();
         assert!(header.contains("SELECT"));
+    }
+
+    #[test]
+    fn chat_wheel_scroll_leaves_and_returns_to_newest() {
+        let mut app = App::new(Model::default());
+        app.tab = 1;
+        app.chat_max_scroll.set(20);
+        scroll_detail(&mut app, true);
+        assert_eq!(app.scroll[1], 17);
+        scroll_detail(&mut app, false);
+        assert_eq!(app.scroll[1], u16::MAX);
+    }
+
+    #[test]
+    fn history_panel_and_text_selection_controls_fit_a_normal_terminal() {
+        let mut app = App::new(Model::default());
+        app.tab = 1;
+        app.history_open = true;
+        app.model.timeline_truncated = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("History & details"));
+        assert!(content.contains("Load older pages"));
+        assert!(!content.contains("Browse"));
+        let history = app.history_control.get();
+        let select = app.select_control.get();
+        assert!(point_in(history, history.x + 1, 0));
+        assert!(point_in(select, select.x + 1, 0));
     }
 
     #[test]

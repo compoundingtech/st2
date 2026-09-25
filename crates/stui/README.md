@@ -13,8 +13,10 @@ with a running st3 daemon. For source development, use
 A concrete person identity is required so Now and devices show the right data.
 
 Keys: `1`–`4` switch Now, Chat, Control, and Fleet; arrow keys or a sidebar click select an item;
-PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message; `s` hides the sidebar;
-`v` toggles terminal text selection by releasing mouse capture; `i` shows connection details; `q` quits.
+the mouse wheel and PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message;
+`h` or the History control opens Chat history and details, and its Load older pages control fetches more history;
+`s` hides the sidebar; `v` or the Select text control releases mouse capture for native terminal text
+selection (press `v` again to return); `i` shows connection details; `q` quits.
 Now cards show the available action keys. Choose an action, enter a reason for a review decision,
 then confirm with `y`; actions without a typed TUI flow are marked CLI. Chat shows recent received messages for the selected agent and
 bounded normalized history for its current session. It preserves message line breaks, simplifies Markdown headings, lists, quotes and code blocks, and hides known internal transcript markup across supported drivers. Running undeclared
@@ -34,7 +36,8 @@ the sidebar hides automatically.
 Now contains only open attention addressed to the current person. Agent transcript text and
 unread messages do not become person attention. Resource lists stop after four pages of 50 items;
 the active conversation pages past status-only entries until it has twelve content entries or
-reaches four pages, then marks older history. Recent messages load only for the selected agent.
+reaches four pages. Older loaded messages are shown in the History pane, which can fetch up to
+32 pages on demand. Recent messages load only for the selected agent.
 Event bursts refresh affected projections; a full refresh runs every two minutes. The
 event cursor is bounded and deduplicated; a
 cursor gap clears the cached timeline and reloads projections from a fresh capability cursor.
@@ -45,6 +48,7 @@ Verification:
 cargo test -p stui --locked
 cargo build -p stui --locked
 ST3_PERSON=person/<your-id> python3 crates/stui/tests/pty_smoke.py
+ST3_PERSON=person/<your-id> python3 crates/stui/tests/interaction_qa.py target/debug/stui
 ```
 
 The PTY smoke test needs a running local daemon. It checks first-frame and key-to-redraw latency,
