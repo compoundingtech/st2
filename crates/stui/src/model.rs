@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,8 @@ pub struct Model {
     pub actor: String,
     pub status: String,
     recent_events: VecDeque<String>,
+    #[serde(skip)]
+    pending_refresh: BTreeSet<Kind>,
 }
 
 impl Model {
@@ -71,35 +73,21 @@ impl Model {
             actor: capabilities.session_actor,
             ..Self::default()
         };
-        let (now, agents, sessions, messages) = tokio::try_join!(
+        let (now, agents, sessions) = tokio::try_join!(
             read_pages(client, Kind::Now),
             read_pages(client, Kind::Agents),
             read_pages(client, Kind::Sessions),
-            read_pages(client, Kind::Messages),
         )?;
         model.now = now;
         model.agents = agents;
         model.sessions = sessions;
-        model.messages = messages;
         model.status = "Connected · loading details…".into();
         Ok(model)
     }
 
     pub async fn reload(&mut self, client: &Client) -> Result<()> {
-        let (
-            now,
-            messages,
-            launches,
-            missions,
-            work,
-            agents,
-            sessions,
-            runtimes,
-            machines,
-            devices,
-        ) = tokio::try_join!(
+        let (now, launches, missions, work, agents, sessions, runtimes, machines, devices) = tokio::try_join!(
             read_pages(client, Kind::Now),
-            read_pages(client, Kind::Messages),
             read_pages(client, Kind::Launches),
             read_pages(client, Kind::Missions),
             read_pages(client, Kind::Work),
@@ -111,7 +99,6 @@ impl Model {
         )?;
         (
             self.now,
-            self.messages,
             self.launches,
             self.missions,
             self.work,
@@ -121,7 +108,7 @@ impl Model {
             self.machines,
             self.devices,
         ) = (
-            now, messages, launches, missions, work, agents, sessions, runtimes, machines, devices,
+            now, launches, missions, work, agents, sessions, runtimes, machines, devices,
         );
         self.status = "Connected".into();
         Ok(())
@@ -145,11 +132,57 @@ impl Model {
             }
             Err(error) => return Err(error.into()),
         };
-        let (changed, invalidated_sessions) = self.consume_events(events);
-        if changed {
-            self.reload(client).await?;
+        let (mut changed, mut invalidated_sessions) = self.consume_events(events);
+        // Drain a short burst before issuing projection reads. Busy fleets often
+        // publish several related events together.
+        for _ in 0..3 {
+            if !changed {
+                break;
+            }
+            let more = client
+                .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(0))
+                .await?
+                .value;
+            if more.items.is_empty() {
+                break;
+            }
+            let (more_changed, sessions) = self.consume_events(more);
+            changed |= more_changed;
+            invalidated_sessions.extend(sessions);
         }
+        if changed {
+            self.reload_changed(client).await?;
+        }
+        invalidated_sessions.sort();
+        invalidated_sessions.dedup();
         Ok((changed, invalidated_sessions, false))
+    }
+
+    async fn reload_changed(&mut self, client: &Client) -> Result<()> {
+        let mut remaining = std::mem::take(&mut self.pending_refresh);
+        for kind in remaining.clone() {
+            let collection = match read_pages(client, kind).await {
+                Ok(collection) => collection,
+                Err(error) => {
+                    self.pending_refresh.extend(remaining);
+                    return Err(error);
+                }
+            };
+            remaining.remove(&kind);
+            match kind {
+                Kind::Now => self.now = collection,
+                Kind::Launches => self.launches = collection,
+                Kind::Missions => self.missions = collection,
+                Kind::Work => self.work = collection,
+                Kind::Agents => self.agents = collection,
+                Kind::Sessions => self.sessions = collection,
+                Kind::Runtimes => self.runtimes = collection,
+                Kind::Machines => self.machines = collection,
+                Kind::Devices => self.devices = collection,
+                Kind::NativeSessions => unreachable!("native discovery has its own refresh"),
+            }
+        }
+        Ok(())
     }
 
     /// Native harnesses may start outside st3, so no graph event announces them.
@@ -186,20 +219,24 @@ impl Model {
                 self.event_cursor = event.next_cursor;
                 continue;
             }
-            let projection_changed = event.resource_ids.is_empty()
-                || event
-                    .resource_ids
-                    .iter()
-                    .any(|id| !id.starts_with("session/"));
-            changed |= projection_changed
-                && matches!(
-                    event.event_type,
-                    EventType::Upsert
-                        | EventType::Delete
-                        | EventType::TimelineDelta
-                        | EventType::CapabilitiesChanged
-                        | EventType::TerminalAvailable
-                );
+            if matches!(event.event_type, EventType::CapabilitiesChanged) {
+                self.pending_refresh.extend(Kind::ALL);
+            } else if matches!(event.event_type, EventType::TerminalAvailable) {
+                self.pending_refresh.insert(Kind::Runtimes);
+            } else if matches!(
+                event.event_type,
+                EventType::Upsert | EventType::Delete | EventType::TimelineDelta
+            ) {
+                for id in &event.resource_ids {
+                    if !(id.starts_with("session/")
+                        && event.body.get("reason").and_then(serde_json::Value::as_str)
+                            == Some("session-timeline-invalidated"))
+                    {
+                        self.pending_refresh.extend(Kind::for_resource(id));
+                    }
+                }
+            }
+            changed = !self.pending_refresh.is_empty();
             if event.body.get("reason").and_then(serde_json::Value::as_str)
                 == Some("session-timeline-invalidated")
             {
@@ -237,15 +274,42 @@ impl Model {
     }
 
     async fn load_timeline_once(&mut self, client: &Client, session_id: &str) -> Result<()> {
-        // The first page is the newest window. Fetch it alone for immediate conversation
-        // context; older history can be a deliberate follow-up without racing a busy cursor.
-        let page = client
-            .timeline(session_id, None, Some(PAGE_SIZE))
-            .await?
-            .value;
-        self.timeline = page.items;
-        self.timeline_truncated = page.page.has_more;
+        let mut cursor = None;
+        let mut entries = Vec::new();
+        let mut has_more = false;
+        for _ in 0..MAX_PAGES {
+            let page = client
+                .timeline(session_id, cursor.as_deref(), Some(PAGE_SIZE))
+                .await?
+                .value;
+            has_more = page.page.has_more;
+            cursor = page.page.next_cursor;
+            entries.extend(page.items);
+            if !conversation_needs_older_page(&entries, has_more) {
+                break;
+            }
+            if cursor.is_none() {
+                anyhow::bail!("timeline page omitted continuation cursor");
+            }
+        }
+        self.timeline = entries;
+        self.timeline_truncated = has_more;
         self.timeline.sort_by_key(|entry| entry.sequence);
+        Ok(())
+    }
+
+    pub async fn load_messages_for_peer(&mut self, client: &Client, peer: &str) -> Result<()> {
+        let Envelope {
+            snapshot, value, ..
+        } = client
+            .trusted_unscoped_read()
+            .messages_list_for_recipient(peer, None, Some(PAGE_SIZE), true)
+            .await?;
+        self.messages = Collection {
+            items: value.items,
+            snapshot: Some(snapshot),
+            truncated: value.page.has_more,
+        };
         Ok(())
     }
 
@@ -273,18 +337,12 @@ impl Model {
             _ => None,
         })
     }
-    pub fn messages(&self, session: Option<&str>, peer: &str) -> impl Iterator<Item = &Message> {
+    pub fn messages(&self, _session: Option<&str>, peer: &str) -> impl Iterator<Item = &Message> {
         self.messages
             .items
             .iter()
             .filter_map(move |item| match item {
-                Resource::Message(v)
-                    if v.session_id.as_deref() == session
-                        && ((v.from == peer && v.to == self.actor)
-                            || (v.to == peer && v.from == self.actor)) =>
-                {
-                    Some(v)
-                }
+                Resource::Message(v) if v.from == peer || v.to == peer => Some(v),
                 _ => None,
             })
     }
@@ -326,10 +384,9 @@ impl Model {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Kind {
     Now,
-    Messages,
     Launches,
     Missions,
     Work,
@@ -339,6 +396,45 @@ enum Kind {
     Runtimes,
     Machines,
     Devices,
+}
+
+impl Kind {
+    const ALL: [Self; 9] = [
+        Self::Now,
+        Self::Launches,
+        Self::Missions,
+        Self::Work,
+        Self::Agents,
+        Self::Sessions,
+        Self::Runtimes,
+        Self::Machines,
+        Self::Devices,
+    ];
+    fn for_resource(id: &str) -> &'static [Self] {
+        if id.starts_with("attention/") {
+            &[Self::Now]
+        } else if id.starts_with("message/") {
+            &[Self::Now]
+        } else if id.starts_with("launch/") {
+            &[Self::Launches, Self::Now]
+        } else if id.starts_with("mission/") || id.starts_with("mission-run/") {
+            &[Self::Missions, Self::Work, Self::Now]
+        } else if id.starts_with("step-run/") {
+            &[Self::Work, Self::Agents, Self::Missions, Self::Now]
+        } else if id.starts_with("agent/") {
+            &[Self::Agents, Self::Runtimes]
+        } else if id.starts_with("session/") {
+            &[Self::Sessions]
+        } else if id.starts_with("runtime/") {
+            &[Self::Runtimes, Self::Agents, Self::Machines]
+        } else if id.starts_with("machine/") || id.starts_with("host/") {
+            &[Self::Machines]
+        } else if id.starts_with("device/") {
+            &[Self::Devices]
+        } else {
+            &[]
+        }
+    }
 }
 
 async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
@@ -369,11 +465,6 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
             Kind::Now => {
                 client
                     .attention_list(cursor.as_deref(), Some(PAGE_SIZE), false)
-                    .await?
-            }
-            Kind::Messages => {
-                client
-                    .messages_list(cursor.as_deref(), Some(PAGE_SIZE), false)
                     .await?
             }
             Kind::Launches => {
@@ -444,7 +535,8 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
     let body = match &entry.body {
         TimelineBody::Content(v) => v
             .text
-            .clone()
+            .as_deref()
+            .map(clean_message_text)
             .unwrap_or_else(|| format!("[{} attachment]", v.media_type)),
         TimelineBody::ToolCall(v) => format!("called {}", v.name),
         TimelineBody::ToolResult(v) => format!("tool result: {:?}", v.status),
@@ -459,9 +551,57 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
     format!("{role}: {}", body.replace('\n', " ⏎ "))
 }
 
+pub fn conversation_needs_older_page(entries: &[TimelineEntry], has_more: bool) -> bool {
+    has_more
+        && entries
+            .iter()
+            .filter(|entry| matches!(entry.body, TimelineBody::Content(_)))
+            .count()
+            < 12
+}
+
+pub fn clean_message_text(raw: &str) -> String {
+    let text = raw.strip_prefix("[PING] ?").unwrap_or(raw).trim();
+    if let Some(start) = text.rfind(" [id:message/")
+        && text.ends_with(']')
+    {
+        return text[..start].to_owned();
+    }
+    text.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_recent_messages_include_closed_and_sessionless_messages() {
+        let message: Resource = serde_json::from_str(r#"{"kind":"message","id":"message/old","revision":"one","updated_at":"2026-09-25T08:00:00Z","from":"agent/cos","to":"agent/st3","title":null,"content":"hello","state":"closed","sent_at":"2026-09-25T08:00:00Z","in_reply_to":null,"session_id":"session/old"}"#).unwrap();
+        let model = Model {
+            actor: "person/nathan".into(),
+            messages: Collection {
+                items: vec![message],
+                ..Collection::default()
+            },
+            ..Model::default()
+        };
+        assert_eq!(model.messages(Some("session/new"), "agent/st3").count(), 1);
+    }
+
+    #[test]
+    fn regression_chat_page_skips_status_heartbeats() {
+        let statuses = (0..50).map(|sequence| serde_json::from_value::<TimelineEntry>(serde_json::json!({"id":format!("timeline/{sequence}"),"sequence":sequence,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"system","type":"status","final":true,"body":{"status":"running","detail":"ready"}})).unwrap()).collect::<Vec<_>>();
+        assert!(conversation_needs_older_page(&statuses, true));
+    }
+
+    #[test]
+    fn regression_notification_text_is_cleaned() {
+        assert_eq!(
+            clean_message_text("[PING] ? hello [id:message/abc]"),
+            "hello"
+        );
+        assert_eq!(clean_message_text("[PING] ?"), "");
+    }
 
     #[tokio::test]
     #[ignore = "requires a live local st3 daemon"]
@@ -555,6 +695,20 @@ mod tests {
         let cursor = model.event_cursor.clone();
         assert!(!model.consume_events(envelope.value).0);
         assert_eq!(model.event_cursor, cursor);
+    }
+
+    #[test]
+    fn event_refresh_is_selective_and_ignores_unscoped_noise() {
+        let events: EventPage = serde_json::from_value(serde_json::json!({
+            "kind":"event-page", "oldest_cursor":"event-cursor/node/0", "resume_cursor":"event-cursor/node/2", "has_more":false,
+            "items":[
+                {"id":"event/noise","epoch":"node","sequence":1,"previous_cursor":"event-cursor/node/0","next_cursor":"event-cursor/node/1","timestamp":"2026-09-25T08:00:00Z","type":"upsert","resource_ids":[],"snapshot_id":"snapshot/one","body":{}},
+                {"id":"event/attention","epoch":"node","sequence":2,"previous_cursor":"event-cursor/node/1","next_cursor":"event-cursor/node/2","timestamp":"2026-09-25T08:00:01Z","type":"upsert","resource_ids":["attention/one"],"snapshot_id":"snapshot/two","body":{}}
+            ]
+        })).unwrap();
+        let mut model = Model::default();
+        assert!(model.consume_events(events).0);
+        assert_eq!(model.pending_refresh, BTreeSet::from([Kind::Now]));
     }
 
     #[test]

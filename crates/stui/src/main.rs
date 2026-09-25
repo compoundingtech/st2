@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use model::{Model, timeline_line};
+use model::{Model, clean_message_text, timeline_line};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -20,9 +20,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
-    Client, ClientError, ErrorCode, Fence, LaunchCreateParameters, LaunchTarget,
-    MessageSendParameters, TargetParameters, TerminalInputMode, TerminalInputParameters,
-    TerminalScreen,
+    AttentionResolveParameters, Client, ClientError, ErrorCode, Fence, LaunchCreateParameters,
+    LaunchTarget, MessageSendParameters, TargetParameters, TerminalInputMode,
+    TerminalInputParameters, TerminalScreen,
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -37,6 +37,7 @@ use std::{
 };
 
 const TABS: [&str; 4] = ["Now", "Chat", "Control", "Fleet"];
+const TIMELINE_REFRESH: Duration = Duration::from_secs(30);
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -83,6 +84,7 @@ enum Update {
     Partial(Box<Model>),
     Model(Box<Model>),
     Timeline(String, Vec<st3_client::TimelineEntry>, bool),
+    Messages(String, model::Collection),
     TimelineInvalidated(String),
     TimelineCursorGap,
     Error(String),
@@ -106,6 +108,8 @@ struct App {
     chat_scroll_cache: BTreeMap<String, u16>,
     chat_draft_cache: BTreeMap<String, String>,
     last_timeline: Instant,
+    messages_requested: Option<String>,
+    last_messages: Instant,
     last_terminal: Instant,
 }
 impl App {
@@ -129,6 +133,8 @@ impl App {
             chat_scroll_cache: BTreeMap::new(),
             chat_draft_cache: BTreeMap::new(),
             last_timeline: Instant::now(),
+            messages_requested: None,
+            last_messages: Instant::now(),
             last_terminal: Instant::now(),
         }
     }
@@ -146,7 +152,7 @@ impl App {
         self.timeline_cache.clear();
         // Keep the selected conversation visible while the fresh page loads.
         // A later selection still starts from an empty cache, never from this view.
-        self.last_timeline = Instant::now() - Duration::from_secs(10);
+        self.last_timeline = Instant::now() - TIMELINE_REFRESH;
     }
     fn restore_chat_scroll(&mut self) {
         self.scroll[1] = self
@@ -259,6 +265,17 @@ impl App {
         self.model
             .runtimes()
             .find(|runtime| runtime.owner_id == peer.header.id && runtime.terminal_id.is_some())
+    }
+    fn agent_on_host(&self, agent_id: &str, host_id: &str) -> bool {
+        self.model
+            .runtimes()
+            .any(|runtime| runtime.owner_id == agent_id && runtime.owner_host_id == host_id)
+    }
+    fn work_age(&self, work_id: &str) -> Option<String> {
+        self.model
+            .work()
+            .find(|work| work.header.id == work_id)
+            .map(|work| age_label(&work.header.updated_at, &chrono::Utc::now().to_rfc3339()))
     }
     fn count(&self) -> usize {
         self.count_for(self.tab)
@@ -415,7 +432,7 @@ impl App {
                 2 => self
                     .control_missions()
                     .iter()
-                    .map(|v| format!("{}  ·  {}", mission_label(v), self.mission_group(v)))
+                    .map(|v| format!("{}  ·  {}", mission_display_label(v), self.mission_group(v)))
                     .collect(),
                 _ => self
                     .model
@@ -459,7 +476,14 @@ impl App {
                         v.title.clone(),
                         v.detail.clone(),
                         format!("Source: {}", v.source_id),
-                        format!("Actions: {}", v.actions.join(", ")),
+                        format!(
+                            "Actions: {}",
+                            v.actions
+                                .iter()
+                                .map(|action| action_label(action))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                     ]);
                 } else {
                     lines.push("Nothing needs your attention.".into());
@@ -472,9 +496,17 @@ impl App {
                 if let Some(peer) = self.peer() {
                     lines.push(format!("AGENT  /  {}", peer.name));
                     lines.push(String::new());
-                    lines.push(format!("{}  ·  {}", peer.state, peer.reachability));
+                    lines.push(format!(
+                        "{}  ·  {}  ·  observed {}",
+                        peer.state,
+                        peer.reachability,
+                        age_label(&peer.header.updated_at, &chrono::Utc::now().to_rfc3339())
+                    ));
                     if let Some(driver) = &peer.driver {
-                        lines.push(format!("Harness: {driver}"));
+                        lines.push(format!(
+                            "Harness: {driver} · {}",
+                            peer.harness_state.as_deref().unwrap_or("unknown")
+                        ));
                     }
                     lines.push(format!(
                         "Current session: {}",
@@ -489,6 +521,9 @@ impl App {
                         if let Some(next) = &peer.next_work_id {
                             lines.push(format!("  Next: {next}"));
                             lines.push(format!("  {} ready across runs", peer.queued_work_count));
+                            if let Some(age) = self.work_age(next) {
+                                lines.push(format!("  Ready {age}"));
+                            }
                         }
                     }
                     lines.push(String::new());
@@ -498,30 +533,55 @@ impl App {
                         .messages(self.selected_session_id().as_deref(), &peer.header.id)
                         .take(4)
                     {
+                        let cleaned = clean_message_text(&message.content);
                         lines.push(format!(
                             "  {}: {}",
                             message.from,
-                            message.content.replace('\n', " ⏎ ")
+                            if cleaned.is_empty() {
+                                message
+                                    .title
+                                    .as_deref()
+                                    .unwrap_or("(notification)")
+                                    .to_owned()
+                            } else {
+                                cleaned.replace('\n', " ⏎ ")
+                            }
                         ));
                         lines.push(String::new());
                     }
                     lines.push("CONVERSATION".into());
-                    for entry in self
+                    if self.model.timeline_truncated || self.model.messages.truncated {
+                        lines.push("[More history beyond bounded view]".into());
+                    }
+                    let conversation = self
                         .model
                         .timeline
                         .iter()
                         .rev()
-                        .filter(|entry| matches!(entry.body, st3_client::TimelineBody::Content(_)))
+                        .filter(|entry| match &entry.body {
+                            st3_client::TimelineBody::Content(content) => content
+                                .text
+                                .as_deref()
+                                .is_none_or(|text| !clean_message_text(text).is_empty()),
+                            _ => false,
+                        })
                         .take(12)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                    {
+                        .collect::<Vec<_>>();
+                    if conversation.is_empty() {
+                        lines.push(
+                            if self
+                                .selected_session_id()
+                                .is_some_and(|id| self.timeline_cache.contains_key(&id))
+                            {
+                                "No conversation in recent timeline.".into()
+                            } else {
+                                "Loading conversation…".into()
+                            },
+                        );
+                    }
+                    for entry in conversation.into_iter().rev() {
                         lines.push(format!("  {}", timeline_line(entry)));
                         lines.push(String::new());
-                    }
-                    if self.model.timeline_truncated || self.model.messages.truncated {
-                        lines.push("[More history beyond bounded view]".into());
                     }
                 } else if let Some(session) = self.undeclared_session() {
                     let driver = session
@@ -565,7 +625,7 @@ impl App {
                 lines.push("CONTROL  /  MISSIONS".into());
                 lines.push(String::new());
                 if let Some(mission) = self.control_missions().get(self.selected[2]).copied() {
-                    lines.push(mission_label(mission));
+                    lines.push(mission_display_label(mission));
                     lines.push(format!(
                         "{}  ·  {} runs",
                         self.mission_group(mission),
@@ -624,7 +684,8 @@ impl App {
             _ => {
                 lines.push("FLEET  /  MACHINES".into());
                 lines.push(String::new());
-                if let Some(machine) = self.model.machines().nth(self.selected[3]) {
+                let selected_machine = self.model.machines().nth(self.selected[3]);
+                if let Some(machine) = selected_machine {
                     lines.push(format!("{}  ·  {}", machine.name, machine.state));
                     lines.push(format!("Capacity: {}", machine.capacity.state));
                     lines.push(format!(
@@ -641,11 +702,11 @@ impl App {
                 }
                 lines.push(String::new());
                 lines.push("AGENT WORK".into());
-                for agent in self
-                    .model
-                    .agents()
-                    .filter(|agent| agent.active_work_count > 0 || agent.queued_work_count > 0)
-                {
+                for agent in self.model.agents().filter(|agent| {
+                    selected_machine.is_some_and(|machine| {
+                        self.agent_on_host(&agent.header.id, &machine.host_id)
+                    }) && (agent.active_work_count > 0 || agent.queued_work_count > 0)
+                }) {
                     lines.push(format!(
                         "  {}  ·  {} active · {} queued",
                         agent_label(agent),
@@ -654,12 +715,10 @@ impl App {
                     ));
                     if let Some(next) = &agent.next_work_id {
                         lines.push(format!("    Next: {next}"));
+                        if let Some(age) = self.work_age(next) {
+                            lines.push(format!("    Ready {age}"));
+                        }
                     }
-                }
-                lines.push(String::new());
-                lines.push("YOU & DEVICES".into());
-                for v in self.model.devices() {
-                    lines.push(format!("  {}  ·  {}", v.person_id, v.state));
                 }
                 let gateway = self
                     .model
@@ -668,31 +727,38 @@ impl App {
                     .as_ref()
                     .map(|s| s.host_id.as_str())
                     .unwrap_or("connected machine");
-                lines.push(String::new());
-                lines.push(format!("UNDECLARED ON {gateway}"));
-                for session in self.model.undeclared_sessions() {
-                    let driver = session
-                        .extra
-                        .get("driver")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("harness");
-                    let exact = session
-                        .extra
-                        .get("native_session_id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some();
-                    lines.push(format!(
-                        "  {driver}  ·  {}  ·  {}",
-                        if exact {
-                            "native session"
-                        } else {
-                            "unresolved process"
-                        },
-                        session.header.id
-                    ));
+                if selected_machine.is_some_and(|machine| machine.host_id == gateway) {
+                    lines.push(String::new());
+                    lines.push("YOUR DEVICES (connected gateway)".into());
+                    for v in self.model.devices() {
+                        lines.push(format!("  {}  ·  {}", device_label(v), v.state));
+                    }
+                    lines.push(String::new());
+                    lines.push(format!("UNDECLARED ON {gateway}"));
+                    for session in self.model.undeclared_sessions() {
+                        let driver = session
+                            .extra
+                            .get("driver")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("harness");
+                        let exact = session
+                            .extra
+                            .get("native_session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some();
+                        lines.push(format!(
+                            "  {driver}  ·  {}  ·  {}",
+                            if exact {
+                                "native session"
+                            } else {
+                                "unresolved process"
+                            },
+                            session.header.id
+                        ));
+                    }
+                    lines.push(String::new());
+                    lines.push("Discovery is local to the connected gateway.".into());
                 }
-                lines.push(String::new());
-                lines.push("Discovery is local to the connected gateway.".into());
                 if self.model.machines.truncated || self.model.devices.truncated {
                     lines.push("[More fleet items beyond bounded view]".into());
                 }
@@ -748,6 +814,103 @@ fn mission_label(mission: &st3_client::Mission) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+fn mission_display_label(mission: &st3_client::Mission) -> String {
+    let fingerprint = mission
+        .header
+        .id
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{:08x} · {}", fingerprint as u32, mission_label(mission))
+}
+fn action_label(action: &str) -> String {
+    match action {
+        "attention.resolve" => "Resolve (r)".into(),
+        other => other.replace('.', " "),
+    }
+}
+fn age_label(then: &str, now: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(then).ok();
+    let current = chrono::DateTime::parse_from_rfc3339(now).ok();
+    let Some(seconds) = parsed
+        .zip(current)
+        .map(|(then, now)| (now - then).num_seconds().max(0))
+    else {
+        return "unknown age".into();
+    };
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86400)
+    }
+}
+fn device_label(device: &st3_client::Device) -> String {
+    let name = device
+        .name
+        .as_deref()
+        .unwrap_or_else(|| device.header.id.trim_start_matches("device/"));
+    format!("{name} ({})", device.person_id)
+}
+fn person_from_config(path: &std::path::Path) -> Result<Option<String>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: toml::Value = toml::from_str(&raw)?;
+    Ok(value
+        .get("person")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned))
+}
+fn configured_person() -> Result<Option<String>> {
+    if let Ok(person) = std::env::var("ST3_PERSON") {
+        return Ok(Some(person));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    base.map(|base| person_from_config(&base.join("st3/config.toml")))
+        .transpose()
+        .map(Option::flatten)
+}
+fn stdin_hung_up() -> bool {
+    if !io::stdin().is_terminal() {
+        return true;
+    }
+    let mut fd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // A closed PTY master leaves a POLLHUP/POLLERR on the slave; crossterm's
+    // event reader can otherwise spin or block after the terminal disappears.
+    let result = unsafe { libc::poll(&mut fd, 1, 0) };
+    result > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+fn poll_terminal() -> Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut fd, 1, 100) };
+    if result < 0 {
+        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            return Ok(true);
+        }
+        return Err(io::Error::last_os_error().into());
+    }
+    if fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Ok(false);
+    }
+    Ok(true)
 }
 fn agent_label(agent: &st3_client::Agent) -> String {
     let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
@@ -1080,6 +1243,41 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
         KeyCode::Char('s') => app.sidebar = !app.sidebar,
+        KeyCode::Char('r') if app.tab == 0 => {
+            let selected_attention = app.model.attention().nth(app.selected[0]).cloned();
+            if !app.live_ready {
+                app.model.status = "Reconnect before resolving attention".into();
+            } else if let Some(attention) = selected_attention {
+                if attention
+                    .actions
+                    .iter()
+                    .any(|action| action == "attention.resolve")
+                {
+                    let attention_id = attention.header.id.clone();
+                    let fence = app
+                        .model
+                        .now
+                        .fence(&attention_id)
+                        .context("attention fence unavailable")?;
+                    let (id, idem) = action_pair();
+                    client
+                        .attention_resolve(
+                            id,
+                            idem,
+                            fence,
+                            AttentionResolveParameters {
+                                attention_id,
+                                outcome: "resolved".into(),
+                                reason: None,
+                            },
+                        )
+                        .await?;
+                    app.model.reload(client).await?;
+                } else {
+                    app.model.status = "Selected attention has no resolve action".into();
+                }
+            }
+        }
         KeyCode::Char('x') if app.tab == 2 => {
             app.show_system_missions = !app.show_system_missions;
             app.selected[2] = app.selected[2].min(app.count_for(2).saturating_sub(1));
@@ -1162,7 +1360,13 @@ fn main() -> Result<()> {
     }
     let path =
         st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(PathBuf::from))?;
-    let person = std::env::var("ST3_PERSON").ok();
+    let person = configured_person()?;
+    anyhow::ensure!(
+        person
+            .as_deref()
+            .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
+        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st3 config"
+    );
     let cache_path = person
         .as_deref()
         .and_then(|actor| cache::path(&path, actor));
@@ -1214,6 +1418,7 @@ fn main() -> Result<()> {
         let _ = background_updates.send(Update::Model(Box::new(model.clone())));
         let mut last_external_scan = Instant::now();
         let mut last_cache_save = Instant::now();
+        let mut last_full_reload = Instant::now();
         let mut was_offline = false;
         loop {
             let mut changed = match model.sync(&background_client).await {
@@ -1262,6 +1467,16 @@ fn main() -> Result<()> {
                 }
                 last_external_scan = Instant::now();
             }
+            if last_full_reload.elapsed() >= Duration::from_secs(120) {
+                match model.reload(&background_client).await {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        let _ = background_updates
+                            .send(Update::Error(format!("Periodic refresh: {error}")));
+                    }
+                }
+                last_full_reload = Instant::now();
+            }
             if changed && last_cache_save.elapsed() >= Duration::from_secs(60) {
                 if let (Some(path), Some(actor)) = (&background_cache_path, &background_actor) {
                     let _ = cache::save(path, actor, &model);
@@ -1292,8 +1507,11 @@ fn main() -> Result<()> {
         app.model = cached;
         app.dirty = true;
     }
-    while !stopping.load(Ordering::Relaxed) {
-        while let Ok(update) = incoming.try_recv() {
+    while !stopping.load(Ordering::Relaxed) && !stdin_hung_up() {
+        while !stopping.load(Ordering::Relaxed) && !stdin_hung_up() {
+            let Ok(update) = incoming.try_recv() else {
+                break;
+            };
             match update {
                 Update::Partial(model) => {
                     if !app.live_ready {
@@ -1314,11 +1532,13 @@ fn main() -> Result<()> {
                     if app.model.actor == model.actor {
                         model.timeline = std::mem::take(&mut app.model.timeline);
                         model.timeline_truncated = app.model.timeline_truncated;
+                        model.messages = std::mem::take(&mut app.model.messages);
                     } else {
                         app.timeline_cache.clear();
                         app.chat_scroll_cache.clear();
                         app.chat_draft_cache.clear();
                         app.timeline_requested = None;
+                        app.messages_requested = None;
                     }
                     app.model = *model;
                     app.live_ready = true;
@@ -1342,9 +1562,18 @@ fn main() -> Result<()> {
                         app.dirty = true;
                     }
                 }
+                Update::Messages(peer, messages) => {
+                    if app
+                        .peer()
+                        .is_some_and(|selected| selected.header.id == peer)
+                    {
+                        app.model.messages = messages;
+                        app.dirty = true;
+                    }
+                }
                 Update::TimelineInvalidated(id) => {
                     if app.selected_session_id().as_deref() == Some(&id) {
-                        app.last_timeline = Instant::now() - Duration::from_secs(10);
+                        app.last_timeline = Instant::now() - TIMELINE_REFRESH;
                     }
                 }
                 Update::TimelineCursorGap => {
@@ -1365,7 +1594,7 @@ fn main() -> Result<()> {
         if app.tab == 1 {
             let selected_id = app.selected_session_id();
             if selected_id != app.timeline_requested
-                || app.last_timeline.elapsed() >= Duration::from_secs(10)
+                || app.last_timeline.elapsed() >= TIMELINE_REFRESH
             {
                 if selected_id != app.timeline_requested {
                     let cached = selected_id
@@ -1401,12 +1630,40 @@ fn main() -> Result<()> {
                     app.dirty = true;
                 }
             }
+            let selected_peer = app.peer().map(|peer| peer.header.id.clone());
+            if selected_peer != app.messages_requested
+                || app.last_messages.elapsed() >= TIMELINE_REFRESH
+            {
+                app.messages_requested = selected_peer.clone();
+                app.last_messages = Instant::now();
+                app.model.messages = model::Collection::default();
+                if let Some(peer) = selected_peer {
+                    let message_client = client.clone();
+                    let message_updates = updates.clone();
+                    runtime.spawn(async move {
+                        let mut model = Model::default();
+                        match model.load_messages_for_peer(&message_client, &peer).await {
+                            Ok(()) => {
+                                let _ =
+                                    message_updates.send(Update::Messages(peer, model.messages));
+                            }
+                            Err(error) => {
+                                let _ = message_updates
+                                    .send(Update::Error(format!("Recent messages: {error}")));
+                            }
+                        }
+                    });
+                }
+            }
         }
         if app.dirty {
             guard.terminal.draw(|frame| app.render(frame))?;
             app.dirty = false;
         }
-        if event::poll(Duration::from_millis(100))? {
+        if !poll_terminal()? {
+            break;
+        }
+        if event::poll(Duration::ZERO)? && !stopping.load(Ordering::Relaxed) && !stdin_hung_up() {
             match event::read()? {
                 Event::Key(key) => match runtime.block_on(handle_key(&mut app, &client, key)) {
                     Ok(true) => break,
@@ -1450,6 +1707,129 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    fn local_machine(model: &mut Model) {
+        model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/hetz","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/hetz","name":"hetz","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());
+        model.sessions.snapshot = Some(st3_client::Snapshot {
+            id: "snapshot/hetz/1".into(),
+            host_id: "host/hetz".into(),
+            store_index: 1,
+            projection_version: "v0".into(),
+            created_at: "2026-09-25T08:00:00Z".into(),
+        });
+    }
+    #[test]
+    fn regression_person_falls_back_to_local_config() {
+        let dir = std::env::temp_dir().join(format!("stui-person-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "person = \"person/nathan\"\n").unwrap();
+        assert_eq!(
+            person_from_config(&path).unwrap().as_deref(),
+            Some("person/nathan")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_ready_work_and_agent_observation_show_age() {
+        assert!(age_label("2026-09-24T11:56:00Z", "2026-09-25T08:56:00Z").contains("21h"));
+    }
+    #[test]
+    fn regression_agent_header_shows_harness_state() {
+        let mut model = Model::default();
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"failed","reachability":"reachable","driver":"claude","harness_state":"ended"}"#).unwrap());
+        let mut app = App::new(model);
+        app.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Harness: claude · ended"));
+        assert!(content.contains("observed"));
+    }
+
+    #[test]
+    fn regression_mission_labels_are_unique() {
+        let first: st3_client::Resource = serde_json::from_str(r#"{"kind":"mission","id":"mission/a/issue-triage","revision":"a","updated_at":"2026-09-25T08:00:00Z","title":"Issue Triage","state":"running","mission_revision":"a"}"#).unwrap();
+        let second: st3_client::Resource = serde_json::from_str(r#"{"kind":"mission","id":"mission/b/issue-triage","revision":"b","updated_at":"2026-09-25T08:00:00Z","title":"Issue Triage","state":"running","mission_revision":"b"}"#).unwrap();
+        let (st3_client::Resource::Mission(a), st3_client::Resource::Mission(b)) = (first, second)
+        else {
+            panic!()
+        };
+        assert_ne!(mission_display_label(&a), mission_display_label(&b));
+    }
+
+    #[test]
+    fn regression_now_action_has_a_useful_label_and_key() {
+        assert_eq!(action_label("attention.resolve"), "Resolve (r)");
+    }
+
+    #[test]
+    fn regression_fleet_agent_work_is_scoped_to_selected_host() {
+        let agent: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"Worker","state":"running","reachability":"reachable","runtime_ids":["runtime/worker"],"active_work_count":1}"#).unwrap();
+        let runtime: st3_client::Resource = serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/Silber","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"a"}"#).unwrap();
+        let mut model = Model::default();
+        model.agents.items.push(agent);
+        model.runtimes.items.push(runtime);
+        let app = App::new(model);
+        assert!(!app.agent_on_host("agent/worker", "host/hetz"));
+        assert!(app.agent_on_host("agent/worker", "host/Silber"));
+    }
+
+    #[test]
+    fn regression_device_rows_identify_each_device() {
+        let device: st3_client::Resource = serde_json::from_str(r#"{"kind":"device","id":"device/iphone-15","revision":"a","updated_at":"2026-09-25T08:00:00Z","person_id":"person/nathan","session_actor":"person/nathan/session/abc","state":"active","expires_at":"2026-10-01T00:00:00Z"}"#).unwrap();
+        let st3_client::Resource::Device(device) = device else {
+            panic!()
+        };
+        assert!(device_label(&device).contains("iphone-15"));
+    }
+    #[test]
+    fn regression_history_marker_precedes_visible_conversation() {
+        let mut model = Model::default();
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/cos","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"cos","state":"running","reachability":"reachable"}"#).unwrap());
+        model.timeline_truncated = true;
+        model.timeline.push(serde_json::from_str(r#"{"id":"timeline/one","sequence":1,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"assistant","type":"content","final":true,"body":{"media_type":"text/plain","text":"Visible newest message"}}"#).unwrap());
+        let mut app = App::new(model);
+        app.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.find("[More history beyond bounded view]").unwrap()
+                < content.find("Visible newest message").unwrap()
+        );
+    }
+    #[test]
+    fn regression_status_only_timeline_has_an_explanation() {
+        let mut model = Model::default();
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/app-apple","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"App Apple","state":"running","reachability":"reachable","current_session_id":"session/apple"}"#).unwrap());
+        let mut app = App::new(model);
+        app.tab = 1;
+        app.timeline_cache
+            .insert("session/apple".into(), (Vec::new(), false));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("No conversation in recent timeline."));
+    }
     #[test]
     fn all_views_render_at_normal_and_narrow_width() {
         let mut app = App::new(Model::default());
@@ -1522,6 +1902,9 @@ mod tests {
         .unwrap();
         let mut model = Model::default();
         model.agents.items.push(agent);
+        model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/new/review","revision":"one","updated_at":"2026-09-24T11:56:00Z","mission_run_id":"mission-run/new","generation_id":"run-generation/new","definition_id":"one","path":"review","state":"ready","attempt":1,"readiness_epoch":1,"claimant":null,"claim_incarnation":null,"blocked_reason":null}"#).unwrap());
+        model.runtimes.items.push(serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"one","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/hetz","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"one"}"#).unwrap());
+        local_machine(&mut model);
         let mut app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
         for (tab, expected) in [(1, "Next: step-run/new/review"), (3, "2 queued")] {
@@ -1535,6 +1918,10 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(rows.contains(expected), "tab {tab} did not show {expected}");
+            assert!(
+                rows.contains("Ready "),
+                "tab {tab} did not show queued work age"
+            );
         }
     }
 
@@ -1546,6 +1933,7 @@ mod tests {
         .unwrap();
         let mut model = Model::default();
         model.sessions.items.push(session);
+        local_machine(&mut model);
         let mut app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
         for tab in [1, 3] {
