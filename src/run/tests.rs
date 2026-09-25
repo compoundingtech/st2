@@ -2543,6 +2543,72 @@ fn build_run_command_wraps_command_in_sh_c() {
 }
 
 #[test]
+fn spawn_requires_identity_bound_live_stats_after_a_running_roster_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let pty_root = temporary.path().join("pty");
+    std::fs::create_dir(&pty_root).unwrap();
+    let invocations = temporary.path().join("invocations");
+    let report_live = temporary.path().join("report-live");
+    let executable = temporary.path().join("pty-bin");
+    std::fs::write(
+        &executable,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  run)
+    printf '%s\n' 'run -d' >> {invocations:?}
+    exit 0
+    ;;
+  list)
+    printf '%s\n' 'list --json' >> {invocations:?}
+    printf '%s\n' '[{{"name":"h.worker","status":"running","pid":41,"createdAt":"2026-09-12T10:00:00.000Z"}}]'
+    ;;
+  stats)
+    printf '%s\n' "$*" >> {invocations:?}
+    if [ -e {report_live:?} ]; then
+      printf '%s\n' '{{"name":"h.worker","process":{{"alive":true}},"daemon":{{"pid":41}},"createdAt":"2026-09-12T10:00:00.000Z"}}'
+    else
+      printf '%s\n' '{{"name":"h.worker","process":{{"alive":false}},"daemon":{{"pid":41}},"createdAt":"2026-09-12T10:00:00.000Z"}}'
+    fi
+    ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+    let cli = PtyCli {
+        bin: executable.display().to_string(),
+        catalog_root: temporary.path().to_path_buf(),
+        on_command_spawn: None,
+    };
+    let task = target("h.worker", "exit 0");
+
+    let error = cli.spawn(&task, temporary.path()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("ProcessUnavailable"),
+        "a stale running roster row must not pass the boot gate: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&invocations).unwrap(),
+        "run -d\nlist --json\nstats --json h.worker\n",
+        "a disproved launch must not be accepted or retried as an id-collision"
+    );
+
+    std::fs::write(report_live, b"live\n").unwrap();
+    cli.spawn(&task, temporary.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(invocations).unwrap(),
+        "run -d\nlist --json\nstats --json h.worker\nrun -d\nlist --json\nstats --json h.worker\n",
+        "one identity-consistent stats reply must admit a genuinely live generation"
+    );
+}
+
+#[test]
 fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
     let key = "ST2_TEST_PRESENTATION_LITERAL_71c";
     unsafe { std::env::set_var(key, "expanded") }
