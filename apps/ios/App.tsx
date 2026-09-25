@@ -11,6 +11,7 @@ import { agentLabel, agentTree } from './agentTree';
 import { tabsChangedByProjectionEvents } from './projectionRefresh';
 import { rememberBounded } from './boundedCache';
 import { withFreshTerminalFence } from './terminalControls';
+import { RefreshFlight } from './refreshFlight';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -82,7 +83,7 @@ export default function App() {
   const [title, setTitle] = useState(''), [request, setRequest] = useState(''), [workspace, setWorkspace] = useState('');
   const [provider, setProvider] = useState<'codex' | 'claude' | 'pi' | 'omp' | 'opencode'>('codex');
   const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [feedback, setFeedback] = useState('');
-  const refreshing = useRef(false), snapshotRetry = useRef(0);
+  const refreshing = useRef(new RefreshFlight()), snapshotRetry = useRef(0);
   const firstDataShown = useRef(false);
   const cachedActor = useRef(''), cachedIndex = useRef(-1), cacheSavedAt = useRef(0);
   const projectionEventCursor = useRef<string | null>(null);
@@ -172,9 +173,8 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     if (!client || !credential) { setStatus('setup'); return; }
-    if (refreshing.current) return;
-    refreshing.current = true;
     const generation = cacheGeneration.current;
+    if (!refreshing.current.start(generation)) return;
     setStatus(s => s === 'online' ? s : 'connecting');
     try {
       const capability = await client.capabilities(), limit = Math.min(capability.value.limits.max_page_items, 30);
@@ -245,11 +245,11 @@ export default function App() {
         setStatus('offline');
         setError(e instanceof ClientError && e.status >= 400 && e.status < 500 ? errorText(e) : '');
       }
-    } finally { refreshing.current = false; }
+    } finally { refreshing.current.finish(generation); }
   }, [client, credential, url]);
   const refreshNativeSessions = useCallback(async () => {
-    if (!client || refreshing.current) return;
     const generation = cacheGeneration.current;
+    if (!client || refreshing.current.isCurrent(generation)) return;
     const native = await listSessionPages(options => client.sessionsList({ ...options, native_only: true }), Math.min(caps?.limits.max_page_items ?? 30, 30));
     if (generation !== cacheGeneration.current) return;
     setData(previous => ({ ...previous, sessions: [...previous.sessions.filter(session => !isUnmanaged(session)), ...native] }));
