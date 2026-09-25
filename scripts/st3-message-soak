@@ -24,8 +24,8 @@ log() {
 # Fabric exec can time out after the remote st3 command has committed. Recover
 # only the exact durable request, never infer success from a timed-out client.
 recover_sent_subject() {
-  local recipient=$1 token=$2 deadline mailbox subjects count
-  deadline=$(( $(/usr/bin/date +%s) + 30 ))
+  local recipient=$1 token=$2 deadline=${3:-} mailbox subjects count
+  deadline=${deadline:-$(( $(/usr/bin/date +%s) + 30 ))}
   while (( $(/usr/bin/date +%s) < deadline )); do
     if mailbox=$(/usr/bin/timeout 15s "$ST3_BIN" conversations ls "$recipient" \
       --archive --from "$MONITOR" --json 2>/dev/null); then
@@ -67,7 +67,7 @@ probe() {
     if ! response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec silber -- "$SILBER_ST3" conversations send "$recipient" \
       --from "$MONITOR" --subject 'soak request' \
       --body "Reply once with exact receipt token $token." --json); then
-      if subject=$(recover_sent_subject "$recipient" "$token"); then
+      if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
         response=$(/usr/bin/jq -nc --arg subject "$subject" '{subject:$subject}')
         log "recovered direction=$direction stage=send-client-timeout subject=$subject token=$token"
       else
@@ -80,7 +80,7 @@ probe() {
     return 2
   fi
   if ! subject=$(/usr/bin/jq -er '.subject' <<<"$response" 2>/dev/null); then
-    if [[ $direction == silber-to-hetz ]] && subject=$(recover_sent_subject "$recipient" "$token"); then
+    if [[ $direction == silber-to-hetz ]] && subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
       log "recovered direction=$direction stage=send-response subject=$subject token=$token"
     else
       log "FAILED direction=$direction stage=send-response token=$token"
