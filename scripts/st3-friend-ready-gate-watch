@@ -16,6 +16,7 @@ MONITOR=agent/fleet/st3/delivery-soak-20260924/monitor
 STATE_DIR=${ST3_GATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/friend-ready-gates}
 REPORT_DIR=$(/usr/bin/dirname "$0")
 IDLE_REPORT="$REPORT_DIR/st3-idle-soak-report"
+IDLE_PREFLIGHT="$REPORT_DIR/st3-idle-soak-preflight"
 MESSAGE_REPORT="$REPORT_DIR/st3-message-soak-report"
 /bin/mkdir -p "$STATE_DIR"
 state="$STATE_DIR/state.json"
@@ -50,6 +51,21 @@ if (( now >= ST3_FRIEND_READY_MESSAGE_START_UNIX + 259200 )); then
   if [[ $message_report_pass == true ]]; then message=pass; else message=fail; fi
 fi
 
+# Fail early on a broken evidence stream. This is not the 24-hour release gate:
+# it checks only post-rollout continuity, one PID, and healthy peer samples.
+idle_preflight=waiting
+idle_preflight_output=
+if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 180 )); then
+  if idle_preflight_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+    -u ST3_IDLE_REPORT_MAX_GAP_SECONDS -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS \
+    ST3_IDLE_PREFLIGHT_START_UNIX="$ST3_FRIEND_READY_IDLE_START_UNIX" \
+    ST3_IDLE_REPORT_REMOTE=1 FABRIC_BIN="$FABRIC_BIN" "$IDLE_PREFLIGHT" 2>&1); then
+    idle_preflight=healthy
+  else
+    idle_preflight=fault
+  fi
+fi
+
 idle_summary=$(/usr/bin/jq -cr '{pass,hosts:[.hosts[]|{host,samples,errors,pid_count,quiet_cpu_median_pct,rss_growth_kib,pass}]}' \
   <<<"$idle_output" 2>/dev/null) || idle_summary='idle report unavailable or malformed'
 if [[ $message_output == PASS:* || $message_output == FAIL:* ]]; then
@@ -60,6 +76,7 @@ else
 fi
 
 old_idle=$(/usr/bin/jq -r '.idle_notice // ""' "$state" 2>/dev/null) || old_idle=
+old_idle_preflight=$(/usr/bin/jq -r '.idle_preflight_notice // ""' "$state" 2>/dev/null) || old_idle_preflight=
 old_message=$(/usr/bin/jq -r '.message_notice // ""' "$state" 2>/dev/null) || old_message=
 old_release=$(/usr/bin/jq -r '.release_notice // ""' "$state" 2>/dev/null) || old_release=
 failures=0
@@ -73,6 +90,21 @@ send_notice() {
     return 1
   fi
 }
+
+if [[ $idle_preflight == fault ]]; then
+  preflight_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:fault"
+  if [[ $old_idle_preflight != "$preflight_notice" ]]; then
+    if receipt=$(send_notice 'friend-ready idle evidence fault' \
+      "The post-rollout idle evidence has a bad sample, restart, gap, stale host, or unavailable remote log. This is an early integrity alert, not a release-gate result. ${idle_preflight_output:0:600} Inspect and restart the complete 24-hour window after remediation."); then
+      old_idle_preflight=$preflight_notice
+      /usr/bin/printf 'idle preflight fault notified in %s\n' "$receipt"
+    else
+      failures=1
+    fi
+  fi
+else
+  old_idle_preflight=
+fi
 
 if [[ $idle != waiting && $idle != "$old_idle" ]]; then
   if receipt=$(send_notice "friend-ready idle gate: $idle" \
@@ -108,10 +140,13 @@ fi
 
 temporary=$(/usr/bin/mktemp "$STATE_DIR/state.XXXXXX")
 /usr/bin/jq -nc --argjson checked_at "$now" --arg idle "$idle" --arg message "$message" \
-  --arg idle_notice "$old_idle" --arg message_notice "$old_message" \
+  --arg idle_preflight "$idle_preflight" \
+  --arg idle_notice "$old_idle" --arg idle_preflight_notice "$old_idle_preflight" \
+  --arg message_notice "$old_message" \
   --arg release_notice "$old_release" \
-  '{checked_at:$checked_at,idle:$idle,message:$message,idle_notice:$idle_notice,
+  '{checked_at:$checked_at,idle:$idle,idle_preflight:$idle_preflight,
+    message:$message,idle_notice:$idle_notice,idle_preflight_notice:$idle_preflight_notice,
     message_notice:$message_notice,release_notice:$release_notice}' >"$temporary"
 /usr/bin/mv "$temporary" "$state"
-/usr/bin/printf 'friend-ready gates idle=%s delivery=%s\n' "$idle" "$message"
+/usr/bin/printf 'friend-ready gates idle=%s preflight=%s delivery=%s\n' "$idle" "$idle_preflight" "$message"
 exit "$failures"

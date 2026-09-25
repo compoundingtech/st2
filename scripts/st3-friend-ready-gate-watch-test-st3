@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ ${1:-} == conversations && ${2:-} == send ]] || exit 2
+[[ ${ST3_GATE_TEST_SEND_FAIL:-0} != 1 ]] || exit 1
+/usr/bin/printf '{"subject":"message/test-notice"}\n'
