@@ -729,35 +729,16 @@ impl App {
                         }
                     }
                     lines.push(String::new());
-                    lines.push("RECENT MESSAGES".into());
-                    let recent = self
+                    let mut recent = self
                         .model
                         .messages(self.selected_session_id().as_deref(), &peer.header.id)
                         .take(4)
                         .collect::<Vec<_>>();
-                    if recent.is_empty() {
-                        lines.push(
-                            if self.messages_requested.as_deref() == Some(peer.header.id.as_str())
-                                && self.model.messages.snapshot.is_none()
-                            {
-                                "  Loading recent messages…".into()
-                            } else {
-                                "  No recent messages.".into()
-                            },
-                        );
-                    }
-                    for message in &recent {
-                        let cleaned = clean_message_text(&message.content);
-                        lines.push(format!("  {}:", message.from));
-                        let body = if cleaned.is_empty() {
-                            message.title.as_deref().unwrap_or("(notification)")
-                        } else {
-                            cleaned.as_str()
-                        };
-                        lines.extend(body.split('\n').map(|line| format!("    {line}")));
-                        lines.push(String::new());
-                    }
-                    lines.push("CONVERSATION".into());
+                    recent.sort_by(|a, b| {
+                        a.sent_at
+                            .cmp(&b.sent_at)
+                            .then_with(|| a.header.id.cmp(&b.header.id))
+                    });
                     let conversation = self
                         .model
                         .timeline
@@ -772,17 +753,13 @@ impl App {
                         })
                         .take(12)
                         .collect::<Vec<_>>();
+                    lines.push(if conversation.is_empty() && !recent.is_empty() {
+                        "ST3 MESSAGES · native transcript unavailable".into()
+                    } else {
+                        "ST3 MESSAGES".into()
+                    });
                     if conversation.is_empty() {
                         if !recent.is_empty() {
-                            lines.push(
-                                "Native transcript unavailable · recent ST3 messages: ".into(),
-                            );
-                            for message in recent.iter().rev().take(3) {
-                                lines.push(format!("  {}:", message.from));
-                                let text = clean_message_text(&message.content);
-                                lines.extend(text.lines().map(|line| format!("    {line}")));
-                                lines.push(String::new());
-                            }
                         } else {
                             lines.push(
                                 if self
@@ -795,6 +772,20 @@ impl App {
                                 },
                             );
                         }
+                    }
+                    for message in &recent {
+                        let cleaned = clean_message_text(&message.content);
+                        lines.push(format!("  {}:", message.from));
+                        let body = if cleaned.is_empty() {
+                            message.title.as_deref().unwrap_or("(notification)")
+                        } else {
+                            cleaned.as_str()
+                        };
+                        lines.extend(body.split('\n').map(|line| format!("    {line}")));
+                        lines.push(String::new());
+                    }
+                    if !conversation.is_empty() {
+                        lines.push("NATIVE CONVERSATION".into());
                     }
                     for entry in conversation.into_iter().rev() {
                         for line in timeline_line(entry).lines() {
@@ -885,7 +876,9 @@ impl App {
                             next_action_label(current)
                         ));
                         lines.push(format!("Owner  {}", work_owner(&self.model, current)));
-                        if let Some(reason) = &current.blocked_reason {
+                        if matches!(current.state.as_str(), "blocked" | "waiting")
+                            && let Some(reason) = &current.blocked_reason
+                        {
                             lines.push(format!("Blocker  {reason}"));
                         }
                         lines.push(String::new());
@@ -906,7 +899,9 @@ impl App {
                             step.path,
                             step.state
                         ));
-                        if let Some(reason) = &step.blocked_reason {
+                        if matches!(step.state.as_str(), "blocked" | "waiting")
+                            && let Some(reason) = &step.blocked_reason
+                        {
                             lines.push(format!("    Blocked: {reason}"));
                         }
                         if let Some(goal) = step.goals.first() {
@@ -1121,7 +1116,12 @@ impl App {
                 }
                 1 => {
                     let selected = self.peer().map(|peer| format!("{} {} · ", state_glyph(&peer.state), agent_label(peer))).unwrap_or_default();
-                    if self.runtime().is_some() {
+                    let graph_only = self.peer().is_some_and(|peer| {
+                        self.model.messages(None, &peer.header.id).next().is_some()
+                    }) && self.model.timeline.iter().all(|entry| !matches!(entry.body, st3_client::TimelineBody::Content(_)));
+                    if graph_only {
+                        format!("{selected}ST3 messages · transcript unavailable · Pg/wheel scroll · Enter terminal")
+                    } else if self.runtime().is_some() {
                         format!("{selected}Enter terminal · Pg/wheel scroll · h history · c message · v select")
                     } else {
                         format!("{selected}Pg/wheel scroll · h history · c message · v select")
@@ -2896,6 +2896,38 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("No conversation in recent timeline."));
+    }
+
+    #[test]
+    fn status_only_chat_keeps_graph_messages_at_the_bottom() {
+        let mut model = Model::default();
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/omp","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"OMP","state":"running","reachability":"reachable","current_session_id":"session/omp"}"#).unwrap());
+        for number in 0..4 {
+            model.messages.items.push(serde_json::from_value(serde_json::json!({
+                "kind":"message", "id":format!("message/{number}"), "revision":"one",
+                "updated_at":"2026-09-25T08:00:00Z", "from":"agent/cos", "to":"agent/omp",
+                "title":null, "content":format!("message {number}: {}", "a long message ".repeat(40)),
+                "state":"closed", "sent_at":"2026-09-25T08:00:00Z", "in_reply_to":null, "session_id":null
+            })).unwrap());
+        }
+        let mut app = App::new(model);
+        app.tab = 1;
+        app.timeline_cache
+            .insert("session/omp".into(), (Vec::new(), false));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("ST3 messages · transcript unavailable"),
+            "{content}"
+        );
+        assert!(content.contains("message 3:"), "{content}");
     }
     #[test]
     fn recent_message_preserves_line_breaks_without_return_glyphs() {
