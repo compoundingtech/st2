@@ -28,7 +28,7 @@ export ST3_GATE_STATE_DIR="$temporary/state"
 export ST3_FRIEND_READY_IDLE_START_UNIX="$start"
 export ST3_FRIEND_READY_MESSAGE_START_UNIX="$now"
 export ST3_FRIEND_READY_AUDIT_WORKSPACE="$temporary"
-export ST3_GATE_TEST_RUN_STATE="$temporary/audit-run-exists"
+export ST3_GATE_TEST_RUN_STATE_PREFIX="$temporary/audit-run"
 
 first=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $first == *'preflight=healthy'* ]]
@@ -82,21 +82,36 @@ risk_second=$(bash "$here/st3-friend-ready-gate-watch")
 
 # A failed delivery report at its deadline still queues claimable remediation.
 export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((now - 259200))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
 due_first=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $due_first == *'friend-ready audit run started:'* && $due_first == *'delivery=fail'* ]]
-[[ -f $ST3_GATE_TEST_RUN_STATE ]]
+[[ -f $run_state ]]
 due_second=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $due_second == *'friend-ready audit run already exists:'* ]]
 
+# Resetting the window must create a new run and resend the same failure state.
+export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((ST3_FRIEND_READY_MESSAGE_START_UNIX + 1))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+reset=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $reset == *'delivery gate fail notified'* && $reset == *'friend-ready audit run started:'* ]]
+[[ -f $run_state ]]
+
+export ST3_FRIEND_READY_IDLE_START_UNIX="$((now - 86400))"
+idle_due=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $idle_due == *'idle gate fail notified'* ]]
+export ST3_FRIEND_READY_IDLE_START_UNIX="$((ST3_FRIEND_READY_IDLE_START_UNIX + 1))"
+idle_reset=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $idle_reset == *'idle gate fail notified'* ]]
+
 # A lost response after commit counts only after an exact read proves the run.
-/bin/rm -- "$ST3_GATE_TEST_RUN_STATE"
+/bin/rm -- "$run_state"
 lost=$(ST3_GATE_TEST_START_LOST_RESPONSE=1 bash "$here/st3-friend-ready-audit-queue")
-[[ $lost == *'exists after ambiguous start:'* && -f $ST3_GATE_TEST_RUN_STATE ]]
-/bin/rm -- "$ST3_GATE_TEST_RUN_STATE"
+[[ $lost == *'exists after ambiguous start:'* && -f $run_state ]]
+/bin/rm -- "$run_state"
 if ST3_GATE_TEST_START_FAIL=1 bash "$here/st3-friend-ready-audit-queue" >/dev/null; then
   echo 'failed audit start unexpectedly succeeded' >&2
   exit 1
 fi
-[[ ! -f $ST3_GATE_TEST_RUN_STATE ]]
+[[ ! -f $run_state ]]
 
 /usr/bin/printf 'st3 friend-ready gate watcher tests passed\n'

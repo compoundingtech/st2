@@ -4,10 +4,15 @@ set -Eeuo pipefail
 : "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
 : "${ST_AGENT:?set ST_AGENT to the standing st3 operator identity}"
 : "${ST3_FRIEND_READY_AUDIT_WORKSPACE:?set the Hetz st3 checkout in the host-local gate environment}"
+: "${ST3_FRIEND_READY_MESSAGE_START_UNIX:?set the delivery window start}"
+[[ $ST3_FRIEND_READY_MESSAGE_START_UNIX =~ ^[0-9]+$ ]] || {
+  echo 'invalid delivery window start' >&2
+  exit 2
+}
 
 mission=mission/fleet/st3/friend-ready-final-audit-20260925
-run=mission-run/friend-ready-final-audit-20260925
-run_id=friend-ready-final-audit-20260925
+run_id="friend-ready-final-audit-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+run="mission-run/$run_id"
 
 [[ -d $ST3_FRIEND_READY_AUDIT_WORKSPACE ]] || {
   echo 'friend-ready audit workspace is unavailable' >&2

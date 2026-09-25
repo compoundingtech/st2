@@ -151,29 +151,32 @@ else
   old_idle_risk=
 fi
 
-if [[ $idle != waiting && $idle != "$old_idle" ]]; then
+idle_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:$idle"
+if [[ $idle != waiting && $idle_notice != "$old_idle" ]]; then
   if receipt=$(send_notice "friend-ready idle gate: $idle" \
     "The 24-hour two-host idle gate is $idle. $idle_summary Keep the release held unless it passes; inspect the retained local samples on both hosts."); then
-    old_idle=$idle
+    old_idle=$idle_notice
     /usr/bin/printf 'idle gate %s notified in %s\n' "$idle" "$receipt"
   else
     failures=1
   fi
 fi
-if [[ $message != waiting && $message != "$old_message" ]]; then
+message_notice="$ST3_FRIEND_READY_MESSAGE_START_UNIX:$message"
+if [[ $message != waiting && $message_notice != "$old_message" ]]; then
   if receipt=$(send_notice "friend-ready delivery gate: $message" \
     "The 72-hour bidirectional exact-receipt gate is $message. $message_summary Keep the release held unless it passes; inspect the retained monitor evidence."); then
-    old_message=$message
+    old_message=$message_notice
     /usr/bin/printf 'delivery gate %s notified in %s\n' "$message" "$receipt"
   else
     failures=1
   fi
 fi
 if [[ $idle == pass && $message == pass ]]; then
-  if [[ $old_release != pass ]]; then
+  release_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:$ST3_FRIEND_READY_MESSAGE_START_UNIX:pass"
+  if [[ $old_release != "$release_notice" ]]; then
     if receipt=$(send_notice 'friend-ready gates passed' \
       "Both the 24-hour idle and 72-hour exact-receipt gates pass on their default thresholds. Verify the claimed mission products and final release evidence before marking friend-ready. $idle_summary $message_summary"); then
-      old_release=pass
+      old_release=$release_notice
       /usr/bin/printf 'combined gates notified in %s\n' "$receipt"
     else
       failures=1
