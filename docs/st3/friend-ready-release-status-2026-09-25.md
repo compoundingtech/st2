@@ -18,6 +18,12 @@ Watcher update `cfe036f` also sends an early CPU-risk notice after two hours
 and 60 quiet intervals per host if the unchanged CPU limits are exceeded. It
 is installed on Hetz; its own fixture test and first service run passed. The
 24-hour report remains the authority.
+The final-audit mission is published but not started early. At the 72-hour
+delivery deadline, the gate watcher queues one exact claimable audit run even
+if the delivery report fails, so diagnosis or final review survives a missed
+notification. Its step reruns both full reports as mechanical gates before
+completion. The watcher and queue helper passed duplicate-start and
+lost-response fixtures; this does not preempt either live soak gate.
 
 At 04:17:39 UTC the delivery monitor recorded a Silber-to-Hetz `stage=send`
 failure. The exact request (`message/b67a6fcad1e2b29e`) and one linked reply

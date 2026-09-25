@@ -18,6 +18,7 @@ REPORT_DIR=$(/usr/bin/dirname "$0")
 IDLE_REPORT="$REPORT_DIR/st3-idle-soak-report"
 IDLE_PREFLIGHT="$REPORT_DIR/st3-idle-soak-preflight"
 MESSAGE_REPORT="$REPORT_DIR/st3-message-soak-report"
+AUDIT_QUEUE="$REPORT_DIR/st3-friend-ready-audit-queue"
 /bin/mkdir -p "$STATE_DIR"
 state="$STATE_DIR/state.json"
 now=$(/bin/date -u +%s)
@@ -180,6 +181,16 @@ if [[ $idle == pass && $message == pass ]]; then
   fi
 else
   old_release=
+fi
+
+# A notification is not work. At the delivery deadline, queue one exact audit
+# run whether the report passes or fails, so remediation or release review is
+# claimable even if the operator misses a message. The queue helper reads the
+# exact run before starting it and tolerates a lost response after commit.
+if [[ $message != waiting ]]; then
+  if ! "$AUDIT_QUEUE"; then
+    failures=1
+  fi
 fi
 
 temporary=$(/usr/bin/mktemp "$STATE_DIR/state.XXXXXX")

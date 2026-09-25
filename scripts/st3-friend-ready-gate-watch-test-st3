@@ -1,5 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-[[ ${1:-} == conversations && ${2:-} == send ]] || exit 2
-[[ ${ST3_GATE_TEST_SEND_FAIL:-0} != 1 ]] || exit 1
-/usr/bin/printf '{"subject":"message/test-notice"}\n'
+case "${1:-} ${2:-}" in
+  'conversations send')
+    [[ ${ST3_GATE_TEST_SEND_FAIL:-0} != 1 ]] || exit 1
+    /usr/bin/printf '{"subject":"message/test-notice"}\n'
+    ;;
+  'missions show')
+    [[ ${3:-} == mission-run/friend-ready-final-audit-20260925 ]] || exit 2
+    [[ -f ${ST3_GATE_TEST_RUN_STATE:-/nonexistent} ]] || exit 1
+    /usr/bin/printf '{"subject":"mission-run/friend-ready-final-audit-20260925"}\n'
+    ;;
+  'missions start')
+    [[ ${3:-} == mission/fleet/st3/friend-ready-final-audit-20260925 ]] || exit 2
+    [[ -n ${ST3_GATE_TEST_RUN_STATE:-} ]] || exit 2
+    [[ ${ST3_GATE_TEST_START_FAIL:-0} != 1 ]] || exit 1
+    /usr/bin/touch "$ST3_GATE_TEST_RUN_STATE"
+    [[ ${ST3_GATE_TEST_START_LOST_RESPONSE:-0} != 1 ]] || exit 1
+    /usr/bin/printf '{"subject":"mission-run/friend-ready-final-audit-20260925"}\n'
+    ;;
+  *) exit 2 ;;
+esac
