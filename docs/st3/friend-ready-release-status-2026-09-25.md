@@ -67,6 +67,13 @@ the release gates after the final tested rollout.
   is absent from its registry. COS is obtaining Nathan's model choice before
   changing the `st3-network` declaration. The declared model must be honored
   or fail visibly before this seat can be called friend-ready.
+- Source commit `5e3b80f` adds an exact OMP registry check before the wrapper
+  claims its seat. The new regression rejects the unavailable requested model
+  and accepts an exact custom selector; all 836 active `st2` library tests pass
+  (one ignored). This commit is pushed but intentionally not installed while
+  the current declaration remains unsupported. Installing it first would stop
+  the OMP seat. The next rollout must pair it with Nathan's selected model and
+  then reset the soak windows after the host restart.
 
 ## 11:13 UTC earlier TUI usability rollout
 
