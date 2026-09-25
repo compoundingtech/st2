@@ -20,9 +20,11 @@ is installed on Hetz; its own fixture test and first service run passed. The
 
 At 04:17:39 UTC the delivery monitor recorded a Silber-to-Hetz `stage=send`
 failure. The exact request (`message/b67a6fcad1e2b29e`) and one linked reply
-(`message/992b7fc53bef47b0`) were already durable: Fabric `exec` lost its
-response after the remote send committed. The failed monitor line remains in
-the retained log. Commits `602e090` and `506cd51` recover an exact-token
+(`message/992b7fc53bef47b0`) were already durable, but the Fabric `exec`
+caller timed out without a response after the send committed. The retained
+evidence does not establish whether that exact remote CLI process exited
+promptly. The failed monitor line remains in the retained log. Commits
+`602e090` and `506cd51` recover an exact-token
 request from the recipient's durable mailbox and then require its linked
 reply, allowing the full receipt deadline for recovery. A deterministic test
 discarded the Fabric response after a real remote commit and logged one
