@@ -41,6 +41,15 @@ tailscale serve --bg --yes "unix:${CLIENT_GATEWAY_SOCKET}"
 tailscale serve status
 ```
 
+On macOS, verify the HTTPS route with an unauthenticated request to
+`/v1/client/capabilities`: the gateway should return a complete `403` response.
+If Tailscale Serve returns `502` when pointed at the Unix socket, run a persistent
+launchd-managed bridge from a loopback-only TCP port to `st3-client.sock`, then
+point Tailscale Serve at that port. The bridge must bind `127.0.0.1`, reconnect to
+the socket for each request, and start independently of the st3 daemon so a daemon
+restart does not leave the HTTPS route pointing at an absent process. Recheck the
+HTTPS route after every rollout, then make an authenticated paired-client read.
+
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
 single-use attachment capability. Begin pairing over the trusted local socket with, for example,
