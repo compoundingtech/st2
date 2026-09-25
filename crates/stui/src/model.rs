@@ -479,7 +479,7 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
             }
             Kind::Work => {
                 client
-                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), false)
+                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), true)
                     .await?
             }
             Kind::Agents => {
@@ -616,10 +616,12 @@ mod tests {
         let mut model = Model::bootstrap(&client).await.unwrap();
         model.reload(&client).await.unwrap();
         eprintln!(
-            "full snapshot: {:?}, agents: {}, sessions: {}",
+            "full snapshot: {:?}, agents: {}, sessions: {}, work: {} (truncated: {})",
             started.elapsed(),
             model.agents().count(),
-            model.sessions.items.len()
+            model.sessions.items.len(),
+            model.work.items.len(),
+            model.work.truncated
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
@@ -636,8 +638,9 @@ mod tests {
         let started = std::time::Instant::now();
         let model = Model::bootstrap(&client).await.unwrap();
         eprintln!(
-            "bootstrap: {:?}, agents: {}",
+            "bootstrap: {:?}, attention: {}, agents: {}",
             started.elapsed(),
+            model.attention().count(),
             model.agents().count()
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(3));

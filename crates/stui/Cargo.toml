@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 st3-client = { path = "../st3-client" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v7"] }

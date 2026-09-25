@@ -14,17 +14,18 @@ use model::{Model, clean_message_text, timeline_line};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::Line,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
     AttentionResolveParameters, Client, ClientError, ErrorCode, Fence, LaunchCreateParameters,
-    LaunchTarget, MessageSendParameters, TargetParameters, TerminalInputMode,
-    TerminalInputParameters, TerminalScreen,
+    LaunchTarget, LaunchVariantParameters, MessageSendParameters, Resource, TargetParameters,
+    TerminalInputMode, TerminalInputParameters, TerminalScreen,
 };
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashSet},
     io::{self, IsTerminal, Stdout},
     path::PathBuf,
@@ -66,9 +67,11 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Normal,
+    Confirm,
+    ActionReason,
     Chat,
     Title,
     Request,
@@ -101,6 +104,13 @@ struct App {
     launch: [String; 4],
     attached: Option<Attached>,
     return_focused: bool,
+    selection_mode: bool,
+    status_details: bool,
+    pending_action: Option<(String, String)>,
+    pending_reason: Option<String>,
+    action_result: Option<String>,
+    chat_max_scroll: Cell<u16>,
+    sidebar_offsets: [Cell<usize>; 4],
     live_ready: bool,
     dirty: bool,
     timeline_requested: Option<String>,
@@ -118,7 +128,7 @@ impl App {
             model,
             tab: 0,
             selected: [0; 4],
-            scroll: [0; 4],
+            scroll: [0, u16::MAX, 0, 0],
             sidebar: true,
             show_system_missions: false,
             mode: Mode::Normal,
@@ -126,6 +136,13 @@ impl App {
             launch: Default::default(),
             attached: None,
             return_focused: false,
+            selection_mode: false,
+            status_details: false,
+            pending_action: None,
+            pending_reason: None,
+            action_result: None,
+            chat_max_scroll: Cell::new(0),
+            sidebar_offsets: [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)],
             live_ready: false,
             dirty: true,
             timeline_requested: None,
@@ -158,7 +175,7 @@ impl App {
         self.scroll[1] = self
             .selected_session_id()
             .and_then(|id| self.chat_scroll_cache.get(&id).copied())
-            .unwrap_or_default();
+            .unwrap_or(u16::MAX);
     }
     fn chat_draft_key(&self) -> Option<String> {
         self.selected_session_id()
@@ -292,14 +309,23 @@ impl App {
         let steps = self
             .model
             .work()
-            .filter(|work| mission.runs.contains(&work.mission_run_id));
+            .filter(|work| mission.runs.last() == Some(&work.mission_run_id));
         let states = steps.map(|work| work.state.as_str()).collect::<Vec<_>>();
-        if states.contains(&"blocked") {
+        if mission.state == "blocked" || states.contains(&"blocked") {
             "Blocked"
-        } else if states.contains(&"waiting") {
-            "Waiting"
-        } else if matches!(mission.state.as_str(), "running" | "standing") {
+        } else if states
+            .iter()
+            .any(|state| matches!(*state, "claimed" | "running"))
+            || mission.state == "running"
+        {
             "Running"
+        } else if mission.state == "standing" {
+            "Standing"
+        } else if states
+            .iter()
+            .any(|state| matches!(*state, "waiting" | "blocked"))
+        {
+            "Waiting"
         } else if matches!(mission.state.as_str(), "ready" | "draft") {
             "Drafts"
         } else {
@@ -318,34 +344,68 @@ impl App {
             "Blocked" => 0,
             "Waiting" => 1,
             "Running" => 2,
-            "Drafts" => 3,
-            _ => 4,
+            "Standing" => 3,
+            "Drafts" => 4,
+            _ => 5,
         });
         missions
     }
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let chunks = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
-        let title = if self.attached.is_some() {
-            " Smalltalk  ·  [Return to Smalltalk] "
+        if self.attached.is_some() {
+            frame.render_widget(
+                Paragraph::new(" ← Return to Smalltalk (Ctrl+\\)").style(Style::default().fg(
+                    if self.return_focused {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    },
+                )),
+                chunks[0],
+            );
         } else {
-            " Smalltalk  ·  st3 "
-        };
-        frame.render_widget(
-            Paragraph::new(title)
-                .style(Style::default().fg(if self.return_focused {
-                    Color::Yellow
+            let connection = if self.live_ready {
+                "● Online"
+            } else if self.model.status == "Loading…" {
+                "◌ Loading"
+            } else {
+                "○ Offline"
+            };
+            let state = if self.selection_mode {
+                format!("SELECT · {connection}")
+            } else {
+                connection.to_owned()
+            };
+            let status_width = (state.chars().count() as u16 + 2).min(area.width);
+            frame.render_widget(
+                Tabs::new(TABS.map(Line::from))
+                    .select(self.tab)
+                    .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+                    .divider("  ·  "),
+                Rect {
+                    width: area.width.saturating_sub(status_width),
+                    ..chunks[0]
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(state).style(Style::default().fg(if self.live_ready {
+                    Color::Green
                 } else {
-                    Color::Cyan
-                }))
-                .block(Block::default().borders(Borders::BOTTOM)),
-            chunks[0],
-        );
+                    Color::Yellow
+                })),
+                Rect {
+                    x: area.x + area.width.saturating_sub(status_width),
+                    width: status_width,
+                    ..chunks[0]
+                },
+            );
+        }
         if let Some(attached) = &self.attached {
             let columns = Layout::horizontal([
                 Constraint::Length(if self.sidebar && area.width >= 66 {
@@ -390,14 +450,6 @@ impl App {
             );
             return;
         }
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(chunks[1]);
-        frame.render_widget(
-            Tabs::new(TABS.map(Line::from))
-                .select(self.tab)
-                .highlight_style(Style::default().fg(Color::Cyan))
-                .divider("  ·  "),
-            rows[0],
-        );
         let columns = Layout::horizontal([
             Constraint::Length(if self.sidebar && area.width >= 66 {
                 area.width / 3
@@ -406,19 +458,33 @@ impl App {
             }),
             Constraint::Min(1),
         ])
-        .split(rows[1]);
+        .split(chunks[1]);
         if columns[0].width > 0 {
             let list: Vec<String> = match self.tab {
                 0 => self
                     .model
                     .attention()
-                    .map(|v| format!("{} {}", v.priority, v.title))
+                    .map(|v| {
+                        format!(
+                            "{}  {}\n   {} · {}",
+                            priority_glyph(&v.priority),
+                            v.title,
+                            v.attention_kind.replace('-', " "),
+                            age_label(&v.requested_at, &chrono::Utc::now().to_rfc3339())
+                        )
+                    })
                     .collect(),
                 1 => self
                     .agent_tree()
                     .iter()
                     .map(|(v, depth)| {
-                        format!("{}{}  ·  {}", "  ".repeat(*depth), agent_label(v), v.state)
+                        format!(
+                            "{}{} {}  ·  {}",
+                            "  ".repeat(*depth),
+                            state_glyph(&v.state),
+                            agent_label(v),
+                            v.reachability
+                        )
                     })
                     .chain(self.model.undeclared_sessions().map(|v| {
                         let driver = v
@@ -432,7 +498,19 @@ impl App {
                 2 => self
                     .control_missions()
                     .iter()
-                    .map(|v| format!("{}  ·  {}", mission_display_label(v), self.mission_group(v)))
+                    .map(|v| {
+                        let (done, total) = mission_progress(&self.model, v);
+                        let current = mission_current_work(&self.model, v);
+                        format!(
+                            "{}\n   {}  ·  {}  ·  {}",
+                            mission_display_label(v),
+                            self.mission_group(v),
+                            mission_progress_label(&self.model, v, done, total),
+                            current
+                                .map(|work| work.path.as_str())
+                                .unwrap_or("no active step")
+                        )
+                    })
                     .collect(),
                 _ => self
                     .model
@@ -447,13 +525,26 @@ impl App {
                     ListItem::new(format!("{v}\n")).style(Style::default().fg(
                         if i == self.selected[self.tab] {
                             Color::White
+                        } else if self.tab == 1 {
+                            self.agent_tree()
+                                .get(i)
+                                .map(|(agent, _)| state_color(&agent.state))
+                                .unwrap_or(Color::DarkGray)
+                        } else if self.tab == 0 {
+                            self.model
+                                .attention()
+                                .nth(i)
+                                .map(|attention| priority_color(&attention.priority))
+                                .unwrap_or(Color::Gray)
                         } else {
                             Color::Gray
                         },
                     ))
                 })
                 .collect::<Vec<_>>();
-            let mut state = ListState::default().with_selected(Some(self.selected[self.tab]));
+            let mut state = ListState::default()
+                .with_offset(self.sidebar_offsets[self.tab].get())
+                .with_selected(Some(self.selected[self.tab]));
             frame.render_stateful_widget(
                 List::new(if entries.is_empty() {
                     vec![ListItem::new("No items")]
@@ -466,25 +557,54 @@ impl App {
                 columns[0],
                 &mut state,
             );
+            self.sidebar_offsets[self.tab].set(state.offset());
         }
         let mut lines = Vec::new();
+        if self.status_details {
+            lines.push(format!("Connection: {}", self.model.status));
+            lines.push("i hide connection details".into());
+            lines.push(String::new());
+        }
+        if let Some(result) = &self.action_result {
+            lines.push(format!("RESULT  {result}"));
+            lines.push(String::new());
+        }
+        if let Some((id, action)) = &self.pending_action {
+            let title = self
+                .model
+                .attention()
+                .find(|attention| &attention.header.id == id)
+                .map(|attention| attention.title.as_str())
+                .unwrap_or(id);
+            lines.push(format!("CONFIRM  {} · {title}", action_label(action)));
+            if let Some(reason) = &self.pending_reason {
+                lines.push(format!("Reason: {reason}"));
+            }
+            lines.push(String::new());
+        }
         match self.tab {
             0 => {
-                lines.push("Actionable person attention".into());
+                lines.push("NOW  /  YOUR ATTENTION".into());
+                lines.push(String::new());
                 if let Some(v) = self.model.attention().nth(self.selected[0]) {
                     lines.extend([
-                        v.title.clone(),
-                        v.detail.clone(),
-                        format!("Source: {}", v.source_id),
+                        format!("┌─ {}  {}", priority_glyph(&v.priority), v.title),
                         format!(
-                            "Actions: {}",
-                            v.actions
-                                .iter()
-                                .map(|action| action_label(action))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            "│  {} · requested {}",
+                            v.attention_kind.replace('-', " "),
+                            age_label(&v.requested_at, &chrono::Utc::now().to_rfc3339())
                         ),
+                        "│".into(),
+                        v.detail.clone(),
+                        format!("Source  {}", v.source_id),
+                        "│".into(),
+                        "AVAILABLE ACTIONS".into(),
                     ]);
+                    for action in &v.actions {
+                        lines.push(format!("  {}", action_label(action)));
+                    }
+                    lines.push("Choose a key, then confirm with y. CLI actions need st3.".into());
+                    lines.push("└────────────────────────".into());
                 } else {
                     lines.push("Nothing needs your attention.".into());
                 }
@@ -498,7 +618,7 @@ impl App {
                     lines.push(String::new());
                     lines.push(format!(
                         "{}  ·  {}  ·  observed {}",
-                        peer.state,
+                        format!("{} {}", state_glyph(&peer.state), peer.state),
                         peer.reachability,
                         age_label(&peer.header.updated_at, &chrono::Utc::now().to_rfc3339())
                     ));
@@ -631,19 +751,43 @@ impl App {
                         self.mission_group(mission),
                         mission.runs.len()
                     ));
+                    let (done, total) = mission_progress(&self.model, mission);
+                    lines.push(format!(
+                        "Progress  {}",
+                        mission_progress_label(&self.model, mission, done, total)
+                    ));
                     lines.push(mission.header.id.clone());
                     lines.push(String::new());
+                    if let Some(current) = mission_current_work(&self.model, mission) {
+                        lines.push(format!(
+                            "NEXT  {}  ·  {}",
+                            current.path,
+                            next_action_label(current)
+                        ));
+                        if let Some(claimant) = &current.claimant {
+                            lines.push(format!("Owner  {claimant}"));
+                        }
+                        if let Some(reason) = &current.blocked_reason {
+                            lines.push(format!("Blocker  {reason}"));
+                        }
+                        lines.push(String::new());
+                    }
                     lines.push("CURRENT WORK".into());
                     let steps = self
                         .model
                         .work()
-                        .filter(|work| mission.runs.contains(&work.mission_run_id));
+                        .filter(|work| mission.runs.last() == Some(&work.mission_run_id));
                     let mut count = 0;
                     for step in steps {
                         if matches!(step.state.as_str(), "completed" | "cancelled") {
                             continue;
                         }
-                        lines.push(format!("  {}  ·  {}", step.path, step.state));
+                        lines.push(format!(
+                            "  {} {}  ·  {}",
+                            state_glyph(&step.state),
+                            step.path,
+                            step.state
+                        ));
                         if let Some(reason) = &step.blocked_reason {
                             lines.push(format!("    Blocked: {reason}"));
                         }
@@ -764,23 +908,41 @@ impl App {
                 }
             }
         }
-        frame.render_widget(
-            Paragraph::new(lines.join("\n"))
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll[self.tab], 0))
-                .block(Block::default().title(TABS[self.tab]).borders(Borders::ALL)),
-            columns[1],
-        );
+        let detail = Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(TABS[self.tab]).borders(Borders::ALL));
+        let visible = columns[1].height.saturating_sub(2) as usize;
+        let max_scroll = detail
+            .line_count(columns[1].width.saturating_sub(2))
+            .saturating_sub(2)
+            .saturating_sub(visible)
+            .min(u16::MAX as usize) as u16;
+        if self.tab == 1 {
+            self.chat_max_scroll.set(max_scroll);
+        }
+        let scroll = if self.scroll[self.tab] == u16::MAX {
+            max_scroll
+        } else {
+            self.scroll[self.tab].min(max_scroll)
+        };
+        frame.render_widget(detail.scroll((scroll, 0)), columns[1]);
         let footer = match self.mode {
             Mode::Normal => format!(
-                "{}  ·  1–4 views  ·  ↑↓ select  ·  s sidebar  ·  {}  ·  q quit",
-                self.model.status,
+                "1–4 views · ↑↓ select · PgUp/PgDn scroll · v select text · i connection · {} · q quit",
                 match self.tab {
-                    1 => "Enter terminal / c message",
+                    1 => "Enter terminal / c message / End newest",
                     2 => "c new mission",
                     _ => "",
                 }
             ),
+            Mode::Confirm => self
+                .pending_action
+                .as_ref()
+                .map(|(_, action)| {
+                    format!("Confirm {}?  y proceed · Esc cancel", action_label(action))
+                })
+                .unwrap_or_else(|| "Esc cancel".into()),
+            Mode::ActionReason => format!("Reason: {}█ · Enter continue · Esc cancel", self.input),
             Mode::Chat => format!("Message: {}█ · Enter send · Esc cancel", self.input),
             Mode::Title => format!("Launch title: {}█", self.input),
             Mode::Request => format!("Request: {}█", self.input),
@@ -827,9 +989,122 @@ fn mission_display_label(mission: &st3_client::Mission) -> String {
 }
 fn action_label(action: &str) -> String {
     match action {
-        "attention.resolve" => "Resolve (r)".into(),
-        other => other.replace('.', " "),
+        "attention.resolve" => "Resolve [r]".into(),
+        "review.approve" | "launch.approve" => "Approve [a]".into(),
+        "review.reject" => "Reject [j]".into(),
+        "launch.cancel" => "Cancel [d]".into(),
+        "mission.approve-revision" => "Approve revision [CLI]".into(),
+        "mission.cancel-revision" => "Cancel revision [CLI]".into(),
+        "message.read" => "Mark read [m]".into(),
+        other => format!("{} [CLI]", other.replace('.', " ")),
     }
+}
+fn action_key(action: &str) -> Option<char> {
+    match action {
+        "attention.resolve" => Some('r'),
+        "review.approve" | "launch.approve" => Some('a'),
+        "review.reject" => Some('j'),
+        "launch.cancel" => Some('d'),
+        "message.read" => Some('m'),
+        _ => None,
+    }
+}
+fn priority_glyph(priority: &str) -> &'static str {
+    match priority {
+        "critical" => "◆",
+        "high" => "▲",
+        "normal" => "●",
+        _ => "·",
+    }
+}
+fn state_glyph(state: &str) -> &'static str {
+    match state {
+        "running" | "claimed" | "active" => "●",
+        "ready" | "waiting" | "standing" => "◌",
+        "completed" | "approved" => "✓",
+        "blocked" | "failed" => "!",
+        _ => "·",
+    }
+}
+fn state_color(state: &str) -> Color {
+    match state {
+        "running" | "claimed" | "active" => Color::Green,
+        "ready" | "waiting" => Color::Yellow,
+        "blocked" | "failed" => Color::Red,
+        _ => Color::Gray,
+    }
+}
+fn priority_color(priority: &str) -> Color {
+    match priority {
+        "critical" => Color::Red,
+        "high" => Color::Yellow,
+        _ => Color::Gray,
+    }
+}
+fn mission_progress(model: &Model, mission: &st3_client::Mission) -> (usize, usize) {
+    let steps = model
+        .work()
+        .filter(|work| mission.runs.last() == Some(&work.mission_run_id))
+        .collect::<Vec<_>>();
+    (
+        steps
+            .iter()
+            .filter(|work| work.state == "completed")
+            .count(),
+        steps.len(),
+    )
+}
+fn mission_progress_label(
+    model: &Model,
+    mission: &st3_client::Mission,
+    done: usize,
+    total: usize,
+) -> String {
+    if mission.runs.is_empty() {
+        "Not started".into()
+    } else if model.work.snapshot.is_none() {
+        "Loading work".into()
+    } else if model.work.truncated && total == 0 {
+        "Work beyond bounded view".into()
+    } else if model.work.truncated {
+        format!("{done}/{total}+ visible steps")
+    } else {
+        format!("{done}/{total} steps")
+    }
+}
+fn mission_current_work<'a>(
+    model: &'a Model,
+    mission: &st3_client::Mission,
+) -> Option<&'a st3_client::Work> {
+    model
+        .work()
+        .filter(|work| mission.runs.last() == Some(&work.mission_run_id))
+        .filter(|work| !matches!(work.state.as_str(), "completed" | "cancelled" | "failed"))
+        .min_by_key(|work| match work.state.as_str() {
+            "blocked" => 0,
+            "claimed" | "running" => 1,
+            "verifying" => 2,
+            "ready" => 3,
+            _ => 4,
+        })
+}
+fn next_action_label(work: &st3_client::Work) -> &'static str {
+    match work.state.as_str() {
+        "claimed" | "running" => "Agent working",
+        "blocked" => "Resolve blocker",
+        "verifying" => "Await review",
+        "ready" => "Agent can claim",
+        "waiting" => "Await dependency",
+        _ => "Inspect step",
+    }
+}
+fn sidebar_item_at(app: &App, column: u16, row: u16, width: u16) -> Option<usize> {
+    if !app.sidebar || width < 66 || column >= width / 3 || row < 2 {
+        return None;
+    }
+    let item_height = if matches!(app.tab, 0 | 2) { 3 } else { 2 };
+    let index = app.sidebar_offsets[app.tab].get() + usize::from((row - 2) / item_height);
+    (index < app.count()).then_some(index)
 }
 fn age_label(then: &str, now: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(then).ok();
@@ -1056,6 +1331,158 @@ fn terminal_screen_fence(
         ..Fence::default()
     })
 }
+async fn run_attention_action(
+    app: &mut App,
+    client: &Client,
+    attention_id: &str,
+    action: &str,
+    reason: Option<String>,
+) -> Result<String> {
+    anyhow::ensure!(app.live_ready, "Reconnect before acting");
+    let page = client.attention_list(None, Some(50), false).await?;
+    let attention = page
+        .value
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Resource::Attention(attention) if attention.header.id == attention_id => {
+                Some(attention)
+            }
+            _ => None,
+        })
+        .context("Attention changed; refresh and choose again")?;
+    anyhow::ensure!(
+        attention.person_id == app.model.actor
+            && attention
+                .actions
+                .iter()
+                .any(|available| available == action),
+        "Action is no longer available"
+    );
+    let mut fence = Fence {
+        snapshot_id: page.snapshot.id,
+        ..Fence::default()
+    };
+    fence.subject_revisions.insert(
+        attention.header.id.clone(),
+        attention.header.revision.clone(),
+    );
+    let source = attention.source_id.clone();
+    if action.starts_with("launch.") {
+        let launch = client.launches_get(&source).await?;
+        let Resource::Launch(launch_resource) = launch.value else {
+            anyhow::bail!("Launch is no longer available");
+        };
+        fence.snapshot_id = launch.snapshot.id;
+        fence
+            .subject_revisions
+            .insert(launch_resource.header.id, launch_resource.header.revision);
+    }
+    let (id, idem) = action_pair();
+    let result = match action {
+        "attention.resolve" => {
+            client
+                .attention_resolve(
+                    id,
+                    idem,
+                    fence,
+                    AttentionResolveParameters {
+                        attention_id: attention.header.id.clone(),
+                        outcome: "resolved".into(),
+                        reason: None,
+                    },
+                )
+                .await?
+        }
+        "review.approve" => {
+            client
+                .review_approve(
+                    id,
+                    idem,
+                    fence,
+                    TargetParameters {
+                        target_id: source,
+                        reason,
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        "review.reject" => {
+            client
+                .review_reject(
+                    id,
+                    idem,
+                    fence,
+                    TargetParameters {
+                        target_id: source,
+                        reason,
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        "message.read" => {
+            client
+                .message_read(
+                    id,
+                    idem,
+                    fence,
+                    TargetParameters {
+                        target_id: source,
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        "launch.cancel" => {
+            client
+                .launch_cancel(
+                    id,
+                    idem,
+                    fence,
+                    TargetParameters {
+                        target_id: source,
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        "launch.approve" => {
+            let variants = client.launch_variants_list(&source, None, Some(50)).await?;
+            let variant = variants
+                .value
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Resource::LaunchVariant(variant) if variant.preview_token.is_some() => {
+                        Some(variant)
+                    }
+                    _ => None,
+                })
+                .max_by_key(|variant| variant.ordinal)
+                .context("No current launch preview; review it in the CLI")?;
+            fence.preview_token = variant.preview_token.clone();
+            client
+                .launch_approve(
+                    id,
+                    idem,
+                    fence,
+                    LaunchVariantParameters {
+                        launch_id: source,
+                        variant_id: variant.header.id.clone(),
+                    },
+                )
+                .await?
+        }
+        _ => anyhow::bail!("This action needs the CLI: {action}"),
+    };
+    let outcome = format!("{}: {}", action_label(action), result.value.kind);
+    match app.model.reload(client).await {
+        Ok(()) => Ok(outcome),
+        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
+    }
+}
 async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<bool> {
     if key.kind != KeyEventKind::Press {
         return Ok(false);
@@ -1099,11 +1526,42 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         }
         return Ok(false);
     }
+    if app.mode == Mode::Confirm {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::Normal;
+                app.pending_action = None;
+                app.pending_reason = None;
+            }
+            KeyCode::Char('y') => {
+                if let Some((attention_id, action)) = app.pending_action.take() {
+                    app.mode = Mode::Normal;
+                    let reason = app.pending_reason.take();
+                    app.action_result = Some(
+                        match run_attention_action(app, client, &attention_id, &action, reason)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => format!("{} failed: {error}", action_label(&action)),
+                        },
+                    );
+                    app.scroll[0] = 0;
+                }
+            }
+            _ => {}
+        }
+        app.dirty = true;
+        return Ok(false);
+    }
     if app.mode != Mode::Normal {
         match key.code {
             KeyCode::Esc => {
                 if app.mode == Mode::Chat {
                     app.remember_chat_draft();
+                }
+                if app.mode == Mode::ActionReason {
+                    app.pending_action = None;
+                    app.pending_reason = None;
                 }
                 app.mode = Mode::Normal;
                 app.input.clear();
@@ -1114,6 +1572,16 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             KeyCode::Enter => {
                 let value = std::mem::take(&mut app.input);
                 match app.mode {
+                    Mode::ActionReason => {
+                        if value.trim().is_empty() {
+                            app.action_result =
+                                Some("Enter a reason for this review decision".into());
+                        } else {
+                            app.action_result = None;
+                            app.pending_reason = Some(value);
+                            app.mode = Mode::Confirm;
+                        }
+                    }
                     Mode::Chat => {
                         if !value.trim().is_empty() {
                             if !app.live_ready {
@@ -1223,6 +1691,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                         app.mode = Mode::Normal;
                     }
                     Mode::Normal => {}
+                    Mode::Confirm => unreachable!(),
                 }
             }
             KeyCode::Char(c)
@@ -1243,38 +1712,31 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
         KeyCode::Char('s') => app.sidebar = !app.sidebar,
-        KeyCode::Char('r') if app.tab == 0 => {
-            let selected_attention = app.model.attention().nth(app.selected[0]).cloned();
-            if !app.live_ready {
-                app.model.status = "Reconnect before resolving attention".into();
-            } else if let Some(attention) = selected_attention {
-                if attention
+        KeyCode::Char('i') => app.status_details = !app.status_details,
+        KeyCode::Char('v') => {
+            app.selection_mode = !app.selection_mode;
+            if app.selection_mode {
+                execute!(io::stdout(), DisableMouseCapture)?;
+            } else {
+                execute!(io::stdout(), EnableMouseCapture)?;
+            }
+        }
+        KeyCode::Char(c) if app.tab == 0 && "arjdm".contains(c) => {
+            if let Some(attention) = app.model.attention().nth(app.selected[0]) {
+                if let Some(action) = attention
                     .actions
                     .iter()
-                    .any(|action| action == "attention.resolve")
+                    .find(|action| action_key(action) == Some(c))
                 {
-                    let attention_id = attention.header.id.clone();
-                    let fence = app
-                        .model
-                        .now
-                        .fence(&attention_id)
-                        .context("attention fence unavailable")?;
-                    let (id, idem) = action_pair();
-                    client
-                        .attention_resolve(
-                            id,
-                            idem,
-                            fence,
-                            AttentionResolveParameters {
-                                attention_id,
-                                outcome: "resolved".into(),
-                                reason: None,
-                            },
-                        )
-                        .await?;
-                    app.model.reload(client).await?;
-                } else {
-                    app.model.status = "Selected attention has no resolve action".into();
+                    app.pending_action = Some((attention.header.id.clone(), action.clone()));
+                    app.pending_reason = None;
+                    app.mode = if action.starts_with("review.") {
+                        Mode::ActionReason
+                    } else {
+                        Mode::Confirm
+                    };
+                    app.input.clear();
+                    app.scroll[0] = 0;
                 }
             }
         }
@@ -1305,6 +1767,9 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             }
         }
         KeyCode::PageUp => {
+            if app.tab == 1 && app.scroll[1] == u16::MAX {
+                app.scroll[1] = app.chat_max_scroll.get();
+            }
             app.scroll[app.tab] = app.scroll[app.tab].saturating_sub(10);
             if app.tab == 1 {
                 app.remember_chat_scroll();
@@ -1313,8 +1778,15 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         KeyCode::PageDown => {
             app.scroll[app.tab] = app.scroll[app.tab].saturating_add(10);
             if app.tab == 1 {
+                if app.scroll[1] >= app.chat_max_scroll.get() {
+                    app.scroll[1] = u16::MAX;
+                }
                 app.remember_chat_scroll();
             }
+        }
+        KeyCode::End if app.tab == 1 => {
+            app.scroll[1] = u16::MAX;
+            app.remember_chat_scroll();
         }
         KeyCode::Char('c') if app.tab == 1 => {
             if !app.live_ready {
@@ -1676,10 +2148,30 @@ fn main() -> Result<()> {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(_))
                         && app.attached.is_some()
-                        && mouse.row < 2 =>
+                        && mouse.row == 0 =>
                 {
                     app.return_focused = true;
                     app.dirty = true;
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(_))
+                        && app.attached.is_none()
+                        && app.mode == Mode::Normal =>
+                {
+                    if let Some(index) =
+                        sidebar_item_at(&app, mouse.column, mouse.row, guard.terminal.size()?.width)
+                    {
+                        if app.tab == 1 {
+                            app.remember_chat_scroll();
+                        }
+                        app.selected[app.tab] = index;
+                        if app.tab == 1 {
+                            app.restore_chat_scroll();
+                        } else {
+                            app.scroll[app.tab] = 0;
+                        }
+                        app.dirty = true;
+                    }
                 }
                 Event::Resize(_, _) => app.dirty = true,
                 _ => {}
@@ -1766,7 +2258,7 @@ mod tests {
 
     #[test]
     fn regression_now_action_has_a_useful_label_and_key() {
-        assert_eq!(action_label("attention.resolve"), "Resolve (r)");
+        assert_eq!(action_label("attention.resolve"), "Resolve [r]");
     }
 
     #[test]
@@ -1982,7 +2474,7 @@ mod tests {
         app.remember_chat_scroll();
         app.selected[1] = 1;
         app.restore_chat_scroll();
-        assert_eq!(app.scroll[1], 0);
+        assert_eq!(app.scroll[1], u16::MAX);
         app.scroll[1] = 4;
         app.remember_chat_scroll();
         app.selected[1] = 0;
@@ -2010,5 +2502,237 @@ mod tests {
         assert_eq!(app.timeline_requested.as_deref(), Some("session/alpha"));
         assert_eq!(app.chat_draft_cache.len(), 2);
         assert_eq!(app.chat_scroll_cache.get("session/alpha"), Some(&18));
+    }
+
+    #[test]
+    fn layout_has_top_tabs_compact_connection_and_selection_hint() {
+        let mut app = App::new(Model::default());
+        app.live_ready = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first = (0..100)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(first.contains("Now") && first.contains("Chat"));
+        assert!(first.contains("Online"));
+        assert!(!first.contains("Smalltalk"));
+        assert!(buffer[(1, 0)].bg != Color::Reset);
+    }
+    #[test]
+    fn connection_error_is_available_on_demand_not_in_footer() {
+        let mut model = Model::default();
+        model.status = "Sync: long cache error with useful detail".into();
+        let mut app = App::new(model);
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top = (0..100)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        let footer = (0..100)
+            .map(|x| buffer[(x, 24)].symbol())
+            .collect::<String>();
+        assert!(top.contains("Offline"));
+        assert!(!footer.contains("cache error"));
+        app.status_details = true;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Sync: long cache error"));
+    }
+    #[test]
+    fn chat_follows_newest_message_and_click_targets_agent_row() {
+        let mut model = Model::default();
+        for name in ["alpha", "beta"] {
+            model.agents.items.push(serde_json::from_value(serde_json::json!({"kind":"agent","id":format!("agent/{name}"),"revision":"one","updated_at":"2026-09-25T08:00:00Z","name":name,"state":"running","reachability":"reachable"})).unwrap());
+        }
+        for sequence in 1..=20 {
+            model.timeline.push(serde_json::from_value(serde_json::json!({"id":format!("timeline/{sequence}"),"sequence":sequence,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"assistant","type":"content","final":true,"body":{"media_type":"text/plain","text":format!("Message {sequence}")}})).unwrap());
+        }
+        let mut app = App::new(model);
+        app.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Message 20"));
+        assert_eq!(sidebar_item_at(&app, 2, 2, 90), Some(0));
+        assert_eq!(sidebar_item_at(&app, 2, 4, 90), Some(1));
+        assert_eq!(sidebar_item_at(&app, 2, 4, 60), None);
+        app.sidebar_offsets[1].set(1);
+        assert_eq!(sidebar_item_at(&app, 2, 2, 90), Some(1));
+        app.selection_mode = true;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let header = (0..90)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(header.contains("SELECT"));
+    }
+
+    #[test]
+    fn now_card_lists_actions_and_confirmation_keys() {
+        let mut model = Model::default();
+        model.actor = "person/nathan".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review deployment","detail":"Approve the release?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        let app = App::new(model);
+        let mut terminal = Terminal::new(TestBackend::new(110, 35)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Approve [a]"));
+        assert!(content.contains("Reject [j]"));
+        assert!(content.contains("Approve the release?"));
+    }
+    #[tokio::test]
+    async fn attention_key_requires_explicit_confirmation() {
+        let mut model = Model::default();
+        model.actor = "person/nathan".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review","detail":"Approve?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        let mut app = App::new(model);
+        let client = Client::unix("/nonexistent-stui-test.sock");
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::ActionReason);
+        assert_eq!(app.pending_action.as_ref().unwrap().1, "review.approve");
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::ActionReason);
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+        assert_eq!(app.pending_reason.as_deref(), Some("y"));
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn mission_progress_counts_terminal_and_active_steps() {
+        let mut model = Model::default();
+        model.missions.items.push(serde_json::from_str(r#"{"kind":"mission","id":"mission/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","title":"Release","state":"running","mission_revision":"a","runs":["mission-run/old","mission-run/a"]}"#).unwrap());
+        for (path, state) in [
+            ("build", "completed"),
+            ("review", "claimed"),
+            ("deploy", "waiting"),
+        ] {
+            model.work.items.push(serde_json::from_value(serde_json::json!({"kind":"work","id":format!("step-run/a/{path}"),"revision":"one","updated_at":"2026-09-25T08:00:00Z","mission_run_id":"mission-run/a","generation_id":"generation/a","definition_id":"def/a","path":path,"state":state,"attempt":1,"readiness_epoch":1})).unwrap());
+        }
+        if let Some(Resource::Work(work)) = model
+            .work
+            .items
+            .iter_mut()
+            .find(|item| item.header().id == "step-run/a/review")
+        {
+            work.claimant = Some("agent/reviewer".into());
+        }
+        model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/old/ship","revision":"one","updated_at":"2026-09-24T08:00:00Z","mission_run_id":"mission-run/old","generation_id":"generation/old","definition_id":"def/old","path":"ship","state":"completed","attempt":1,"readiness_epoch":1}"#).unwrap());
+        let mission = model.missions().next().unwrap();
+        assert_eq!(mission_progress(&model, mission), (1, 3));
+        assert_eq!(
+            mission_current_work(&model, mission).unwrap().path,
+            "review"
+        );
+        assert_eq!(
+            next_action_label(mission_current_work(&model, mission).unwrap()),
+            "Agent working"
+        );
+        assert_eq!(App::new(model.clone()).mission_group(mission), "Running");
+        model.work.snapshot = Some(st3_client::Snapshot {
+            id: "snapshot/one".into(),
+            host_id: "host/one".into(),
+            store_index: 1,
+            projection_version: "v0".into(),
+            created_at: "2026-09-25T08:00:00Z".into(),
+        });
+        model.work.truncated = true;
+        assert_eq!(
+            mission_progress_label(&model, model.missions().next().unwrap(), 1, 3),
+            "1/3+ visible steps"
+        );
+        let mut app = App::new(model);
+        app.tab = 2;
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("NEXT"));
+        assert!(content.contains("Agent working"));
+        assert!(content.contains("Owner"));
+        assert!(content.contains("agent/reviewer"));
+        if let Some(Resource::Work(work)) = app
+            .model
+            .work
+            .items
+            .iter_mut()
+            .find(|item| item.header().id == "step-run/a/deploy")
+        {
+            work.state = "blocked".into();
+            work.blocked_reason = Some("Needs owner review".into());
+        }
+        let mission = app.model.missions().next().unwrap();
+        assert_eq!(app.mission_group(mission), "Blocked");
+        assert_eq!(
+            mission_current_work(&app.model, mission).unwrap().path,
+            "deploy"
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Resolve blocker"));
+        assert!(content.contains("Needs owner review"));
     }
 }

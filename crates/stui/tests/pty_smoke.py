@@ -63,7 +63,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
                     break
         return bytes(output), time.monotonic() - started
 
-    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else b"Smalltalk", 2)
+    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else b"Now", 2)
     assert first_frame < 1, f"first frame took {first_frame:.3f}s"
     if ending != "panic":
         for key in (b"2", b"3", b"4", b"1"):
@@ -71,6 +71,12 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
             changed, latency = wait_for(b"", 1)
             assert changed, f"{key!r} did not redraw"
             assert latency < 0.5, f"{key!r} navigation took {latency:.3f}s"
+        os.write(master, b"v")
+        selection, _ = wait_for(b"\x1b[?1000l", 1)
+        assert b"\x1b[?1000l" in selection, "selection mode did not release mouse capture"
+        os.write(master, b"v")
+        mouse, _ = wait_for(b"\x1b[?1000h", 1)
+        assert b"\x1b[?1000h" in mouse, "selection mode did not restore mouse capture"
         collect(1)  # A live background snapshot may redraw after navigation.
         if ending == "normal":
             os.write(master, b"q")
@@ -131,7 +137,7 @@ def hangup_case(binary: str) -> None:
         ready, _, _ = select.select([master], [], [], 0.1)
         if ready:
             output.extend(os.read(master, 65536))
-            if b"Smalltalk" in plain(output):
+            if b"Now" in plain(output):
                 break
     else:
         proc.kill()
