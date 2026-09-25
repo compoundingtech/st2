@@ -115,20 +115,19 @@ public actor St3Client {
         var request = URLRequest(url: components.url!); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
         let task = session.webSocketTask(with: request); task.resume(); defer { task.cancel(with: .normalClosure, reason: nil) }
         let decoder = JSONDecoder()
-        let screenData = try websocketData(await: task.receive())
+        let screenData = try websocketData(from: try await task.receive())
         if let error = try? decoder.decode(ErrorEnvelope.self, from: screenData) { throw error }
         let screen = try decoder.decode(Envelope<TerminalScreen>.self, from: screenData)
-        let frames: Envelope<TerminalFramePage>? = try await {
-            do {
-                let data = try websocketData(await: task.receive())
-                if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
-                return try decoder.decode(Envelope<TerminalFramePage>.self, from: data)
-            } catch let error as ErrorEnvelope { throw error } catch { return nil }
-        }()
+        let frames: Envelope<TerminalFramePage>?
+        do {
+            let data = try websocketData(from: try await task.receive())
+            if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
+            frames = try decoder.decode(Envelope<TerminalFramePage>.self, from: data)
+        } catch let error as ErrorEnvelope { throw error } catch { frames = nil }
         return TerminalStreamBatch(screen: screen, frames: frames)
     }
 
-    private func websocketData(await message: URLSessionWebSocketTask.Message) throws -> Data {
+    private func websocketData(from message: URLSessionWebSocketTask.Message) throws -> Data {
         switch message { case .data(let data): return data; case .string(let text): return Data(text.utf8); @unknown default: throw URLError(.cannotParseResponse) }
     }
 
