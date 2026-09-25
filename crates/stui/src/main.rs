@@ -27,7 +27,7 @@ use st3_client::{
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
-    io::{self, IsTerminal, Stdout},
+    io::{self, Stdout},
     path::PathBuf,
     sync::{
         Arc,
@@ -61,18 +61,9 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let restore = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-        let raw = disable_raw_mode();
-        let cursor = self.terminal.show_cursor();
-        if let Some(path) = std::env::var_os("STUI_TEST_RESTORE_TRACE") {
-            let _ = std::fs::write(
-                path,
-                format!(
-                    "restore={restore:?}\nraw={raw:?}\ncursor={cursor:?}\nstdout_tty={}\n",
-                    io::stdout().is_terminal()
-                ),
-            );
-        }
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        let _ = self.terminal.show_cursor();
     }
 }
 

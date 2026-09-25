@@ -90,13 +90,14 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
             os.write(master, b"q")
         else:
             proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+    deadline = time.monotonic() + 5
+    while proc.poll() is None and time.monotonic() < deadline:
+        collect(0.02)
+    if proc.poll() is None:
         proc.kill()
         proc.wait()
         raise AssertionError(f"{ending}: TUI did not exit")
-    collect(1)
+    collect(0.2)
     os.close(master)
     modes = sorted(set(re.findall(rb"\x1b\[\?[0-9;]*[hl]", captured)))
     assert b"\x1b[?1049l" in captured, (
