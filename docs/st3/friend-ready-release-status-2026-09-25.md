@@ -1,11 +1,12 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `3300900` for `st3` and `e3c6fdd` for `stui` is
+**Release hold.** Source `c2db7ab` for `st3` and `8d2d4e5` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
 source is merged at `e49c097`. The 16:12:47 UTC windows were invalidated by
 the TUI and message projection repair rollout. New windows began at 17:09:40
-UTC (`1790356180`) after both daemons restarted; their full 24-hour idle and 72-hour bidirectional
-delivery reports are still due.
+UTC (`1790356180`) after both daemons restarted. The later TUI and driver
+binary updates did not restart either daemon, so the window remains intact;
+the full 24-hour idle and 72-hour bidirectional delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -24,6 +25,43 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 20:38 UTC CoS retest repairs
+
+- The CoS retest confirmed three earlier TUI repairs and found that Ctrl+\\
+  could not leave an attached terminal. Crossterm can decode that chord as
+  Ctrl+4. The TUI now accepts both encodings, and clicking the visible Return
+  control detaches immediately. The attached view explicitly says it is
+  interactive; keys other than the detach chord are sent to the agent terminal.
+  Live installed PTY attachment QA passed both controls against OMP on Hetz
+  and Fabric on Silber. A transient reconnect also exposed a stale footer
+  notice; the TUI clears it after a successful model refresh.
+- Transient `st3` driver API warnings now append to a private host state log
+  instead of stderr shared with the harness PTY. Silber's idle Fabric steward
+  was restarted from its unchanged `st3-network` KDL at 20:38:29 UTC to pick
+  up the driver fix; it returned to an idle new incarnation with no active
+  work and strict doctor passing. Its old session had referenced an immutable
+  Claude hook set missing on Silber. The exact set was copied from Hetz and
+  restored on Silber before the restart. The new terminal shows neither
+  reported diagnostic.
+- Hetz installed `st3` SHA-256
+  `291a7cb2f3960c39b6d9d528c034ff5ad0e9a4b4500c8fc5f92647189da41838`
+  and `stui` SHA-256
+  `f1534c54ac91fbe088de99b2feab97233519917260dd04a6fcdcbdeb034b3953`;
+  Silber installed `st3` SHA-256
+  `74a8904c1833e762eee426f6da08003672dea5849407fe4a1cd0766d0cf08d2d`
+  and `stui` SHA-256
+  `b14c0b69e8f6dbd09fead9fc66f51982f6ca295d8e9c24499f473b63bebc3759`.
+  Prior binaries are backed up on each host. The full local suite passed 417
+  library, 88 CLI, and 47 active TUI tests; the Mac CLI and TUI unit suites
+  passed. One concurrent Mac library run hit a terminal test failure and a
+  gateway reconnect test that did not finish; it was stopped, so it is not
+  counted as a pass. The installed live attachment QA passed on both hosts.
+- The gate watcher still reports `idle_preflight=healthy` and, after two hours
+  of quiet evidence, `idle_risk=within-limit` at 20:30 UTC. The continuous
+  delivery monitor continues to record exact linked receipts. Neither early
+  signal replaces the 24-hour or 72-hour release verdict. CoS has been asked
+  to run Nathan's full TUI retest after this installation.
 
 ## 17:09 UTC CoS walkthrough repairs and new evidence windows
 

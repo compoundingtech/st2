@@ -7,6 +7,7 @@ import sys
 import time
 import uuid
 
+sys.dont_write_bytecode = True
 from interaction_qa import PTY, click, screen, send, wait_screen
 
 
