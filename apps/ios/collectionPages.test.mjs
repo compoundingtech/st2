@@ -28,3 +28,14 @@ assert.equal(retried.truncated, false);
 assert.equal(firstPages, 2);
 assert.equal(secondPages, 2);
 await assert.rejects(listCollectionPages(async () => result([], true, 'same'), 30), /did not advance/);
+
+// (1) One forbidden collection must not blank the others or hide why it is missing.
+const { settleCollections } = await import('./collectionPages.ts');
+const ok = { pages: [], truncated: false };
+const forbidden = Object.assign(new Error('device inventory requires an explicitly authenticated person'), { response: { code: 'forbidden' } });
+const settled = settleCollections(['attention', 'devices'], await Promise.allSettled([Promise.resolve(ok), Promise.reject(forbidden)]), error => `${error.response.code}: ${error.message}`);
+assert.deepEqual(settled.values, { attention: ok });
+assert.deepEqual(settled.errors, { devices: 'forbidden: device inventory requires an explicitly authenticated person' });
+assert.equal(settled.firstError, undefined);
+const allFailed = settleCollections(['attention'], await Promise.allSettled([Promise.reject(forbidden)]), String);
+assert.equal(allFailed.firstError, forbidden);

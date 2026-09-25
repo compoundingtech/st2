@@ -36,3 +36,16 @@ export async function listCollectionPages(
   }
   throw new Error('Collection pagination retries exhausted.');
 }
+
+// Collections are read independently. A failure (for example a scope the device lacks) is
+// reported for that collection and keeps the rest of the projection; only a total failure throws.
+export function settleCollections<K extends string, V>(keys: readonly K[], results: PromiseSettledResult<V>[], describe: (error: unknown) => string): { values: Partial<Record<K, V>>; errors: Partial<Record<K, string>>; firstError?: unknown } {
+  const values: Partial<Record<K, V>> = {}, errors: Partial<Record<K, string>> = {};
+  keys.forEach((key, index) => {
+    const result = results[index];
+    if (result.status === 'fulfilled') values[key] = result.value;
+    else errors[key] = describe(result.reason);
+  });
+  const firstError = Object.keys(values).length ? undefined : results.find((result): result is PromiseRejectedResult => result.status === 'rejected')?.reason;
+  return { values, errors, ...(firstError === undefined ? {} : { firstError }) };
+}
