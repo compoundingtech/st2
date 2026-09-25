@@ -7,4 +7,4 @@ Type=oneshot
 EnvironmentFile=%h/.config/st3/message-soak.env
 EnvironmentFile=%h/.config/st3/friend-ready-gates.env
 ExecStart=/usr/bin/bash %h/.local/bin/st3-friend-ready-gate-watch
-TimeoutStartSec=300
+TimeoutStartSec=600

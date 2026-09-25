@@ -14,6 +14,11 @@ The gate does not replace graph gate evidence for individual missions: work comp
 
 `st3-friend-ready-gate-watch.timer` runs every 15 minutes on Hetz. Its host-local, untracked environment file pins the first local Silber idle sample and the complete-logging delivery monitor start. Before each due time it records `waiting`; afterward it checks both unmodified default reports, sends a durable normalized message to the claimed st3 operator on each pass/fail transition, and sends a combined release-review wake only when both pass. At each 72-hour delivery deadline it also starts one exact final-audit mission run, keyed by that window's start, whether delivery passes or fails. The run is claimable work with mechanical gates for both unmodified reports; a message alone is never treated as work. The watcher checks the exact run before starting and after an ambiguous start response, then retries on its next timer invocation if no run exists. It keys notifications by window start as well as result, so a reset window cannot silently inherit an old failure notice. It persists notification state after successful send so a failed send is retried and a duplicate delivery cannot silently erase a gate transition. The reports, not the watcher state, remain the release authority.
 
+The watcher service has a ten-minute start budget: three independent remote
+reads may each consume their two-minute Fabric timeout during an outage, and
+the remaining time permits fault notification and audit-queue retry. Its
+15-minute timer continues to retry a failed invocation.
+
 During the idle window the watcher also runs `st3-idle-soak-preflight` against
 only samples since the pinned final-build start. This separate integrity check
 alerts early if a host's evidence is missing or stale, a sample or peer is bad,
