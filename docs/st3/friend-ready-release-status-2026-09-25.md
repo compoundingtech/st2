@@ -56,9 +56,12 @@ is installed on Hetz; its own fixture test and first service run passed. The
   stalled-connection PTY smoke against the live daemon. Its debug-only panic
   restoration check passed separately on the debug binary.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
-  daemon. All six iOS logic tests and the TypeScript typecheck passed. Prior
-  signed Debug simulator and paired-gateway proofs remain the device evidence;
-  a physical iPhone installation is optional for this mission.
+  daemon. On the current source, all six iOS logic tests, the TypeScript
+  typecheck, and `npm run export:ios` passed; the offline export produced a
+  1.6 MiB iOS Hermes bundle. Prior signed Debug simulator and paired-gateway
+  proofs remain the native device evidence; an exported bundle alone does not
+  prove pairing or a physical iPhone installation, which is optional for this
+  mission.
 - The earlier `326904a` build had a three-minute **diagnostic only** with no
   sample errors, unchanged daemon PIDs, and quiet median CPU of 13.3% on Hetz
   and 17.4% on Silber. Those figures must not be attributed to `0da07d7` or
