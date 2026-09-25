@@ -135,22 +135,31 @@ impl Model {
             Err(error) => return Err(error.into()),
         };
         let (mut changed, mut invalidated_sessions) = self.consume_events(events);
-        // Drain a short burst before issuing projection reads. Busy fleets often
-        // publish several related events together.
-        for _ in 0..3 {
-            if !changed {
-                break;
+        // Coalesce a busy event stream before projection reads. A mission
+        // publish/start can emit dozens of related changes; refreshing after
+        // each event makes one Chat viewer multiply daemon CPU under load.
+        if changed {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            for _ in 0..16 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let more = client
+                    .events(
+                        Some(&self.event_cursor),
+                        Some(PAGE_SIZE),
+                        Some(remaining.as_millis().min(1_500) as u64),
+                    )
+                    .await?
+                    .value;
+                if more.items.is_empty() {
+                    break;
+                }
+                let (more_changed, sessions) = self.consume_events(more);
+                changed |= more_changed;
+                invalidated_sessions.extend(sessions);
             }
-            let more = client
-                .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(0))
-                .await?
-                .value;
-            if more.items.is_empty() {
-                break;
-            }
-            let (more_changed, sessions) = self.consume_events(more);
-            changed |= more_changed;
-            invalidated_sessions.extend(sessions);
         }
         if changed {
             self.reload_changed(client).await?;
