@@ -104,7 +104,6 @@ struct App {
     input: String,
     launch: [String; 4],
     attached: Option<Attached>,
-    return_focused: bool,
     selection_mode: bool,
     selection_frame_drawn: bool,
     history_open: bool,
@@ -147,7 +146,6 @@ impl App {
             input: String::new(),
             launch: Default::default(),
             attached: None,
-            return_focused: false,
             selection_mode: false,
             selection_frame_drawn: false,
             history_open: false,
@@ -391,13 +389,8 @@ impl App {
         .split(area);
         if self.attached.is_some() {
             frame.render_widget(
-                Paragraph::new(" ← Return to Smalltalk (Ctrl+\\)").style(Style::default().fg(
-                    if self.return_focused {
-                        Color::Yellow
-                    } else {
-                        Color::Cyan
-                    },
-                )),
+                Paragraph::new(" ← Return to Smalltalk (Ctrl+\\)")
+                    .style(Style::default().fg(Color::Cyan)),
                 chunks[0],
             );
         } else {
@@ -519,7 +512,7 @@ impl App {
                 columns[1],
             );
             frame.render_widget(
-                Paragraph::new("Ctrl+\\ detach  ·  Click Return control then Enter"),
+                Paragraph::new("Interactive terminal · Ctrl+\\ or click Return to detach"),
                 chunks[2],
             );
             return;
@@ -1607,6 +1600,10 @@ fn key_input(key: KeyEvent) -> Option<String> {
     }
 }
 
+fn is_detach_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
+}
+
 async fn attach(app: &mut App, client: &Client) -> Result<()> {
     let Some(runtime) = app.runtime() else {
         app.model.status = "No controllable terminal for selected agent".into();
@@ -1708,7 +1705,6 @@ async fn detach(app: &mut App, client: &Client) -> Result<()> {
         }
     }
     app.attached = None;
-    app.return_focused = false;
     app.dirty = true;
     Ok(())
 }
@@ -1943,11 +1939,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     if let Some(attached) = &app.attached {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('\\') {
-            detach(app, client).await?;
-            return Ok(false);
-        }
-        if app.return_focused && key.code == KeyCode::Enter {
+        if is_detach_key(key) {
             detach(app, client).await?;
             return Ok(false);
         }
@@ -2679,8 +2671,10 @@ fn main() -> Result<()> {
                         && app.attached.is_some()
                         && mouse.row == 0 =>
                 {
-                    app.return_focused = true;
-                    app.dirty = true;
+                    if let Err(error) = runtime.block_on(detach(&mut app, &client)) {
+                        app.model.status = format!("Detach failed: {error}");
+                        app.dirty = true;
+                    }
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(_))
@@ -2987,6 +2981,22 @@ mod tests {
             key_input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)).as_deref(),
             Some("C-x")
         );
+    }
+
+    #[test]
+    fn terminal_detach_accepts_both_crossterm_encodings() {
+        assert!(is_detach_key(KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_detach_key(KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_detach_key(KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[tokio::test]

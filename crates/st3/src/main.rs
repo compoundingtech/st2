@@ -7556,9 +7556,35 @@ fn tolerate_driver_api_outage(
     }
     let now = Instant::now();
     if last_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
-        eprintln!("warning: `{subject}` lost the st3 API and will retry: {error:#}");
+        // The driver shares a PTY with its provider. Writing to stderr here would
+        // corrupt the provider's interactive screen while the API is restarting.
+        let _ = write_driver_api_warning(subject, &error);
         *last_warning = Some(now);
     }
+    Ok(())
+}
+
+fn write_driver_api_warning(subject: &str, error: &anyhow::Error) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .context("no state directory for driver warning")?;
+    let directory = state_home.join("st3");
+    fs::create_dir_all(&directory)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(directory.join("driver-api-warnings.log"))?;
+    let at = current_unix_ms()?;
+    writeln!(
+        file,
+        "{at} {subject} {}",
+        format!("{error:#}").replace('\n', " ")
+    )?;
     Ok(())
 }
 

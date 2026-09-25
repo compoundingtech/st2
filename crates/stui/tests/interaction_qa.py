@@ -105,6 +105,27 @@ def main(binary: str) -> None:
         send(session, "\x1b")
         wait_screen(session, lambda value: "Select text [v]" in value.splitlines()[0], "return from selection")
         assert "Chat" in screen(session).splitlines()[0], "Esc in selection must not quit"
+        attach_label = os.environ.get("STUI_QA_ATTACH_LABEL")
+        if attach_label:
+            for _ in range(120):
+                footer = screen(session).splitlines()[-1]
+                if attach_label.lower() in footer.lower() and "Enter terminal" in footer:
+                    break
+                send(session, "\x1b[B")
+                time.sleep(0.03)
+            else:
+                raise AssertionError(f"no selectable terminal for {attach_label}")
+            send(session, "\r")
+            wait_screen(session, lambda value: "Return to Smalltalk" in value
+                        and "Interactive terminal" in value, "attached terminal")
+            send(session, "\x1c")  # Ctrl+\\, decoded as Ctrl+4 by some terminals.
+            wait_screen(session, lambda value: "Return to Smalltalk" not in value
+                        and "History [h]" in value, "Ctrl+\\ detach")
+            send(session, "\r")
+            wait_screen(session, lambda value: "Return to Smalltalk" in value, "reattached terminal")
+            click(session, 5, 1)
+            wait_screen(session, lambda value: "Return to Smalltalk" not in value
+                        and "History [h]" in value, "click Return detach")
         print("Chat interaction QA passed: click target, wheel, History, older pages, text selection")
     finally:
         try:
