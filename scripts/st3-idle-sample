@@ -31,7 +31,31 @@ else
 fi
 
 activity_json=$("$ST3_BIN" activity --limit 200 --json)
-replication_json=$("$ST3_BIN" replication status --json)
+# Replication status computes an exact graph digest. A concurrent write can
+# delay one read long enough for the outer sampler alarm to record a false
+# missing sample. Bound each attempt and retry once; a sustained failure still
+# fails this sample and remains visible in the retained evidence.
+replication_json=
+replication_read_attempts=0
+replication_read_ok=0
+for attempt in 1 2; do
+  replication_read_attempts=$attempt
+  if [[ $(/usr/bin/uname -s) == Darwin ]]; then
+    if replication_json=$(/usr/bin/perl -e 'alarm 10; exec @ARGV or die $!' \
+      "$ST3_BIN" replication status --json); then
+      replication_read_ok=1
+      break
+    fi
+  elif replication_json=$(/usr/bin/timeout -k 1s 10s \
+    "$ST3_BIN" replication status --json); then
+    replication_read_ok=1
+    break
+  fi
+done
+[[ $replication_read_ok == 1 && -n $replication_json ]] || {
+  echo 'replication status was unavailable after two bounded reads' >&2
+  exit 1
+}
 graph_index=$("$JQ_BIN" -er '.snapshot.store_index' <<<"$activity_json")
 material_index=$("$JQ_BIN" -er '[.value.items[] |
   select(.body.change != "harness.usage" and .body.change != "harness.observed"
@@ -50,8 +74,10 @@ peer_last_success_ms=$("$JQ_BIN" -er '.peers[0].last_success_at_unix_ms' <<<"$re
   --argjson pending "$pending" \
   --argjson received "$received" --arg peer_status "$peer_status" \
   --argjson peer_error "$peer_error" --argjson peer_last_success_ms "$peer_last_success_ms" \
+  --argjson replication_read_attempts "$replication_read_attempts" \
   '{at:$at,host:$host,pid:$pid,cpu_seconds:$cpu_seconds,rss_kib:$rss_kib,
     context_switches:$context_switches,graph_index:$graph_index,
     material_index:$material_index,pending:$pending,
     received:$received,peer_status:$peer_status,peer_error:$peer_error,
-    peer_last_success_ms:$peer_last_success_ms}'
+    peer_last_success_ms:$peer_last_success_ms,
+    replication_read_attempts:$replication_read_attempts}'
