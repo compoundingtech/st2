@@ -1118,7 +1118,7 @@ impl App {
                     "↑↓/click agent · wheel/Pg scroll · h history · m import · v select · q quit".into()
                 }
                 1 => {
-                    let selected = self.peer().map(|peer| format!("{} {} · ", state_glyph(&peer.state), agent_label(peer))).unwrap_or_default();
+                    let selected = self.peer().map(|peer| format!("{} {} · observed {} · ", state_glyph(&peer.state), agent_label(peer), age_label(&peer.header.updated_at, &chrono::Utc::now().to_rfc3339()))).unwrap_or_default();
                     let graph_only = self.peer().is_some_and(|peer| {
                         self.model.messages(None, &peer.header.id).next().is_some()
                     }) && self.model.timeline.iter().all(|entry| !matches!(entry.body, st3_client::TimelineBody::Content(_)));
