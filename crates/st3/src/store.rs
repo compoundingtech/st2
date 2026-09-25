@@ -509,6 +509,7 @@ impl Store {
 struct ReplicationSnapshot {
     store_index: u64,
     replica_generation: u64,
+    max_envelope_rowid: i64,
     inventory: ReplicationInventory,
     authority_digest: String,
     graph_digest: String,
@@ -786,8 +787,12 @@ impl Store {
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
         let connection = self.readers.get();
-        let expected = expected_operations(&connection)?;
-        let mut statement = connection.prepare(
+        // Replication and harness observations can append claims while doctor runs. Both
+        // sides of this comparison must see the same SQLite snapshot, or a healthy
+        // projection can appear to drift between the two reads.
+        let transaction = connection.unchecked_transaction()?;
+        let expected = expected_operations(&transaction)?;
+        let mut statement = transaction.prepare(
             "SELECT id, request_digest, canonical_claim_id, state FROM operations ORDER BY id",
         )?;
         let actual = statement
@@ -802,6 +807,8 @@ impl Store {
                 ))
             })?
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
         let mut drift = Vec::new();
         for id in expected
             .keys()
@@ -7905,19 +7912,47 @@ impl Store {
         let transaction = connection.transaction()?;
         seed_replica_envelopes_tx(&transaction, &self.origin)?;
         transaction.commit()?;
-        let mut statement = connection.prepare(
-            "SELECT writer, sequence, envelope_hash FROM replica_envelopes
-             ORDER BY writer, sequence, envelope_hash",
-        )?;
-        let envelopes = statement
-            .query_map([], |row| {
-                Ok(ReplicaEnvelopeId {
-                    writer: row.get(0)?,
-                    sequence: row.get(1)?,
-                    hash: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let previous = self
+            .replication_snapshot
+            .lock()
+            .expect("replication snapshot mutex poisoned")
+            .clone();
+        let envelope_count: usize =
+            connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
+                row.get(0)
+            })?;
+        let (envelopes, max_envelope_rowid) = if let Some(previous) = previous {
+            let mut statement = connection.prepare(
+                "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+                 WHERE rowid>?1 ORDER BY rowid",
+            )?;
+            let additions = statement
+                .query_map([previous.max_envelope_rowid], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        ReplicaEnvelopeId {
+                            writer: row.get(1)?,
+                            sequence: row.get(2)?,
+                            hash: row.get(3)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if envelope_count == previous.inventory.envelopes.len() + additions.len() {
+                let mut envelopes = previous.inventory.envelopes.clone();
+                let mut max_rowid = previous.max_envelope_rowid;
+                for (rowid, identity) in additions {
+                    max_rowid = max_rowid.max(rowid);
+                    let position = envelopes.binary_search(&identity).unwrap_or_else(|at| at);
+                    envelopes.insert(position, identity);
+                }
+                (envelopes, max_rowid)
+            } else {
+                full_replication_inventory_rows(&connection)?
+            }
+        } else {
+            full_replication_inventory_rows(&connection)?
+        };
         let inventory = ReplicationInventory {
             digest: replication_inventory_digest(&envelopes),
             envelopes,
@@ -7929,6 +7964,7 @@ impl Store {
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
+            max_envelope_rowid,
             inventory,
             authority_digest,
             graph_digest: graph_digest(&connection)?,
@@ -13714,6 +13750,34 @@ fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position
     format!("record/{}", hex::encode(digest))
 }
 
+fn full_replication_inventory_rows(
+    connection: &Connection,
+) -> Result<(Vec<ReplicaEnvelopeId>, i64)> {
+    let mut statement = connection.prepare(
+        "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+         ORDER BY writer, sequence, envelope_hash",
+    )?;
+    let mut max_rowid = 0;
+    let envelopes = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ReplicaEnvelopeId {
+                    writer: row.get(1)?,
+                    sequence: row.get(2)?,
+                    hash: row.get(3)?,
+                },
+            ))
+        })?
+        .map(|row| {
+            let (rowid, identity) = row?;
+            max_rowid = max_rowid.max(rowid);
+            Ok(identity)
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+    Ok((envelopes, max_rowid))
+}
+
 fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"st3-replication-inventory-v1\0");
@@ -13828,6 +13892,66 @@ fn unchanged_replication_snapshot_reuses_inventory() {
     assert_ne!(
         first_hash, second_hash,
         "the inventory must commit payload bytes"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let target = Store::open_memory("z").unwrap();
+    let initial = target.replication_snapshot().unwrap();
+    target
+        .append_client_claim(&ClaimInput {
+            subject: "resource/local-envelope".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([(
+                "kind".into(),
+                Value::String("custom.test.replication".into()),
+            )]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("local-envelope".into()),
+        })
+        .unwrap();
+    let local = target.replication_snapshot().unwrap();
+    assert_eq!(
+        local.inventory.envelopes.len(),
+        initial.inventory.envelopes.len() + 1
+    );
+
+    let source = Store::open_memory("a").unwrap();
+    source
+        .append_client_claim(&ClaimInput {
+            subject: "resource/remote-envelope".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([(
+                "kind".into(),
+                Value::String("custom.test.replication".into()),
+            )]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("remote-envelope".into()),
+        })
+        .unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let exchange = source
+        .export_replication_exchange(FLEET, &ReplicationInventory::default())
+        .unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    target
+        .receive_replication_exchange("a", FLEET, &exchange)
+        .unwrap();
+    let incremental = target.replication_snapshot().unwrap();
+    let connection = target.connection.lock().unwrap();
+    let (full, max_rowid) = full_replication_inventory_rows(&connection).unwrap();
+    assert_eq!(incremental.inventory.envelopes, full);
+    assert_eq!(incremental.max_envelope_rowid, max_rowid);
+    assert_eq!(
+        incremental.inventory.digest,
+        replication_inventory_digest(&full)
     );
 }
 
@@ -22024,6 +22148,42 @@ version 2
 
         let reopened = Store::open(&path, "node").unwrap();
         assert!(reopened.operation_projection_drift().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operation_projection_drift_uses_one_snapshot_during_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for index in 0..64 {
+                    store
+                        .append_client_claim(&ClaimInput {
+                            subject: format!("resource/projection-{index}"),
+                            kind: "resource.observed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([(
+                                "kind".into(),
+                                Value::String("custom.test.projection".into()),
+                            )]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!("projection-operation-{index}")),
+                        })
+                        .unwrap();
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        while !done.load(Ordering::Acquire) {
+            assert!(store.operation_projection_drift().unwrap().is_empty());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        assert!(store.operation_projection_drift().unwrap().is_empty());
     }
 
     #[test]
