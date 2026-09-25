@@ -1,12 +1,11 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `c2db7ab` for `st3` and `8d2d4e5` for `stui` is
-deployed as host-native binaries on Hetz and Silber. The direct-network iOS
-source is merged at `e49c097`. The 16:12:47 UTC windows were invalidated by
-the TUI and message projection repair rollout. New windows began at 17:09:40
-UTC (`1790356180`) after both daemons restarted. The later TUI and driver
-binary updates did not restart either daemon, so the window remains intact;
-the full 24-hour idle and 72-hour bidirectional delivery reports are still due.
+**Release hold.** Source `1c86b31` for `st3` and `stui` is deployed as
+host-native binaries on Hetz and Silber. The direct-network iOS source is
+merged at `e49c097`. The OMP transcript repair required new daemon binaries;
+both hosts restarted and the current evidence windows began at 20:53:08 UTC
+(`1790369588`), the first healthy two-host sample. The full 24-hour idle and
+72-hour bidirectional delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -21,10 +20,38 @@ not an invitation to start the trial while this hold is active.
 | Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The pty-rust seat is restored as a top-level durable agent, with its observer and subscriptions in an active intake run. The restarted OMP seat uses a supported model; both strict doctors pass. | Keep the seats and pty-rust intake active overnight. |
 | Addressable inboxes | The continuous monitor has exact linked receipts, and a temporary OMP seat answered one request exactly once before and after its restart on the repaired daemon. | Keep the monitor running through the new 72-hour window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
-| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. | Continue the release soak; Nathan is not the TUI acceptance tester. |
+| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. The managed OMP timeline now reads saved turns and tool calls on both hosts. | Independent CoS TUI retest and release soak; Nathan is not the TUI acceptance tester. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 20:53 UTC OMP timeline and final TUI retest rollout
+
+- CoS's full installed TUI retest confirmed the earlier interaction findings
+  were fixed and reported three remaining issues: OMP showed only status in
+  Chat, its agent row said only `Omp`, and opening Chat raised Silber daemon
+  CPU. The current OMP harness has a durable JSONL session with 49 message
+  records. `1c86b31` binds the current managed incarnation to that saved
+  session and renders its normalized turns and tools; the row now says
+  `PTY Rust · OMP`. The unmanaged-session discovery scan runs on entry and
+  then once per minute, down from every 15 seconds. The CPU effect still
+  needs a matched installed measurement.
+- The live OMP timeline returned identical first pages on Hetz and Silber:
+  42 message entries, 31 content entries, and 27 tool calls. This is a
+  bounded 100-entry page, not the entire saved conversation. The full local
+  suites passed 418 ST3 library, 88 CLI, and 48 active TUI tests. The Mac
+  TUI suite passed 48 active tests. Installed PTY attachment QA passed on
+  both hosts after rollout, and both strict doctors passed with signed peers
+  up and zero unresolved replication records. CoS has been asked for one
+  consolidated final retest.
+- Installed SHA-256 for Hetz: `st3`
+  `1b94dd874c9d422774dde1f24015940d457bb4742b83ba0ddd3bacacacf09df3`,
+  `stui` `30fedc13689d65794b0d00781abed82bbf0a32649d7b30d096cf303853d229ef`.
+  Installed SHA-256 for Silber: `st3`
+  `9572d69c650e1d280a3b86f83dca7b5f6d6aedf13f7d247a58defdf0a7ca5320`,
+  `stui` `e554b2a5faad90cc61c35897a1cceff1cb2f99593e644060db5df293c9a045c4`.
+  Both hosts retained the prior binaries in their local rollout backups.
+  The new gate marker is Unix `1790369588`; early watcher state is waiting.
 
 ## 20:38 UTC CoS retest repairs
 
