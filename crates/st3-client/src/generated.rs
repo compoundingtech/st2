@@ -569,6 +569,8 @@ pub struct Device {
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
     pub person_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub session_actor: String,
     pub state: String,
     #[serde(default)]

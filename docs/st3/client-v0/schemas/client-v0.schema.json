@@ -570,6 +570,7 @@
           "properties": {
             "kind": { "const": "device" },
             "person_id": { "$ref": "#/$defs/Id" },
+            "name": { "type": ["string", "null"] },
             "session_actor": { "$ref": "#/$defs/Id" },
             "state": { "enum": ["active", "expired", "revoked"] },
             "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },

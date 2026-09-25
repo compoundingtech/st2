@@ -8,12 +8,14 @@ and fresh fences; there is no offline mutation queue.
 
 Install the repo's `.#st3` Nix package and run `ST3_PERSON=person/<your-id> stui` in a terminal
 with a running st3 daemon. For source development, use
-`ST3_PERSON=person/<your-id> cargo run -p stui --locked`. `ST3_ENDPOINT` can override the discovered Unix socket. Without `ST3_PERSON`, the local
-client has read-only identity; sending messages and creating launches require a person identity.
+`ST3_PERSON=person/<your-id> cargo run -p stui --locked`. `ST3_ENDPOINT` can override the discovered Unix socket. When `ST3_PERSON` is unset,
+`stui` uses `person` from `~/.config/st3/config.toml` (or `$XDG_CONFIG_HOME/st3/config.toml`).
+A concrete person identity is required so Now and devices show the right data.
 
 Keys: `1`–`4` switch Now, Chat, Control, and Fleet; arrow keys select an item; PageUp/PageDown
-scroll the detail pane; `s` hides the sidebar; `q` quits. Chat shows messages for the selected
-managed agent's current session and bounded normalized session history. Running undeclared
+scroll the detail pane; `s` hides the sidebar; `q` quits. In Now, `r` resolves selected attention
+when that action is available. Chat shows recent received messages for the selected agent and
+bounded normalized history for its current session. Running undeclared
 harness sessions discovered on the connected host also appear there and in Fleet, clearly marked
 read-only; the app never offers them managed-agent controls. Their discovery refreshes every
 15 seconds even without a graph event. Discovery is local to the connected host, not a claim
@@ -29,7 +31,9 @@ the sidebar hides automatically.
 
 Now contains only open attention addressed to the current person. Agent transcript text and
 unread messages do not become person attention. Resource lists stop after four pages of 50 items;
-the active conversation fetches its newest 50 normalized entries and marks older history. The
+the active conversation pages past status-only entries until it has twelve content entries or
+reaches four pages, then marks older history. Recent messages load only for the selected agent.
+Event bursts refresh affected projections; a full refresh runs every two minutes. The
 event cursor is bounded and deduplicated; a
 cursor gap clears the cached timeline and reloads projections from a fresh capability cursor.
 
@@ -43,6 +47,6 @@ ST3_PERSON=person/<your-id> python3 crates/stui/tests/pty_smoke.py
 
 The PTY smoke test needs a running local daemon. It checks first-frame and key-to-redraw latency,
 also against a deliberately stalled getter, plus alternate-screen restoration after normal exit,
-SIGTERM, and a debug panic. For a packaged release binary, pass its path followed by `--no-panic`;
+SIGTERM, a long-running PTY hangup, and a debug panic. For a packaged release binary, pass its path followed by `--no-panic`;
 the release build has no debug panic hook. Ignored live tests measure first data and full-snapshot
 latency.

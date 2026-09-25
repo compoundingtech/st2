@@ -119,6 +119,34 @@ def delayed_getter_case(binary: str) -> None:
             thread.join(timeout=1)
 
 
+def hangup_case(binary: str) -> None:
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
+                            env={**os.environ, "TERM": "xterm-256color"})
+    os.close(slave)
+    deadline = time.monotonic() + 3
+    output = bytearray()
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            output.extend(os.read(master, 65536))
+            if b"Smalltalk" in plain(output):
+                break
+    else:
+        proc.kill()
+        raise AssertionError("hangup: no first frame")
+    time.sleep(10)  # Exercise hangup after the live snapshot and event poll are running.
+    os.close(master)
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise AssertionError("hangup: TUI survived terminal close")
+    print("hangup: exited after PTY close")
+
+
 if __name__ == "__main__":
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
     skip_panic = "--no-panic" in sys.argv[2:]
@@ -128,3 +156,4 @@ if __name__ == "__main__":
             continue
         run_case(binary, case)
     delayed_getter_case(binary)
+    hangup_case(binary)

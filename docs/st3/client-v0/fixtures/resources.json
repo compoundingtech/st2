@@ -78,7 +78,7 @@
   },
   {
     "id": "device/ios-release", "kind": "device", "revision": "dv2", "updated_at": "2026-09-20T11:09:30Z",
-    "person_id": "person/nathan", "session_actor": "person/nathan/session/ios-release", "state": "active",
+    "person_id": "person/nathan", "name": "Nathan's iPhone", "session_actor": "person/nathan/session/ios-release", "state": "active",
     "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z"
   },
   {

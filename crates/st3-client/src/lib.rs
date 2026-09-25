@@ -124,6 +124,14 @@ pub enum ClientError {
 }
 
 impl Client {
+    /// An unscoped read on the trusted local Unix socket. Paired transports
+    /// retain their credential and authority; only local clients can use this.
+    pub fn trusted_unscoped_read(&self) -> Self {
+        match &self.endpoint {
+            Endpoint::Unix(path) if self.credential.is_none() => Self::unix(path),
+            _ => self.clone(),
+        }
+    }
     pub fn unix(path: impl AsRef<Path>) -> Self {
         Self {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
@@ -232,6 +240,23 @@ impl Client {
             format!("?{}", query.join("&"))
         };
         self.get(&format!("/v1/client/{collection}{suffix}")).await
+    }
+
+    pub async fn messages_list_for_recipient(
+        &self,
+        recipient: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters(
+            "messages",
+            cursor,
+            limit,
+            history,
+            &[("person", recipient)],
+        )
+        .await
     }
 
     /// Read the bounded Now projection for one exact mission run without a

@@ -1100,7 +1100,9 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    // The default store status scan omits unhealthy current agents along with
+    // history. Scan both, then keep current-layer agents below.
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
     let work_queues = store.agent_work_queues()?;
     let mut agents = status
         .subjects
@@ -1108,7 +1110,7 @@ fn client_agent_resources(
         .filter(|subject| {
             subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
         })
-        .filter(|subject| history || subject.projection.actionable)
+        .filter(|subject| history || subject.projection.layer == "current")
         .map(|subject| {
             let fields = subject
                 .actual
@@ -10255,6 +10257,33 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "failed");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("failed".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("incarnation-1".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("agent-health-crashed".into()),
+            })
+            .unwrap();
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(
+            resources.len(),
+            1,
+            "current unhealthy agents must remain visible"
+        );
+        assert_eq!(resources[0]["state"], "failed");
+        assert_eq!(resources[0]["operational"]["layer"], "current");
     }
 
     #[tokio::test]

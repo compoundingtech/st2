@@ -1054,8 +1054,14 @@ fn device_resources(
         .claims;
     claims.sort_by_key(|claim| claim.store_index);
     let mut paired = BTreeMap::<String, (&ClaimRecord, Option<&ClaimRecord>)>::new();
+    let mut names = BTreeMap::<String, String>::new();
     for claim in &claims {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        if claim.kind == "custom.client.pairing-begun"
+            && let Some(name) = fields.get("device_name").and_then(Value::as_str)
+        {
+            names.insert(claim.subject.clone(), name.to_owned());
+        }
         let Some(device_id) = fields.get("device_id").and_then(Value::as_str) else {
             continue;
         };
@@ -1097,6 +1103,7 @@ fn device_resources(
                 "revision": selected.id,
                 "updated_at": client_timestamp(selected.accepted_at_unix_ms),
                 "person_id": person,
+                "name": names.get(&completed.subject),
                 "session_actor": fields.get("session_actor").cloned().unwrap_or(Value::Null),
                 "state": state_name,
                 "scopes": fields.get("scopes").cloned().unwrap_or_else(|| json!([])),
@@ -4263,6 +4270,57 @@ mod tests {
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn device_projection_uses_paired_device_name() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "custom/client/pairing-named";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "custom.client.pairing-begun".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("pairing_id".into(), Value::String("pairing/named".into())),
+                    (
+                        "device_name".into(),
+                        Value::String("Nathan's iPhone".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("device_id".into(), Value::String("device/named".into())),
+                    ("person_id".into(), Value::String("person/nathan".into())),
+                    (
+                        "session_actor".into(),
+                        Value::String("person/nathan/session/named".into()),
+                    ),
+                    (
+                        "expires_at_unix_ms".into(),
+                        Value::from(client_now_ms() as u64 + 60_000),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let resources =
+            device_resources(&state, &new_client_snapshot(&state), "person/nathan").unwrap();
+        assert_eq!(resources[0]["name"], "Nathan's iPhone");
     }
 
     #[test]
