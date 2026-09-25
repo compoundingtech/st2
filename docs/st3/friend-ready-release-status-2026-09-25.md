@@ -1,11 +1,11 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `82fe455` is deployed as host-native `st3` and `stui`
-on Hetz and Silber. The final direct-network iOS source is merged at `e49c097`.
-The 24-hour idle and 72-hour bidirectional delivery windows that began at
-05:08:50 UTC are invalid after the daemon restarts. New windows began at
-11:13:18 UTC, the first healthy final-build sample; their full reports are due
-after one and three days respectively.
+**Release hold.** Source `8696c2e` for `st3` and `2af1b1b` for `stui` is
+deployed as host-native binaries on Hetz and Silber. The direct-network iOS
+source is merged at `e49c097`. The earlier 11:13:18 UTC soak windows were
+invalidated by this rollout. New windows began at 11:40:44 UTC after both
+daemons restarted and the OMP seat became ready; their full 24-hour idle and
+72-hour bidirectional delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -17,15 +17,58 @@ not an invitation to start the trial while this hold is active.
 
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
-| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. | Repair the OMP stale driver observation before strict doctor can pass. |
-| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode replied to an exact native inbox token after this rollout. | Obtain the pending post-rollout OMP reply and keep the monitor running through the new window. |
-| Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; a controlled OMP restart retained its completed step and next claimed work, and its new session replied through the native inbox. | Keep the restarted OMP seat healthy overnight. |
-| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, and active-first nested Chat agents. | Nathan retests the exact installed TUI build; the authenticated iOS read check is pending. |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The restarted OMP seat is ready; both strict doctors pass. | Keep the OMP seat ready overnight. |
+| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode and the restarted OMP seat have sent linked native graph replies. | Keep the monitor running through the new window. |
+| Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
+| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, and cleaned channel wrappers. | Nathan retests the exact installed TUI build. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
 
-## 11:13 UTC final TUI usability rollout
+## 11:40 UTC OMP and macOS TUI repair rollout
+
+- `8696c2e` stops the ST2 launch placeholder from overwriting the live OMP/PI
+  extension-channel observation after 15 minutes, and stops a startup deadline
+  from firing for an incarnation that was already ready. Both regressions failed
+  before the patch and pass after it. `2af1b1b` adds a macOS terminal watcher
+  because Crossterm can stay inside its event poll on a closed tmux PTY. The
+  macOS release PTY smoke now passes quit, signal, delayed getter, direct PTY
+  hangup, and tmux session close; the installed binaries pass the same smoke on
+  both hosts. A Claude conversation fixture verifies that Chat hides ST3 channel
+  wrappers and delivery markers. The locked suites passed 413 `st3` library,
+  88 CLI, 5 client CLI, 21 contract, 27 example, 12 operational, and 40 `stui`
+  tests (two live benchmarks ignored).
+- Hetz installed SHA-256 `ecbfea8e8627e66d48fd6cf991c44aa363cdfad0ff0133cbd2e42d5b7a75e0d5`
+  for `st3` and `b959b33267a69e3dac212b3a345c538b6e838a488a8d12d9b453492a02eac431`
+  for `stui`; daemon PID `1833382`, replication PID `1833384`. Silber installed
+  `1f0ccb7a80b403f3db77a5a414448d251880227ae9e1675f4a33dde37a24b0fc`
+  and `977a58e49f96fb80eca847332070528e20074c6d35ad0726915abf738f1f0cb5`;
+  daemon PID `17396`, replication PID `17403`. Each host retains its previous
+  tested pair under its local `rollout-backups/8696c2e-20260925-1132/`.
+- Both strict doctors pass: current native harnesses ready, signed peers up,
+  zero unresolved or unhealthy replication records. The OMP seat restarted at
+  11:39:21 UTC with a new ready incarnation. Messages held during its stale
+  observation were delivered after the restart. OMP answered the first two
+  probes as terminal text; after an explicit CLI instruction it sent linked
+  graph reply `message/f408450501cf4b88`, which reached and was closed by COS.
+  The exact-token delivery monitor recorded another Silber-to-Hetz
+  receipt at 11:40:52 UTC, after both daemon restarts. Silber's gateway returns
+  unauthenticated 403 over direct LAN, `.local`, and tailnet HTTP. The native
+  iOS simulator used its existing paired credential over direct LAN HTTP after
+  rollout: Now showed four actionable items, all collection reads succeeded,
+  the live ST3 timeline rendered, and six connections remained established
+  through 30 seconds of long polling with no transport errors.
+- The 24-hour idle and 72-hour delivery markers were reset to Unix
+  `1790336444` (11:40:44 UTC). The early preflight passes with three
+  continuous healthy post-rollout samples per host. The full windows are still
+  the release gates; early CPU/RSS samples include restart warm-up and do not
+  establish a flat 24-hour result. OMP 18.1.22 silently fell back from its
+  declared `openai-codex/gpt-6-sol` model to `gpt-5.6-sol` because the former
+  is absent from its registry. COS is obtaining Nathan's model choice before
+  changing the `st3-network` declaration. The declared model must be honored
+  or fail visibly before this seat can be called friend-ready.
+
+## 11:13 UTC earlier TUI usability rollout
 
 - Source `82fe455` integrates the TUI usability fixes and corrects the macOS
   PTY smoke test to drain output while the child exits. The Mac terminal guard
@@ -49,8 +92,8 @@ the release gates after the final tested rollout.
   11:14:11 UTC. The Silber OpenCode agent linked its exact-token reply to
   `message/0c1da1f938d3f1e9` after the restart. The OMP post-rollout reply is
   pending.
-- Silber's paired gateway returned unauthenticated HTTP 403 through
-  `192.168.178.25:4102`, `Silber.local:4102`, and `100.92.93.47:4102` after
+- Silber's paired gateway returned unauthenticated HTTP 403 through its LAN IP,
+  `.local` name, and tailnet IP after
   the restart. The rebuilt iPhone 18 Pro simulator app used its existing paired
   credential over direct LAN HTTP after the rollout: Now showed four actionable
   items, the ST3 conversation rendered with the older-history marker above its
