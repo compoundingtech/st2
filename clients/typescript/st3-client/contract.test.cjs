@@ -66,6 +66,20 @@ test('preserves versioned cursor gap errors', async () => {
     });
 });
 
+test('completes pairing with either canonical or bare pairing ID', async () => {
+    const calls = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return response(envelope({ kind: 'paired-session', device_id: 'device/test', person_id: 'person/test', session_actor: 'person/test/session/test', credential: 'proof', scopes: [], expires_at: '2026-10-01T00:00:00Z' }));
+    } });
+    for (const id of ['pairing/test', 'test']) {
+        await client.completePairing(id, { api_version: 'st3.client.v0', code: 'ABCDEFGH', device_public_key: 'public-key-for-test-device-00000000' });
+    }
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every(call => call.url === 'https://example.test/v1/client/pairings/test/complete'));
+    assert.ok(calls.every(call => call.init.method === 'POST'));
+});
+
 test('generated hash uses normative schema and operations bytes', () => {
     const crypto = require('node:crypto');
     const root = path.join(__dirname, '../../..');

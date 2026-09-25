@@ -23,7 +23,7 @@ export class ClientError extends Error {
 }
 
 function routedId(id: string): string {
-    return id.replace(/^(launch|session)\//, '');
+    return id.replace(/^(launch|session|pairing)\//, '');
 }
 
 function query(options: Record<string, string | number | boolean | undefined>): string {
