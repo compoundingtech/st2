@@ -4949,7 +4949,7 @@ mission "example/zero-run" state="ready" {
             composer_claim.body["fields"]["session_id"],
             Value::String(session_id.clone())
         );
-        let composer_resource = client_message_resources(&state.store, None, true)
+        let composer_resource = client_message_resources(&state.store, None, true, None)
             .unwrap()
             .into_iter()
             .find(|message| message["id"] == affected[0])

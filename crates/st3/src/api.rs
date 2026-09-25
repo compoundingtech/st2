@@ -1678,6 +1678,7 @@ fn client_message_resources(
     store: &Store,
     person: Option<&str>,
     history: bool,
+    peer: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let current_ids = store
         .operational_messages(person, false)?
@@ -1687,6 +1688,9 @@ fn client_message_resources(
     let messages = store.operational_messages(person, history)?;
     let mut resources = Vec::new();
     for message in messages {
+        if peer.is_some_and(|peer| message.from != peer && message.to != peer) {
+            continue;
+        }
         let claims = store.claims_for(&message.subject, None)?;
         let first = claims.first();
         let last = claims.last();
@@ -2462,13 +2466,13 @@ async fn client_messages(
     if effective_query.cursor.is_some() {
         return client_page(&state, &snapshot, "messages", Vec::new(), &effective_query).map(Json);
     }
-    let mut items = client_message_resources(&state.store, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
-    if let Some(peer) = query.actor.as_deref() {
-        items.retain(|item| {
-            item["from"].as_str() == Some(peer) || item["to"].as_str() == Some(peer)
-        });
-    }
+    let items = client_message_resources(
+        &state.store,
+        person.as_deref(),
+        query.history,
+        query.actor.as_deref(),
+    )
+    .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "messages", items, &effective_query).map(Json)
 }
 
@@ -2480,7 +2484,7 @@ async fn client_messages_detail(
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     client_detail(
-        client_message_resources(&state.store, person.as_deref(), query.history)
+        client_message_resources(&state.store, person.as_deref(), query.history, None)
             .map_err(ApiError::internal)?,
         "message",
         &id,
