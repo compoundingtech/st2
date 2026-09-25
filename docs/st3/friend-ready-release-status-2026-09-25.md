@@ -45,8 +45,8 @@ not an invitation to start the trial while this hold is active.
   to the existing UI run. The completed initial fixes carried forward; the
   active integration step restarted under its original `restart-active` policy
   and was completed with the same rollout evidence. The new TUI layout step is
-  claimed. The revised source is committed in `st3-network` branch
-  `st3-ui-feedback-20260925` at `a2c2a45`. It selects `when-idle` for future
+  claimed. The revised source is committed on `st3-network` main at
+  `e19d61d`. It selects `when-idle` for future
   revisions; that setting did not change this cutover.
 - All prior 24-hour idle and 72-hour delivery markers remain diagnostic only.
   Start new complete windows only after the new TUI work is integrated, installed,
