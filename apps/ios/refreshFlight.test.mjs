@@ -10,3 +10,13 @@ assert.equal(flight.isCurrent(1), true, 'the old request must not clear the new 
 assert.equal(flight.start(1), false);
 flight.finish(1);
 assert.equal(flight.start(1), true);
+
+// Event-driven full reloads are coalesced: a burst of projection events causes at most one
+// reload per interval, with the remaining wait returned so the caller sleeps instead of reloading.
+const { coalescedRefreshDelay } = await import('./refreshFlight.ts');
+assert.equal(coalescedRefreshDelay(0, 1_000, 10_000), 0, 'the first event-driven reload is not delayed');
+assert.equal(coalescedRefreshDelay(100_000, 103_000, 10_000), 7_000);
+assert.equal(coalescedRefreshDelay(100_000, 110_000, 10_000), 0);
+let reloads = 0, last = 0;
+for (let at = 1; at <= 60_000; at += 250) if (coalescedRefreshDelay(last, at, 10_000) === 0) { reloads++; last = at; }
+assert.ok(reloads <= 6, `a minute of back-to-back events reloaded ${reloads} times`);

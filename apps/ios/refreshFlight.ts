@@ -17,3 +17,9 @@ export class RefreshFlight {
     return this.activeGeneration === generation;
   }
 }
+
+// A busy fleet emits projection events continuously, and every full reload runs status scans on
+// the daemon. Reload for events at most once per interval; returns how long to wait first.
+export function coalescedRefreshDelay(lastRefreshAt: number, now: number, minIntervalMs: number): number {
+  return lastRefreshAt ? Math.max(0, lastRefreshAt + minIntervalMs - now) : 0;
+}

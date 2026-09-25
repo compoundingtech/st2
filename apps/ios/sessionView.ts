@@ -73,3 +73,56 @@ export async function listSessionPages(
   }
   throw new Error('Session pagination retries exhausted.');
 }
+
+type Entry = { id: string; sequence: number; type: string; body: unknown };
+type TimelinePage<T> = { value: { items: T[]; page: { has_more: boolean; next_cursor?: string | null } } };
+export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number };
+
+export function isConversational(entry: Entry): boolean {
+  return entry.type === 'content' && !!timelineText(entry.body)?.trim();
+}
+
+// Timeline pages arrive newest first. Status heartbeats, tool calls, and usage can fill whole pages,
+// so keep reading older pages (bounded) until enough conversation is visible. A later poll stops at
+// the newest entry it already has and merges, instead of re-reading deep history.
+export async function loadRecentConversation<T extends Entry>(
+  list: (options: { limit: number; cursor?: string }) => Promise<TimelinePage<T>>,
+  { pageSize, maxPages, want, previous }: { pageSize: number; maxPages: number; want: number; previous?: Conversation<T> },
+): Promise<Conversation<T>> {
+  const known = previous && previous.newestSequence >= 0 ? previous : undefined;
+  const found = new Map<string, T>();
+  let cursor: string | undefined;
+  let hasOlder = false;
+  let newestSequence = known?.newestSequence ?? -1;
+  let reachedKnown = false;
+  for (let page = 0; page < maxPages; page++) {
+    const result = (await list({ limit: pageSize, cursor })).value;
+    for (const entry of result.items) {
+      newestSequence = Math.max(newestSequence, entry.sequence);
+      if (known && entry.sequence <= known.newestSequence) reachedKnown = true;
+      // Known entries on this page are kept too: a streaming entry is revised in place.
+      if (isConversational(entry)) found.set(entry.id, entry);
+    }
+    hasOlder = result.page.has_more && !!result.page.next_cursor;
+    if (reachedKnown || found.size >= want || !hasOlder) break;
+    cursor = result.page.next_cursor!;
+  }
+  if (known && reachedKnown) {
+    for (const entry of known.entries) if (!found.has(entry.id)) found.set(entry.id, entry);
+    hasOlder = known.hasOlder || found.size > want;
+  } else if (found.size > want) hasOlder = true;
+  const entries = [...found.values()].sort((a, b) => a.sequence - b.sequence).slice(-want);
+  return { entries, hasOlder, newestSequence };
+}
+
+export type ConversationRow<T> = { kind: 'older' } | { kind: 'entry'; entry: T };
+export function conversationRows<T>(entries: T[], hasOlder: boolean): ConversationRow<T>[] {
+  return [...(hasOlder ? [{ kind: 'older' as const }] : []), ...entries.map(entry => ({ kind: 'entry' as const, entry }))];
+}
+
+type SessionMessage = { session_id?: string | null; from: string; to: string; sent_at: string };
+export function sessionMessagesFor<T extends SessionMessage>(messages: T[], session: Pick<SessionView, 'id' | 'owner_id'>): T[] {
+  return messages
+    .filter(message => message.session_id === session.id || message.from === session.owner_id || message.to === session.owner_id)
+    .sort((a, b) => a.sent_at.localeCompare(b.sent_at));
+}
