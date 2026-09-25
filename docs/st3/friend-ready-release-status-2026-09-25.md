@@ -93,12 +93,15 @@ is not release evidence.
   `b6837bb` daemon source (tree at `2d861e6`); release-profile checks passed
   408 st3 library, 86 CLI, and 17 stui tests, with two live stui tests ignored.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
-  daemon. On the current source, all six iOS logic tests, the TypeScript
-  typecheck, and `npm run export:ios` passed; the offline export produced a
-  1.6 MiB iOS Hermes bundle. Prior signed Debug simulator and paired-gateway
-  proofs remain the native device evidence; an exported bundle alone does not
-  prove pairing or a physical iPhone installation, which is optional for this
-  mission.
+  daemon. The iOS Chat terminal now offers capability-gated line and key input
+  with a fresh fence, bounded stale-fence retry, and runtime-incarnation guard;
+  it does not queue offline input or retry an ambiguous transport failure.
+  All seven iOS logic tests, the TypeScript typecheck, and `npm run export:ios`
+  passed; the offline export produced a 1.6 MiB iOS Hermes bundle. Prior signed
+  Debug simulator and paired-gateway proofs remain the native device evidence;
+  the new control UI has not yet had a connected simulator smoke, and an
+  exported bundle alone does not prove pairing or a physical iPhone
+  installation, which is optional for this mission.
 - The earlier `326904a` build had a three-minute **diagnostic only** with no
   sample errors, unchanged daemon PIDs, and quiet median CPU of 13.3% on Hetz
   and 17.4% on Silber. Those figures must not be attributed to `0da07d7` or

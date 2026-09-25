@@ -57,8 +57,9 @@ tailnet-only HTTPS, following the
 the privileged `st3.sock`. Begin a single-use pairing for the intended person
 with `st3 devices --as person/<name> pair "iPhone"`, then enter the gateway URL,
 pairing ID, and code on the app. The credential belongs in iOS Keychain. Test
-Now, Chat, Control, Fleet, and revocation while connected; revoked credentials
-must lose access. Do not place a populated pairing link, private URL, device
+Now, Chat (including fenced terminal input on a permitted running terminal),
+Control, Fleet, and revocation while connected; revoked credentials must lose
+access. Do not place a populated pairing link, private URL, device
 ID, or signing identity in a commit or support message.
 
 ## If something goes wrong

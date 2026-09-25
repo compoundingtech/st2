@@ -10,6 +10,7 @@ import { listCollectionPages, type CollectionResult } from './collectionPages';
 import { agentLabel, agentTree } from './agentTree';
 import { tabsChangedByProjectionEvents } from './projectionRefresh';
 import { rememberBounded } from './boundedCache';
+import { withFreshTerminalFence } from './terminalControls';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
@@ -70,6 +71,9 @@ export default function App() {
   const [chatDetailOpen, setChatDetailOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false), [historicalSessions, setHistoricalSessions] = useState<SessionView[]>([]), [historyBusy, setHistoryBusy] = useState(false);
   const [terminalId, setTerminalId] = useState(''), [screen, setScreen] = useState<TerminalScreen | null>(null), [terminalIssue, setTerminalIssue] = useState('');
+  const [terminalDraft, setTerminalDraft] = useState('');
+  const [terminalActionNotice, setTerminalActionNotice] = useState('');
+  const terminalIncarnation = useRef(''), terminalSending = useRef(false);
   const [reviewLaunch, setReviewLaunch] = useState(''), [variants, setVariants] = useState<LaunchVariant[]>([]);
   const [selectedMissionId, setSelectedMissionId] = useState(''), [showSystemMissions, setShowSystemMissions] = useState(false), [showPlanner, setShowPlanner] = useState(false);
   const [missionDetailView, setMissionDetailView] = useState<Mission | null>(null);
@@ -131,6 +135,9 @@ export default function App() {
           setTimeline(conversationCache.current.get(id) ?? []);
           setComposer(draftCache.current.get(id) ?? '');
           setTerminalId(terminal?.startsWith('terminal/') ? terminal : '');
+          terminalIncarnation.current = '';
+          setTerminalDraft('');
+          setTerminalActionNotice('');
           setScreen(null);
           setTerminalIssue('');
           setChatDetailOpen(true);
@@ -363,7 +370,11 @@ export default function App() {
       polling = true;
       try {
         const result = await client!.terminalScreen(terminalId);
-        if (live) { setScreen(result.value); setTerminalIssue(''); }
+        if (live) {
+          if (!terminalIncarnation.current) terminalIncarnation.current = result.value.runtime_incarnation;
+          setScreen(result.value);
+          setTerminalIssue(terminalIncarnation.current === result.value.runtime_incarnation ? '' : 'Terminal restarted; reopen it before sending input.');
+        }
       } catch (error) {
         if (live && error instanceof ClientError && error.status >= 400 && error.status < 500) { unavailable = true; setTerminalIssue(errorText(error)); }
       } finally { polling = false; }
@@ -376,7 +387,24 @@ export default function App() {
   async function review(id: string) { if (!client || status !== 'online') return; try { const result = await client.launchVariantsList(id, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30) }); setReviewLaunch(id); setVariants(items(result.value, 'launch-variant')); setError(''); } catch (e) { setError(errorText(e)); } }
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
   async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
-  function showTerminal(id: string) { if (!client || status !== 'online') return; setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
+  function showTerminal(id: string) { if (!client || status !== 'online') return; terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
+  async function sendTerminalInput(mode: 'line' | 'key', value: string) {
+    if (!client || !terminalId || status !== 'online' || busy || terminalSending.current || !value || !terminalIncarnation.current) return;
+    const incarnation = terminalIncarnation.current;
+    terminalSending.current = true;
+    setBusy(true);
+    try {
+      await withFreshTerminalFence(client, terminalId, incarnation, fence => {
+        const id = actionId();
+        return client.terminalInput({ id, idempotency_key: id, fence, parameters: { terminal_id: terminalId, mode, value } });
+      });
+      if (mode === 'line') setTerminalDraft('');
+      const latest = await client.terminalScreen(terminalId);
+      if (latest.value.runtime_incarnation !== incarnation) throw new Error('Terminal restarted; reopen it before sending input.');
+      setScreen(latest.value); setTerminalIssue(''); setTerminalActionNotice(''); setError('');
+    } catch (cause) { setTerminalActionNotice(`Input was not confirmed. Inspect the screen before retrying: ${errorText(cause)}`); }
+    finally { terminalSending.current = false; setBusy(false); }
+  }
   async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; dirtyProjectionTabs.current.clear(); lastNativeRefreshAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline([]); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
   async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
@@ -393,10 +421,11 @@ export default function App() {
   async function createLaunch() { if (!client || !title.trim() || !request.trim() || !workspace.trim()) return; await runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: title.trim(), request: request.trim(), target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: workspace.trim() }, provider, ...(model.trim() ? { model: model.trim() } : {}), ...(effort.trim() ? { effort: effort.trim() } : {}) } }); setTitle(''); setRequest(''); }); }
   async function reviseLaunch(launch: Launch) { if (!client || !feedback.trim()) return; await runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback: feedback.trim() } }); setFeedback(''); }); }
   async function resolve(item: Attention) { if (!client) return; await runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); }); }
-  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection(); setCredential(null); setCaps(null); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setStatus('setup'); }
+  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection(); setCredential(null); setCaps(null); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setStatus('setup'); }
   async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { if (!isSnapshotChurn(e)) setError(errorText(e)); } finally { setHistoryBusy(false); } }
   function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
   const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
+  const canControlTerminal = caps?.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted') ?? false;
   const selectedAgent = selectedSession ? data.agents?.find(agent => agent.id === selectedSession.owner_id) : undefined;
   const currentSessions = data.sessions.filter(s => s.state === 'running').sort((a, b) => Number(isUnmanaged(b)) - Number(isUnmanaged(a)));
   const knownHostId = snapshot?.host_id ?? cachedHostId;
@@ -409,7 +438,7 @@ export default function App() {
   const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
   const sessionMessages = data.messages.filter(m => m.session_id === sessionId).sort((a, b) => a.sent_at.localeCompare(b.sent_at));
   const conversationEntries = timeline.filter(e => e.type === 'content' && timelineText(e.body) !== null);
-  function selectSession(id: string) { if (sessionId && chatDetailOpen) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
+  function selectSession(id: string) { if (sessionId && chatDetailOpen) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? []); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
   const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
   const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
   const selectedMission = missionDetailView?.id === selectedMissionId ? missionDetailView : visibleMissions.find(m => m.id === selectedMissionId);
@@ -445,13 +474,24 @@ export default function App() {
           <Button label="Refresh" onPress={() => void refresh()} />
         </> : null}
         {active === 'Chat' ? chatDetailOpen && selectedSession ? <>
-          <Button label="← Agents" onPress={() => { setChatDetailOpen(false); setTerminalId(''); setScreen(null); setTerminalIssue(''); }} />
+          <Button label="← Agents" onPress={() => { setChatDetailOpen(false); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); }} />
           <Text style={styles.section}>{selectedAgent ? agentLabel(selectedAgent) : sessionLabel(selectedSession, sourceHost)}</Text>
           <Text style={styles.muted}>{sessionDetail(selectedSession)}</Text>
           {terminalId ? <>
-            <Button label="← Conversation" onPress={() => { setScreen(null); setTerminalId(''); setTerminalIssue(''); }} />
-            <Card title="Terminal · read-only" detail={screen ? screen.lines.map(line => line.text).join('\n') : terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />
+            <Button label="← Conversation" onPress={() => { terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalId(''); setTerminalIssue(''); }} />
+            <Card title={canControlTerminal ? 'Terminal · live controls' : 'Terminal · read-only'} detail={screen ? screen.lines.map(line => line.text).join('\n') : terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />
+            {terminalIssue ? <Text style={styles.warning}>{terminalIssue}</Text> : null}
+            {terminalActionNotice ? <Text style={styles.warning}>{terminalActionNotice}</Text> : null}
             {screen && status !== 'online' ? <Text style={styles.muted}>Offline · showing the last terminal frame.</Text> : null}
+            {screen && canControlTerminal ? <>
+              <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} placeholder="Type a terminal line" placeholderTextColor="#8195a2" value={terminalDraft} onChangeText={setTerminalDraft} />
+              <Button label="Send line" disabled={busy || status !== 'online' || !!terminalIssue || !terminalDraft.length} onPress={() => void sendTerminalInput('line', terminalDraft)} />
+              <View style={styles.row}>
+                {(['return', 'tab', 'escape', 'Up', 'Down'] as const).map(key => <Button key={key} label={key === 'return' ? 'Enter' : key === 'escape' ? 'Esc' : key} disabled={busy || status !== 'online' || !!terminalIssue} onPress={() => void sendTerminalInput('key', key)} />)}
+                <Button label="Ctrl-C" disabled={busy || status !== 'online' || !!terminalIssue} onPress={() => Alert.alert('Interrupt terminal process?', 'Send Ctrl-C to this terminal.', [{ text: 'Cancel' }, { text: 'Interrupt', onPress: () => void sendTerminalInput('key', 'C-c') }])} />
+              </View>
+              <Text style={styles.muted}>Inputs require a live paired connection and are fenced to this terminal incarnation.</Text>
+            </> : null}
           </> : <>
             {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label="View terminal" disabled={status !== 'online'} onPress={() => void showTerminal(r.terminal_id!)} />) : null}
             <Text style={styles.section}>Conversation</Text>
