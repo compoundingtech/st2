@@ -22,7 +22,7 @@ function stripSensitive(value: unknown): unknown {
 }
 
 export function encodeProjectionCache(gateway: string, actor: string, hostId: string, storeIndex: number, data: Data, now = Date.now(), truncated: Array<keyof Data> = []): string | null {
-  if (!gateway.startsWith('https://') || !actor || !Number.isFinite(storeIndex)) return null;
+  if (!/^https?:\/\//.test(gateway) || !actor || !Number.isFinite(storeIndex)) return null;
   const bounded = Object.fromEntries((Object.keys(kinds) as Array<keyof Data>).map(key => [key, data[key].slice(0, LIMITS[key])])) as Data;
   const clipped = (Object.keys(kinds) as Array<keyof Data>).filter(key => data[key].length > LIMITS[key]);
   const cache: Cache = { version: VERSION, gateway, savedAt: now, hostId, actor, storeIndex, truncated: [...new Set([...truncated, ...clipped])].filter(key => key in kinds), data: stripSensitive(bounded) as Data };

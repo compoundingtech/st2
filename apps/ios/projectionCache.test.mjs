@@ -34,3 +34,9 @@ assert.equal(bounded?.data.sessions.length, 100);
 assert.deepEqual(bounded?.truncated, ['sessions']);
 const serverTruncated = decodeProjectionCache(encodeProjectionCache(gateway, 'person/one', 'host/hetz', 42, emptyData, now, ['attention']), gateway, now);
 assert.deepEqual(serverTruncated?.truncated, ['attention']);
+
+// A direct Tailscale HTTP gateway gets the same bounded offline cache as HTTPS.
+const tailnet = 'http://100.64.0.1:4102';
+const tailnetCache = encodeProjectionCache(tailnet, 'person/one', 'host/hetz', 42, data, now);
+assert.ok(tailnetCache);
+assert.equal(decodeProjectionCache(tailnetCache, tailnet, now)?.gateway, tailnet);
