@@ -258,6 +258,56 @@ pub(crate) fn find_bound_transcript(
     Ok(None)
 }
 
+/// Find the newest transcript created by the current managed OMP incarnation.
+/// The directory is constructed from the declared seat, never from client input.
+pub(crate) fn find_managed_omp_transcript(
+    directory: &Path,
+    started_after_unix_ms: u128,
+) -> Result<Option<ExternalSession>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        anyhow::ensure!(
+            index < MAX_DISCOVERED_FILES,
+            "managed OMP session directory exceeds the bounded file inventory"
+        );
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().is_some_and(|ext| ext == "jsonl")
+        {
+            files.push(entry.path());
+        }
+    }
+    // OMP names sessions with an ISO timestamp prefix. Try a bounded number
+    // of newest candidates so a partial header cannot hide a valid predecessor.
+    files.sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
+    for path in files.into_iter().take(64) {
+        let Some(metadata) = read_metadata(ExternalDriver::Omp, &path)? else {
+            continue;
+        };
+        if metadata.started_at_unix_ms < started_after_unix_ms {
+            continue;
+        }
+        return Ok(Some(ExternalSession {
+            id: external_session_id(ExternalDriver::Omp, &metadata.native_id),
+            revision: metadata.revision,
+            driver: ExternalDriver::Omp,
+            native_id: metadata.native_id,
+            transcript: metadata.transcript,
+            cwd: metadata.cwd,
+            title: metadata.title,
+            started_at_unix_ms: metadata.started_at_unix_ms,
+            updated_at_unix_ms: metadata.updated_at_unix_ms,
+            process: None,
+        }));
+    }
+    Ok(None)
+}
+
 pub(crate) fn find_fresh(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
     Ok(discover_fresh(home, true)?
         .sessions

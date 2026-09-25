@@ -1392,6 +1392,45 @@ fn managed_claude_transcript(
     .map_err(ApiError::internal)
 }
 
+fn managed_omp_transcript(
+    state: &AppState,
+    owner: &str,
+    incarnation: &str,
+) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    let Some((_, started_at)) = incarnation.split_once(':') else {
+        return Ok(None);
+    };
+    let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started_at) else {
+        return Ok(None);
+    };
+    let observed = state
+        .store
+        .latest_claim(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+        .is_some_and(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            fields["driver"] == "omp" && fields["incarnation_id"] == incarnation
+        });
+    if !observed {
+        return Ok(None);
+    }
+    let identity = owner.strip_prefix("agent/").unwrap_or(owner);
+    let directory = state
+        .state_dir
+        .join("drivers")
+        .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+        .join("catalog")
+        .join("agents")
+        .join(st2::run::detect_host())
+        .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
+        .join("provider-sessions");
+    crate::external_sessions::find_managed_omp_transcript(
+        &directory,
+        (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
+    )
+    .map_err(ApiError::internal)
+}
+
 pub(super) fn timeline_value(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -1431,9 +1470,14 @@ pub(super) fn timeline_value(
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
     if let Some(incarnation) = incarnation {
-        if let Some(external) = managed_codex_transcript(state, owner, incarnation)?
-            .or(managed_claude_transcript(state, owner, incarnation)?)
-        {
+        let external = match managed_codex_transcript(state, owner, incarnation)? {
+            Some(external) => Some(external),
+            None => match managed_claude_transcript(state, owner, incarnation)? {
+                Some(external) => Some(external),
+                None => managed_omp_transcript(state, owner, incarnation)?,
+            },
+        };
+        if let Some(external) = external {
             return native_timeline_page(state, snapshot, &session_id, query, &external);
         }
     }
@@ -5193,6 +5237,75 @@ mission "example/zero-run" state="ready" {
         .unwrap();
         assert!(
             super::managed_claude_transcript(&state, owner, incarnation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_omp_session_reads_the_current_saved_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "managed-omp-test");
+        let owner = "agent/fleet/pty-rust/omp";
+        let identity = owner.strip_prefix("agent/").unwrap();
+        let incarnation = "123:2026-09-25T15:11:54.870Z";
+        let directory = state
+            .state_dir
+            .join("drivers")
+            .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
+            .join("catalog/agents")
+            .join(st2::run::detect_host())
+            .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
+            .join("provider-sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("2026-09-25T14-00-00-000Z_old.jsonl");
+        let current = directory.join("2026-09-25T15-11-55-793Z_current.jsonl");
+        std::fs::write(
+            &old,
+            format!(
+                "{}\n",
+                json!({"type":"session","id":"old","timestamp":"2026-09-25T14:00:00Z","cwd":"/tmp"})
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &current,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session","id":"current","timestamp":"2026-09-25T15:11:55.793Z","cwd":"/tmp"}),
+                json!({"type":"message","id":"answer","timestamp":"2026-09-25T15:12:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Saved OMP answer"},{"type":"toolCall","id":"call-1","name":"read","arguments":{"file":"example"}}]}}),
+            ),
+        )
+        .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "harness.observed".into(),
+                actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("omp".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let exact = super::managed_omp_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.native_id, "current");
+        let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
+        assert!(
+            timeline
+                .iter()
+                .any(|entry| entry["body"]["text"] == "Saved OMP answer")
+        );
+        assert!(timeline.iter().any(|entry| entry["type"] == "tool_call"));
+        assert!(
+            super::managed_omp_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()
                 .is_none()
         );

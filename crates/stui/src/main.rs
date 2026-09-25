@@ -1535,23 +1535,32 @@ fn watch_terminal_hangup() {
 }
 fn agent_label(agent: &st3_client::Agent) -> String {
     let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
-    slug.split('-')
-        .map(|word| match word.to_ascii_lowercase().as_str() {
-            "st3" => "ST3".to_string(),
-            "cos" => "COS".to_string(),
-            "ios" => "iOS".to_string(),
-            "tui" => "TUI".to_string(),
-            "pty" => "PTY".to_string(),
-            _ => {
-                let mut chars = word.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let label = |slug: &str| {
+        slug.split('-')
+            .map(|word| match word.to_ascii_lowercase().as_str() {
+                "st3" => "ST3".to_string(),
+                "cos" => "COS".to_string(),
+                "ios" => "iOS".to_string(),
+                "tui" => "TUI".to_string(),
+                "pty" => "PTY".to_string(),
+                "omp" => "OMP".to_string(),
+                _ => {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if slug.eq_ignore_ascii_case("omp") {
+        if let Some(parent) = agent.name.rsplit('/').nth(1) {
+            return format!("{} · OMP", label(parent));
+        }
+    }
+    label(slug)
 }
 fn agent_is_child_of(child: &st3_client::Agent, parent: &st3_client::Agent) -> bool {
     if child.header.id == parent.header.id {
@@ -2386,7 +2395,7 @@ fn main() -> Result<()> {
             let _ = cache::save(path, actor, &model);
         }
         let _ = background_updates.send(Update::Model(Box::new(model.clone())));
-        let mut last_external_scan = Instant::now();
+        let mut last_external_scan = Instant::now() - Duration::from_secs(60);
         let mut last_cache_save = Instant::now();
         let mut last_full_reload = Instant::now();
         let mut was_offline = false;
@@ -2423,7 +2432,7 @@ fn main() -> Result<()> {
                     false
                 }
             };
-            if last_external_scan.elapsed() >= Duration::from_secs(15) {
+            if last_external_scan.elapsed() >= Duration::from_secs(60) {
                 match model.refresh_sessions(&background_client).await {
                     Ok(sessions_changed) => changed |= sessions_changed,
                     Err(error) => {
@@ -3054,6 +3063,12 @@ mod tests {
         app.selected[1] = 1;
         assert_eq!(app.peer().unwrap().name, "Child");
         assert_eq!(agent_label(app.peer().unwrap()), "Child");
+    }
+
+    #[test]
+    fn omp_agent_label_names_the_seat_and_driver() {
+        let agent: st3_client::Agent = serde_json::from_str(r#"{"kind":"agent","id":"agent/fleet/pty-rust/omp","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"fleet/pty-rust/omp","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
+        assert_eq!(agent_label(&agent), "PTY Rust · OMP");
     }
 
     #[test]
