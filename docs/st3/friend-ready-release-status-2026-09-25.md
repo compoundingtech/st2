@@ -1,15 +1,56 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Daemon candidate `623f9cb` is deployed to both active hosts.
-The TUI and iOS repairs are in progress. The 24-hour idle and 72-hour
+**Release hold.** Daemon and TUI candidate `5c41edc` is deployed to both active
+hosts. The final direct-network iOS source is merged at `e49c097`; the follow-on
+TUI usability steps are active in the existing UI mission. The 24-hour idle and 72-hour
 bidirectional delivery windows that began at 05:08:50 UTC are invalid after
-the daemon restarts and will be reset after the final tested rollout.
+the daemon restarts and will be reset after the final tested UI rollout.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
 short diagnostic into release evidence.
 The [friend trial handoff](friend-trial-handoff.md) is staged for that review,
 not an invitation to start the trial while this hold is active.
+
+## 10:08 UTC TUI, iOS, and direct-network rollout
+
+- `5c41edc` merges the TUI and iOS presentation/refresh repairs with bounded
+  reads. Hetz and Silber now run host-linked release `st3` and `stui` binaries
+  built from that commit. A first Hetz attempt copied the Nix-linked binaries
+  into a service environment with a system allocator preload; its runtime
+  linker rejected that combination. The prior binaries were restored, services
+  returned to health, and the host-linked build was tested before the final
+  install. Both hosts retain rollback copies of the pre-rollout binaries.
+- Hetz installed SHA-256 `010bd61a3dc64a2e1cf08b4e3bd83b76ee98c3b435e1fac790c4280dcd3866eb`
+  for `st3` and `6179df84d985ab13381f7ec738c2fb221976920dc9fe919086b4699094aa8ecd`
+  for `stui`; daemon PID `1465194`, replication PID `1465196`. Silber installed
+  `ccebf57f6225aeb0ced164a17361da11fc75a09973ced9c0a15fbecade6b1322`
+  and `33f95879745cc7c540baff2a4e43330a7f2941bea7b5d339c45605ee4efa1e89`;
+  daemon PID `31613`, replication PID `31615`. Both strict doctors pass after
+  one graph-authorized repair of an unrelated stale PTY wake contradiction.
+  Signed peers are up with zero unresolved and unhealthy records.
+- Native messages reached the iOS worker from Hetz and its linked reply reached
+  Hetz from Silber after the service restarts. The paired gateway returns the
+  expected unauthenticated 403 through the LAN IP, `.local`, and tailnet routes;
+  no privileged daemon socket is exposed. A rebuilt native simulator app using
+  the direct LAN route remained Connected, showed seven actionable Now items,
+  and held timeline and event long polls for 60 seconds without transport errors
+  after the Silber restart. The `.local` pairing and direct tailnet app paths
+  were proven before the restart. Final app source `e49c097` adds scoped local
+  and tailnet HTTP acceptance and was pushed after this daemon build; its
+  TypeScript typecheck, 13 logic test files, and iOS export of 610 modules pass.
+  Physical-device Local Network permission presentation remains untested.
+- The follow-on TUI usability feedback was added by revision
+  `9f7f6bc711b514a4bb221cfb53b99039a1c39097b65e7987497c67d323a10845`
+  to the existing UI run. The completed initial fixes carried forward; the
+  active integration step restarted under its original `restart-active` policy
+  and was completed with the same rollout evidence. The new TUI layout step is
+  claimed. The revised source is committed in `st3-network` branch
+  `st3-ui-feedback-20260925` at `a2c2a45`. It selects `when-idle` for future
+  revisions; that setting did not change this cutover.
+- All prior 24-hour idle and 72-hour delivery markers remain diagnostic only.
+  Start new complete windows only after the new TUI work is integrated, installed,
+  and checked. Do not infer a soak pass from the short post-restart checks above.
 
 ## 08:55 UTC Codex recovery and bounded-read rollouts
 
