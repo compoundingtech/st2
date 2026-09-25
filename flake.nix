@@ -267,6 +267,7 @@
           ];
           postInstall = ''
             ln -s st3 $out/bin/st
+            ln -s ${pty.packages.${system}.default}/bin/pty $out/bin/pty
             $out/bin/st3 completions bash > st3.bash
             $out/bin/st3 completions zsh > _st3
             $out/bin/st3 completions fish > st3.fish
@@ -283,6 +284,7 @@
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
           test -x ${st3}/bin/stui
+          test -x ${st3}/bin/pty
           ${st3}/bin/st3 --help > st3.help
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help

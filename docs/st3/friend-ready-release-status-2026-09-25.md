@@ -6,6 +6,8 @@ Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
 short diagnostic into release evidence.
+The [friend trial handoff](friend-trial-handoff.md) is staged for that review,
+not an invitation to start the trial while this hold is active.
 
 Monitoring commit `8817b15` adds an early post-rollout evidence preflight. It
 notifies the operator of a bad sample, PID change, stale host, or excessive gap

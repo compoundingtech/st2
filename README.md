@@ -14,7 +14,7 @@ The normal product entry points answer three questions:
 ## Install
 
 The Nix package installs `st3`, the shorter `st` symlink, the `stui` terminal
-app, and `st3-migrate`:
+app, `st3-migrate`, and the pinned `pty` runtime:
 
 ```sh
 nix profile install .#st3
@@ -28,8 +28,8 @@ cargo build -p st3 -p st3-migrate --locked
 target/debug/st3 --help
 ```
 
-The runtime needs `pty` on `PATH`. Native agents also need their selected harness, such as Codex,
-Claude, pi, OMP, or OpenCode.
+Source builds need `pty` on `PATH`; the Nix package includes it. Native agents
+also need their selected harness, such as Codex, Claude, pi, OMP, or OpenCode.
 
 ## Start and check this machine
 
