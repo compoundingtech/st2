@@ -58,8 +58,13 @@ the release gates after the final tested rollout.
 - Both release starts are now Unix `1790352767` (16:12:47 UTC), the first
   healthy Silber sample after the final restart. The immediate retained idle
   preflight passed with one post-marker sample per host, one PID each, and no
-  errors. The full idle gate is due after 24 hours and the delivery gate after
-  72 hours. Their reports remain pending.
+  errors; the gate watcher then reported `preflight=healthy`. The continuous
+  delivery monitor recorded one exact linked Hetz-to-Silber reply for
+  `message/02551e38d0114847` at 16:15:37 UTC. A second exact one-shot
+  Silber-to-Hetz probe recorded one linked reply for
+  `message/3bbcb2634caedea1` at 16:16:32 UTC. The full idle gate is due
+  after 24 hours and the delivery gate after 72 hours. Their reports remain
+  pending.
 
 ## 15:46 UTC closed-message replay fix and fresh evidence windows
 
