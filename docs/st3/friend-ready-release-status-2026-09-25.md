@@ -1,10 +1,11 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Daemon and TUI candidate `5c41edc` is deployed to both active
-hosts. The final direct-network iOS source is merged at `e49c097`; the follow-on
-TUI usability steps are active in the existing UI mission. The 24-hour idle and 72-hour
-bidirectional delivery windows that began at 05:08:50 UTC are invalid after
-the daemon restarts and will be reset after the final tested UI rollout.
+**Release hold.** Source `82fe455` is deployed as host-native `st3` and `stui`
+on Hetz and Silber. The final direct-network iOS source is merged at `e49c097`.
+The 24-hour idle and 72-hour bidirectional delivery windows that began at
+05:08:50 UTC are invalid after the daemon restarts. New windows began at
+11:13:18 UTC, the first healthy final-build sample; their full reports are due
+after one and three days respectively.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -16,13 +17,56 @@ not an invitation to start the trial while this hold is active.
 
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
-| Declarative agents | Standing and mission-owned seats are visible in the graph; both hosts pass strict doctor with ready native drivers. | Verify the newly declared OMP overnight seats start on their assigned hosts and remain reachable. |
-| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions and no unresolved failure streak. | Exercise each new OMP inbox across hosts and keep the monitor running through the new window. |
-| Clean-session recovery | Codex's controlled fresh-thread restart retained its graph work and resumed delivery; current work, claims, and agent incarnations are inspectable. | Restart one disposable OMP seat with claimed work and an inbound message, then verify the new session resumes from graph state without duplicate or lost handling. |
-| Visible work | CLI mission/work detail and the iOS Control view expose current runs, goals, blockers, and work. The TUI usability worker is implementing clearer Control cards and actions. | Install and test the final TUI build against live mission data; deploy `a9e0709` so retired zero-run definitions disappear from current CLI and app views. |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. | Repair the OMP stale driver observation before strict doctor can pass. |
+| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode replied to an exact native inbox token after this rollout. | Obtain the pending post-rollout OMP reply and keep the monitor running through the new window. |
+| Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; a controlled OMP restart retained its completed step and next claimed work, and its new session replied through the native inbox. | Keep the restarted OMP seat healthy overnight. |
+| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, and active-first nested Chat agents. | Nathan retests the exact installed TUI build; the authenticated iOS read check is pending. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 11:13 UTC final TUI usability rollout
+
+- Source `82fe455` integrates the TUI usability fixes and corrects the macOS
+  PTY smoke test to drain output while the child exits. The Mac terminal guard
+  reported successful alternate-screen, raw-mode, and cursor restoration; the
+  corrected debug and installed-release smokes pass quit, signal, delayed
+  getter, and hangup on both hosts, plus the debug panic case. The `stui` unit
+  suite passes 40 tests (two live benchmarks ignored); the earlier full locked
+  `st3` suite and Nix package build passed for the same production changes.
+- Hetz installed SHA-256 `6f74516e5bddd599440be7efd624b1cb1edb12c737bbb1e0c2e2837db214f309`
+  for `st3` and `7d9945b618c455a5455779ec0d07aa27f5fc539a46b4f019d393e863f89c70a9`
+  for `stui`; daemon PID `1777376`, worker PID `1777378`. Silber installed
+  `68718549bd4ddb9d2f1622cfe8bb4024a57eed5392317ae0e9cf96f38c071b14`
+  and `61eaefd811552227b58379233a8e648790607df3de896c40a83ace741702aa2a`;
+  daemon PID `46725`, worker PID `46727`. Each host retains its previous pair
+  under `~/.local/state/st3/rollout-backups/82fe455-20260925-1110/`.
+- Both services are active. Both doctors report signed peers up, zero unresolved
+  records, zero unhealthy projections, and one shared pre-existing warning:
+  `agent/fleet/pty-rust/omp` has a stale driver observation. This is a strict
+  doctor failure and remains a release hold; COS is investigating that seat.
+  The post-restart delivery monitor logged an exact Hetz-to-Silber receipt at
+  11:14:11 UTC. The Silber OpenCode agent linked its exact-token reply to
+  `message/0c1da1f938d3f1e9` after the restart. The OMP post-rollout reply is
+  pending.
+- Silber's paired gateway returned unauthenticated HTTP 403 through
+  `192.168.178.25:4102`, `Silber.local:4102`, and `100.92.93.47:4102` after
+  the restart. The rebuilt iPhone 18 Pro simulator app used its existing paired
+  credential over direct LAN HTTP after the rollout: Now showed four actionable
+  items, the ST3 conversation rendered with the older-history marker above its
+  content, and three long polls remained connected for 30 seconds with no
+  transport error. Nathan's TUI retest remains pending. The final 24-hour and
+  72-hour markers were pinned to Unix
+  `1790334798` (11:13:18 UTC), after both service restarts and at the first
+  healthy two-host sample. The early idle evidence preflight passes with three
+  continuous, healthy samples per host. This short preflight is not a release
+  gate pass; the full 24-hour and 72-hour reports remain due.
+- The OMP readiness warning is a real delivery defect. At 11:05:13 UTC the
+  graph recorded the live OMP harness as indeterminate and emitted a readiness
+  deadline fault after its 11:05:03 idle observation. All OMP/PTY processes
+  remained alive, but both a COS message and the final-build native inbox probe
+  remained `sent` without a reply. This seat has no current work; remediation
+  is required before friend-ready release.
 
 ## 10:08 UTC TUI, iOS, and direct-network rollout
 
