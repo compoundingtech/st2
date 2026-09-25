@@ -15,7 +15,7 @@ LOCAL_SAMPLE="$(/usr/bin/dirname "$ST3_BIN")/st3-idle-sample"
 if [[ $MODE != --local-only && $MODE != --local-once ]]; then
   REMOTE_SAMPLE="$(/usr/bin/dirname "$ST3_SOAK_SILBER_BIN")/st3-idle-sample"
 fi
-/usr/bin/mkdir -p "$STATE_DIR"
+/bin/mkdir -p "$STATE_DIR"
 
 record() {
   local host=$1 result failure
@@ -62,5 +62,5 @@ while true; do
     record silber
   fi
   [[ $MODE == --once || $MODE == --local-once ]] && exit 0
-  /usr/bin/sleep 60
+  /bin/sleep 60
 done
