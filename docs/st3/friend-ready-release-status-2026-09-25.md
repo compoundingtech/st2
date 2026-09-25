@@ -18,6 +18,20 @@ and 60 quiet intervals per host if the unchanged CPU limits are exceeded. It
 is installed on Hetz; its own fixture test and first service run passed. The
 24-hour report remains the authority.
 
+At 04:17:39 UTC the delivery monitor recorded a Silber-to-Hetz `stage=send`
+failure. The exact request (`message/b67a6fcad1e2b29e`) and one linked reply
+(`message/992b7fc53bef47b0`) were already durable: Fabric `exec` lost its
+response after the remote send committed. The failed monitor line remains in
+the retained log. Commits `602e090` and `506cd51` recover an exact-token
+request from the recipient's durable mailbox and then require its linked
+reply, allowing the full receipt deadline for recovery. A deterministic test
+discarded the Fabric response after a real remote commit and logged one
+recovered request and one successful receipt. The repaired monitor restarted
+at 04:25:22 UTC and logged a fresh exact receipt in both directions by
+04:30:54 UTC. Its 72-hour marker was reset to that monitor start; the old
+window cannot pass. A six-minute one-per-direction diagnostic passed, but it
+is not release evidence.
+
 ## Candidate and recovery proof
 
 - Each daemon restart was preceded by a normalized ACK from the independent COS
@@ -73,6 +87,9 @@ is installed on Hetz; its own fixture test and first service run passed. The
   passed normal exit, SIGTERM restoration, navigation latency, and a
   stalled-connection PTY smoke against the live daemon. Its debug-only panic
   restoration check passed separately on the debug binary.
+- The package was rebuilt and its help check passed again from the deployed
+  `b6837bb` daemon source (tree at `2d861e6`); release-profile checks passed
+  408 st3 library, 86 CLI, and 17 stui tests, with two live stui tests ignored.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
   daemon. On the current source, all six iOS logic tests, the TypeScript
   typecheck, and `npm run export:ios` passed; the offline export produced a
@@ -92,9 +109,9 @@ is installed on Hetz; its own fixture test and first service run passed. The
   before 2026-09-26 04:14:57 UTC. It must show one stable PID per host, no missing or
   bad samples, enough quiet intervals, CPU within the stated limits, and flat
   last-hour RSS relative to the first hour.
-- The complete-failure-logging delivery monitor began at 2026-09-24 22:50:25
-  UTC. Its unmodified 72-hour report cannot pass before 2026-09-27 22:50:25
-  UTC. It requires at least 400 exact receipts per direction, no failures or
+- The complete-failure-logging delivery window restarted at 2026-09-25
+  04:25:22 UTC. Its unmodified 72-hour report cannot pass before 2026-09-28
+  04:25:22 UTC. It requires at least 400 exact receipts per direction, no failures or
   excessive gaps, and an active, current monitor.
 - Keep inspecting peer status, last successful exchange, and errors throughout
   the soak. The current status API does not expose exact live TCP dial counts;
