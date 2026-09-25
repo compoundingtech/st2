@@ -65,6 +65,11 @@ the release gates after the final tested rollout.
   `message/3bbcb2634caedea1` at 16:16:32 UTC. The full idle gate is due
   after 24 hours and the delivery gate after 72 hours. Their reports remain
   pending.
+- Silber's current paired-client loopback bridge and direct LAN route both
+  returned the expected complete HTTP 403 to unauthenticated reads after the
+  restart. The bridge launch agents were running. This checks the route and
+  authentication boundary; the earlier simulator run supplied the paired
+  application read proof.
 
 ## 15:46 UTC closed-message replay fix and fresh evidence windows
 
