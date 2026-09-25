@@ -764,9 +764,7 @@ impl App {
                             current.path,
                             next_action_label(current)
                         ));
-                        if let Some(claimant) = &current.claimant {
-                            lines.push(format!("Owner  {claimant}"));
-                        }
+                        lines.push(format!("Owner  {}", work_owner(&self.model, current)));
                         if let Some(reason) = &current.blocked_reason {
                             lines.push(format!("Blocker  {reason}"));
                         }
@@ -794,9 +792,7 @@ impl App {
                         if let Some(goal) = step.goals.first() {
                             lines.push(format!("    Goal: {goal}"));
                         }
-                        if let Some(claimant) = &step.claimant {
-                            lines.push(format!("    Agent: {claimant}"));
-                        }
+                        lines.push(format!("    Owner: {}", work_owner(&self.model, step)));
                         count += 1;
                     }
                     if count == 0 {
@@ -1096,6 +1092,25 @@ fn next_action_label(work: &st3_client::Work) -> &'static str {
         "ready" => "Agent can claim",
         "waiting" => "Await dependency",
         _ => "Inspect step",
+    }
+}
+fn work_owner(model: &Model, work: &st3_client::Work) -> String {
+    let agent_id = work.claimant.as_deref().or_else(|| {
+        model
+            .agents()
+            .find(|agent| {
+                agent.next_work_id.as_deref() == Some(&work.header.id)
+                    || agent.current_work_ids.contains(&work.header.id)
+            })
+            .map(|agent| agent.header.id.as_str())
+    });
+    match agent_id {
+        Some(id) => model
+            .agents()
+            .find(|agent| agent.header.id == id)
+            .map(|agent| format!("{} · {id}", agent_label(agent)))
+            .unwrap_or_else(|| id.to_owned()),
+        None => "Unassigned".into(),
     }
 }
 fn sidebar_item_at(app: &App, column: u16, row: u16, width: u16) -> Option<usize> {
@@ -2670,6 +2685,7 @@ mod tests {
             work.claimant = Some("agent/reviewer".into());
         }
         model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/old/ship","revision":"one","updated_at":"2026-09-24T08:00:00Z","mission_run_id":"mission-run/old","generation_id":"generation/old","definition_id":"def/old","path":"ship","state":"completed","attempt":1,"readiness_epoch":1}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/queue","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"queue","state":"running","reachability":"reachable","next_work_id":"step-run/a/deploy"}"#).unwrap());
         let mission = model.missions().next().unwrap();
         assert_eq!(mission_progress(&model, mission), (1, 3));
         assert_eq!(
@@ -2734,5 +2750,6 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Resolve blocker"));
         assert!(content.contains("Needs owner review"));
+        assert!(content.contains("agent/queue"));
     }
 }
