@@ -1,11 +1,11 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `8696c2e` for `st3` and `2af1b1b` for `stui` is
+**Release hold.** Source `ea74722` for `st3` and `2af1b1b` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
-source is merged at `e49c097`. The earlier 11:13:18 UTC soak windows were
-invalidated by this rollout. New windows began at 11:40:44 UTC after both
-daemons restarted and the OMP seat became ready; their full 24-hour idle and
-72-hour bidirectional delivery reports are still due.
+source is merged at `e49c097`. The earlier 11:40:44 UTC soak windows were
+invalidated by the CPU hotfix rollout. New windows began at 13:55:44 UTC after
+both daemons restarted; their full 24-hour idle and 72-hour bidirectional
+delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -24,6 +24,42 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 13:55 UTC Hetz idle CPU hot-loop repair
+
+- At the two-hour diagnostic point, Hetz had 82 quiet intervals with median
+  daemon CPU 78.3% of one core, above its unchanged 15% gate. Silber had 81
+  quiet intervals at 16.3%, below its 50% gate. RSS did not grow over the
+  short window; replication and both strict doctors stayed healthy. This was
+  an early risk alert, not a 24-hour verdict.
+- The ready product step's work-wake messages were read and closed at 11:49,
+  but the wake projection ignored that durable acknowledgement and kept its
+  retry deadline in the past after the step was released. Hetz's reconciler
+  repeatedly rescanned the graph. Claiming the step at 13:45 removed the
+  overdue deadline and CPU fell from roughly 80% to roughly 20% of a core.
+  Regression `work_actions_require_an_active_incarnation_bound_lease` failed
+  before `f9a9116` and passes after it; the full locked `st3` suite passed
+  413 library, 88 CLI, 5 client CLI, 21 contract, 27 example, and 12
+  operational tests. The fix treats a read or closed wake in the current
+  incarnation as acknowledged when scheduling reconcile work.
+- `ea74722` temporarily reverts the separate staged OMP model gate so this CPU
+  hotfix can be installed while Nathan's declared model remains absent from
+  OMP's registry. The model gate patch is retained at `5e3b80f` for reapplication
+  with his chosen exact model. Hetz installed `st3` SHA-256
+  `7a2be4eedd262274a2a0d7a42f9b915b237acff8b8d21d4fa2f2ad948278404e`
+  (daemon PID `3356763`, replication PID `3356765`); Silber installed
+  `fdc71b0edebd6d8b9418cabc6079bad9f754ba3154aa12ddc3024aa74b54cd37`
+  (daemon PID `32095`, replication PID `32097`). Each host retains the previous
+  daemon binary in its local `rollout-backups/ea74722-20260925-1354/`.
+  The installed `stui` binaries remain at `2af1b1b`.
+- Both strict doctors pass after the restart: signed peers up, zero unresolved
+  or unhealthy replication records, and the same ready OMP incarnation. Direct
+  LAN, `.local`, and tailnet gateway routes still return unauthenticated 403.
+  The exact delivery monitor logged a Hetz-to-Silber linked receipt during the
+  rollout at 13:55:15 UTC. New release markers are Unix `1790344544`
+  (13:55:44 UTC), the first healthy post-rollout sample. The one-sample
+  preflight passes on both hosts; the full windows and a live ready-step CPU
+  comparison are still pending.
 
 ## 11:40 UTC OMP and macOS TUI repair rollout
 
@@ -70,10 +106,10 @@ the release gates after the final tested rollout.
 - Source commit `5e3b80f` adds an exact OMP registry check before the wrapper
   claims its seat. The new regression rejects the unavailable requested model
   and accepts an exact custom selector; all 836 active `st2` library tests pass
-  (one ignored). This commit is pushed but intentionally not installed while
-  the current declaration remains unsupported. Installing it first would stop
-  the OMP seat. The next rollout must pair it with Nathan's selected model and
-  then reset the soak windows after the host restart.
+  (one ignored). This commit was temporarily reverted by `ea74722` so the CPU
+  hotfix could deploy while the current declaration remains unsupported.
+  Reapply it with Nathan's selected model, then reset the soak windows after
+  the host restart.
 
 ## 11:13 UTC earlier TUI usability rollout
 
