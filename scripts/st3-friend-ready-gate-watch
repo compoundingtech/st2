@@ -66,6 +66,34 @@ if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 180 )); then
   fi
 fi
 
+# The final CPU verdict still needs a full day. Once there is enough quiet
+# post-rollout evidence to be informative, wake the operator early if its
+# median is already outside the unchanged release limits.
+idle_risk=waiting
+idle_risk_summary=
+if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 7200 )); then
+  idle_risk_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+    -u ST3_IDLE_REPORT_MAX_GAP_SECONDS -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS \
+    ST3_IDLE_REPORT_DURATION_SECONDS="$((now - ST3_FRIEND_READY_IDLE_START_UNIX))" \
+    ST3_IDLE_REPORT_MIN_SAMPLES=1 ST3_IDLE_REPORT_MIN_QUIET=1 \
+    ST3_IDLE_REPORT_REMOTE=1 FABRIC_BIN="$FABRIC_BIN" "$IDLE_REPORT" 2>&1) || :
+  if /usr/bin/jq -e '(.hosts | length) == 2 and all(.hosts[]; .quiet_intervals >= 60)' \
+    <<<"$idle_risk_output" >/dev/null 2>&1; then
+    idle_risk_summary=$(/usr/bin/jq -cr \
+      '{hosts:[.hosts[]|{host,quiet_intervals,quiet_cpu_median_pct}]}' \
+      <<<"$idle_risk_output")
+    if /usr/bin/jq -e 'all(.hosts[];
+      .quiet_cpu_median_pct != null and .quiet_cpu_median_pct >= 0 and
+      (if .host == "hetz" then .quiet_cpu_median_pct <= 15
+       elif .host == "silber" then .quiet_cpu_median_pct <= 50 else false end))' \
+      <<<"$idle_risk_output" >/dev/null; then
+      idle_risk=within-limit
+    else
+      idle_risk=high-cpu
+    fi
+  fi
+fi
+
 idle_summary=$(/usr/bin/jq -cr '{pass,hosts:[.hosts[]|{host,samples,errors,pid_count,quiet_cpu_median_pct,rss_growth_kib,pass}]}' \
   <<<"$idle_output" 2>/dev/null) || idle_summary='idle report unavailable or malformed'
 if [[ $message_output == PASS:* || $message_output == FAIL:* ]]; then
@@ -77,6 +105,7 @@ fi
 
 old_idle=$(/usr/bin/jq -r '.idle_notice // ""' "$state" 2>/dev/null) || old_idle=
 old_idle_preflight=$(/usr/bin/jq -r '.idle_preflight_notice // ""' "$state" 2>/dev/null) || old_idle_preflight=
+old_idle_risk=$(/usr/bin/jq -r '.idle_risk_notice // ""' "$state" 2>/dev/null) || old_idle_risk=
 old_message=$(/usr/bin/jq -r '.message_notice // ""' "$state" 2>/dev/null) || old_message=
 old_release=$(/usr/bin/jq -r '.release_notice // ""' "$state" 2>/dev/null) || old_release=
 failures=0
@@ -104,6 +133,21 @@ if [[ $idle_preflight == fault ]]; then
   fi
 else
   old_idle_preflight=
+fi
+
+if [[ $idle_risk == high-cpu ]]; then
+  risk_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:high-cpu"
+  if [[ $old_idle_risk != "$risk_notice" ]]; then
+    if receipt=$(send_notice 'friend-ready idle CPU at risk' \
+      "The provisional post-rollout quiet CPU median exceeds the unchanged release limit after at least 60 quiet intervals per host. This is an early risk signal, not the 24-hour verdict. $idle_risk_summary Investigate without editing the evidence or thresholds."); then
+      old_idle_risk=$risk_notice
+      /usr/bin/printf 'idle CPU risk notified in %s\n' "$receipt"
+    else
+      failures=1
+    fi
+  fi
+else
+  old_idle_risk=
 fi
 
 if [[ $idle != waiting && $idle != "$old_idle" ]]; then
@@ -141,12 +185,16 @@ fi
 temporary=$(/usr/bin/mktemp "$STATE_DIR/state.XXXXXX")
 /usr/bin/jq -nc --argjson checked_at "$now" --arg idle "$idle" --arg message "$message" \
   --arg idle_preflight "$idle_preflight" \
+  --arg idle_risk "$idle_risk" \
   --arg idle_notice "$old_idle" --arg idle_preflight_notice "$old_idle_preflight" \
+  --arg idle_risk_notice "$old_idle_risk" \
   --arg message_notice "$old_message" \
   --arg release_notice "$old_release" \
-  '{checked_at:$checked_at,idle:$idle,idle_preflight:$idle_preflight,
+  '{checked_at:$checked_at,idle:$idle,idle_preflight:$idle_preflight,idle_risk:$idle_risk,
     message:$message,idle_notice:$idle_notice,idle_preflight_notice:$idle_preflight_notice,
+    idle_risk_notice:$idle_risk_notice,
     message_notice:$message_notice,release_notice:$release_notice}' >"$temporary"
 /usr/bin/mv "$temporary" "$state"
-/usr/bin/printf 'friend-ready gates idle=%s preflight=%s delivery=%s\n' "$idle" "$idle_preflight" "$message"
+/usr/bin/printf 'friend-ready gates idle=%s preflight=%s cpu-risk=%s delivery=%s\n' \
+  "$idle" "$idle_preflight" "$idle_risk" "$message"
 exit "$failures"

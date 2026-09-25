@@ -20,3 +20,10 @@ alerts early if a host's evidence is missing or stale, a sample or peer is bad,
 the daemon PID changes, or a sample gap exceeds three minutes. It never grants
 release or relaxes the 24-hour CPU/RSS gate. A failed alert send is retried on
 the next timer run; the alert is deduplicated for the current start marker.
+
+After two hours, the watcher also evaluates the post-rollout quiet CPU median
+when each host has at least 60 quiet intervals. It sends a deduplicated early
+risk notice if Hetz exceeds 15% or Silber exceeds 50%. This is a warning to
+investigate, not a final gate result; the complete 24-hour report remains the
+release authority. Missing remote evidence remains an integrity fault under
+the preflight rather than a passing CPU check.
