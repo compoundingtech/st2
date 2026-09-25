@@ -72,6 +72,7 @@ enum Mode {
     Normal,
     Confirm,
     ActionReason,
+    ImportConfirm,
     Chat,
     Title,
     Request,
@@ -108,6 +109,7 @@ struct App {
     status_details: bool,
     pending_action: Option<(String, String)>,
     pending_reason: Option<String>,
+    pending_import: Option<String>,
     action_result: Option<String>,
     chat_max_scroll: Cell<u16>,
     sidebar_offsets: [Cell<usize>; 4],
@@ -140,6 +142,7 @@ impl App {
             status_details: false,
             pending_action: None,
             pending_reason: None,
+            pending_import: None,
             action_result: None,
             chat_max_scroll: Cell::new(0),
             sidebar_offsets: [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)],
@@ -209,10 +212,6 @@ impl App {
     }
     fn agent_tree(&self) -> Vec<(&st3_client::Agent, usize)> {
         let agents = self.model.agents().collect::<Vec<_>>();
-        let ids = agents
-            .iter()
-            .map(|a| a.header.id.as_str())
-            .collect::<HashSet<_>>();
         let mut result = Vec::new();
         let mut seen = HashSet::new();
         fn add<'a>(
@@ -226,21 +225,15 @@ impl App {
                 return;
             }
             result.push((agent, depth));
-            for child in agents.iter().filter(|child| {
-                child
-                    .under
-                    .iter()
-                    .any(|parent| parent.agent_id == agent.header.id)
-            }) {
+            for child in agents
+                .iter()
+                .filter(|child| agent_is_child_of(child, agent))
+            {
                 add(child, depth + 1, agents, seen, result);
             }
         }
         for agent in &agents {
-            if !agent
-                .under
-                .iter()
-                .any(|parent| ids.contains(parent.agent_id.as_str()))
-            {
+            if !agents.iter().any(|parent| agent_is_child_of(agent, parent)) {
                 add(agent, 0, &agents, &mut seen, &mut result);
             }
         }
@@ -479,10 +472,20 @@ impl App {
                     .iter()
                     .map(|(v, depth)| {
                         format!(
-                            "{}{} {}  ·  {}",
+                            "{}{} {}{}  ·  {}",
                             "  ".repeat(*depth),
                             state_glyph(&v.state),
                             agent_label(v),
+                            if v.active_work_count > 0 || !v.current_work_ids.is_empty() {
+                                format!(
+                                    " · {} work",
+                                    v.active_work_count.max(v.current_work_ids.len() as u64)
+                                )
+                            } else if v.queued_work_count > 0 {
+                                format!(" · {} queued", v.queued_work_count)
+                            } else {
+                                String::new()
+                            },
                             v.reachability
                         )
                     })
@@ -648,11 +651,23 @@ impl App {
                     }
                     lines.push(String::new());
                     lines.push("RECENT MESSAGES".into());
-                    for message in self
+                    let recent = self
                         .model
                         .messages(self.selected_session_id().as_deref(), &peer.header.id)
                         .take(4)
-                    {
+                        .collect::<Vec<_>>();
+                    if recent.is_empty() {
+                        lines.push(
+                            if self.messages_requested.as_deref() == Some(peer.header.id.as_str())
+                                && self.model.messages.snapshot.is_none()
+                            {
+                                "  Loading recent messages…".into()
+                            } else {
+                                "  No recent messages.".into()
+                            },
+                        );
+                    }
+                    for message in recent {
                         let cleaned = clean_message_text(&message.content);
                         lines.push(format!(
                             "  {}: {}",
@@ -700,7 +715,9 @@ impl App {
                         );
                     }
                     for entry in conversation.into_iter().rev() {
-                        lines.push(format!("  {}", timeline_line(entry)));
+                        for line in timeline_line(entry).lines() {
+                            lines.push(format!("  {line}"));
+                        }
                         lines.push(String::new());
                     }
                 } else if let Some(session) = self.undeclared_session() {
@@ -732,11 +749,35 @@ impl App {
                         lines.push(format!("Workspace: {workspace}"));
                     }
                     lines.push("── Normalized history ──".into());
-                    lines.extend(self.model.timeline.iter().map(timeline_line));
+                    if self.model.timeline.is_empty() {
+                        lines.push(if self.timeline_cache.contains_key(&session.header.id) {
+                            "No conversation in recent timeline.".into()
+                        } else {
+                            "Loading conversation…".into()
+                        });
+                    }
+                    for entry in &self.model.timeline {
+                        for line in timeline_line(entry).lines() {
+                            lines.push(format!("  {line}"));
+                        }
+                    }
                     if self.model.timeline_truncated || self.model.sessions.truncated {
                         lines.push("[More sessions or history beyond bounded view]".into());
                     }
-                    lines.push("This session is not managed by st3; message and terminal controls are unavailable.".into());
+                    lines.push(if session_is_importable(session) {
+                        "m import session into st3 · confirmation stops the exact process and resumes it under st3".into()
+                    } else if exact {
+                        format!(
+                            "Import unavailable: {}",
+                            session
+                                .extra
+                                .get("import_reason")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("native discovery did not mark this session importable")
+                        )
+                    } else {
+                        "Import requires an exact native session ID; this process is unresolved.".into()
+                    });
                 } else {
                     lines.push("No agents or undeclared sessions available.".into());
                 }
@@ -926,6 +967,9 @@ impl App {
             Mode::Normal => format!(
                 "1–4 views · ↑↓ select · PgUp/PgDn scroll · v select text · i connection · {} · q quit",
                 match self.tab {
+                    1 if self.undeclared_session().is_some_and(session_is_importable) => {
+                        "m import / End newest"
+                    }
                     1 => "Enter terminal / c message / End newest",
                     2 => "c new mission",
                     _ => "",
@@ -939,6 +983,10 @@ impl App {
                 })
                 .unwrap_or_else(|| "Esc cancel".into()),
             Mode::ActionReason => format!("Reason: {}█ · Enter continue · Esc cancel", self.input),
+            Mode::ImportConfirm => format!(
+                "y confirm import {} · Esc cancel · stops exact process, resumes under st3",
+                self.pending_import.as_deref().unwrap_or("session")
+            ),
             Mode::Chat => format!("Message: {}█ · Enter send · Esc cancel", self.input),
             Mode::Title => format!("Launch title: {}█", self.input),
             Mode::Request => format!("Request: {}█", self.input),
@@ -1222,6 +1270,34 @@ fn agent_label(agent: &st3_client::Agent) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+fn agent_is_child_of(child: &st3_client::Agent, parent: &st3_client::Agent) -> bool {
+    if child.header.id == parent.header.id {
+        return false;
+    }
+    if child
+        .under
+        .iter()
+        .any(|relation| relation.agent_id == parent.header.id)
+    {
+        return true;
+    }
+    child.under.is_empty()
+        && parent.header.id == "agent/fleet/st3/standing/st3"
+        && (child.header.id.starts_with("agent/fleet/st3/")
+            || child.header.id.starts_with("agent/st3/"))
+}
+fn session_is_importable(session: &st3_client::Session) -> bool {
+    session
+        .extra
+        .get("native_session_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && session
+            .extra
+            .get("importable")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
 fn key_input(key: KeyEvent) -> Option<String> {
     match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => Some(format!("C-{c}")),
@@ -1490,6 +1566,69 @@ async fn run_attention_action(
         Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
     }
 }
+async fn fresh_import_fence(client: &Client, target: &str) -> Result<Fence> {
+    let mut cursor = None;
+    for _ in 0..4 {
+        let page = client
+            .sessions_list_native(cursor.as_deref(), Some(50), false)
+            .await?;
+        for item in &page.value.items {
+            if let Resource::Session(session) = item {
+                if session.header.id == target {
+                    anyhow::ensure!(
+                        session.state == "running"
+                            && session
+                                .extra
+                                .get("managed")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false)
+                            && session_is_importable(session),
+                        "session is no longer an importable, exact, running undeclared session"
+                    );
+                    return Ok(Fence {
+                        snapshot_id: page.snapshot.id,
+                        subject_revisions: BTreeMap::from([(
+                            target.to_owned(),
+                            session.header.revision.clone(),
+                        )]),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if !page.value.page.has_more {
+            anyhow::bail!("session is no longer in native discovery");
+        }
+        cursor = page.value.page.next_cursor;
+        anyhow::ensure!(
+            cursor.is_some(),
+            "native discovery has no continuation cursor"
+        );
+    }
+    anyhow::bail!("session is beyond the bounded native discovery view")
+}
+
+async fn import_session(app: &mut App, client: &Client, target: &str) -> Result<String> {
+    let fence = fresh_import_fence(client, target).await?;
+    let (id, idem) = action_pair();
+    let result = client
+        .session_import(
+            id,
+            idem,
+            fence,
+            TargetParameters {
+                target_id: target.to_owned(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let outcome = format!("Import {}: {}", target, result.value.kind);
+    match app.model.reload(client).await {
+        Ok(()) => Ok(outcome),
+        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
+    }
+}
+
 async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<bool> {
     if key.kind != KeyEventKind::Press {
         return Ok(false);
@@ -1553,6 +1692,26 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                         },
                     );
                     app.scroll[0] = 0;
+                }
+            }
+            _ => {}
+        }
+        app.dirty = true;
+        return Ok(false);
+    }
+    if app.mode == Mode::ImportConfirm {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::Normal;
+                app.pending_import = None;
+            }
+            KeyCode::Char('y') => {
+                if let Some(target) = app.pending_import.take() {
+                    app.mode = Mode::Normal;
+                    app.action_result = Some(match import_session(app, client, &target).await {
+                        Ok(result) => result,
+                        Err(error) => format!("Import failed: {error}"),
+                    });
                 }
             }
             _ => {}
@@ -1699,6 +1858,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                     }
                     Mode::Normal => {}
                     Mode::Confirm => unreachable!(),
+                    Mode::ImportConfirm => unreachable!(),
                 }
             }
             KeyCode::Char(c)
@@ -1802,6 +1962,23 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 app.start_chat_composer();
             } else {
                 app.model.status = "Undeclared sessions are read-only".into();
+            }
+        }
+        KeyCode::Char('m') if app.tab == 1 => {
+            if !app.live_ready {
+                app.model.status = "Reconnect before importing a session".into();
+            } else if let Some(session) = app.undeclared_session() {
+                if session_is_importable(session) {
+                    app.pending_import = Some(session.header.id.clone());
+                    app.mode = Mode::ImportConfirm;
+                } else {
+                    app.model.status = session
+                        .extra
+                        .get("import_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Import requires an exact native session ID and importability")
+                        .to_owned();
+                }
             }
         }
         KeyCode::Char('c') if app.tab == 2 => {
@@ -2387,6 +2564,127 @@ mod tests {
         app.selected[1] = 1;
         assert_eq!(app.peer().unwrap().name, "Child");
         assert_eq!(agent_label(app.peer().unwrap()), "Child");
+    }
+
+    #[test]
+    fn st3_descendants_nest_and_top_level_omp_shows_its_work() {
+        let mut model = Model::default();
+        for (id, name, driver, active) in [
+            ("agent/fleet/st3/standing/st3", "ST3", "codex", 0),
+            (
+                "agent/st3/tui-ios-fixes/2026-09-25/st3-tui-fixer",
+                "TUI fixer",
+                "codex",
+                1,
+            ),
+            (
+                "agent/fleet/st3/delivery-soak/recipient",
+                "Recipient",
+                "codex",
+                0,
+            ),
+            ("agent/fleet/pty-rust/omp", "OMP", "omp", 1),
+        ] {
+            model.agents.items.push(
+                serde_json::from_value(serde_json::json!({
+                    "kind":"agent", "id":id, "revision":"one", "updated_at":"2026-09-25T08:00:00Z",
+                    "name":name, "driver":driver, "state":"running", "reachability":"reachable",
+                    "active_work_count":active
+                }))
+                .unwrap(),
+            );
+        }
+        let mut app = App::new(model);
+        app.tab = 1;
+        let tree = app.agent_tree();
+        assert_eq!(
+            tree.iter()
+                .find(|(agent, _)| agent.name == "TUI fixer")
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            tree.iter()
+                .find(|(agent, _)| agent.name == "Recipient")
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            tree.iter()
+                .find(|(agent, _)| agent.name == "OMP")
+                .unwrap()
+                .1,
+            0
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("1 work"));
+    }
+    #[tokio::test]
+    async fn exact_undeclared_session_offers_confirmed_migration() {
+        let session: Resource = serde_json::from_str(r#"{"kind":"session","id":"session/external","revision":"native-rev","updated_at":"2026-09-25T08:00:00Z","owner_id":"external-session/codex/one","state":"running","started_at":"2026-09-25T07:00:00Z","ended_at":null,"timeline_cursor":"cursor/one","managed":false,"driver":"codex","native_session_id":"one","importable":true}"#).unwrap();
+        let mut model = Model::default();
+        model.sessions.items.push(session);
+        let mut app = App::new(model);
+        app.tab = 1;
+        app.live_ready = true;
+        let client = Client::unix("/nonexistent-stui-test.sock");
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("m import"));
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::ImportConfirm);
+        assert_eq!(app.pending_import.as_deref(), Some("session/external"));
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::ImportConfirm);
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert!(app.pending_import.is_none());
+        let unresolved: Resource = serde_json::from_str(r#"{"kind":"session","id":"session/unresolved","revision":"one","updated_at":"2026-09-25T08:00:00Z","owner_id":"external-process/claude/42","state":"running","started_at":"2026-09-25T07:00:00Z","ended_at":null,"timeline_cursor":"cursor/two","managed":false,"driver":"claude","native_session_id":null}"#).unwrap();
+        app.model.sessions.items.push(unresolved);
+        app.selected[1] = 1;
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.model.status.contains("exact native session ID"));
     }
 
     #[test]

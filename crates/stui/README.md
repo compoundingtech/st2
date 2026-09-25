@@ -17,13 +17,12 @@ PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message; `
 `v` toggles terminal text selection by releasing mouse capture; `i` shows connection details; `q` quits.
 Now cards show the available action keys. Choose an action, enter a reason for a review decision,
 then confirm with `y`; actions without a typed TUI flow are marked CLI. Chat shows recent received messages for the selected agent and
-bounded normalized history for its current session. Running undeclared
-harness sessions discovered on the connected host also appear there and in Fleet, clearly marked
-read-only; the app never offers them managed-agent controls. Their discovery refreshes every
+bounded normalized history for its current session. It preserves message line breaks, simplifies Markdown headings, lists, quotes and code blocks, and hides known internal transcript markup across supported drivers. Running undeclared
+harness sessions discovered on the connected host also appear there and in Fleet. An exact native session offers `m` to import it into st3 after `y` confirmation; this stops the exact running process and resumes it under st3. Unresolved processes cannot be imported from the TUI. Their discovery refreshes every
 15 seconds even without a graph event. Discovery is local to the connected host, not a claim
 that unqueried machines have no undeclared sessions. Press `c` to compose for a managed agent
 and Enter to attach its available terminal. Declared agents follow their `under` relationships
-in the Chat tree; undeclared sessions remain separate. Control groups missions by blocked,
+in the Chat tree, including st3 descendants under the st3 parent; undeclared sessions remain separate. Active work badges keep top-level agents' work visible. Control groups missions by blocked,
 waiting, running, standing, drafts, and archive. It shows progress for the latest run and the
 current step, owner, blockers, and next action in the detail pane. A `+` on progress means the
 bounded history did not include every step. System missions are hidden initially; `x` toggles them. In Control, `c` starts a
