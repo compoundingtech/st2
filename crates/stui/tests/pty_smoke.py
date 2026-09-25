@@ -98,7 +98,11 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         raise AssertionError(f"{ending}: TUI did not exit")
     collect(1)
     os.close(master)
-    assert b"\x1b[?1049l" in captured, f"{ending}: alternate screen was not restored (exit {proc.returncode}, {len(captured)} bytes)"
+    modes = sorted(set(re.findall(rb"\x1b\[\?[0-9;]*[hl]", captured)))
+    assert b"\x1b[?1049l" in captured, (
+        f"{ending}: alternate screen was not restored "
+        f"(exit {proc.returncode}, {len(captured)} bytes, modes {modes}, tail {captured[-48:].hex()})"
+    )
     assert (proc.returncode == 0) == (ending != "panic"), f"{ending}: unexpected exit {proc.returncode}"
     print(f"{ending}: restoration OK" if ending == "panic" else f"{ending}: first frame {first_frame:.3f}s, keys <0.5s, restoration OK")
 
