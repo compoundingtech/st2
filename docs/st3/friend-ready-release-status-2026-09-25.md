@@ -1,6 +1,7 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Candidate `b6837bb` is deployed to both active hosts, but the
+**Release hold.** Daemon candidate `3db863d` is deployed to both active hosts;
+the latest app/client source is `5de494f`. The
 default 24-hour idle and 72-hour bidirectional delivery gates have not elapsed.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
@@ -36,6 +37,27 @@ is not release evidence.
 
 ## Candidate and recovery proof
 
+- A connected iOS simulator exposed that the old paired-device grant contained
+  only projection and terminal reads plus attention and launch control. Chat
+  sends, mission/work actions, and terminal input could not work through that
+  credential. `3db863d` preserves that limited default and adds an explicit
+  `--full-control` choice made by the initiating person on the trusted local
+  socket. A paired-gateway contract test proves the remote cannot initiate it,
+  the chosen scopes are granted, and revocation cuts access. Existing limited
+  devices are not silently widened. After the connected simulator check, the
+  exact temporary full-control test device was revoked; `devices --all ls`
+  confirmed it revoked while both pre-existing limited devices stayed active.
+- The new daemon was installed on Hetz at 05:03:33 UTC (PID `595654`, binary SHA
+  `4659b2d9183f03942d3577232505795d86382a47e268e7fe79f529f5dfec3c61`)
+  and Silber at 05:05:59 UTC (PID `45998`, binary SHA
+  `0d90adb81844c35a4cee28beb42138a07fa9073deb0a62d9dcb9998d33b7fbc1`).
+  Prior binaries are retained locally under each host's
+  `rollout-backups/3db863d-20260925-0502/st3-before`. Both strict doctors
+  passed after convergence; Hetz briefly reported operation-projection drift
+  during replication and passed on the next check. COS independently confirmed
+  each new PID, both original agent incarnations, the same Codex thread, signed
+  replication with zero pending/invalid/unhealthy records, and native receipt
+  of `message/1ea7e8bccb7ce333` after the Silber restart.
 - Each daemon restart was preceded by a normalized ACK from the independent COS
   seat. Rollback binaries are retained locally on the corresponding host.
 - The prior `0da07d7` window reached a diagnostic Hetz quiet CPU median of
@@ -96,12 +118,17 @@ is not release evidence.
   daemon. The iOS Chat terminal now offers capability-gated line and key input
   with a fresh fence, bounded stale-fence retry, and runtime-incarnation guard;
   it does not queue offline input or retry an ambiguous transport failure.
-  All seven iOS logic tests, the TypeScript typecheck, and `npm run export:ios`
-  passed; the offline export produced a 1.6 MiB iOS Hermes bundle. Prior signed
-  Debug simulator and paired-gateway proofs remain the native device evidence;
-  the new control UI has not yet had a connected simulator smoke, and an
-  exported bundle alone does not prove pairing or a physical iPhone
-  installation, which is optional for this mission.
+  The generated TypeScript client's canonical pairing-ID route was corrected
+  and regression-tested. The Debug simulator then completed a real
+  full-control pairing through the paired-only HTTPS gateway, reconnected,
+  and displayed usable terminal controls above the live screen. The app also
+  now lets a new credential refresh while an old request is in flight. No keys were
+  sent to a working agent merely for UI proof. All eight iOS logic tests, five
+  TypeScript client tests, the TypeScript typecheck, and `npm run export:ios`
+  passed; the offline export produced a 1.6 MiB iOS Hermes bundle. The Swift
+  client generator's reserved identifier and async WebSocket receive defects
+  were fixed, and its six macOS tests passed. A physical iPhone installation is
+  optional for this mission and remains unproven.
 - The earlier `326904a` build had a three-minute **diagnostic only** with no
   sample errors, unchanged daemon PIDs, and quiet median CPU of 13.3% on Hetz
   and 17.4% on Silber. Those figures must not be attributed to `0da07d7` or
@@ -109,14 +136,14 @@ is not release evidence.
 
 ## Pending release evidence
 
-- The post-rollout two-host idle window restarted with the first final Silber
-  PID sample at 2026-09-25 04:14:57 UTC. The unmodified report cannot pass
-  before 2026-09-26 04:14:57 UTC. It must show one stable PID per host, no missing or
+- The post-rollout two-host idle window restarted at 2026-09-25 05:08:50 UTC,
+  after both `3db863d` restarts and COS's independent check. The unmodified
+  report cannot pass before 2026-09-26 05:08:50 UTC. It must show one stable PID per host, no missing or
   bad samples, enough quiet intervals, CPU within the stated limits, and flat
   last-hour RSS relative to the first hour.
 - The complete-failure-logging delivery window restarted at 2026-09-25
-  04:25:22 UTC. Its unmodified 72-hour report cannot pass before 2026-09-28
-  04:25:22 UTC. It requires at least 400 exact receipts per direction, no failures or
+  05:08:50 UTC. Its unmodified 72-hour report cannot pass before 2026-09-28
+  05:08:50 UTC. It requires at least 400 exact receipts per direction, no failures or
   excessive gaps, and an active, current monitor.
 - Keep inspecting peer status, last successful exchange, and errors throughout
   the soak. The current status API does not expose exact live TCP dial counts;
@@ -124,8 +151,10 @@ is not release evidence.
   not an invented production counter. The earlier
   [idle baseline](idle-stability-2026-09-23.md) is not a matched 24-hour window.
 - Long-running Fabric `exec` clients were observed hanging after remote
-  commands had stopped, while short commands and st3 signed replication kept
-  working. The Fabric owner has requested a graph-queued diagnosis and
+  commands had stopped, including one build response during this rollout and
+  an independent COS check at 05:07 UTC. Short commands and st3 signed
+  replication kept working; the build artifact and doctors were checked
+  separately. The Fabric owner has requested a graph-queued diagnosis and
   regression; this operator-path issue remains open rather than being silently
   counted as a passed st3 messaging check.
 
