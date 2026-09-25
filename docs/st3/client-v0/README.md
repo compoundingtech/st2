@@ -42,6 +42,13 @@ concurrent-read check. Run the forwarder as a persistent service so daemon resta
 the client. On iOS 17 and later, an App Transport Security exception can target Tailscale's
 `100.64.0.0/10` range without opening arbitrary HTTP destinations.
 
+On a shared LAN, the same paired-only socket can be forwarded from a listener bound to one private
+LAN IP and reached through that address or the host's `.local` name. iOS needs Local Network
+permission and an App Transport Security local-network allowance. Plain HTTP on the LAN exposes
+the paired bearer credential to anyone able to observe that LAN traffic; pairing authenticates
+requests but does not encrypt this transport. Keep the listener on an explicit private interface,
+and use HTTPS or the tailnet route when the LAN is not trusted.
+
 Tailscale Serve remains an optional HTTPS carrier for clients that need it. If using Serve,
 publish only the paired-only socket:
 
