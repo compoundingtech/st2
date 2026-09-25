@@ -11920,6 +11920,12 @@ fn current_harness_at(
                 optional.insert(name, value.as_str().map(str::to_owned));
             }
         }
+        // Newer observations carry a complete snapshot, including explicit nulls.
+        // Once every field and the latest state are known, older observations cannot
+        // affect this view. Sparse legacy observations still fall through to history.
+        if current.is_some() && optional.len() == 7 {
+            break;
+        }
     }
     let work_activity = connection
         .query_row(
@@ -26130,6 +26136,31 @@ message "human-attention" {
         assert_eq!(current.driver.as_deref(), Some("codex"));
         assert_eq!(current.transport.as_deref(), Some("app-server"));
         assert_eq!(current.reason, None);
+
+        let mut complete = BTreeMap::from([
+            ("state".into(), Value::String("ready".into())),
+            ("driver".into(), Value::String("codex".into())),
+            ("transport".into(), Value::String("app-server".into())),
+            ("incarnation_id".into(), Value::String("new".into())),
+        ]);
+        for field in ["reason", "blocked_on", "ask", "input_buffer", "exit"] {
+            complete.insert(field.into(), Value::Null);
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: complete,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("harness-new-complete-snapshot".into()),
+            })
+            .unwrap();
+        let complete = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(complete.state, "ready");
+        assert_eq!(complete.transport.as_deref(), Some("app-server"));
+        assert_eq!(complete.reason, None);
 
         store
             .append_claim(&ClaimInput {
