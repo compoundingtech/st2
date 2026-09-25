@@ -894,7 +894,7 @@ impl App {
                     let steps = self
                         .model
                         .work()
-                        .filter(|work| mission.runs.last() == Some(&work.mission_run_id));
+                        .filter(|work| mission_work_matches(mission, work));
                     let mut count = 0;
                     for step in steps {
                         if matches!(step.state.as_str(), "completed" | "cancelled") {
@@ -1242,10 +1242,20 @@ fn priority_color(priority: &str) -> Color {
         _ => Color::Gray,
     }
 }
+fn mission_work_matches(mission: &st3_client::Mission, work: &st3_client::Work) -> bool {
+    if mission.runs.last() != Some(&work.mission_run_id) {
+        return false;
+    }
+    mission
+        .run_generations
+        .get(&work.mission_run_id)
+        .is_none_or(|current| current == &work.generation_id)
+}
+
 fn mission_progress(model: &Model, mission: &st3_client::Mission) -> (usize, usize) {
     let steps = model
         .work()
-        .filter(|work| mission.runs.last() == Some(&work.mission_run_id))
+        .filter(|work| mission_work_matches(mission, work))
         .collect::<Vec<_>>();
     (
         steps
@@ -1279,7 +1289,7 @@ fn mission_current_work<'a>(
 ) -> Option<&'a st3_client::Work> {
     model
         .work()
-        .filter(|work| mission.runs.last() == Some(&work.mission_run_id))
+        .filter(|work| mission_work_matches(mission, work))
         .filter(|work| !matches!(work.state.as_str(), "completed" | "cancelled" | "failed"))
         .min_by_key(|work| match work.state.as_str() {
             "blocked" => 0,
@@ -3447,7 +3457,7 @@ mod tests {
     #[test]
     fn mission_progress_counts_terminal_and_active_steps() {
         let mut model = Model::default();
-        model.missions.items.push(serde_json::from_str(r#"{"kind":"mission","id":"mission/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","title":"Release","state":"running","mission_revision":"a","runs":["mission-run/old","mission-run/a"]}"#).unwrap());
+        model.missions.items.push(serde_json::from_str(r#"{"kind":"mission","id":"mission/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","title":"Release","state":"running","mission_revision":"a","runs":["mission-run/old","mission-run/a"],"run_generations":{"mission-run/a":"generation/a"}}"#).unwrap());
         for (path, state) in [
             ("build", "completed"),
             ("review", "claimed"),
@@ -3464,6 +3474,7 @@ mod tests {
             work.claimant = Some("agent/reviewer".into());
         }
         model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/old/ship","revision":"one","updated_at":"2026-09-24T08:00:00Z","mission_run_id":"mission-run/old","generation_id":"generation/old","definition_id":"def/old","path":"ship","state":"completed","attempt":1,"readiness_epoch":1}"#).unwrap());
+        model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/superseded/review","revision":"one","updated_at":"2026-09-24T08:00:00Z","mission_run_id":"mission-run/a","generation_id":"generation/superseded","definition_id":"def/old","path":"review","state":"cancelled","attempt":1,"readiness_epoch":1}"#).unwrap());
         model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/queue","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"queue","state":"running","reachability":"reachable","next_work_id":"step-run/a/deploy"}"#).unwrap());
         let mission = model.missions().next().unwrap();
         assert_eq!(mission_progress(&model, mission), (1, 3));
