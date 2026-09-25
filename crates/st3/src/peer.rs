@@ -778,10 +778,15 @@ fn start_outbound(
                 match exchange(&http, &backend, &node, &peer, &auth, &main_socket).await {
                     Ok(_) => {
                         backoff = Duration::from_secs(1);
+                        // A busy harness can write several observations while one exchange is
+                        // in flight. Keep the first exchange immediate, then coalesce the
+                        // resulting wake burst without disabling the 30-second retry path.
+                        let not_before = tokio::time::Instant::now() + Duration::from_secs(10);
                         tokio::select! {
                             _ = notify.changed() => {}
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
                         }
+                        tokio::time::sleep_until(not_before).await;
                     }
                     Err(error) => {
                         let status = if error.to_string().contains("signature")
