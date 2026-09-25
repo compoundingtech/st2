@@ -65,7 +65,7 @@ export default function App() {
   const [caps, setCaps] = useState<Capabilities | null>(null), [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [status, setStatus] = useState<'setup' | 'connecting' | 'online' | 'offline'>('setup');
   const [hasSynced, setHasSynced] = useState(false);
-  const [error, setError] = useState(''), [busy, setBusy] = useState(false);
+  const [error, setError] = useState(''), [pairingIssue, setPairingIssue] = useState(''), [busy, setBusy] = useState(false);
   const [expandedAttentionId, setExpandedAttentionId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState(''), [timeline, setTimeline] = useState<TimelineEntry[]>([]), [composer, setComposer] = useState('');
   const [chatDetailOpen, setChatDetailOpen] = useState(false);
@@ -113,7 +113,7 @@ export default function App() {
   }); }, []);
   useEffect(() => {
     if (!__DEV__) return;
-    let handled = false;
+    let activePairLink = '';
     async function handleDevPairLink(link: string | null) {
       if (!link) return;
       const parsed = new URL(link);
@@ -145,13 +145,14 @@ export default function App() {
         }
         return;
       }
-      if (handled) return;
       if (parsed.hostname !== 'pair') return;
+      if (activePairLink === link) return;
       const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
       const id = parsed.searchParams.get('id');
       const code = parsed.searchParams.get('code');
       if (!gateway?.startsWith('https://') || !id || !code) return;
-      handled = true;
+      activePairLink = link;
+      setPairingIssue('');
       setBusy(true);
       try {
         const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
@@ -159,8 +160,8 @@ export default function App() {
         await clearCachedProjection();
         await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
         await AsyncStorage.setItem(URL_KEY, gateway);
-        setUrl(gateway); setUrlDraft(gateway); setCredential(result.value.credential); setError('');
-      } catch (e) { setError(errorText(e)); }
+        setUrl(gateway); setUrlDraft(gateway); setCredential(result.value.credential); setPairingIssue(''); setError('');
+      } catch (e) { activePairLink = ''; setPairingIssue(`Pairing failed: ${errorText(e)}`); }
       finally { setBusy(false); }
     }
     void Linking.getInitialURL().then(handleDevPairLink);
@@ -412,7 +413,7 @@ export default function App() {
     const result = await client.completePairing(pairingId.trim(), { api_version: API_VERSION, code: pairingCode.trim(), device_public_key: publicKey });
     await clearCachedProjection();
     await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
-    setCredential(result.value.credential); setPairingCode(''); setPairingId(''); setError('');
+    setCredential(result.value.credential); setPairingCode(''); setPairingId(''); setPairingIssue(''); setError('');
   } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
   async function runAction(action: () => Promise<unknown>) { if (status !== 'online') { setError('Reconnect before sending an action.'); return; } setBusy(true); try { await action(); setError(''); await refresh(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
   function fence(revisions: Record<string, string> = {}) { if (!snapshot) throw new Error('Refresh before acting.'); return { snapshot_id: snapshot.id, subject_revisions: revisions }; }
@@ -421,7 +422,7 @@ export default function App() {
   async function createLaunch() { if (!client || !title.trim() || !request.trim() || !workspace.trim()) return; await runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: title.trim(), request: request.trim(), target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: workspace.trim() }, provider, ...(model.trim() ? { model: model.trim() } : {}), ...(effort.trim() ? { effort: effort.trim() } : {}) } }); setTitle(''); setRequest(''); }); }
   async function reviseLaunch(launch: Launch) { if (!client || !feedback.trim()) return; await runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback: feedback.trim() } }); setFeedback(''); }); }
   async function resolve(item: Attention) { if (!client) return; await runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); }); }
-  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection(); setCredential(null); setCaps(null); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setStatus('setup'); }
+  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection(); setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setStatus('setup'); }
   async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { if (!isSnapshotChurn(e)) setError(errorText(e)); } finally { setHistoryBusy(false); } }
   function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
   const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
@@ -445,7 +446,9 @@ export default function App() {
 
   return <SafeAreaView style={styles.page}>
     <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? offlinePresentation(hasSynced).title : 'Pair this device'}</Text></View>
-    {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}{busy ? <ActivityIndicator color="#67d6c5" /> : null}
+    {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}
+    {pairingIssue ? <Pressable onPress={() => setPairingIssue('')} style={styles.error}><Text style={styles.errorText}>{pairingIssue}</Text></Pressable> : null}
+    {busy ? <ActivityIndicator color="#67d6c5" /> : null}
     <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); }}>
       {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only Tailscale HTTPS gateway. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
         <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://your-tailnet-host" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} /><Button label="Save gateway" onPress={() => void saveUrl()} />
