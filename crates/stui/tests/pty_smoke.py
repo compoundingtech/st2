@@ -38,6 +38,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         env["STUI_TEST_PANIC_AFTER_ENTER"] = "1"
     proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
+    captured = bytearray()
 
     def collect(seconds: float) -> bytes:
         output = bytearray()
@@ -46,7 +47,9 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
             ready, _, _ = select.select([master], [], [], 0.1)
             if ready:
                 try:
-                    output.extend(os.read(master, 65536))
+                    chunk = os.read(master, 65536)
+                    output.extend(chunk)
+                    captured.extend(chunk)
                 except OSError:
                     break
         return bytes(output)
@@ -58,7 +61,9 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
             ready, _, _ = select.select([master], [], [], 0.02)
             if ready:
                 try:
-                    output.extend(os.read(master, 65536))
+                    chunk = os.read(master, 65536)
+                    output.extend(chunk)
+                    captured.extend(chunk)
                 except OSError:
                     break
                 if marker in (output if marker.startswith(b"\x1b") else plain(output)):
@@ -80,6 +85,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         mouse, _ = wait_for(b"\x1b[?1000h", 1)
         assert b"\x1b[?1000h" in mouse, "selection mode did not restore mouse capture"
         collect(1)  # A live background snapshot may redraw after navigation.
+        assert proc.poll() is None, f"{ending}: TUI exited before quit/signal ({proc.returncode})"
         if ending == "normal":
             os.write(master, b"q")
         else:
@@ -90,9 +96,9 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         proc.kill()
         proc.wait()
         raise AssertionError(f"{ending}: TUI did not exit")
-    final = collect(1)
+    collect(1)
     os.close(master)
-    assert b"\x1b[?1049l" in initial + final, f"{ending}: alternate screen was not restored"
+    assert b"\x1b[?1049l" in captured, f"{ending}: alternate screen was not restored (exit {proc.returncode}, {len(captured)} bytes)"
     assert (proc.returncode == 0) == (ending != "panic"), f"{ending}: unexpected exit {proc.returncode}"
     print(f"{ending}: restoration OK" if ending == "panic" else f"{ending}: first frame {first_frame:.3f}s, keys <0.5s, restoration OK")
 
