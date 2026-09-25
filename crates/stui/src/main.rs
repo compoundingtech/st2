@@ -2514,6 +2514,13 @@ fn main() -> Result<()> {
                     }
                     app.model = *model;
                     app.live_ready = true;
+                    if app
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.starts_with("Reconnect before"))
+                    {
+                        app.notice = None;
+                    }
                     for tab in 0..4 {
                         app.selected[tab] =
                             app.selected[tab].min(app.count_for(tab).saturating_sub(1));
