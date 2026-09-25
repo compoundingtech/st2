@@ -114,6 +114,11 @@ is not release evidence.
 - The package was rebuilt and its help check passed again from the deployed
   `b6837bb` daemon source (tree at `2d861e6`); release-profile checks passed
   408 st3 library, 86 CLI, and 17 stui tests, with two live stui tests ignored.
+- The final source at `db99329` also passed `nix build .#st3 --no-link` and
+  `nix build .#checks.x86_64-linux.st3-help --no-link`. Its release-profile
+  checks passed 408 st3 library, 87 CLI, and 17 stui tests, with two live stui
+  tests ignored. This verifies packaging; the 24-hour and 72-hour live gates
+  remain pending.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
   daemon. The iOS Chat terminal now offers capability-gated line and key input
   with a fresh fence, bounded stale-fence retry, and runtime-incarnation guard;
