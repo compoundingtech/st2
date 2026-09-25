@@ -482,10 +482,9 @@ export default function App() {
           <Text style={styles.muted}>{sessionDetail(selectedSession)}</Text>
           {terminalId ? <>
             <Button label="← Conversation" onPress={() => { terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalId(''); setTerminalIssue(''); }} />
-            <Card title={canControlTerminal ? 'Terminal · live controls' : 'Terminal · read-only'} detail={screen ? screen.lines.map(line => line.text).join('\n') : terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />
+            <Text style={styles.section}>{canControlTerminal ? 'Terminal · live controls' : 'Terminal · read-only'}</Text>
             {terminalIssue ? <Text style={styles.warning}>{terminalIssue}</Text> : null}
             {terminalActionNotice ? <Text style={styles.warning}>{terminalActionNotice}</Text> : null}
-            {screen && status !== 'online' ? <Text style={styles.muted}>Offline · showing the last terminal frame.</Text> : null}
             {screen && canControlTerminal ? <>
               <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} placeholder="Type a terminal line" placeholderTextColor="#8195a2" value={terminalDraft} onChangeText={setTerminalDraft} />
               <Button label="Send line" disabled={busy || status !== 'online' || !!terminalIssue || !terminalDraft.length} onPress={() => void sendTerminalInput('line', terminalDraft)} />
@@ -495,6 +494,8 @@ export default function App() {
               </View>
               <Text style={styles.muted}>Inputs require a live paired connection and are fenced to this terminal incarnation.</Text>
             </> : null}
+            <Card title="Screen" detail={screen ? screen.lines.map(line => line.text).join('\n') : terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />
+            {screen && status !== 'online' ? <Text style={styles.muted}>Offline · showing the last terminal frame.</Text> : null}
           </> : <>
             {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label="View terminal" disabled={status !== 'online'} onPress={() => void showTerminal(r.terminal_id!)} />) : null}
             <Text style={styles.section}>Conversation</Text>
