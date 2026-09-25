@@ -23,7 +23,7 @@ not an invitation to start the trial while this hold is active.
   install. Both hosts retain rollback copies of the pre-rollout binaries.
 - Hetz installed SHA-256 `010bd61a3dc64a2e1cf08b4e3bd83b76ee98c3b435e1fac790c4280dcd3866eb`
   for `st3` and `6179df84d985ab13381f7ec738c2fb221976920dc9fe919086b4699094aa8ecd`
-  for `stui`; daemon PID `1465194`, replication PID `1465196`. Silber installed
+  for `stui`; daemon PID `1465196`, replication PID `1465194`. Silber installed
   `ccebf57f6225aeb0ced164a17361da11fc75a09973ced9c0a15fbecade6b1322`
   and `33f95879745cc7c540baff2a4e43330a7f2941bea7b5d339c45605ee4efa1e89`;
   daemon PID `31613`, replication PID `31615`. Both strict doctors pass after
