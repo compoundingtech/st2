@@ -16542,11 +16542,16 @@ fn enrich_step_wake_at(
         .filter(|suffix| !suffix.contains('/'))
         .unwrap_or(assignee);
     let mut statement = connection.prepare(
-        "SELECT body, accepted_at_unix_ms FROM claims INDEXED BY claims_message_to_index
-         WHERE kind='message.sent' AND accepted_at_unix_ms<=?1
-           AND instr(body, ?2)>0
-           AND json_extract(body, '$.fields.to') IN (?3, ?4)
-         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, id",
+        "SELECT claims.body, claims.accepted_at_unix_ms,
+                EXISTS(SELECT 1 FROM claims consumed
+                       WHERE consumed.subject=claims.subject
+                         AND consumed.kind IN ('message.read','message.closed')
+                         AND consumed.accepted_at_unix_ms<=?1)
+         FROM claims INDEXED BY claims_message_to_index
+         WHERE claims.kind='message.sent' AND claims.accepted_at_unix_ms<=?1
+           AND instr(claims.body, ?2)>0
+           AND json_extract(claims.body, '$.fields.to') IN (?3, ?4)
+         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms, claims.id",
     )?;
     let rows = statement.query_map(
         params![
@@ -16555,10 +16560,16 @@ fn enrich_step_wake_at(
             assignee,
             bare_assignee
         ],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        },
     )?;
     for row in rows {
-        let (body, accepted) = row?;
+        let (body, accepted, consumed) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
         let fields = body.get("fields").unwrap_or(&body);
         let matching_incarnation = fields
@@ -16572,14 +16583,14 @@ fn enrich_step_wake_at(
                     .map(str::to_owned)
             });
         if let Some(incarnation) = matching_incarnation {
-            attempts.push((accepted.parse::<u128>().unwrap_or(0), incarnation));
+            attempts.push((accepted.parse::<u128>().unwrap_or(0), incarnation, consumed));
         }
     }
-    let first_attempt = attempts.first().map(|(accepted, _)| *accepted);
-    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, _)| *accepted);
+    let first_attempt = attempts.first().map(|(accepted, _, _)| *accepted);
+    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, _, _)| *accepted);
     let wake_incarnation_key = attempts
         .last()
-        .map(|(_, incarnation)| incarnation.as_str())
+        .map(|(_, incarnation, _)| incarnation.as_str())
         .unwrap_or(current_incarnation_key.as_str());
     let wake_incarnation_id = harness_incarnation_for_key_at(
         connection,
@@ -16600,6 +16611,11 @@ fn enrich_step_wake_at(
             "claimed" | "working" | "verifying" | "completed" | "failed" | "cancelled"
         ) {
         Some("claim".into())
+    } else if attempts
+        .iter()
+        .any(|(_, incarnation, consumed)| *consumed && incarnation == wake_incarnation_key)
+    {
+        Some("consumed".into())
     } else if first_attempt.is_some_and(|requested| {
         harness.as_ref().is_some_and(|harness| {
             current_incarnation_key == wake_incarnation_key
@@ -22746,6 +22762,31 @@ version 2
             .populate_work_wake_for_reconcile(&mut lean, now_ms())
             .unwrap();
         assert_eq!(lean.wake, Some(wake));
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/correct-recipient".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{status}-indexed-wake")),
+                })
+                .unwrap();
+        }
+        store
+            .populate_work_wake_for_reconcile(&mut lean, now_ms())
+            .unwrap();
+        assert_eq!(
+            lean.wake.as_ref().unwrap().acknowledged_by.as_deref(),
+            Some("consumed"),
+            "a closed wake must not leave an overdue reconcile deadline"
+        );
         let request = |incarnation: &str, key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
