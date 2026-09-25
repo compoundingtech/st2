@@ -6183,6 +6183,45 @@ impl Store {
         }
     }
 
+    /// The reconciler needs historical work-wake attempts, including closed
+    /// ones, but not an agent's unrelated lifetime of conversation messages.
+    /// First select a superset from the indexed recipient's sent claims; the
+    /// final tag check keeps this equivalent to filtering the normal mailbox.
+    pub fn work_wake_messages_for_reconcile(&self, agent: &str) -> Result<Vec<MessageView>> {
+        let recipient = normalize_message_party(agent);
+        let bare_recipient = recipient
+            .strip_prefix("agent/")
+            .filter(|suffix| !suffix.contains('/'))
+            .unwrap_or(&recipient);
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT sent.subject,
+                    (SELECT MIN(created.store_index) FROM claims created
+                     WHERE created.subject=sent.subject) AS created_index
+             FROM claims sent INDEXED BY claims_message_to_index
+             WHERE sent.kind='message.sent'
+               AND json_extract(sent.body, '$.fields.to') IN (?1, ?2)
+               AND instr(sent.body, 'st3-work:')>0
+             ORDER BY created_index, sent.subject",
+        )?;
+        let subjects = statement
+            .query_map(params![recipient, bare_recipient], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut messages = Vec::with_capacity(subjects.len());
+        for (subject, created_index) in subjects {
+            let message = self.message_view_cached(&connection, &subject, created_index)?;
+            if message.to == recipient
+                && message.tags.iter().any(|tag| tag.starts_with("st3-work:"))
+            {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
+    }
+
     pub fn message(&self, subject: &str) -> Result<Option<MessageView>> {
         let connection = self.readers.get();
         let created_index = connection.query_row(
@@ -21964,6 +22003,98 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .messages_page(Some("agent/worker"), true, None, store.index().unwrap(), 1)
             .unwrap();
         assert_eq!(closed[0].status, "closed");
+    }
+
+    #[test]
+    fn reconciler_work_mailbox_keeps_closed_attempts_without_unrelated_messages() {
+        let store = Store::open_memory("node").unwrap();
+        for (id, to, content, tags) in [
+            (
+                "wake-closed",
+                "agent/worker",
+                "ready",
+                vec!["st3-work:step-run/one@1@1@worker"],
+            ),
+            (
+                "ordinary",
+                "agent/worker",
+                "mentions st3-work: but has no work tag",
+                vec![],
+            ),
+            (
+                "wake-open",
+                "agent/worker",
+                "ready again",
+                vec!["st3-work:step-run/two@1@1@worker"],
+            ),
+            (
+                "other-agent",
+                "agent/other",
+                "ready",
+                vec!["st3-work:step-run/other@1@1@other"],
+            ),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("daemon/runtime".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("daemon/runtime".into())),
+                        ("to".into(), Value::String(to.into())),
+                        ("content".into(), Value::String(content.into())),
+                        ("status".into(), Value::String("sent".into())),
+                        (
+                            "tags".into(),
+                            Value::Array(
+                                tags.into_iter()
+                                    .map(|tag| Value::String(tag.into()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("work-mailbox-{id}")),
+                })
+                .unwrap();
+        }
+        for (kind, status) in [
+            ("message.staged", "staged"),
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/wake-closed".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/worker".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("closed-work-mailbox-{status}")),
+                })
+                .unwrap();
+        }
+
+        let expected = store
+            .messages(Some("agent/worker"), true)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.tags.iter().any(|tag| tag.starts_with("st3-work:")))
+            .map(|message| (message.subject, message.status))
+            .collect::<Vec<_>>();
+        let actual = store
+            .work_wake_messages_for_reconcile("agent/worker")
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.subject, message.status))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].1, "closed");
+        assert_eq!(actual[1].1, "sent");
     }
 
     #[test]

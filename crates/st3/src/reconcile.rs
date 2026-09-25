@@ -1064,7 +1064,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         // Closed work wakes still count as attempts. A closed wake can mean the
         // harness started a turn but could not claim this independent step yet;
         // forgetting it would replay attempt 1 and notify this reconciler forever.
-        let messages = self.store.messages(Some(agent), true)?;
+        let messages = self.store.work_wake_messages_for_reconcile(agent)?;
         let work = self.store.work_for_reconcile(agent)?;
         let harness = self.store.current_harness(agent)?;
 
