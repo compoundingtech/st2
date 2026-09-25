@@ -31,12 +31,24 @@ pub const ARCHIVE_SCHEMA: &str = "st2.catalog-archive.v1";
 pub const UNARCHIVE_SCHEMA: &str = "st2.catalog-unarchive.v1";
 pub const TOMBSTONE_SCHEMA: &str = "st2.catalog-archive-tombstone.v1";
 pub const RETIRED_LEDGER_SCHEMA: &str = "st2.catalog-retired-observed.v1";
+pub const DIRECT_DEAD_LEDGER_SCHEMA: &str = "st2.catalog-direct-dead-observed.v1";
 
 /// Archive root child of the catalog control directory.
 const ARCHIVE_DIR: &str = "archive";
 const TOMBSTONE_SUFFIX: &str = ".tombstone.json";
 /// The supervisor's retirement-observation ledger, a sibling of the authoring lock.
 const RETIRED_LEDGER_FILE: &str = "retired-observed.json";
+/// The supervisor's direct-actor death-observation ledger, beside the retirement ledger.
+const DIRECT_DEAD_LEDGER_FILE: &str = "direct-dead-observed.json";
+
+const RETIRED_LEDGER: Ledger = Ledger {
+    file: RETIRED_LEDGER_FILE,
+    schema: RETIRED_LEDGER_SCHEMA,
+};
+const DIRECT_DEAD_LEDGER: Ledger = Ledger {
+    file: DIRECT_DEAD_LEDGER_FILE,
+    schema: DIRECT_DEAD_LEDGER_SCHEMA,
+};
 
 /// `<catalog>/.st2/archive` — the root every archived identity directory lands under.
 pub fn archive_root(catalog: &Path) -> PathBuf {
@@ -176,10 +188,12 @@ pub fn archive(request: ArchiveRequest) -> Result<ArchiveResult> {
         &request.host,
         &request.selection,
         request.dry_run,
+        (Vec::new(), Vec::new()),
     )
 }
 
-/// The supervisor's maintenance pass: archive every retired seat whose grace period expired.
+/// The supervisor's maintenance pass: archive every retired seat and every dead direct OMP actor
+/// whose grace period expired.
 ///
 /// `Ok(None)` means another authoring holder has the lock, so the pass did nothing. Skipping is
 /// the point: a reconcile pass queued behind `st2 catalog apply` stalls every live agent's
@@ -202,15 +216,23 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Ar
 
     // Persist the observation before archiving. A failed move then costs one batch, not every
     // seat's clock; the rows the move retires are pruned by the next pass's reconciliation.
-    let mut hosts = read_ledger(&catalog);
+    let mut hosts = read_ledger(&catalog, &RETIRED_LEDGER);
     let retired = retired_identities(&found.specs, &request.host);
     let (changed, mut due) =
         observe_retirements(&mut hosts, &request.host, &retired, request.grace, now_ms);
     if changed {
-        write_ledger(&catalog, hosts)?;
+        write_ledger(&catalog, &RETIRED_LEDGER, hosts)?;
     }
-
     due.truncate(request.limit);
+
+    let direct = due_direct_actors(
+        &catalog,
+        &found,
+        &request.host,
+        request.grace,
+        request.limit - due.len(),
+        now_ms,
+    )?;
     archive_locked(
         &lock,
         &catalog,
@@ -218,8 +240,103 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Ar
         &request.host,
         &Selection::Due(due),
         false,
+        direct,
     )
     .map(Some)
+}
+
+/// Observe this host's direct OMP actors against a fresh PTY registry read and plan the ones
+/// whose death outlived `grace`, at most `limit` of them.
+///
+/// Death is exact evidence only: the identity decodes to one PTY session ID, and the registry the
+/// catalog's supervisor manages holds no running record for it. A PTY that runs again drops its
+/// ledger row, so a later death serves a fresh grace period. The registry read happens under the
+/// exclusive lock and only when a direct actor exists, so a catalog without them pays nothing.
+///
+/// Rows of the actors about to leave are dropped in the same ledger write: an unarchived actor
+/// then serves a fresh grace period instead of leaving again on the next pass, and a failed move
+/// errs toward keeping the actor live for another period.
+fn due_direct_actors(
+    catalog: &Path,
+    found: &crate::Discovered,
+    host: &str,
+    grace: Duration,
+    limit: usize,
+    now_ms: u64,
+) -> Result<(Vec<Candidate>, Vec<Refusal>)> {
+    let actors = crate::direct_actor::discover(catalog, found, Some(host))?;
+    let dead = if actors.is_empty() {
+        BTreeSet::new()
+    } else {
+        let runner =
+            crate::run::SystemRunner::new(catalog.to_path_buf(), crate::run::exec_state_dir(host));
+        let sessions = runner
+            .list_sessions()
+            .context("read PTY registry for direct actor liveness")?;
+        dead_direct_identities(&actors, &sessions)
+    };
+    let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
+    let (mut changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
+
+    let due: BTreeSet<String> = due.into_iter().collect();
+    let mut candidates = Vec::new();
+    let mut refused = Vec::new();
+    for actor in actors
+        .into_iter()
+        .filter(|actor| due.contains(&actor.identity))
+    {
+        if candidates.len() == limit {
+            break;
+        }
+        let occupied = archive_root(catalog).join(host).join(&actor.identity);
+        if fs::symlink_metadata(&occupied).is_ok() {
+            refused.push(Refusal {
+                id: actor.id(),
+                code: "archive-occupied",
+                message: format!(
+                    "the archive already holds {}; unarchive it or move it aside first",
+                    relative(catalog, &occupied).unwrap_or_else(|| occupied.display().to_string())
+                ),
+            });
+            continue;
+        }
+        candidates.push(Candidate {
+            id: actor.id(),
+            reason: Some(format!(
+                "direct OMP actor: PTY session {} has no running record",
+                actor.pty_id
+            )),
+            host: actor.host,
+            identity: actor.identity,
+            from: actor.dir,
+        });
+    }
+    if let Some(observed) = hosts.get_mut(host) {
+        for candidate in &candidates {
+            changed |= observed.remove(&candidate.identity).is_some();
+        }
+    }
+    if changed {
+        write_ledger(catalog, &DIRECT_DEAD_LEDGER, hosts)?;
+    }
+    Ok((candidates, refused))
+}
+
+/// The identities of `actors` whose PTY session has no running record in `sessions`.
+fn dead_direct_identities(
+    actors: &[crate::direct_actor::DirectActor],
+    sessions: &[crate::Session],
+) -> BTreeSet<String> {
+    let running: BTreeSet<&str> = sessions
+        .iter()
+        .filter(|session| session.alive)
+        .map(|session| session.pty_id.as_str())
+        .collect();
+    actors
+        .iter()
+        .filter(|actor| !running.contains(actor.pty_id.as_str()))
+        .map(|actor| actor.identity.clone())
+        .collect()
 }
 
 /// Archive under a lock the caller already holds, against a discovery it already made.
@@ -230,8 +347,9 @@ fn archive_locked(
     host: &str,
     selection: &Selection,
     dry_run: bool,
+    (direct, direct_refused): (Vec<Candidate>, Vec<Refusal>),
 ) -> Result<ArchiveResult> {
-    let (candidates, refused) = plan(catalog, host, found, selection)?;
+    let (mut candidates, mut refused) = plan(catalog, host, found, selection)?;
 
     if let Selection::Identities(_) = selection
         && let Some(refusal) = refused.first()
@@ -243,6 +361,8 @@ fn archive_locked(
             refusal.message
         );
     }
+    candidates.extend(direct);
+    refused.extend(direct_refused);
 
     let root = archive_root(catalog);
     let mut archived = Vec::new();
@@ -712,22 +832,23 @@ fn result(
     }
 }
 
-// ---- Retirement observation ledger ------------------------------------------------------------
+// ---- Observation ledgers ----------------------------------------------------------------------
 
-/// When this catalog's supervisor first observed each retired seat, per host.
+/// When this catalog's supervisor first observed each archive-bound identity, per host.
 ///
 /// st2 records nothing when a desired state changes: the declaration is rewritten in place, the
 /// receipt goes to the caller's stdout, and the generation counter carries no per-identity data.
 /// So the grace period is measured from the supervisor's first observation of the retirement
 /// rather than from the edit that caused it. That observation is control-plane state under
 /// `.st2/` and never enters the spec — `retired` keeps every declared byte reversible, which is
-/// the guarantee archival is built on top of.
+/// the guarantee archival is built on top of. A direct OMP actor has no declaration at all, so
+/// its death is measured the same way, in its own ledger.
 ///
 /// Hosts are separate maps because one catalog may declare several, and a supervisor can only
 /// observe its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RetiredLedger {
+struct ObservationLedger {
     #[serde(default)]
     schema: String,
     /// host → identity → epoch millis of the first observation.
@@ -735,38 +856,53 @@ struct RetiredLedger {
     hosts: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
+/// Which observation ledger a read or write addresses.
+struct Ledger {
+    file: &'static str,
+    schema: &'static str,
+}
+
 /// `<catalog>/.st2/retired-observed.json`.
 pub fn retired_ledger_path(catalog: &Path) -> PathBuf {
     catalog.join(CONTROL_DIR).join(RETIRED_LEDGER_FILE)
 }
 
-/// Read the ledger, treating an absent, unreadable, or foreign-schema file as empty.
+/// `<catalog>/.st2/direct-dead-observed.json`.
+pub fn direct_dead_ledger_path(catalog: &Path) -> PathBuf {
+    catalog.join(CONTROL_DIR).join(DIRECT_DEAD_LEDGER_FILE)
+}
+
+/// Read a ledger, treating an absent, unreadable, or foreign-schema file as empty.
 ///
-/// A lost ledger restarts every grace period, which errs toward keeping seats in the live catalog
-/// — the recoverable direction. Refusing the pass instead would let one unreadable control file
-/// stop reconciliation.
-fn read_ledger(catalog: &Path) -> BTreeMap<String, BTreeMap<String, u64>> {
-    let Ok(body) = fs::read(retired_ledger_path(catalog)) else {
+/// A lost ledger restarts every grace period, which errs toward keeping identities in the live
+/// catalog — the recoverable direction. Refusing the pass instead would let one unreadable control
+/// file stop reconciliation.
+fn read_ledger(catalog: &Path, ledger: &Ledger) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let Ok(body) = fs::read(catalog.join(CONTROL_DIR).join(ledger.file)) else {
         return BTreeMap::new();
     };
-    match serde_json::from_slice::<RetiredLedger>(&body) {
-        Ok(ledger) if ledger.schema == RETIRED_LEDGER_SCHEMA => ledger.hosts,
+    match serde_json::from_slice::<ObservationLedger>(&body) {
+        Ok(read) if read.schema == ledger.schema => read.hosts,
         _ => BTreeMap::new(),
     }
 }
 
-/// Replace the ledger atomically. The caller holds the exclusive authoring lock.
-fn write_ledger(catalog: &Path, hosts: BTreeMap<String, BTreeMap<String, u64>>) -> Result<()> {
-    let ledger = RetiredLedger {
-        schema: RETIRED_LEDGER_SCHEMA.to_owned(),
+/// Replace a ledger atomically. The caller holds the exclusive authoring lock.
+fn write_ledger(
+    catalog: &Path,
+    ledger: &Ledger,
+    hosts: BTreeMap<String, BTreeMap<String, u64>>,
+) -> Result<()> {
+    let body = ObservationLedger {
+        schema: ledger.schema.to_owned(),
         hosts,
     };
-    let mut body = serde_json::to_vec_pretty(&ledger)?;
+    let mut body = serde_json::to_vec_pretty(&body)?;
     body.push(b'\n');
 
-    let path = retired_ledger_path(catalog);
+    let path = catalog.join(CONTROL_DIR).join(ledger.file);
     let control = path.parent().context("ledger path has no control dir")?;
-    let staged = control.join(format!("{RETIRED_LEDGER_FILE}.new"));
+    let staged = control.join(format!("{}.new", ledger.file));
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -774,13 +910,13 @@ fn write_ledger(catalog: &Path, hosts: BTreeMap<String, BTreeMap<String, u64>>) 
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(&staged)
-        .with_context(|| format!("stage retirement ledger {}", staged.display()))?;
+        .with_context(|| format!("stage observation ledger {}", staged.display()))?;
     file.write_all(&body)?;
     file.sync_all()?;
     drop(file);
     if let Err(error) = fs::rename(&staged, &path) {
         let _ = fs::remove_file(&staged);
-        return Err(error).with_context(|| format!("install retirement ledger {}", path.display()));
+        return Err(error).with_context(|| format!("install observation ledger {}", path.display()));
     }
     sync_dir(control)
 }
@@ -794,11 +930,12 @@ fn retired_identities(specs: &[agent_spec::spec::AgentSpec], host: &str) -> BTre
         .collect()
 }
 
-/// Fold one observation into the ledger and report which seats have outlived `grace`.
+/// Fold one observation into a ledger and report which identities have outlived `grace`.
 ///
-/// The host's map is reconciled to exactly `retired`: a seat that came back drops its entry, so
-/// re-retiring it starts a fresh clock rather than inheriting the old one. Returns whether the
-/// ledger changed (and therefore needs persisting) alongside the grace-expired identities.
+/// The host's map is reconciled to exactly `retired`: a seat that came back (or a direct actor
+/// whose PTY runs again) drops its entry, so a second retirement starts a fresh clock rather than
+/// inheriting the old one. Returns whether the ledger changed (and therefore needs persisting)
+/// alongside the grace-expired identities.
 fn observe_retirements(
     hosts: &mut BTreeMap<String, BTreeMap<String, u64>>,
     host: &str,
@@ -827,29 +964,42 @@ fn observe_retirements(
 
 /// Does the supervisor's archive step have anything to do this pass?
 ///
-/// Answered from the specs the pass already parsed plus one small JSON read, so a steady catalog
-/// pays neither a second discovery nor a second `pty list`. Deliberately advisory: the decision
-/// that moves bytes is re-made under the exclusive lock, because a seat can be un-retired between
-/// this question and that lock.
+/// Answered from the discovery and PTY registry snapshot the pass already made, one two-level
+/// directory read, and two small JSON reads, so a steady catalog pays neither a second discovery
+/// nor a second `pty list`. Deliberately advisory: the decision that moves bytes is re-made under
+/// the exclusive lock, because a seat can be un-retired, or a PTY restarted, between this
+/// question and that lock.
 pub fn pass_has_work(
     catalog: &Path,
     host: &str,
-    specs: &[agent_spec::spec::AgentSpec],
+    found: &crate::Discovered,
+    sessions: &[crate::Session],
     grace: Duration,
 ) -> bool {
-    pass_has_work_at(catalog, host, specs, grace, crate::message::now_ms())
+    pass_has_work_at(catalog, host, found, sessions, grace, crate::message::now_ms())
 }
 
 fn pass_has_work_at(
     catalog: &Path,
     host: &str,
-    specs: &[agent_spec::spec::AgentSpec],
+    found: &crate::Discovered,
+    sessions: &[crate::Session],
     grace: Duration,
     now_ms: u64,
 ) -> bool {
-    let retired = retired_identities(specs, host);
-    let mut hosts = read_ledger(catalog);
+    let retired = retired_identities(&found.specs, host);
+    let mut hosts = read_ledger(catalog, &RETIRED_LEDGER);
     let (changed, due) = observe_retirements(&mut hosts, host, &retired, grace, now_ms);
+    if changed || !due.is_empty() {
+        return true;
+    }
+    // An unreadable `agents/` tree is left to the locked step, which reports it as a warning.
+    let Ok(actors) = crate::direct_actor::discover(catalog, found, Some(host)) else {
+        return true;
+    };
+    let dead = dead_direct_identities(&actors, sessions);
+    let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
+    let (changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
     changed || !due.is_empty()
 }
 
@@ -1022,6 +1172,39 @@ mod tests {
         assert_eq!(
             hosts["other"]["theirs"], 0,
             "only the local supervisor may reconcile its own host's rows"
+        );
+    }
+
+    #[test]
+    fn only_a_running_record_for_the_exact_pty_id_keeps_a_direct_actor_alive() {
+        let actor = |segment: &str| crate::direct_actor::DirectActor {
+            host: HOST.to_owned(),
+            identity: format!("direct.omp.{segment}"),
+            pty_id: crate::direct_actor::decode_pty_segment(segment).unwrap(),
+            dir: PathBuf::from(format!("/catalog/agents/h/direct.omp.{segment}")),
+        };
+        let session = |pty_id: &str, alive: bool| crate::Session {
+            pty_id: pty_id.to_owned(),
+            alive,
+            exit_code: None,
+            presentation: None,
+        };
+        let actors = [
+            actor("e2jcd9pf"),
+            actor("2ahzpbs3"),
+            actor("x-776562"),
+            actor("3bk3wt7v"),
+        ];
+        let sessions = [
+            session("e2jcd9pf", true),
+            session("2ahzpbs3", false),
+            session("web", true),
+            // A running session whose ID merely contains the actor's is not its session.
+            session("3bk3wt7v-child", true),
+        ];
+        assert_eq!(
+            dead_direct_identities(&actors, &sessions),
+            retired(&["direct.omp.2ahzpbs3", "direct.omp.3bk3wt7v"])
         );
     }
 }

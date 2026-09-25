@@ -1173,6 +1173,24 @@ these admitted facts rather than walking supervisor edges themselves. The
 `desiredState: "retired"`; an absent lifecycle stays null, which lowers to
 running.
 
+The same envelope publishes every actor's resource root (R47) as a
+catalog-relative directory, the subject boundary under which the actor's
+declaration-anchored state, driver records, and `resources/` live. Each
+`agents` row appends `resourceRoot`, its declaration's parent directory — the
+directory st2 itself resolves for that agent's inbox and context. A direct OMP
+actor has no declaration: its entrypoint derives
+`ST_AGENT=<host>.direct.omp.<encoded-pty-id>`, and writers create
+`agents/<host>/direct.omp.<encoded-pty-id>/` lazily under that identity. The
+additive `directActors` array lists every such directory holding no parsed or
+failed declaration, across all hosts, as
+`{id, host, identity, ptyId, resourceRoot}`. The segment decoder is strict: a
+PTY-generated eight-character ID is its own segment, every other valid ID is
+`x-` plus its lowercase hex bytes, and only the canonical encoding decodes, so
+`ptyId` is the exact PTY session ID and a directory whose name does not decode
+is not listed. Direct actors never enter `agents`, and archived ones are
+`archived` rows like any other identity. Consumers fold per-actor views at
+these roots and never infer subject boundaries themselves.
+
 Retired reconciliation first attempts every live task teardown for the agent.
 Only when all of those attempts succeed does it settle the declaration's whole
 inbox; one failure leaves every inbox file untouched and the next pass retries
@@ -1221,6 +1239,24 @@ exactly the currently retired seats on every pass it runs, so a seat that comes
 back drops its row and a second retirement serves a fresh grace period; an
 absent or unreadable ledger restarts every clock, which errs toward keeping
 seats in the live catalog.
+
+The same supervisor step archives dead direct OMP actors (R48), because nothing
+else ever retires them: they have no declaration to retire. On the local host, a
+direct actor is dead when the catalog's effective PTY registry — the one the
+pass already lists — holds no `running` record for its decoded PTY session ID;
+an exited or vanished record and an absent one are the same fact. Deaths are
+observed in `.st2/direct-dead-observed.json`
+(`st2.catalog-direct-dead-observed.v1`, same shape and reconciliation as the
+retirement ledger), so a PTY that runs again drops its row and a later death
+serves a fresh grace period. Under the exclusive lock the step re-reads the
+registry, then archives each actor dead for at least `archive-after` exactly
+like a retired seat — whole-directory rename to
+`.st2/archive/<host>/<identity>` plus a tombstone whose `reason` names the PTY
+session — within the same 25-per-pass bound, retired seats first. An occupied
+archive slot is a reported skip. The rows of the actors that leave are dropped
+in the same ledger write, so `st2 catalog unarchive` restores the directory and
+the restored actor serves a fresh grace period instead of leaving again on the
+next pass. Archive retention is out of scope here (compoundingtech/st2#530).
 
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:

@@ -12,6 +12,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LEDGER: &str = ".st2/retired-observed.json";
+const DIRECT_LEDGER: &str = ".st2/direct-dead-observed.json";
 const RETIRED: &str = "desired-state \"retired\" reason=\"Migration finished\"";
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -64,6 +65,20 @@ fn now_ms() -> u64 {
 
 /// Place each identity's observed retirement `age_ms` in the past.
 fn seed_ledger(root: &Path, observed: &[(&str, u64)]) {
+    seed_ledger_at(root, LEDGER, "st2.catalog-retired-observed.v1", observed);
+}
+
+/// Place each direct actor's observed PTY death `age_ms` in the past.
+fn seed_direct_ledger(root: &Path, observed: &[(&str, u64)]) {
+    seed_ledger_at(
+        root,
+        DIRECT_LEDGER,
+        "st2.catalog-direct-dead-observed.v1",
+        observed,
+    );
+}
+
+fn seed_ledger_at(root: &Path, path: &str, schema: &str, observed: &[(&str, u64)]) {
     let rows = observed
         .iter()
         .map(|(identity, age_ms)| format!("      \"{identity}\": {}", now_ms() - age_ms))
@@ -71,15 +86,19 @@ fn seed_ledger(root: &Path, observed: &[(&str, u64)]) {
         .join(",\n");
     write(
         root,
-        LEDGER,
+        path,
         &format!(
-            "{{\n  \"schema\": \"st2.catalog-retired-observed.v1\",\n  \"hosts\": {{\n    \"h\": {{\n{rows}\n    }}\n  }}\n}}\n"
+            "{{\n  \"schema\": \"{schema}\",\n  \"hosts\": {{\n    \"h\": {{\n{rows}\n    }}\n  }}\n}}\n"
         ),
     );
 }
 
 fn ledger(root: &Path) -> Option<serde_json::Value> {
-    let body = fs::read(root.join(LEDGER)).ok()?;
+    ledger_at(root, LEDGER)
+}
+
+fn ledger_at(root: &Path, path: &str) -> Option<serde_json::Value> {
+    let body = fs::read(root.join(path)).ok()?;
     Some(serde_json::from_slice(&body).unwrap())
 }
 
@@ -443,4 +462,201 @@ fn a_contended_authoring_lock_skips_the_pass_instead_of_blocking_it() {
         "nothing may move while another holder owns the lock"
     );
     drop(held);
+}
+
+/// A direct OMP actor's directory: no declaration, only what writers created under its identity.
+fn direct_actor(root: &Path, identity: &str) {
+    write(
+        root,
+        &format!("agents/h/{identity}/resources/decisions/1790000000000-abc123.md"),
+        "# decision\n\nkeep the fold at the actor boundary\n",
+    );
+}
+
+fn st2(root: &Path, bin: &Path, args: &[&str]) -> Output {
+    let home = root.parent().unwrap().join("home");
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["--catalog", root.to_str().unwrap()])
+        .args(args)
+        .env("PATH", bin)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("PTY_ROOT", home.join("pty"))
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_direct_actor_whose_pty_death_outlived_the_grace_period_is_archived_and_a_live_one_stays() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    // `e2jcd9pf` runs; `2ahzpbs3` left an exited record; `web` (encoded `x-776562`) and
+    // `3bk3wt7v` have no record at all.
+    pty_shim(
+        &bin,
+        "[{\"name\":\"e2jcd9pf\",\"status\":\"running\"},{\"name\":\"2ahzpbs3\",\"status\":\"exited\"}]",
+    );
+    seat(&catalog, "held", "desired-state \"suspended\" reason=\"paused\"");
+    for identity in [
+        "direct.omp.e2jcd9pf",
+        "direct.omp.2ahzpbs3",
+        "direct.omp.x-776562",
+        "direct.omp.3bk3wt7v",
+    ] {
+        direct_actor(&catalog, identity);
+    }
+    let decision = fs::read(
+        catalog.join("agents/h/direct.omp.2ahzpbs3/resources/decisions/1790000000000-abc123.md"),
+    )
+    .unwrap();
+    // A stale row for the running PTY proves liveness, not the clock, gates the move.
+    seed_direct_ledger(
+        &catalog,
+        &[
+            ("direct.omp.e2jcd9pf", 9 * DAY_MS),
+            ("direct.omp.2ahzpbs3", 8 * DAY_MS),
+            ("direct.omp.x-776562", 8 * DAY_MS),
+        ],
+    );
+
+    let output = up_once(&catalog, &bin);
+
+    assert!(
+        stdout(&output).contains("archived (2)"),
+        "the pass must report both dead actors:\n{}",
+        stdout(&output)
+    );
+    assert!(
+        catalog.join("agents/h/direct.omp.e2jcd9pf").is_dir(),
+        "a running PTY's actor never leaves"
+    );
+    assert!(
+        catalog.join("agents/h/direct.omp.3bk3wt7v").is_dir(),
+        "a death first observed this pass serves its own grace period"
+    );
+    for identity in ["direct.omp.2ahzpbs3", "direct.omp.x-776562"] {
+        assert!(!catalog.join("agents/h").join(identity).exists(), "{identity}");
+        assert!(
+            catalog.join(".st2/archive/h").join(identity).is_dir(),
+            "{identity}"
+        );
+    }
+    assert_eq!(
+        fs::read(catalog.join(
+            ".st2/archive/h/direct.omp.2ahzpbs3/resources/decisions/1790000000000-abc123.md"
+        ))
+        .unwrap(),
+        decision,
+        "the whole actor directory moves byte-identically"
+    );
+
+    let tombstone: serde_json::Value = serde_json::from_slice(
+        &fs::read(catalog.join(".st2/archive/h/direct.omp.x-776562.tombstone.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tombstone["schema"], "st2.catalog-archive-tombstone.v1");
+    assert_eq!(tombstone["id"], "h.direct.omp.x-776562");
+    assert_eq!(tombstone["identity"], "direct.omp.x-776562");
+    assert_eq!(tombstone["archiveRoot"], ".st2/archive/h/direct.omp.x-776562");
+    assert!(
+        tombstone["reason"].as_str().unwrap().contains("PTY session web "),
+        "the reason names the exact decoded PTY session: {tombstone:#}"
+    );
+
+    let rows = &ledger_at(&catalog, DIRECT_LEDGER).unwrap()["hosts"]["h"];
+    assert!(
+        rows.get("direct.omp.e2jcd9pf").is_none(),
+        "a running PTY drops its death observation: {rows:#}"
+    );
+    let fresh = rows["direct.omp.3bk3wt7v"].as_u64().unwrap();
+    assert!(now_ms().saturating_sub(fresh) < 5 * 60 * 1000, "{rows:#}");
+
+    let graph = st2(&catalog, &bin, &["catalog", "graph", "--host", "h", "--json"]);
+    let graph: serde_json::Value = serde_json::from_slice(&graph.stdout).unwrap();
+    let archived = graph["archived"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        archived,
+        ["h.direct.omp.2ahzpbs3", "h.direct.omp.x-776562"],
+        "{graph:#}"
+    );
+    let direct = graph["directActors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct,
+        ["h.direct.omp.3bk3wt7v", "h.direct.omp.e2jcd9pf"],
+        "{graph:#}"
+    );
+}
+
+#[test]
+fn an_archived_direct_actor_unarchives_to_its_live_directory_and_restarts_its_clock() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    seat(&catalog, "held", "desired-state \"suspended\" reason=\"paused\"");
+    direct_actor(&catalog, "direct.omp.2ahzpbs3");
+    let decision = fs::read(
+        catalog.join("agents/h/direct.omp.2ahzpbs3/resources/decisions/1790000000000-abc123.md"),
+    )
+    .unwrap();
+    seed_direct_ledger(&catalog, &[("direct.omp.2ahzpbs3", 8 * DAY_MS)]);
+
+    up_once(&catalog, &bin);
+    assert!(catalog.join(".st2/archive/h/direct.omp.2ahzpbs3").is_dir());
+
+    let restored = st2(
+        &catalog,
+        &bin,
+        &[
+            "catalog",
+            "unarchive",
+            "direct.omp.2ahzpbs3",
+            "--host",
+            "h",
+            "--json",
+        ],
+    );
+    assert!(
+        restored.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(receipt["id"], "h.direct.omp.2ahzpbs3");
+    assert_eq!(receipt["to"], "agents/h/direct.omp.2ahzpbs3");
+    assert_eq!(
+        fs::read(
+            catalog
+                .join("agents/h/direct.omp.2ahzpbs3/resources/decisions/1790000000000-abc123.md")
+        )
+        .unwrap(),
+        decision
+    );
+    assert!(!catalog
+        .join(".st2/archive/h/direct.omp.2ahzpbs3.tombstone.json")
+        .exists());
+
+    // The archive pass pruned the old row, so the restored actor is observed afresh rather than
+    // archived again on the very next pass.
+    let output = up_once(&catalog, &bin);
+    assert!(
+        catalog.join("agents/h/direct.omp.2ahzpbs3").is_dir(),
+        "an unarchived actor serves a fresh grace period:\n{}",
+        stdout(&output)
+    );
+    let observed = ledger_at(&catalog, DIRECT_LEDGER).unwrap()["hosts"]["h"]
+        ["direct.omp.2ahzpbs3"]
+        .as_u64()
+        .unwrap();
+    assert!(now_ms().saturating_sub(observed) < 5 * 60 * 1000);
 }

@@ -1159,8 +1159,8 @@ pub struct UpReport {
     pub other_host: Vec<String>,
     /// identities with no runnable task (unrendered).
     pub unrunnable: Vec<String>,
-    /// bus ids archived out of the live catalog this pass because their retirement outlived
-    /// `archive-after`.
+    /// bus ids archived out of the live catalog this pass because their retirement, or a direct
+    /// OMP actor's PTY death, outlived `archive-after`.
     pub archived: Vec<String>,
     /// discovery warnings (mismatches, …).
     pub warnings: Vec<String>,
@@ -2058,7 +2058,7 @@ fn reconcile_pass_with_residency(
     // exclusive lock, which is what makes its eligibility decision current rather than a snapshot
     // this pass took before it launched anything.
     drop(catalog_lock);
-    archive_expired_retirements(root, this_host, &found.specs, &mut report);
+    archive_expired_retirements(root, this_host, &found, &sessions, &mut report);
     report
 }
 
@@ -2067,8 +2067,8 @@ fn reconcile_pass_with_residency(
 /// them — the same bound `MAX_PRESENTATION_PATCHES_PER_PASS` puts on presentation repair.
 const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 
-/// Archive retired seats whose grace period expired — the supervisor's half of
-/// `st2 catalog archive` (dotfiles#2411, Q11).
+/// Archive retired seats and dead direct OMP actors whose grace period expired — the supervisor's
+/// half of `st2 catalog archive` (dotfiles#2411, Q11).
 ///
 /// `archive-after "0"` in `catalog.kdl` disables the step entirely. It never queues for the
 /// exclusive lock: a pass blocked behind `st2 catalog apply` would stall every live agent's
@@ -2077,7 +2077,8 @@ const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 fn archive_expired_retirements(
     root: &Path,
     this_host: &str,
-    specs: &[agent_spec::spec::AgentSpec],
+    found: &crate::Discovered,
+    sessions: &[Session],
     report: &mut UpReport,
 ) {
     let grace = match crate::catalog::load(root) {
@@ -2089,7 +2090,9 @@ fn archive_expired_retirements(
             return;
         }
     };
-    if grace.is_zero() || !crate::catalog_archive::pass_has_work(root, this_host, specs, grace) {
+    if grace.is_zero()
+        || !crate::catalog_archive::pass_has_work(root, this_host, found, sessions, grace)
+    {
         return;
     }
 
@@ -2109,7 +2112,7 @@ fn archive_expired_retirements(
                     target: "st2",
                     id = %entry.id,
                     to = %entry.to,
-                    "archived a retired agent out of the live catalog"
+                    "archived an agent out of the live catalog"
                 );
                 report.archived.push(entry.id);
             }
