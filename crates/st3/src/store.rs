@@ -714,6 +714,7 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
             connection.execute_batch(
                 "PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
+                 PRAGMA cache_size = -8192;
                  PRAGMA query_only = ON;",
             )?;
             Ok(connection)
@@ -729,6 +730,10 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st3 database {}", path.display()))?;
+        // Keep the hot graph and replication index pages in SQLite's bounded
+        // page cache. The default (~2 MiB per connection) churns against the
+        // large durable claim store during otherwise quiet replication.
+        connection.execute_batch("PRAGMA cache_size = -32768;")?;
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
@@ -17984,6 +17989,25 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn persistent_store_uses_bounded_sqlite_page_caches() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.sqlite3"), "node").unwrap();
+        let writer_cache_kib: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        let reader_cache_kib: i64 = store
+            .readers
+            .get()
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(writer_cache_kib, -32768);
+        assert_eq!(reader_cache_kib, -8192);
+    }
 
     #[test]
     fn replication_projection_retries_missing_and_stale_health_only() {
