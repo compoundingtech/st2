@@ -1354,18 +1354,10 @@ async fn run_attention_action(
     reason: Option<String>,
 ) -> Result<String> {
     anyhow::ensure!(app.live_ready, "Reconnect before acting");
-    let page = client.attention_list(None, Some(50), false).await?;
-    let attention = page
-        .value
-        .items
-        .iter()
-        .find_map(|item| match item {
-            Resource::Attention(attention) if attention.header.id == attention_id => {
-                Some(attention)
-            }
-            _ => None,
-        })
-        .context("Attention changed; refresh and choose again")?;
+    let current = client.attention_get(attention_id).await?;
+    let Resource::Attention(attention) = &current.value else {
+        anyhow::bail!("Attention changed; refresh and choose again");
+    };
     anyhow::ensure!(
         attention.person_id == app.model.actor
             && attention
@@ -1375,7 +1367,7 @@ async fn run_attention_action(
         "Action is no longer available"
     );
     let mut fence = Fence {
-        snapshot_id: page.snapshot.id,
+        snapshot_id: current.snapshot.id,
         ..Fence::default()
     };
     fence.subject_revisions.insert(
