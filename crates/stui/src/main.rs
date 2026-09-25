@@ -27,7 +27,7 @@ use st3_client::{
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
-    io::{self, Stdout},
+    io::{self, IsTerminal, Stdout},
     path::PathBuf,
     sync::{
         Arc,
