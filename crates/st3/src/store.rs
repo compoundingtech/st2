@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -493,6 +493,7 @@ pub struct Store {
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
+    seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     origin: String,
@@ -735,9 +736,10 @@ impl Store {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
             rebuild_planning_tx(&transaction)?;
-            seed_replica_envelopes_tx(&transaction, &origin)?;
+            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
+        let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = open_read_connections(path, false)?;
         Ok(Self {
@@ -746,6 +748,7 @@ impl Store {
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
+            seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -771,9 +774,10 @@ impl Store {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
             rebuild_planning_tx(&transaction)?;
-            seed_replica_envelopes_tx(&transaction, &origin)?;
+            seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
+        let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = open_read_connections(&uri, true)?;
         Ok(Self {
@@ -782,6 +786,7 @@ impl Store {
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
+            seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -7967,9 +7972,15 @@ impl Store {
         }
 
         let mut connection = self.connection.lock().expect("store mutex poisoned");
-        let transaction = connection.transaction()?;
-        seed_replica_envelopes_tx(&transaction, &self.origin)?;
-        transaction.commit()?;
+        let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
+        let latest_batch = max_batch_rowid(&connection)?;
+        if latest_batch > seeded_through {
+            let transaction = connection.transaction()?;
+            seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
+            transaction.commit()?;
+            self.seeded_batch_rowid
+                .store(latest_batch, Ordering::Release);
+        }
         let previous = self
             .replication_snapshot
             .lock()
@@ -13684,26 +13695,47 @@ fn validate_replica_repair(
     Ok(true)
 }
 
-fn seed_replica_envelopes_tx(transaction: &Transaction<'_>, relay: &str) -> Result<()> {
-    let mut statement = transaction.prepare(
+fn max_batch_rowid(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM batches", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+}
+
+fn seed_replica_envelopes_tx(
+    transaction: &Transaction<'_>,
+    relay: &str,
+    after_rowid: Option<i64>,
+) -> Result<()> {
+    let order = if after_rowid.is_some() {
+        "batches.rowid"
+    } else {
+        "origin, replica_sequence, id"
+    };
+    let mut statement = transaction.prepare(&format!(
         "SELECT id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms
          FROM batches
-         WHERE NOT EXISTS (
+         WHERE batches.rowid>=?1
+           AND NOT EXISTS (
              SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id
          )
-         ORDER BY origin, replica_sequence, id",
-    )?;
+         ORDER BY {order}"
+    ))?;
     let headers = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?
+        .query_map(
+            [after_rowid.map_or(i64::MIN, |rowid| rowid.saturating_add(1))],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     for (id, writer, sequence, previous_hash, legacy_hash, accepted_at) in headers {
@@ -22226,6 +22258,20 @@ version 2
         assert!(
             missing_envelopes.contains("replica_envelopes_batch"),
             "the inventory seed query must use the envelope batch index:\n{missing_envelopes}"
+        );
+        let incremental_seed = plan(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM batches
+             WHERE batches.rowid>=1
+               AND NOT EXISTS (
+                   SELECT 1 FROM replica_envelopes
+                   WHERE replica_envelopes.batch_id=batches.id
+               )
+             ORDER BY batches.rowid",
+        );
+        assert!(
+            incremental_seed.contains("USING INTEGER PRIMARY KEY"),
+            "an incremental seed must range-scan only new batches:\n{incremental_seed}"
         );
         let batch_claims = plan(
             "EXPLAIN QUERY PLAN
