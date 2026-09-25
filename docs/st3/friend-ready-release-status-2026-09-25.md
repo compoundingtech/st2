@@ -7,6 +7,11 @@ their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
 short diagnostic into release evidence.
 
+Monitoring commit `8817b15` adds an early post-rollout evidence preflight. It
+notifies the operator of a bad sample, PID change, stale host, or excessive gap
+before the 24-hour deadline, with retry after a failed notification send. The
+preflight is currently healthy; it cannot pass the release gate.
+
 ## Candidate and recovery proof
 
 - Each daemon restart was preceded by a normalized ACK from the independent COS
@@ -52,6 +57,11 @@ short diagnostic into release evidence.
   the retained-client regression proves connection reuse in a focused TCP test,
   not an invented production counter. The earlier
   [idle baseline](idle-stability-2026-09-23.md) is not a matched 24-hour window.
+- Long-running Fabric `exec` clients were observed hanging after remote
+  commands had stopped, while short commands and st3 signed replication kept
+  working. The Fabric owner has requested a graph-queued diagnosis and
+  regression; this operator-path issue remains open rather than being silently
+  counted as a passed st3 messaging check.
 
 The exact gate definitions and override rules are in the
 [friend-ready delivery gate](friend-ready-delivery-gate.md). Any failure is a
