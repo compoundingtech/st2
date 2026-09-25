@@ -3,9 +3,10 @@
 **Release hold.** Source `f9b234f` for `st3` and `4be1a21` for `stui` is deployed
 as host-native binaries on Hetz and Silber. The direct-network iOS source is
 merged at `e49c097`. The final OMP tool-role repair required new daemon binaries;
-both hosts restarted and the current evidence windows began at 21:42:56 UTC
-(`1790372576`), the first healthy Silber sample after both restarts. The full 24-hour idle and
-72-hour bidirectional delivery reports are still due.
+both hosts restarted at 21:42 UTC. An idle-sampler fault invalidated the first
+idle window. The repaired idle window began at 22:36:14 UTC (`1790375774`);
+the delivery window still begins at 21:42:56 UTC (`1790372576`). The full
+24-hour idle and 72-hour bidirectional delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -24,6 +25,29 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 22:36 UTC idle evidence repair and reset
+
+- The retained Silber log recorded one `local-exit-142` at 22:24:45 UTC after
+  its 30-second sampler alarm. The same daemon PID and healthy peer resumed in
+  the following sample. The earlier 21:42:56 UTC idle window is invalid and
+  remains in the log; it was not edited or discarded. Timing probes found
+  `replication status` occasionally took 3.31 seconds while the other sampler
+  reads stayed below one second. The exact stage of the 30-second stall was
+  not captured.
+- `40cb509` bounds a replication-status read to 10 seconds and retries it once.
+  A persistent failure still produces an error sample. The raw sample now
+  records whether the first or second attempt succeeded. A controlled first
+  stall produced a healthy sample with attempt count two; two stalls failed
+  the sample. The installed script passed a live read on both hosts and has
+  SHA-256 `960bf1839595124815d58503d13e1eb662a10bc91111a2b8915b1cc36812d4a6`.
+  The daemon and TUI binaries and PIDs were not changed.
+- The idle marker is now Unix `1790375774` (22:36:14 UTC), the first healthy
+  Silber sample from the repaired sampler; Hetz logged its corresponding
+  healthy sample two seconds later. The 24-hour idle report is due September
+  26 at 22:36:14 UTC. The independent delivery marker remains `1790372576`,
+  with its 72-hour report due September 28 at 21:42:56 UTC. The watcher is
+  running and awaiting a new three-minute idle preflight.
 
 ## 21:43 UTC final OMP role and TUI CPU rollout
 
