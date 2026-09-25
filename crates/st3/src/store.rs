@@ -16208,14 +16208,24 @@ fn enrich_step_wake_at(
         "st3-work:{}@{}@{}@",
         view.subject, view.attempt, view.readiness_epoch
     );
+    let bare_assignee = assignee
+        .strip_prefix("agent/")
+        .filter(|suffix| !suffix.contains('/'))
+        .unwrap_or(assignee);
     let mut statement = connection.prepare(
-        "SELECT body, accepted_at_unix_ms FROM claims
+        "SELECT body, accepted_at_unix_ms FROM claims INDEXED BY claims_message_to_index
          WHERE kind='message.sent' AND accepted_at_unix_ms<=?1
            AND instr(body, ?2)>0
+           AND json_extract(body, '$.fields.to') IN (?3, ?4)
          ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, id",
     )?;
     let rows = statement.query_map(
-        params![snapshot_unix_ms.to_string(), wake_tag_prefix],
+        params![
+            snapshot_unix_ms.to_string(),
+            wake_tag_prefix,
+            assignee,
+            bare_assignee
+        ],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
     for row in rows {
@@ -22083,6 +22093,44 @@ version 2
         );
         assert!(queue.upcoming_work_ids.contains(subject));
         assert!(queue.upcoming_work_ids.contains(other));
+        let wake_tag = format!("st3-work:{subject}@1@1@incarnation");
+        for (name, recipient) in [
+            ("correct-recipient", "agent/node.worker"),
+            ("wrong-recipient", "agent/someone.else"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{name}"),
+                    kind: "message.sent".into(),
+                    actor: Some("daemon/runtime".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("daemon/runtime".into())),
+                        ("to".into(), Value::String(recipient.into())),
+                        ("content".into(), Value::String("wake".into())),
+                        ("status".into(), Value::String("sent".into())),
+                        (
+                            "tags".into(),
+                            Value::Array(vec![Value::String(wake_tag.clone())]),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("indexed-wake-{name}")),
+                })
+                .unwrap();
+        }
+        let wake = store
+            .work_at_snapshot(Some("agent/node.worker"), true, now_ms())
+            .unwrap()
+            .into_iter()
+            .find(|step| step.subject == *subject)
+            .unwrap()
+            .wake
+            .unwrap();
+        assert_eq!(
+            wake.attempts, 1,
+            "a wake for another recipient is not this agent's attempt"
+        );
         let request = |incarnation: &str, key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
