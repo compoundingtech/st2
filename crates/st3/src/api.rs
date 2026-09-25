@@ -150,6 +150,13 @@ struct ClientPageCursor {
 
 fn signal_changed(state: &AppState) {
     state.notify.notify_one();
+    signal_visible_change(state);
+}
+
+// Usage samples and lease renewals are durable and visible, but neither can
+// advance a mission on its own. Terminal child state, claim expiry deadlines,
+// and harness readiness still wake the reconciler through their own paths.
+fn signal_visible_change(state: &AppState) {
     state
         .event_notify
         .send_modify(|generation| *generation = generation.saturating_add(1));
@@ -3135,9 +3142,12 @@ async fn replication_receive(
     Json(request): Json<ReplicationReceiveRequest>,
 ) -> Result<Json<ReplicationReceiveResponse>, ApiError> {
     let store = state.store.clone();
-    let response = blocking_action(move || {
+    let (response, reconcile_changed) = blocking_action(move || {
         let before_index = store
             .index()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let projection_was_healthy = !store
+            .replication_projection_needs_recovery()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
         let receipt = store.receive_replication_exchange(
             &request.peer,
@@ -3167,15 +3177,28 @@ async fn replication_receive(
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
         let changed =
             store_index != before_index || (projected && (admission.changed || repairs != 0));
-        Ok(ReplicationReceiveResponse {
-            receipt,
-            changed,
-            store_index,
-        })
+        let quiet_only = projection_was_healthy
+            && projected
+            && repairs == 0
+            && admission.unknown == 0
+            && admission.invalid == 0
+            && store
+                .claims_since_only_quiet_notifications(before_index)
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        Ok((
+            ReplicationReceiveResponse {
+                receipt,
+                changed,
+                store_index,
+            },
+            changed && !quiet_only,
+        ))
     })
     .await?;
     if response.changed {
-        state.notify.notify_one();
+        if reconcile_changed {
+            state.notify.notify_one();
+        }
         state
             .event_notify
             .send_modify(|generation| *generation = generation.saturating_add(1));
@@ -4959,7 +4982,11 @@ async fn post_claim(
         .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
     if appended {
-        signal_changed(&state);
+        if request.kind == "harness.usage" {
+            signal_visible_change(&state);
+        } else {
+            signal_changed(&state);
+        }
     }
     Ok(Json(response))
 }
@@ -6666,6 +6693,7 @@ async fn post_work_action(
             format!("`{incarnation}` is not the current live incarnation of `{actor}`"),
         )));
     }
+    let quiet_renewal = action == "renew";
     let store = state.store.clone();
     let (mut response, desired) = blocking_action(move || {
         let response = store.work_action(&subject, &action, &request)?;
@@ -6690,7 +6718,11 @@ async fn post_work_action(
             .cloned()
             .unwrap_or_default();
     }
-    signal_changed(&state);
+    if quiet_renewal {
+        signal_visible_change(&state);
+    } else {
+        signal_changed(&state);
+    }
     Ok(Json(response))
 }
 
@@ -8000,6 +8032,32 @@ mod tests {
     fn replication_heartbeats_do_not_process_the_backlog() {
         assert!(!replication_receive_has_new_data(0));
         assert!(replication_receive_has_new_data(1));
+    }
+
+    #[tokio::test]
+    async fn visible_change_updates_clients_and_peer_without_waking_reconciler() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut events = state.event_notify.subscribe();
+        signal_visible_change(&state);
+        events.changed().await.unwrap();
+        assert_eq!(*events.borrow(), 1);
+        assert!(state.state_dir.join("replication.wake").exists());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                state.notify.notified(),
+            )
+            .await
+            .is_err()
+        );
+        signal_changed(&state);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            state.notify.notified(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

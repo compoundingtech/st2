@@ -8426,6 +8426,20 @@ impl Store {
         Ok(status.as_deref() != Some("healthy"))
     }
 
+    /// True only when at least one new claim was projected and every new claim
+    /// is a usage sample or a lease renewal. Other projection changes must
+    /// still run the reconciler, including a recovered stale projection.
+    pub fn claims_since_only_quiet_notifications(&self, after_index: u64) -> Result<bool> {
+        let connection = self.readers.get();
+        let (total, other): (u64, u64) = connection.query_row(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE kind NOT IN ('harness.usage', 'work.renewed'))
+             FROM claims WHERE store_index > ?1",
+            [after_index],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(total != 0 && other == 0)
+    }
+
     pub fn apply_replication_repairs(&self) -> Result<usize> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
@@ -18115,6 +18129,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn quiet_claim_detection_requires_only_usage_or_renewal_since_cursor() {
+        let store = Store::open_memory("node").unwrap();
+        let before = store.index().unwrap();
+        assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+        let append = |kind| {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let fields = if kind == "harness.usage" {
+                json!({"driver": "codex", "incarnation_id": "current", "semantics": "response", "total_tokens": 1})
+            } else if kind == "harness.observed" {
+                json!({"driver": "codex", "incarnation_id": "current", "state": "ready"})
+            } else {
+                json!({
+                    "status": "claimed", "attempt": 1, "readiness_epoch": 1,
+                    "claimant": "agent/node.test", "claim_incarnation": "current",
+                    "claim_expires_at_unix_ms": now_ms().saturating_add(60_000),
+                    "worker_reported": false
+                })
+            };
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                if kind == "work.renewed" {
+                    "step-run/test/work"
+                } else {
+                    "agent/node.test"
+                },
+                kind,
+                Some("agent/node.test"),
+                &json!({"fields": fields}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        };
+        append("harness.usage");
+        append("work.renewed");
+        assert!(store.claims_since_only_quiet_notifications(before).unwrap());
+        let after_quiet = store.index().unwrap();
+        append("harness.observed");
+        assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+        assert!(
+            !store
+                .claims_since_only_quiet_notifications(after_quiet)
+                .unwrap()
+        );
     }
 
     #[test]
