@@ -11,6 +11,10 @@ Monitoring commit `8817b15` adds an early post-rollout evidence preflight. It
 notifies the operator of a bad sample, PID change, stale host, or excessive gap
 before the 24-hour deadline, with retry after a failed notification send. The
 preflight is currently healthy; it cannot pass the release gate.
+Watcher update `cfe036f` also sends an early CPU-risk notice after two hours
+and 60 quiet intervals per host if the unchanged CPU limits are exceeded. It
+is installed on Hetz; its own fixture test and first service run passed. The
+24-hour report remains the authority.
 
 ## Candidate and recovery proof
 
