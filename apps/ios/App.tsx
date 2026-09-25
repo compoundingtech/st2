@@ -14,6 +14,7 @@ import { withFreshTerminalFence } from './terminalControls';
 import { coalescedRefreshDelay, RefreshFlight } from './refreshFlight';
 import { ForegroundGate } from './foreground';
 import { gatewayFetch } from './gatewayFetch';
+import { gatewayTransport, LAN_HTTP_WARNING, normalizeGatewayUrl } from './gatewayUrl';
 import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, deviceDetail, deviceTitle, missionLabels, pingPresentation, queuedWorkSummary } from './presentation';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
@@ -157,10 +158,10 @@ export default function App() {
       }
       if (parsed.hostname !== 'pair') return;
       if (activePairLink === link) return;
-      const gateway = parsed.searchParams.get('gateway')?.replace(/\/+$/, '');
+      const gateway = normalizeGatewayUrl(parsed.searchParams.get('gateway') ?? '');
       const id = parsed.searchParams.get('id');
       const code = parsed.searchParams.get('code');
-      if (!gateway?.startsWith('https://') || !id || !code) return;
+      if (!gateway || !id || !code) return;
       activePairLink = link;
       setPairingIssue('');
       setBusy(true);
@@ -438,7 +439,7 @@ export default function App() {
     finally { terminalSending.current = false; setBusy(false); }
   }
   async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cachedIndex.current = -1; cacheSavedAt.current = 0; projectionEventCursor.current = null; dirtyProjectionTabs.current.clear(); lastNativeRefreshAt.current = 0; firstDataShown.current = false; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline(emptyConversation); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
-  async function saveUrl() { const normalized = urlDraft.trim().replace(/\/+$/, ''); if (!/^https:\/\//.test(normalized)) { setError('Enter the paired gateway HTTPS URL.'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
+  async function saveUrl() { const normalized = normalizeGatewayUrl(urlDraft); if (!normalized) { setError('Enter the paired gateway HTTPS URL, or http:// with a Tailscale address (100.x), a .local name, or a private LAN address (10.x, 172.16-31.x, 192.168.x).'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
   async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
     const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
     const result = await client.completePairing(pairingId.trim(), { api_version: API_VERSION, code: pairingCode.trim(), device_public_key: publicKey });
@@ -487,8 +488,8 @@ export default function App() {
     {otherLoadErrors.length && status === 'online' ? <View style={styles.error}><Text style={styles.errorText}>Not loaded: {otherLoadErrors.map(([key, message]) => `${key} (${message})`).join(' · ')}</Text></View> : null}
     {busy ? <ActivityIndicator color="#67d6c5" /> : null}
     <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); }}>
-      {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only Tailscale HTTPS gateway. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
-        <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://your-tailnet-host" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} /><Button label="Save gateway" onPress={() => void saveUrl()} />
+      {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only gateway: its HTTPS URL; http:// with the host's Tailscale address (100.x.y.z), which Tailscale encrypts; or http:// with its .local name or private LAN address, which is not encrypted. Begin pairing on a trusted st3 machine, then enter its short-lived ID and code.</Text>
+        <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} />{gatewayTransport(urlDraft) === 'lan' ? <Text style={styles.warning}>{LAN_HTTP_WARNING}</Text> : null}<Button label="Save gateway" onPress={() => void saveUrl()} />
         {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : !hasSynced && status !== 'online' ? <>
         <Text style={styles.title}>{status === 'offline' ? 'Offline' : 'Connecting…'}</Text>
         <Text style={styles.muted}>{status === 'offline' ? offlinePresentation(false).detail : 'Loading your workspace for the first time.'}</Text>
@@ -606,7 +607,7 @@ export default function App() {
           {!data.machines.some(m => m.id === gatewayMachineId) ? <Card title={sourceHost} detail="Connected gateway machine"><Text style={styles.section}>Undeclared sessions</Text>{undeclaredSessions.map(s => <Text key={s.id} style={styles.muted}>{isUnresolved(s) ? 'Unresolved running process' : 'Exact native session'} · {s.driver ?? 'native harness'}{s.process ? ` · PID ${s.process.pid}` : ''}</Text>)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}</Card> : null}
           <Text style={styles.muted}>Discovery covers the connected gateway machine only.</Text>
           <Text style={styles.section}>You & devices</Text>
-          <Card title="This connection" detail={caps ? `${caps.session_actor} · ${caps.transport}` : 'Reconnecting'}><Text style={styles.small}>{url}</Text><Button label="Forget local credential" onPress={() => Alert.alert('Forget this device?', 'You will need to pair again.', [{ text: 'Cancel' }, { text: 'Forget', onPress: () => void forget() }])} /></Card>
+          <Card title="This connection" detail={caps ? `${caps.session_actor} · ${caps.transport}` : 'Reconnecting'}><Text style={styles.small}>{url}</Text>{gatewayTransport(url) === 'lan' ? <Text style={styles.warning}>{LAN_HTTP_WARNING}</Text> : null}<Button label="Forget local credential" onPress={() => Alert.alert('Forget this device?', 'You will need to pair again.', [{ text: 'Cancel' }, { text: 'Forget', onPress: () => void forget() }])} /></Card>
           {data.devices.map(d => <Card key={d.id} title={deviceTitle(d, caps?.session_actor)} detail={deviceDetail(d, now)}><Text style={styles.small}>{d.scopes.join(', ')}</Text></Card>)}
           <Text style={styles.section}>Tab order</Text>
           {order.map(t => <View key={t} style={styles.orderRow}><Text style={styles.cardTitle}>{t}</Text><Button label="↑" onPress={() => move(t, -1)} /><Button label="↓" onPress={() => move(t, 1)} /></View>)}
