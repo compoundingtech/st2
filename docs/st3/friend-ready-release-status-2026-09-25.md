@@ -1,10 +1,10 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `08dbe1a` for `st3` and `5a429bd` for `stui` is
+**Release hold.** Source `3300900` for `st3` and `e3c6fdd` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
-source is merged at `e49c097`. The 15:46:21 UTC windows were invalidated by
-the revision-phase fix rollout. New windows began at 16:12:47 UTC after
-both daemons restarted; their full 24-hour idle and 72-hour bidirectional
+source is merged at `e49c097`. The 16:12:47 UTC windows were invalidated by
+the TUI and message projection repair rollout. New windows began at 17:09:40
+UTC (`1790356180`) after both daemons restarted; their full 24-hour idle and 72-hour bidirectional
 delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
@@ -24,6 +24,58 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 17:09 UTC CoS walkthrough repairs and new evidence windows
+
+- CoS's installed TUI walkthrough reported 11 findings, including Esc quitting
+  from text selection and Enter failing to attach to terminals. The TUI now
+  leaves selection on Esc, reads a fresh runtime fence before attach, retries
+  a changing fence, and shows attach errors in the footer. Live PTY checks
+  attached to OMP on Hetz and Fabric on Silber, then returned to Chat.
+- Control now includes agentless steps in client work projections and counts
+  only the current run generation. The live pty-rust intake card shows its
+  working `steward-intake` step and `Agentless step` owner. This client-only
+  store query leaves reconciler work selection unchanged.
+- Chat hides stopped historical agents, labels initial connection as
+  Connecting, shows the selected agent's name, state, and observation age at
+  the bottom, gives History an honest availability label, and ignores the
+  terminal's Ctrl+4 encoding outside attachment. If a native transcript has
+  only status entries, Chat shows the selected agent's graph messages in time
+  order, including linked replies. The OMP view displays its exact
+  `OMP-GRAPH-1144`, `omp alive`, and latest proof replies. Its native session
+  timeline itself still contains status entries only; that driver data remains
+  a separate limitation.
+- Harness observation bursts now refresh the TUI roster at most once per 30
+  seconds. Peer message reads filter before claim projection. One short Silber
+  diagnostic sampled roughly 13.5% of one daemon core without the TUI and 24%
+  with Chat open; CoS's earlier sample was about 14% and 37% respectively.
+  A second matched 30-second diagnostic after the final rollout measured
+  5.36 seconds of daemon CPU without the TUI (17.9% of one core) and 6.90
+  seconds with Chat open (23.0%). These short measurements are not the
+  24-hour idle gate.
+- The `st3` library suite passed 417 tests. The installed TUI source passed
+  46 active unit tests and the PTY click, wheel, History, older-page, and Esc
+  selection interaction test on both hosts. Both strict doctors pass after
+  the final rollout. Hetz installed `st3` SHA-256
+  `ab9c99a5bbc12c4e589d034d6ac0e7da48fbc30e1cfe8676174d95e795df305c`
+  and `stui` SHA-256
+  `c2dcf457edc8b3b6b8ffd0242c50ecc7e4f1255c02530c2cfe4ce6d068525be1`;
+  Silber installed `st3` SHA-256
+  `a2143c6c0ab13ab5a0b7a003848fa6523a653caf2ddfed259decb0c125d666f1`
+  and `stui` SHA-256
+  `100552afeeabe1cfbfef699aa4c095bc37ef04f996d56dc21dec9b11af4db022`.
+  Each host retains its prior pair in its local `rollout-backups` directory.
+- Both new gate starts are Unix `1790356180` (17:09:40 UTC), the first
+  healthy Silber sample after the last restart. The gate watcher has
+  `idle=waiting`, `idle_preflight=healthy`, and `message=waiting` at 17:13:22
+  UTC. The preflight checked four Hetz and five Silber post-marker samples,
+  zero errors, one daemon PID on each host, and a maximum 61-second gap;
+  it is not a release verdict. The full gates are due at 17:09:40 UTC on
+  September 26 and 28 respectively. The old-window idle integrity alert was
+  expected from the controlled restarts and no longer applies to the new
+  window. The continuous delivery monitor has new exact linked receipts in
+  both directions: Hetz to Silber at 17:10:10 UTC (32 seconds) and Silber to
+  Hetz at 17:15:36 UTC (26 seconds), each with one matching reply.
 
 ## 16:12 UTC revision-phase repair and pty-rust intake recovery
 
