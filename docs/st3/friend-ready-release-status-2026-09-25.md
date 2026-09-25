@@ -1,10 +1,10 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `1c86b31` for `st3` and `stui` is deployed as
-host-native binaries on Hetz and Silber. The direct-network iOS source is
-merged at `e49c097`. The OMP transcript repair required new daemon binaries;
-both hosts restarted and the current evidence windows began at 20:53:08 UTC
-(`1790369588`), the first healthy two-host sample. The full 24-hour idle and
+**Release hold.** Source `f9b234f` for `st3` and `4be1a21` for `stui` is deployed
+as host-native binaries on Hetz and Silber. The direct-network iOS source is
+merged at `e49c097`. The final OMP tool-role repair required new daemon binaries;
+both hosts restarted and the current evidence windows began at 21:42:56 UTC
+(`1790372576`), the first healthy Silber sample after both restarts. The full 24-hour idle and
 72-hour bidirectional delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
@@ -20,10 +20,44 @@ not an invitation to start the trial while this hold is active.
 | Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The pty-rust seat is restored as a top-level durable agent, with its observer and subscriptions in an active intake run. The restarted OMP seat uses a supported model; both strict doctors pass. | Keep the seats and pty-rust intake active overnight. |
 | Addressable inboxes | The continuous monitor has exact linked receipts, and a temporary OMP seat answered one request exactly once before and after its restart on the repaired daemon. | Keep the monitor running through the new 72-hour window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
-| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. The managed OMP timeline now reads saved turns and tool calls on both hosts. | Independent CoS TUI retest and release soak; Nathan is not the TUI acceptance tester. |
+| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. The managed OMP timeline now reads saved turns, tool calls, and tool results on both hosts. CoS's matched quiet CPU retest found a 0.6% core viewer cost. | Full release soak; Nathan is not the TUI acceptance tester. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 21:43 UTC final OMP role and TUI CPU rollout
+
+- `f9b234f` renders native OMP `toolResult` records as tool-role messages and
+  formats short JSON tool output for the TUI. Both restarted daemons returned
+  the same 116-entry saved OMP timeline page: 32 tool calls, 32 tool-role
+  messages, and 32 tool-role content entries. The native conversation is a
+  durable JSONL file on its host; the graph separately holds addressed ST3
+  messages and work, not a replicated copy of the entire native transcript.
+- CoS measured `4be1a21` on the same Silber daemon PID in three alternating
+  90-second no-viewer/Chat-viewer pairs. The equal-activity quiet pair was
+  22.3% versus 22.9% of one core, or about 0.6% added by a viewer. Unlike
+  the prior build, busy graph windows did not show a viewer cost per envelope.
+  The TUI reads current work on event refresh and caches work history for
+  30 seconds. The final installed TUI remained `4be1a21`; `3feb6ba` updates
+  only the live interaction QA for sparse agent conversations and tool-heavy
+  history pages.
+- Both strict doctors passed after the daemon restart, including ready native
+  drivers, peers up, and zero unresolved replication records. Installed PTY
+  attachment QA passed on Hetz and Silber; Chat click, wheel, History, older
+  pages, and selection QA passed on Hetz. Hetz installed `st3` SHA-256
+  `1ca8fcc9002332426771df83fc542334e4e4f01ee005482befe19947378d7f37`
+  and `stui` SHA-256
+  `9d73a108e2737df3e8eb133a86521a4f0d5f83959253137c85e55ce3b615d6db`.
+  Silber installed `st3` SHA-256
+  `eaea25a57b4f1f5409d05ae77ce9f5c1f2f1ac0be7c953f1bd95e7e50204981b`
+  and `stui` SHA-256
+  `8c63e0de10a81ebac959c04e2d5e57e1e7d6a9795d755cede1196f75c87c463a`.
+  Prior daemon binaries are retained in host-local rollout backups.
+- Both new gate starts are Unix `1790372576` (21:42:56 UTC), the first healthy
+  Silber sample with its new PID after Hetz had also logged a healthy new-PID
+  sample. The watcher returned `idle=waiting`, `preflight=waiting`, and
+  `delivery=waiting` at 21:43 UTC. The idle and delivery reports are due
+  September 26 and 28 at 21:42:56 UTC respectively.
 
 ## 20:53 UTC OMP timeline and final TUI retest rollout
 
