@@ -6203,12 +6203,14 @@ impl Store {
     ) -> Result<MessageView> {
         // A message view depends only on its immutable subject claims and the selected
         // desired row. Unrelated graph writes must not invalidate every native mailbox.
-        let (latest_claim_index, desired_claim_id) = connection.query_row(
+        let mut statement = connection.prepare_cached(
             "SELECT (SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1),
                     (SELECT claim_id FROM desired WHERE subject=?1)",
-            [subject],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?)),
         )?;
+        let (latest_claim_index, desired_claim_id) = statement.query_row([subject], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        drop(statement);
         if let Some(view) = self
             .message_cache
             .lock()
