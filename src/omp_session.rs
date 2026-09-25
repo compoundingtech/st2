@@ -69,6 +69,7 @@ pub(crate) const OMP_KIND: HarnessKind = HarnessKind {
     session_env: CHANNEL_SESSION,
     seq_env: CHANNEL_SEQ,
     verify_version: Some(verify_supported_version),
+    verify_launch: Some(verify_requested_model),
 };
 
 /// Run one interactive omp provider and maintain its presence until it exits.
@@ -101,6 +102,44 @@ fn verify_supported_version(binary: &str) -> Result<()> {
         "omp {version} is unverified (admitted minors: {}); repeat the docs/vrs/06-omp-driver \
          admission checks before extending the gate",
         harness_version::series_display(&SUPPORTED_OMP_MINORS)
+    );
+    Ok(())
+}
+
+/// omp accepts an unknown `--model` and silently selects a different model.
+/// Refuse that launch before claiming the seat. The local registry includes
+/// custom models, so this checks the provider's own resolved selectors.
+fn verify_requested_model(argv: &[String]) -> Result<()> {
+    let mut requested = None;
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--model" {
+            requested = Some(args.next().context("omp --model needs a value")?.as_str());
+        } else if let Some(value) = arg.strip_prefix("--model=") {
+            requested = Some(value);
+        }
+    }
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    anyhow::ensure!(!requested.is_empty(), "omp --model needs a value");
+    let binary = &argv[0];
+    let output = std::process::Command::new(binary)
+        .args(["models", "--json"])
+        .output()
+        .with_context(|| format!("running {binary} models --json for the omp model gate"))?;
+    anyhow::ensure!(output.status.success(), "{binary} models --json failed");
+    let registry: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("decoding the omp model registry")?;
+    let models = registry
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .context("omp model registry has no models array")?;
+    anyhow::ensure!(
+        models.iter().any(
+            |model| model.get("selector").and_then(serde_json::Value::as_str) == Some(requested)
+        ),
+        "omp model `{requested}` is absent from the local registry; configure that exact model or change the declaration"
     );
     Ok(())
 }
@@ -335,5 +374,39 @@ mod tests {
             gate(fake.path().to_str().unwrap()).is_err(),
             "the descriptor's gate must be the refusing one"
         );
+    }
+
+    #[test]
+    fn model_gate_refuses_silent_fallback_but_accepts_an_exact_custom_selector() {
+        let fake = FakeExecutable::new(
+            "#!/bin/sh\nprintf '%s\\n' '{\"models\":[{\"selector\":\"openai-codex/gpt-5.6-sol\"},{\"selector\":\"custom/gpt-6-sol\"}]}'\n",
+        );
+        let binary = fake.path().to_string_lossy().into_owned();
+        let gate = OMP_KIND
+            .verify_launch
+            .expect("omp must validate its launch model");
+        let rejected = vec![
+            binary.clone(),
+            "--model".into(),
+            "openai-codex/gpt-6-sol".into(),
+        ];
+        let error = gate(&rejected).unwrap_err();
+        assert!(
+            error.to_string().contains("absent from the local registry"),
+            "{error}"
+        );
+
+        let admitted = vec![binary.clone(), "--model=custom/gpt-6-sol".into()];
+        gate(&admitted).unwrap();
+
+        // Driver args can override a model flag; validate the effective last value.
+        let override_args = vec![
+            binary,
+            "--model".into(),
+            "openai-codex/gpt-6-sol".into(),
+            "--model".into(),
+            "openai-codex/gpt-5.6-sol".into(),
+        ];
+        gate(&override_args).unwrap();
     }
 }
