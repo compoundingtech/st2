@@ -5397,6 +5397,9 @@ fn accept_message(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
+    if let Some(parent) = request.in_reply_to.as_deref() {
+        settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
+    }
     signal_changed(state);
     Ok(Json(MessageView {
         subject,
@@ -5409,6 +5412,54 @@ fn accept_message(
         tags: request.tags,
         created_index: record.store_index,
     }))
+}
+
+/// A recipient's successful reply is durable evidence that the parent was consumed.
+/// Settle it here so a restarted native seat cannot receive the same request again merely
+/// because it answered before running a separate `conversations archive` command.
+fn settle_answered_message(
+    store: &Store,
+    parent: &str,
+    from: &str,
+    to: &str,
+    reply: &str,
+    reply_claim: &str,
+) -> Result<(), ApiError> {
+    let parent = message_subject(parent);
+    let Some(message) = store.message(&parent).map_err(ApiError::internal)? else {
+        return Ok(());
+    };
+    // A thread participant can send a follow-up without consuming the other party's inbox.
+    if message.to != from || message.from != to {
+        return Ok(());
+    }
+    for lifecycle in ["delivered", "read", "closed"] {
+        let current = store
+            .message(&parent)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("message `{parent}` does not exist")))?;
+        let needed = match lifecycle {
+            "delivered" => matches!(current.status.as_str(), "sent" | "staged"),
+            "read" => current.status == "delivered",
+            "closed" => current.status == "read",
+            _ => unreachable!(),
+        };
+        if !needed {
+            continue;
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: parent.clone(),
+                kind: format!("message.{lifecycle}"),
+                actor: Some(from.into()),
+                fields: BTreeMap::from([("status".into(), Value::String(lifecycle.into()))]),
+                evidence: vec![reply_claim.into()],
+                expected_subject: None,
+                idempotency_key: Some(format!("reply-settled:{reply}:{lifecycle}")),
+            })
+            .map_err(ApiError::bad)?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -9528,6 +9579,131 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["from"], "person/requester");
+    }
+
+    #[tokio::test]
+    async fn replying_settles_the_original_across_native_delivery_transports() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        for transport in [
+            "omp-channel",
+            "pi-channel",
+            "claude-channel",
+            "codex-app-server",
+            "opencode-server",
+        ] {
+            let (status, original) = json_request(
+                app.clone(),
+                "/v1/messages",
+                serde_json::to_value(MessageSendRequest {
+                    idempotency_key: format!("replay-original-{transport}"),
+                    from: "agent/sender".into(),
+                    to: "agent/receiver".into(),
+                    content: "Please answer once.".into(),
+                    title: None,
+                    in_reply_to: None,
+                    tags: Vec::new(),
+                })
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{original}");
+            let subject = original["subject"].as_str().unwrap();
+            let path = format!(
+                "/v1/messages/{}/claims",
+                subject.trim_start_matches("message/")
+            );
+            for lifecycle in ["staged", "delivered"] {
+                let (status, claim) = json_request(
+                    app.clone(),
+                    &path,
+                    serde_json::to_value(MessageLifecycleRequest {
+                        lifecycle: lifecycle.into(),
+                        actor: Some("agent/receiver".into()),
+                        transport: Some(transport.into()),
+                        runtime_id: None,
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: format!("replay-{transport}-{lifecycle}"),
+                    })
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{claim}");
+            }
+            let reply = serde_json::to_value(MessageSendRequest {
+                idempotency_key: format!("replay-reply-{transport}"),
+                from: "agent/receiver".into(),
+                to: "agent/sender".into(),
+                content: "Answered.".into(),
+                title: None,
+                in_reply_to: Some(subject.into()),
+                tags: Vec::new(),
+            })
+            .unwrap();
+            let (status, sent) = json_request(app.clone(), "/v1/messages", reply.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{sent}");
+            let (status, repeated) = json_request(app.clone(), "/v1/messages", reply).await;
+            assert_eq!(status, StatusCode::OK, "{repeated}");
+            let (_, settled) = get_request(
+                app.clone(),
+                &format!(
+                    "/v1/messages/read/{}",
+                    subject.trim_start_matches("message/")
+                ),
+            )
+            .await;
+            assert_eq!(settled["status"], "closed", "{transport}: {settled}");
+        }
+        let (_, mailbox) =
+            get_request(app, "/v1/messages/page?to=agent%2Freceiver&limit=100").await;
+        assert!(mailbox["items"].as_array().unwrap().is_empty(), "{mailbox}");
+    }
+
+    #[tokio::test]
+    async fn a_sender_followup_does_not_settle_the_recipient_message() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let send = |key: &str, from: &str, to: &str, parent: Option<String>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: to.into(),
+                content: "Please respond.".into(),
+                title: None,
+                in_reply_to: parent,
+                tags: Vec::new(),
+            })
+            .unwrap()
+        };
+        let (_, first) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("followup-original", "agent/sender", "agent/receiver", None),
+        )
+        .await;
+        let subject = first["subject"].as_str().unwrap();
+        let (status, _) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send(
+                "followup-same-sender",
+                "agent/sender",
+                "agent/receiver",
+                Some(subject.into()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, original) = get_request(
+            app,
+            &format!(
+                "/v1/messages/read/{}",
+                subject.trim_start_matches("message/")
+            ),
+        )
+        .await;
+        assert_eq!(original["status"], "sent");
     }
 
     #[tokio::test]
