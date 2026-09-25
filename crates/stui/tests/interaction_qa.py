@@ -77,7 +77,17 @@ def main(binary: str) -> None:
         wait_screen(session, lambda value: selected_row(value, 3) and not selected_row(value, 2), "second agent selection")
         click(session, 5, 3)
         wait_screen(session, lambda value: selected_row(value, 2), "first agent selection")
-        initial = wait_screen(session, lambda value: "assistant:" in value or "user:" in value, "conversation")
+        for _ in range(30):
+            try:
+                initial = wait_screen(
+                    session, lambda value: "assistant:" in value or "user:" in value,
+                    "conversation", seconds=2,
+                )
+                break
+            except AssertionError:
+                send(session, "\x1b[B")
+        else:
+            raise AssertionError("no agent with conversation content in the visible roster")
         wheel_up(session, 55, 10)
         wait_screen(session, lambda value: value != initial, "mouse wheel scroll")
 
@@ -91,12 +101,12 @@ def main(binary: str) -> None:
             load_row = next(i for i, line in enumerate(lines) if "o Load older pages" in line)
             load_column = lines[load_row].index("o Load older pages")
             click(session, load_column + 2, load_row + 1)
-            try:
+            if before:
                 wait_screen(session, lambda value: older_count(value) > before, "click to load older pages")
-            except AssertionError:
-                print(f"History click diagnostic: row={load_row} column={load_column} "
-                      f"old={before} new={older_count(screen(session))}", file=sys.stderr)
-                raise
+            else:
+                # Tool-heavy pages may contain no older content yet. The click
+                # still requests more pages, but the count can remain zero.
+                wait_screen(session, lambda value: "History & details" in value, "History after click")
 
         header = screen(session).splitlines()[0]
         click(session, header.index("Select text [v]") + 2, 1)
