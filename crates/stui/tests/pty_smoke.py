@@ -5,6 +5,8 @@ Run with ST3_PERSON=person/<you> python3 crates/stui/tests/pty_smoke.py.
 The script reports only checks and byte counts; it never prints terminal contents.
 """
 
+from __future__ import annotations
+
 import fcntl
 import os
 import pty
