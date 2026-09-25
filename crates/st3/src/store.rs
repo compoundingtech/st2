@@ -492,9 +492,18 @@ pub struct Store {
     readers: ReadPool,
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
+    message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     origin: String,
+}
+
+const MESSAGE_CACHE_LIMIT: usize = 4096;
+
+struct MessageCacheEntry {
+    latest_claim_index: u64,
+    desired_claim_id: Option<String>,
+    view: MessageView,
 }
 
 #[cfg(test)]
@@ -736,6 +745,7 @@ impl Store {
             readers: ReadPool::new(readers),
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
+            message_cache: Mutex::new(HashMap::new()),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -771,6 +781,7 @@ impl Store {
             readers: ReadPool::new(readers),
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
+            message_cache: Mutex::new(HashMap::new()),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -6170,8 +6181,55 @@ impl Store {
             |row| row.get::<_, Option<u64>>(0),
         )?;
         created_index
-            .map(|index| message_view_tx(&connection, subject, index))
+            .map(|index| self.message_view_cached(&connection, subject, index))
             .transpose()
+    }
+
+    fn message_view_cached(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        created_index: u64,
+    ) -> Result<MessageView> {
+        // A message view depends only on its immutable subject claims and the selected
+        // desired row. Unrelated graph writes must not invalidate every native mailbox.
+        let (latest_claim_index, desired_claim_id) = connection.query_row(
+            "SELECT (SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1),
+                    (SELECT claim_id FROM desired WHERE subject=?1)",
+            [subject],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        if let Some(view) = self
+            .message_cache
+            .lock()
+            .expect("message cache mutex poisoned")
+            .get(subject)
+            .filter(|entry| {
+                entry.latest_claim_index == latest_claim_index
+                    && entry.desired_claim_id == desired_claim_id
+                    && entry.view.created_index == created_index
+            })
+            .map(|entry| entry.view.clone())
+        {
+            return Ok(view);
+        }
+        let view = message_view_tx(connection, subject, created_index)?;
+        let mut cache = self
+            .message_cache
+            .lock()
+            .expect("message cache mutex poisoned");
+        if cache.len() >= MESSAGE_CACHE_LIMIT && !cache.contains_key(subject) {
+            cache.clear();
+        }
+        cache.insert(
+            subject.to_owned(),
+            MessageCacheEntry {
+                latest_claim_index,
+                desired_claim_id,
+                view: view.clone(),
+            },
+        );
+        Ok(view)
     }
 
     pub fn messages_page(
@@ -6240,7 +6298,7 @@ impl Store {
                 .flatten();
             let mut output = Vec::new();
             for (subject, created_index) in subjects {
-                let message = message_view_tx(&connection, &subject, created_index)?;
+                let message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
                     output.push(message);
                 }
@@ -6303,7 +6361,7 @@ impl Store {
             .flatten();
         let mut output = Vec::new();
         for (subject, created_index) in subjects {
-            let message = message_view_tx(&connection, &subject, created_index)?;
+            let message = self.message_view_cached(&connection, &subject, created_index)?;
             if recipient
                 .as_deref()
                 .is_none_or(|recipient| recipient == message.to)
@@ -21834,6 +21892,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].subject, "message/second");
         assert!(next.is_none());
+        assert_eq!(
+            store.message("message/first").unwrap().unwrap().status,
+            "closed"
+        );
+        let (closed, _) = store
+            .messages_page(Some("agent/worker"), true, None, store.index().unwrap(), 1)
+            .unwrap();
+        assert_eq!(closed[0].status, "closed");
     }
 
     #[test]
