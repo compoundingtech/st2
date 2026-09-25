@@ -6,8 +6,9 @@ mission and fleet details without blocking keys. A private, actor-and-endpoint-s
 cache keeps the last snapshot visible while reconnecting. Actions still need a live connection
 and fresh fences; there is no offline mutation queue.
 
-Run `ST3_PERSON=person/<your-id> cargo run -p stui --locked` in a terminal with a running st3
-daemon. `ST3_ENDPOINT` can override the discovered Unix socket. Without `ST3_PERSON`, the local
+Install the repo's `.#st3` Nix package and run `ST3_PERSON=person/<your-id> stui` in a terminal
+with a running st3 daemon. For source development, use
+`ST3_PERSON=person/<your-id> cargo run -p stui --locked`. `ST3_ENDPOINT` can override the discovered Unix socket. Without `ST3_PERSON`, the local
 client has read-only identity; sending messages and creating launches require a person identity.
 
 Keys: `1`–`4` switch Now, Chat, Control, and Fleet; arrow keys select an item; PageUp/PageDown
@@ -42,4 +43,6 @@ ST3_PERSON=person/<your-id> python3 crates/stui/tests/pty_smoke.py
 
 The PTY smoke test needs a running local daemon. It checks first-frame and key-to-redraw latency,
 also against a deliberately stalled getter, plus alternate-screen restoration after normal exit,
-SIGTERM, and a debug panic. Ignored live tests measure first data and full-snapshot latency.
+SIGTERM, and a debug panic. For a packaged release binary, pass its path followed by `--no-panic`;
+the release build has no debug panic hook. Ignored live tests measure first data and full-snapshot
+latency.

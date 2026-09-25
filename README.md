@@ -13,7 +13,8 @@ The normal product entry points answer three questions:
 
 ## Install
 
-The Nix package installs `st3`, the shorter `st` symlink, and `st3-migrate`:
+The Nix package installs `st3`, the shorter `st` symlink, the `stui` terminal
+app, and `st3-migrate`:
 
 ```sh
 nix profile install .#st3

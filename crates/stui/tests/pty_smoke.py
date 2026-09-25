@@ -121,6 +121,10 @@ def delayed_getter_case(binary: str) -> None:
 
 if __name__ == "__main__":
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
+    skip_panic = "--no-panic" in sys.argv[2:]
     for case in ("normal", "signal", "panic"):
+        if case == "panic" and skip_panic:
+            print("panic: skipped (release binary has no debug panic hook)")
+            continue
         run_case(binary, case)
     delayed_getter_case(binary)

@@ -237,6 +237,8 @@
             "st3"
             "-p"
             "st3-migrate"
+            "-p"
+            "stui"
           ];
           cargoTestFlags = [
             "-p"
@@ -247,6 +249,8 @@
             "st3-migrate"
             "-p"
             "st3-schema"
+            "-p"
+            "stui"
           ];
           # Render tests create throwaway repositories and call Git to protect
           # tracked files. Keep that dependency in the hermetic check sandbox.
@@ -269,7 +273,7 @@
             installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
           '';
           meta = {
-            description = "Small Talk claims-graph runtime and the st2 KDL migration tool";
+            description = "Small Talk claims-graph runtime, terminal UI, and st2 KDL migration tool";
             homepage = "https://github.com/compoundingtech/st2";
             license = pkgs.lib.licenses.mit;
             mainProgram = "st3";
@@ -278,6 +282,7 @@
 
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
+          test -x ${st3}/bin/stui
           ${st3}/bin/st3 --help > st3.help
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help
