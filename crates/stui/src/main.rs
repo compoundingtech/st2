@@ -732,13 +732,7 @@ impl App {
                     let mut recent = self
                         .model
                         .messages(self.selected_session_id().as_deref(), &peer.header.id)
-                        .take(4)
                         .collect::<Vec<_>>();
-                    recent.sort_by(|a, b| {
-                        a.sent_at
-                            .cmp(&b.sent_at)
-                            .then_with(|| a.header.id.cmp(&b.header.id))
-                    });
                     let conversation = self
                         .model
                         .timeline
@@ -753,6 +747,14 @@ impl App {
                         })
                         .take(12)
                         .collect::<Vec<_>>();
+                    if !conversation.is_empty() {
+                        recent.truncate(4);
+                    }
+                    recent.sort_by(|a, b| {
+                        a.sent_at
+                            .cmp(&b.sent_at)
+                            .then_with(|| a.header.id.cmp(&b.header.id))
+                    });
                     lines.push(if conversation.is_empty() && !recent.is_empty() {
                         "ST3 MESSAGES · native transcript unavailable".into()
                     } else {
@@ -2902,7 +2904,7 @@ mod tests {
     fn status_only_chat_keeps_graph_messages_at_the_bottom() {
         let mut model = Model::default();
         model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/omp","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"OMP","state":"running","reachability":"reachable","current_session_id":"session/omp"}"#).unwrap());
-        for number in 0..4 {
+        for number in 0..6 {
             model.messages.items.push(serde_json::from_value(serde_json::json!({
                 "kind":"message", "id":format!("message/{number}"), "revision":"one",
                 "updated_at":"2026-09-25T08:00:00Z", "from":"agent/cos", "to":"agent/omp",
@@ -2927,7 +2929,7 @@ mod tests {
             content.contains("ST3 messages · transcript unavailable"),
             "{content}"
         );
-        assert!(content.contains("message 3:"), "{content}");
+        assert!(content.contains("message 5:"), "{content}");
     }
     #[test]
     fn recent_message_preserves_line_breaks_without_return_glyphs() {
