@@ -54,6 +54,18 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
 
 ## Candidate and recovery proof
 
+- The separate replication workers were restarted under COS's prior ACK after
+  the operator recovered on a fresh thread. Hetz changed from PID `79278` to
+  `1160828`, running the installed `3db863d` binary SHA
+  `4659b2d9183f03942d3577232505795d86382a47e268e7fe79f529f5dfec3c61`.
+  Silber changed from PID `2106` to `90745`, running its installed binary SHA
+  `0d90adb81844c35a4cee28beb42138a07fa9073deb0a62d9dcb9998d33b7fbc1`.
+  The daemon PIDs stayed `595654` and `45998`. Both immediate strict doctors
+  passed, each signed peer was `up`, and both replicas had zero pending,
+  invalid, or unhealthy records. The gate watcher reported a healthy idle
+  preflight at 08:15 UTC; the delivery monitor remained active and its last
+  pre-restart exact receipt was at 08:14:16 UTC. COS was asked to check each
+  host independently after its worker restart. Neither gate window was reset.
 - A connected iOS simulator exposed that the old paired-device grant contained
   only projection and terminal reads plus attention and launch control. Chat
   sends, mission/work actions, and terminal input could not work through that
