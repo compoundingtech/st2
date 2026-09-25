@@ -425,7 +425,12 @@ fn mission_resources(
             let definition = definitions.get(&mission);
             let latest = runs.last();
             let state = if runs.is_empty() {
-                "ready"
+                match definition.map(|(definition, _)| &definition.state) {
+                    Some(crate::model::MissionState::Draft) => "draft",
+                    Some(crate::model::MissionState::Ready) => "ready",
+                    Some(crate::model::MissionState::Retired) => "retired",
+                    None => "ready",
+                }
             } else if runs.iter().any(|run| run.status == "running") {
                 "running"
             } else if runs.iter().any(|run| run.status == "standing") {
@@ -442,7 +447,7 @@ fn mission_resources(
                     _ => "ready",
                 }
             };
-            let historical = matches!(state, "completed" | "failed" | "cancelled");
+            let historical = matches!(state, "completed" | "failed" | "cancelled" | "retired");
             if !history && historical {
                 return Ok(None);
             }
@@ -4438,6 +4443,43 @@ mission "example/zero-run" state="ready" {
             details[0]["visualization"]["mission"],
             "mission/example/zero-run"
         );
+
+        let retired_source = source.replace("state=\"ready\"", "state=\"retired\"");
+        let retired = crate::graph::parse_intent(&retired_source, "zero-run-node").unwrap();
+        let retired_preview = state
+            .store
+            .mission(
+                &retired,
+                crate::model::IntentInput {
+                    kdl: retired_source,
+                    source_name: Some("retired-zero-run.kdl".into()),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(
+                &retired,
+                &retired_preview.subject_tokens,
+                "retire-zero-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert!(
+            current
+                .iter()
+                .all(|value| value["id"] != "mission/example/zero-run")
+        );
+        let retired_resources =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        let retired_mission = retired_resources
+            .iter()
+            .find(|value| value["id"] == "mission/example/zero-run")
+            .unwrap();
+        assert_eq!(retired_mission["state"], "retired");
+        assert_eq!(retired_mission["operational"]["actionable"], false);
     }
 
     #[tokio::test]
