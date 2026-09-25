@@ -41,6 +41,17 @@ at 04:25:22 UTC and logged a fresh exact receipt in both directions by
 window cannot pass. A six-minute one-per-direction diagnostic passed, but it
 is not release evidence.
 
+The same response-loss recovery was extended to the local Hetz send path in
+`86d7df0`. Two isolated live probes deliberately discarded a successful local
+send response and substituted malformed JSON after a successful send;
+both recovered the single exact-token durable request and its linked reply in
+26 seconds. The continuing monitor was stopped while sleeping and restarted
+on the new script at 05:48:41 UTC. The first new exact Hetz→Silber receipt
+arrived at 05:49:08 UTC, 2 minutes 23 seconds after the preceding successful
+Silber→Hetz receipt; the append-only log has no failed probe or excessive gap
+from this restart. The 05:08:50 UTC release markers were not reset. The full
+72-hour report remains the only release verdict.
+
 ## Candidate and recovery proof
 
 - A connected iOS simulator exposed that the old paired-device grant contained
