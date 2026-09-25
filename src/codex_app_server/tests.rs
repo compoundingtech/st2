@@ -1919,7 +1919,7 @@ fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping()
     )
     .unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
-    let mut state = subscribed_state(CodexObservedState::Active {
+    let state = subscribed_state(CodexObservedState::Active {
         turn_id: "turn-live".into(),
     });
     let steer = delivery.maybe_request(&state).unwrap().unwrap();
@@ -1948,25 +1948,15 @@ fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping()
     )
     .unwrap();
 
-    delivery.next_delivery_receipt_refresh = Instant::now();
-    let read = delivery
-        .maybe_snapshot_request(&state)
-        .unwrap()
-        .expect("accepted head needs a typed-history receipt check");
-    assert_eq!(read["method"], "thread/read");
+    assert!(delivery.maybe_snapshot_request(&state).unwrap().is_none());
     delivery
-        .accept_snapshot_response(
-            &json!({
-                "id": read["id"],
-                "result": {"thread": {
-                    "id": "thread-main",
-                    "status": {"type": "active", "activeFlags": []},
-                    "turns": [{"id": "turn-live", "status": "inProgress", "items": [
-                        {"type": "userMessage", "clientId": client_id, "content": []}
-                    ]}]
-                }}
-            }),
-            &mut state,
+        .accept_transcript_receipts(
+            &[json!({
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "thread_id": "thread-main",
+                    "item": {"type": "UserMessage", "client_id": client_id}}
+            })],
+            "thread-main",
         )
         .unwrap();
     assert_eq!(
@@ -1988,6 +1978,75 @@ fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping()
         next["params"]["clientUserMessageId"],
         stable_client_user_message_id("h.worker", "thread-main", &second)
     );
+}
+
+#[test]
+fn a_delivery_on_a_history_larger_than_the_control_limit_uses_bounded_reads() {
+    let mut request_lengths = Vec::new();
+    let mut transcript_bytes_read = Vec::new();
+    for history_bytes in [
+        0,
+        CODEX_CONTROL_MAX_MESSAGE_BYTES as u64 + 1024,
+        2 * CODEX_CONTROL_MAX_MESSAGE_BYTES as u64 + 1024,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "ping").unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-live".into(),
+        });
+        let snapshot = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+        assert_eq!(snapshot["params"]["includeTurns"], false);
+        request_lengths.push(serde_json::to_vec(&snapshot).unwrap().len());
+        delivery
+            .accept_snapshot_response(
+                &json!({"id": snapshot["id"], "result": {"thread": {
+                    "id": "thread-main", "status": {"type": "active"}, "turns": []
+                }}}),
+                &mut state,
+            )
+            .unwrap();
+        let request = delivery.maybe_request(&state).unwrap().unwrap();
+        let client_id = request["params"]["clientUserMessageId"].as_str().unwrap();
+        delivery
+            .accept_response(
+                &json!({"id": request["id"], "result": {"turnId": "turn-live"}}),
+                state.observed(),
+            )
+            .unwrap();
+        assert!(delivery.maybe_snapshot_request(&state).unwrap().is_none());
+
+        let transcript = tmp.path().join("rollout.jsonl");
+        let mut file = File::create(&transcript).unwrap();
+        file.set_len(history_bytes).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(file).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": "thread-main",
+                "item": {"type": "UserMessage", "client_id": client_id}
+            }})
+        )
+        .unwrap();
+        let (frames, bytes_read) = codex_transcript_tail_with_bytes(&transcript).unwrap();
+        transcript_bytes_read.push(bytes_read);
+        delivery
+            .accept_transcript_receipts(&frames, "thread-main")
+            .unwrap();
+        assert_eq!(
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
+        );
+        assert!(file.metadata().unwrap().len() > history_bytes);
+    }
+    assert_eq!(request_lengths[0], request_lengths[1]);
+    assert_eq!(request_lengths[1], request_lengths[2]);
+    assert_eq!(transcript_bytes_read[1], TRANSCRIPT_TURN_RECOVERY_BYTES);
+    assert_eq!(transcript_bytes_read[1], transcript_bytes_read[2]);
 }
 
 #[test]
@@ -2346,7 +2405,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         assert_eq!(snapshot["id"], FIRST_DELIVERY_REQUEST_ID);
         assert_eq!(snapshot["method"], "thread/read");
         assert_eq!(snapshot["params"]["threadId"], "thread-main");
-        assert_eq!(snapshot["params"]["includeTurns"], true);
+        assert_eq!(snapshot["params"]["includeTurns"], false);
         write_json_message(
             &mut websocket,
             &json!({
@@ -3554,7 +3613,7 @@ fn a_typed_item_recovers_the_startup_turn_for_immediate_steering() {
 }
 
 #[test]
-fn delivery_reads_the_current_turn_on_demand_before_steering() {
+fn delivery_reads_bounded_status_and_fences_the_subscribed_turn_before_steering() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
@@ -3569,7 +3628,7 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
     state.subscribed = true;
     state.observed = CodexObservedState::Active {
-        turn_id: "turn-stale".into(),
+        turn_id: "turn-current".into(),
     };
 
     let read = delivery
@@ -3577,7 +3636,7 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
         .unwrap()
         .expect("an unread inbox head requires a fresh thread snapshot");
     assert_eq!(read["method"], "thread/read");
-    assert_eq!(read["params"]["includeTurns"], true);
+    assert_eq!(read["params"]["includeTurns"], false);
     let read_id = read["id"].clone();
     assert!(
         delivery
@@ -3588,7 +3647,7 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
                         "thread": {
                             "id": "thread-main",
                             "status": { "type": "active", "activeFlags": [] },
-                            "turns": [{ "id": "turn-current", "status": "inProgress", "items": [] }]
+                            "turns": []
                         }
                     }
                 }),
@@ -3602,7 +3661,12 @@ fn delivery_reads_the_current_turn_on_demand_before_steering() {
         .expect("the verified current turn is steerable");
     assert_eq!(steer["method"], "turn/steer");
     assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
-    assert_ne!(steer["params"]["expectedTurnId"], "turn-stale");
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-current".into()
+        }
+    );
 }
 
 #[test]

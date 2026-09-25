@@ -31,8 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-// A thread/read snapshot can contain a long rollout transcript in one frame. Keep
-// this finite, but above the provider's 16 MiB default frame limit.
+// Bound unexpected provider frames independently of the size of a saved thread.
 const CODEX_CONTROL_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 use crate::{
@@ -109,7 +108,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const TRANSCRIPT_TURN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const TRANSCRIPT_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const DELIVERY_RECEIPT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_REQUEST_ATTEMPTS: u8 = 3;
 const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
@@ -589,7 +587,6 @@ struct CodexInboxDelivery {
     next_inbox_refresh: Instant,
     next_presence_refresh: Instant,
     next_context_transcript_refresh: Instant,
-    next_delivery_receipt_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
     ledger: delivery_ledger::Ledger,
@@ -728,7 +725,6 @@ impl CodexInboxDelivery {
             next_inbox_refresh: Instant::now(),
             next_presence_refresh: Instant::now(),
             next_context_transcript_refresh: Instant::now(),
-            next_delivery_receipt_refresh: Instant::now(),
             head: None,
             suppressed: false,
             ledger,
@@ -1115,34 +1111,15 @@ impl CodexInboxDelivery {
         let Some(head) = self.head.as_ref() else {
             return Ok(None);
         };
-        // A successful turn/steer result is only transport acceptance. Codex may omit the
-        // corresponding user-message notification on this secondary subscriber while the
-        // owning turn runs for hours. Re-read typed history at a bounded cadence so a consumed
-        // FIFO head cannot indefinitely hide later PINGs.
+        // A successful turn/steer result is only transport acceptance. The live typed
+        // notification or the bounded rollout tail supplies the consumption receipt; reading
+        // all turns here makes each poll grow with the lifetime of the thread.
         if self
             .ledger
             .entry(&head.filename)
             .is_some_and(|entry| entry.phase == delivery_ledger::Phase::TransportAccepted)
         {
-            if Instant::now() < self.next_delivery_receipt_refresh {
-                return Ok(None);
-            }
-            self.next_delivery_receipt_refresh = Instant::now() + DELIVERY_RECEIPT_REFRESH_INTERVAL;
-            let request_id = self.next_request_id;
-            self.next_request_id = self
-                .next_request_id
-                .checked_add(1)
-                .context("Codex delivery request ID overflow")?;
-            self.pending_snapshot = Some(PendingCodexSnapshot {
-                request_id,
-                filename: head.filename.clone(),
-                requested_at: Instant::now(),
-            });
-            return Ok(Some(json!({
-                "method": "thread/read",
-                "id": request_id,
-                "params": { "threadId": state.thread_id(), "includeTurns": true }
-            })));
+            return Ok(None);
         }
         if self
             .verified_snapshot
@@ -1181,7 +1158,7 @@ impl CodexInboxDelivery {
             "id": request_id,
             "params": {
                 "threadId": state.thread_id(),
-                "includeTurns": true,
+                "includeTurns": false,
             }
         })))
     }
@@ -1207,59 +1184,19 @@ impl CodexInboxDelivery {
             self.finish_failed_snapshot(pending, state, "was rejected");
             return Ok(true);
         }
-        self.accept_history_receipts(message, state.thread_id())?;
-        let observed = match observed_from_thread_snapshot(message, state.thread_id()) {
-            Ok(observed) => observed,
-            Err(error) => {
-                tracing::warn!("st2 codex: invalid thread/read response; retrying: {error:#}");
-                self.finish_failed_snapshot(pending, state, "was invalid");
-                return Ok(true);
-            }
-        };
+        let observed =
+            match observed_from_thread_snapshot(message, state.thread_id(), &state.observed) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    tracing::warn!("st2 codex: invalid thread/read response; retrying: {error:#}");
+                    self.finish_failed_snapshot(pending, state, "was invalid");
+                    return Ok(true);
+                }
+            };
         state.observed = observed.clone();
         self.verified_snapshot = Some((pending.filename, observed));
         self.snapshot_attempts = 0;
         Ok(true)
-    }
-
-    fn accept_history_receipts(&mut self, message: &Value, thread_id: &str) -> Result<()> {
-        if message.pointer("/result/thread/id").and_then(Value::as_str) != Some(thread_id) {
-            return Ok(());
-        }
-        let Some(turns) = message
-            .pointer("/result/thread/turns")
-            .and_then(Value::as_array)
-        else {
-            return Ok(());
-        };
-        let consumed = self
-            .ledger
-            .entries()
-            .iter()
-            .filter(|entry| {
-                entry.binding == thread_id
-                    && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
-                    && entry.phase < delivery_ledger::Phase::Consumed
-                    && turns.iter().any(|turn| {
-                        turn.get("items")
-                            .and_then(Value::as_array)
-                            .is_some_and(|items| {
-                                items.iter().any(|item| {
-                                    item.get("type").and_then(Value::as_str) == Some("userMessage")
-                                        && item.get("clientId").and_then(Value::as_str)
-                                            == Some(entry.correlation.value.as_str())
-                                })
-                            })
-                    })
-            })
-            .map(|entry| entry.filename.clone())
-            .collect::<Vec<_>>();
-        for filename in consumed {
-            self.ledger
-                .record(&filename, delivery_ledger::Evidence::Consumed)?;
-            self.next_inbox_refresh = Instant::now();
-        }
-        Ok(())
     }
 
     fn finish_failed_snapshot(
@@ -1361,10 +1298,7 @@ impl CodexInboxDelivery {
         // settle clients (including Codex 0.146) that omit the correlated user-message receipt.
         self.ledger
             .accept_codex_turn(&pending.filename, accepted_turn_id)?;
-        // Give the live typed notification a chance to arrive before polling history. In
-        // particular, a terminal that closes just after emitting its receipt must not lose that
-        // buffered frame to a speculative thread/read write on the closing socket.
-        self.next_delivery_receipt_refresh = Instant::now() + DELIVERY_RECEIPT_REFRESH_INTERVAL;
+        // The live typed notification and bounded rollout tail settle consumption.
         self.rejected = None;
         Ok(true)
     }
@@ -2038,6 +1972,7 @@ impl CodexControlState {
 fn observed_from_thread_snapshot(
     message: &Value,
     expected_thread_id: &str,
+    previous: &CodexObservedState,
 ) -> Result<CodexObservedState> {
     let thread_id = required_string(message, "/result/thread/id", "thread/read response")?;
     anyhow::ensure!(
@@ -2068,30 +2003,52 @@ fn observed_from_thread_snapshot(
             },
         });
     }
-    let active_turns = message
-        .pointer("/result/thread/turns")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
-        .filter_map(|turn| turn.get("id").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    Ok(match active_turns.as_slice() {
-        [turn_id] => match blocked {
-            Some(reason) => CodexObservedState::Held {
-                reason,
-                turn_id: Some((*turn_id).to_string()),
-            },
-            None => CodexObservedState::Active {
-                turn_id: (*turn_id).to_string(),
-            },
+    // includeTurns=false deliberately gives no turn inventory. The subscription and bounded
+    // transcript tail establish the exact turn ID; the status read only confirms its liveness.
+    Ok(match (previous, blocked) {
+        (CodexObservedState::Active { turn_id }, Some(reason)) => CodexObservedState::Held {
+            reason,
+            turn_id: Some(turn_id.clone()),
         },
-        [] => CodexObservedState::Held {
-            reason: blocked.unwrap_or(CodexHoldReason::ActiveWithoutTurn),
+        (CodexObservedState::Active { turn_id }, None) => CodexObservedState::Active {
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                turn_id,
+            },
+            Some(reason),
+        ) => CodexObservedState::Held {
+            reason,
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                turn_id: Some(turn_id),
+            },
+            None,
+        ) => CodexObservedState::Active {
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason:
+                    CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::UnknownProtocol
+                    | CodexHoldReason::ConflictingTurn,
+                ..
+            },
+            _,
+        ) => previous.clone(),
+        (_, Some(reason)) => CodexObservedState::Held {
+            reason,
             turn_id: None,
         },
-        [_, _, ..] => CodexObservedState::Held {
-            reason: CodexHoldReason::ConflictingTurn,
+        (_, None) => CodexObservedState::Held {
+            reason: CodexHoldReason::ActiveWithoutTurn,
             turn_id: None,
         },
     })
@@ -4301,23 +4258,32 @@ fn active_turn_from_codex_transcript(path: &Path) -> Result<Option<String>> {
 }
 
 fn codex_transcript_tail(path: &Path) -> Result<Vec<Value>> {
+    Ok(codex_transcript_tail_with_bytes(path)?.0)
+}
+
+fn codex_transcript_tail_with_bytes(path: &Path) -> Result<(Vec<Value>, u64)> {
     let mut file =
         File::open(path).with_context(|| format!("read Codex transcript {}", path.display()))?;
     let length = file.metadata()?.len();
     let start = length.saturating_sub(TRANSCRIPT_TURN_RECOVERY_BYTES);
     file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
+    // The rollout can grow while it is being read. Cap the stream itself so a busy writer
+    // cannot make one recovery pass read past this fixed window.
+    let mut reader = BufReader::new(file.take(TRANSCRIPT_TURN_RECOVERY_BYTES));
     if start != 0 {
         let mut partial = String::new();
         reader.read_line(&mut partial)?;
     }
     let mut frames = Vec::new();
-    for line in reader.lines() {
+    for line in (&mut reader).lines() {
         if let Ok(value) = serde_json::from_str::<Value>(&line?) {
             frames.push(value);
         }
     }
-    Ok(frames)
+    Ok((
+        frames,
+        TRANSCRIPT_TURN_RECOVERY_BYTES - reader.get_ref().limit(),
+    ))
 }
 
 fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
