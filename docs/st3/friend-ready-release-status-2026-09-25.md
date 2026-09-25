@@ -1,14 +1,48 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Daemon candidate `3db863d` is deployed to both active hosts;
-the latest app/client source is `5de494f`. The
-default 24-hour idle and 72-hour bidirectional delivery gates have not elapsed.
+**Release hold.** Daemon candidate `623f9cb` is deployed to both active hosts.
+The TUI and iOS repairs are in progress. The 24-hour idle and 72-hour
+bidirectional delivery windows that began at 05:08:50 UTC are invalid after
+the daemon restarts and will be reset after the final tested rollout.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
 short diagnostic into release evidence.
 The [friend trial handoff](friend-trial-handoff.md) is staged for that review,
 not an invitation to start the trial while this hold is active.
+
+## 08:55 UTC Codex recovery and bounded-read rollouts
+
+- `b4b23f0` fixed fresh-thread Codex restarts, raised the control frame guard
+  to 64 MiB, and stopped repeated short-exit relaunches with one durable
+  attention request. The controlled restart of
+  `agent/fleet/st3/recovery-probe-20260925` changed its thread ID from
+  `01a0d7b9-0a5a-7400-8c2a-084b4056fbd5` to
+  `01a0d7b9-6291-7050-9e1e-ac6a7c3eeb16`; the probe was stopped. Both
+  hosts passed strict doctor and COS's independent checks after this rollout.
+- `623f9cb` stopped repeated full-history `thread/read` calls. Status reads
+  now omit turns; live events and a hard-capped 2 MiB transcript tail settle
+  native delivery. The focused 81 Codex tests include delivery and exact
+  receipt on transcripts larger than the former control limit, with bounded
+  request and transcript bytes. The full st2 suite passed with the documented
+  optional otel skip, and st3 passed 410 library and 87 CLI tests.
+- Hetz installed `623f9cb` SHA
+  `42dbf325460808bc88b47240e4e81deabda599f9024b071dcb722f5ee8134ca8`
+  at 08:54 UTC, daemon PID `1297290`, replication worker PID `1297308`.
+  Silber installed SHA
+  `6681e3c7ff337dd27b0e3717064e86fdfa35146587b7c1c010718d48b24b60aa`
+  at 08:55 UTC, daemon PID `50189`, replication worker PID `50198`.
+  Strict doctors passed on both hosts, signed peers were up, and unresolved
+  and unhealthy replication counts were zero. The delivery monitor recorded
+  a Hetz-to-Silber exact linked receipt at 08:54:44 UTC. COS independently
+  checked both hosts at 08:55:50 and 08:56:09 UTC: both new PIDs were live,
+  both signed peers were up with zero pending, invalid, or unhealthy records,
+  both standing seats were reachable, and the Silber restart notice arrived
+  natively. `nix build .#st3 --no-link` passed from `623f9cb`, including
+  release-profile checks for 410 st3 library, 87 CLI, and 17 stui tests.
+- The old 05:08:50 UTC idle window now has two daemon PIDs on each host and
+  a retained Silber bad sample. Its alert is an expected release hold, not
+  evidence for the next window. The original append-only logs remain intact.
 
 Monitoring commit `8817b15` adds an early post-rollout evidence preflight. It
 notifies the operator of a bad sample, PID change, stale host, or excessive gap
@@ -170,14 +204,14 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
 
 ## Pending release evidence
 
-- The post-rollout two-host idle window restarted at 2026-09-25 05:08:50 UTC,
-  after both `3db863d` restarts and COS's independent check. The unmodified
-  report cannot pass before 2026-09-26 05:08:50 UTC. It must show one stable PID per host, no missing or
+- The former post-rollout two-host idle window started at 2026-09-25 05:08:50 UTC,
+  after both `3db863d` restarts and COS's independent check. It is invalidated
+  by the later daemon restarts. The next complete 24-hour window must show one stable PID per host, no missing or
   bad samples, enough quiet intervals, CPU within the stated limits, and flat
   last-hour RSS relative to the first hour.
-- The complete-failure-logging delivery window restarted at 2026-09-25
-  05:08:50 UTC. Its unmodified 72-hour report cannot pass before 2026-09-28
-  05:08:50 UTC. It requires at least 400 exact receipts per direction, no failures or
+- The former complete-failure-logging delivery window started at 2026-09-25
+  05:08:50 UTC and is retained only for diagnosis. The next complete 72-hour
+  report requires at least 400 exact receipts per direction, no failures or
   excessive gaps, and an active, current monitor.
 - Keep inspecting peer status, last successful exchange, and errors throughout
   the soak. The current status API does not expose exact live TCP dial counts;
