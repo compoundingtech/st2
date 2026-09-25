@@ -1244,7 +1244,22 @@ fn stdin_hung_up() -> bool {
     // A closed PTY master leaves a POLLHUP/POLLERR on the slave; crossterm's
     // event reader can otherwise spin or block after the terminal disappears.
     let result = unsafe { libc::poll(&mut fd, 1, 0) };
-    result > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    result > 0 && terminal_closed(fd.revents)
+}
+fn terminal_closed(revents: libc::c_short) -> bool {
+    if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if revents & libc::POLLIN != 0 {
+        // Darwin reports a tmux pane's closed slave as readable EOF without POLLHUP.
+        // crossterm then reads zero bytes in a tight loop unless we check the queue.
+        let mut queued: libc::c_int = 0;
+        if unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) } == 0 && queued == 0 {
+            return true;
+        }
+    }
+    false
 }
 fn poll_terminal() -> Result<bool> {
     let mut fd = libc::pollfd {
@@ -1259,7 +1274,7 @@ fn poll_terminal() -> Result<bool> {
         }
         return Err(io::Error::last_os_error().into());
     }
-    if fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+    if terminal_closed(fd.revents) {
         return Ok(false);
     }
     Ok(true)

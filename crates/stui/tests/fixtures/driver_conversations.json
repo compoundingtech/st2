@@ -10,7 +10,8 @@
     "driver": "claude",
     "messages": [
       {"sequence": 2, "role": "assistant", "text": "<thinking>private\nnotes</thinking>Visible first line\nVisible second line", "expected": "assistant: Visible first line\nVisible second line"},
-      {"sequence": 1, "role": "user", "text": "Please check", "expected": "user: Please check"}
+      {"sequence": 1, "role": "user", "text": "Please check", "expected": "user: Please check"},
+      {"sequence": 3, "role": "user", "text": "<channel source=\"plugin:st3-channel:st3\" messageFilename=\"123.md\" identity=\"app-apple\">\n[st3-delivery:123.md]\nPlease inspect the fleet.\n</channel>", "expected": "user: Please inspect the fleet."}
     ]
   },
   {

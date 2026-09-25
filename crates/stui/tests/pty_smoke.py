@@ -12,6 +12,8 @@ import os
 import pty
 import re
 import select
+import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -166,6 +168,49 @@ def hangup_case(binary: str) -> None:
     print("hangup: exited after PTY close")
 
 
+def tmux_hangup_case(binary: str) -> None:
+    tmux = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    if not os.path.exists(tmux):
+        print("tmux hangup: skipped (tmux unavailable)")
+        return
+    socket_name = f"stui-pty-smoke-{os.getpid()}"
+    target = "hup"
+    base = [tmux, "-L", socket_name]
+    subprocess.run(
+        base + ["new-session", "-d", "-s", target,
+                f"exec env ST3_PERSON=person/nathan {shlex.quote(binary)}"],
+        check=True, capture_output=True,
+    )
+    pid = int(subprocess.check_output(
+        base + ["display-message", "-p", "-t", f"{target}:0.0", "#{pane_pid}"],
+    ))
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            command = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True)
+            if "stui" in command:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("tmux hangup: TUI did not start")
+        subprocess.run(base + ["kill-session", "-t", target], check=True, capture_output=True)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print("tmux hangup: exited after session close")
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"tmux hangup: TUI {pid} survived session close")
+    finally:
+        subprocess.run(base + ["kill-session", "-t", target], capture_output=True)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 if __name__ == "__main__":
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
     skip_panic = "--no-panic" in sys.argv[2:]
@@ -176,3 +221,4 @@ if __name__ == "__main__":
         run_case(binary, case)
     delayed_getter_case(binary)
     hangup_case(binary)
+    tmux_hangup_case(binary)

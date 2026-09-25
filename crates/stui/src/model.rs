@@ -604,7 +604,32 @@ pub fn clean_message_text(raw: &str) -> String {
     }
 }
 fn strip_internal_markup(input: &str) -> String {
-    let mut text = input.to_owned();
+    let mut in_st3_channel = false;
+    let mut text = input
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("<channel ")
+                && trimmed.contains("source=\"plugin:st3-channel:st3\"")
+                && trimmed.ends_with('>')
+            {
+                in_st3_channel = true;
+                return None;
+            }
+            if in_st3_channel && trimmed == "</channel>" {
+                in_st3_channel = false;
+                return None;
+            }
+            if trimmed.starts_with("[st3-delivery:") && trimmed.ends_with(".md]") {
+                return None;
+            }
+            Some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if input.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
     for tag in [
         "analysis",
         "thinking",

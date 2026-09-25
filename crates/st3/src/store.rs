@@ -7794,6 +7794,20 @@ impl Store {
         current_harness_at(&connection, subject, None)
     }
 
+    pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        let found: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims
+             WHERE subject=?1 AND kind='harness.observed'
+               AND json_extract(body, '$.fields.incarnation_id')=?2
+               AND json_extract(body, '$.fields.state') IN ('ready','working','idle')
+               AND coalesce(json_extract(body, '$.fields.reason'),'')!='providerAuth')",
+            params![subject, incarnation],
+            |row| row.get(0),
+        )?;
+        Ok(found != 0)
+    }
+
     /// Returns true only when durable runtime evidence proves that a claimed work incarnation is
     /// no longer the actor's live incarnation. Absence of runtime evidence is unknown, not death.
     pub fn work_claim_is_orphaned(&self, work: &StepRunView) -> Result<bool> {

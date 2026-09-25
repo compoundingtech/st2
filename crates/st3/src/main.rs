@@ -6434,7 +6434,8 @@ async fn run_st2_native_driver(
                         predecessor_harness_record.as_deref(),
                         current_record.as_deref(),
                     );
-                    if current_harness_record_started
+                    if native_file_may_override_channel(driver)
+                        && current_harness_record_started
                         && let Some(observed) = st2::harness_state::read(&harness_state_path, None)
                     {
                         // A session claim is a startup fence, not an observation. Preserve the
@@ -6617,6 +6618,10 @@ fn harness_record_belongs_to_current_session(
     current: Option<&[u8]>,
 ) -> bool {
     already_started || current.is_some_and(|bytes| Some(bytes) != predecessor)
+}
+
+fn native_file_may_override_channel(driver: &str) -> bool {
+    !matches!(driver, "pi" | "omp")
 }
 
 fn prepare_native_driver(subject: &str) -> Result<(PathBuf, PathBuf, String, String)> {
@@ -9192,6 +9197,19 @@ mod tests {
             harness_record_belongs_to_current_session(true, Some(predecessor), Some(predecessor)),
             "once the successor fenced ownership, predecessor bytes cannot regain ownership"
         );
+    }
+
+    #[test]
+    fn extension_channel_state_outlives_its_st2_launch_placeholder() {
+        for driver in ["pi", "omp"] {
+            assert!(
+                !native_file_may_override_channel(driver),
+                "{driver} reports harness state through the ST3 extension channel"
+            );
+        }
+        for driver in ["claude", "opencode"] {
+            assert!(native_file_may_override_channel(driver));
+        }
     }
 
     #[test]

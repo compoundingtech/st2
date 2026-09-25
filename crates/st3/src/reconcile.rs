@@ -890,6 +890,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
 
+        // This deadline describes startup only. A harness that was ready and later lost
+        // observation needs a delivery/health diagnosis, not a false startup failure.
+        if self
+            .store
+            .harness_was_ready(&subject.subject, incarnation)?
+        {
+            return Ok(());
+        }
+
         let runtime_claim = self
             .store
             .claims_for(&subject.subject, Some("runtime.observed"))?
@@ -13914,6 +13923,83 @@ version 2
                 .actor
                 .as_deref(),
             Some("daemon/runtime")
+        );
+    }
+
+    #[test]
+    fn a_harness_that_was_ready_does_not_get_a_startup_deadline_when_it_later_degrades() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"omp\" {{ prompt \"Wait.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "ready-before-degraded");
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let member = desired.member.as_ref().unwrap();
+        let observation = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        };
+        let runtime_claim = store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: member_fields(member, "running", Some("worker-one"), true),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("runtime-worker-one".into()),
+            })
+            .unwrap();
+        for (state, key) in [("idle", "ready"), ("indeterminate", "stale")] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: desired.subject.clone(),
+                    kind: "harness.observed".into(),
+                    actor: Some(desired.subject.clone()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("omp".into())),
+                        ("incarnation_id".into(), Value::String("worker-one".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("worker-one-{key}")),
+                })
+                .unwrap();
+        }
+        let (event_notify, _) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_event_notify(event_notify);
+        let after_deadline = runtime_claim.accepted_at_unix_ms + HARNESS_READINESS_DEADLINE_MS + 1;
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &observation, after_deadline)
+            .unwrap();
+        assert!(
+            store
+                .claims_for(&desired.subject, Some("runtime.readiness-deadline-reached"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
         );
     }
 
