@@ -1279,6 +1279,28 @@ fn poll_terminal() -> Result<bool> {
     }
     Ok(true)
 }
+#[cfg(target_os = "macos")]
+fn watch_terminal_hangup() {
+    // On Darwin, crossterm can loop inside event::poll on PTY EOF and never
+    // return to the main loop's terminal check. A separate poller observes the
+    // hangup without consuming input. Once the PTY is gone there is no terminal
+    // left to restore, so end the process even if crossterm is stuck.
+    std::thread::spawn(|| {
+        loop {
+            let mut fd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut fd, 1, 100) } > 0 && terminal_closed(fd.revents) {
+                std::thread::sleep(Duration::from_millis(25));
+                if stdin_hung_up() {
+                    std::process::exit(0);
+                }
+            }
+        }
+    });
+}
 fn agent_label(agent: &st3_client::Agent) -> String {
     let slug = agent.name.rsplit('/').next().unwrap_or(&agent.name);
     slug.split('-')
@@ -2180,6 +2202,8 @@ fn main() -> Result<()> {
     let mut app = App::new(Model::default());
     app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;
+    #[cfg(target_os = "macos")]
+    watch_terminal_hangup();
     #[cfg(debug_assertions)]
     if std::env::var_os("STUI_TEST_PANIC_AFTER_ENTER").is_some() {
         panic!("terminal restoration probe");
