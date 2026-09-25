@@ -2111,11 +2111,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 continue;
             }
-            if run.phase == "revision-draining"
-                && self.store.apply_drained_revision(&run.id)?.is_some()
-            {
-                changed = true;
-                continue;
+            if run.phase == "revision-draining" {
+                if self.store.apply_drained_revision(&run.id)?.is_some() {
+                    changed = true;
+                    continue;
+                }
+                // A replica can receive the old proposal's draining claim after the
+                // successor generation. Recover the persisted run phase when no
+                // draining proposal still targets its current generation.
+                if !self
+                    .store
+                    .revision_proposal_for_run(&run.id)?
+                    .is_some_and(|proposal| proposal.status == "draining")
+                {
+                    changed |=
+                        self.store
+                            .set_mission_run_state(&run.id, &run.status, "normal", None)?;
+                    continue;
+                }
             }
             let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
             let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
@@ -12877,6 +12890,47 @@ version 2
             store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
+    }
+
+    #[test]
+    fn a_run_recovers_from_drain_after_its_proposal_is_gone() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+mission "recover-drain" state="ready" {
+  goal "Keep one step available while a stale drain is repaired."
+  step "wait" {
+    assigned-to "agent/missing"
+    goal "Wait for a worker."
+  }
+}
+"#,
+            "publish-recover-drain",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "recover-drain".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-recover-drain".into(),
+            })
+            .unwrap();
+        store
+            .set_mission_run_state(&run.id, "running", "revision-draining", None)
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.mission_run(&run.id).unwrap().unwrap().phase, "normal");
     }
 
     #[test]

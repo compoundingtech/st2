@@ -1734,7 +1734,11 @@ impl Store {
         let connection = self.readers.get();
         let id = connection
             .query_row(
-                "SELECT id FROM revision_proposals WHERE run_id=?1 AND status IN ('pending-approval','draining') ORDER BY created_at_unix_ms DESC LIMIT 1",
+                "SELECT p.id FROM revision_proposals p
+                 JOIN mission_runs r ON r.id=p.run_id
+                 WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
+                   AND p.status IN ('pending-approval','draining')
+                 ORDER BY p.created_at_unix_ms DESC LIMIT 1",
                 [run],
                 |row| row.get::<_, String>(0),
             )
@@ -2243,7 +2247,11 @@ impl Store {
             }
             let proposal_id = connection
                 .query_row(
-                    "SELECT id FROM revision_proposals WHERE run_id=?1 AND status='draining' ORDER BY created_at_unix_ms LIMIT 1",
+                    "SELECT p.id FROM revision_proposals p
+                     JOIN mission_runs r ON r.id=p.run_id
+                     WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
+                       AND p.status='draining'
+                     ORDER BY p.created_at_unix_ms LIMIT 1",
                     [run_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -15452,8 +15460,17 @@ fn project_revision_proposal(
         if status == "draining" {
             transaction
                 .execute(
-                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![run.strip_prefix("mission-run/").unwrap_or(run), now],
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2
+                     WHERE id=?1 AND current_generation_id=?3 AND phase='normal'
+                       AND status IN ('running','standing','blocked')
+                       AND EXISTS (SELECT 1 FROM revision_proposals
+                                   WHERE id=?4 AND status='draining')",
+                    params![
+                        run.strip_prefix("mission-run/").unwrap_or(run),
+                        now,
+                        generation_id_from_subject(source),
+                        proposal_id
+                    ],
                 )
                 .map_err(internal)?;
         }
@@ -15516,7 +15533,9 @@ fn project_revision_proposal(
             transaction
                 .execute(
                     "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2
-                     WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
+                     WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)
+                       AND current_generation_id=(SELECT source_generation_id FROM revision_proposals WHERE id=?1)
+                       AND phase='normal' AND status IN ('running','standing','blocked')",
                     params![proposal_id, now],
                 )
                 .map_err(internal)?;
@@ -15545,7 +15564,9 @@ fn project_revision_proposal(
         transaction
             .execute(
                 "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2
-                 WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
+                 WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)
+                   AND current_generation_id=(SELECT source_generation_id FROM revision_proposals WHERE id=?1)
+                   AND phase='revision-draining'",
                 params![proposal_id, now],
             )
             .map_err(internal)?;
@@ -25026,6 +25047,22 @@ version 2
         assert_eq!(applied.status, "applied");
         assert_eq!(applied.mission_run.phase, "normal");
         assert_ne!(applied.mission_run.generation, run.generation);
+
+        // A late replica can project the draining proposal after the successor
+        // generation. It must not put an already cut-over run back into drain.
+        let created = store
+            .claims_for(&proposal.subject, Some("revision-proposal.created"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let fields = created.body.get("fields").unwrap_or(&created.body);
+            project_revision_proposal(&transaction, &created, fields).unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(store.mission_run(&run.id).unwrap().unwrap().phase, "normal");
     }
 
     #[test]
