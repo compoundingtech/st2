@@ -3370,6 +3370,63 @@ fn a_binding_from_another_runtime_incarnation_is_rejected() {
 }
 
 #[test]
+fn a_native_seat_restart_retires_the_old_thread_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("binding.json");
+    let prior = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    atomic_json(
+        &path,
+        &CodexThreadBinding::new(&prior, "thread-prior".into()),
+    )
+    .unwrap();
+
+    let selected = select_resume_thread(&path, "h.worker", "h.worker", false).unwrap();
+    assert_eq!(selected, None);
+    assert!(
+        !path.exists(),
+        "the old binding must not make this seat ready"
+    );
+    let prepared = prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref());
+    assert!(!prepared.tui_args.iter().any(|arg| arg == "resume"));
+    assert!(prepared.expected_resume.is_none());
+}
+
+#[test]
+fn codex_control_accepts_a_frame_larger_than_sixteen_mib() {
+    let _stop_exclusive = stop_flag_tests();
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let payload = "x".repeat(16 * 1024 * 1024 + 4096);
+    let expected_size = payload.len();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        let initialize = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(initialize["method"], "initialize");
+        write_json_message(&mut websocket, &json!({ "id": 0, "result": {} })).unwrap();
+        let initialized = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(initialized["method"], "initialized");
+        write_json_message(
+            &mut websocket,
+            &json!({ "method": "thread/read", "params": { "payload": payload } }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let mut websocket = initialize_control(stream).unwrap().unwrap();
+    let ControlRead::Message(message) = poll_json_message(&mut websocket).unwrap() else {
+        panic!("large control frame was not received");
+    };
+    assert_eq!(
+        message["params"]["payload"].as_str().unwrap().len(),
+        expected_size
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());

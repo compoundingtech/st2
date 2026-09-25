@@ -26,6 +26,8 @@ use crate::store::Store;
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
+const CODEX_CRASH_LOOP_ATTEMPTS: usize = 3;
+const CODEX_CRASH_LOOP_INTERVAL_MS: u128 = 5 * 60_000;
 
 fn claude_login_expired(screen: &str) -> bool {
     screen.contains("Login expired · Please run /login")
@@ -1496,6 +1498,48 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        if member.driver.as_deref() == Some("codex") {
+            let token = self
+                .store
+                .selected_desired_token(&subject.subject)?
+                .unwrap_or_default();
+            if self.codex_crash_loop_raised(&subject.subject, &token)? {
+                self.raise_codex_crash_loop(
+                    &subject.subject,
+                    &token,
+                    "the prior Codex crash loop remains stopped",
+                )?;
+                return Ok(());
+            }
+            let recent_failures = self
+                .store
+                .claims_for(&subject.subject, Some("runtime.action.failed"))?
+                .into_iter()
+                .filter(|claim| {
+                    claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
+                        && claim
+                            .body
+                            .pointer("/fields/desired_token")
+                            .and_then(Value::as_str)
+                            == Some(token.as_str())
+                        && now_ms().saturating_sub(claim.accepted_at_unix_ms)
+                            < CODEX_CRASH_LOOP_INTERVAL_MS
+                })
+                .collect::<Vec<_>>();
+            if recent_failures.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
+                let detail = recent_failures
+                    .last()
+                    .and_then(|claim| claim.body.pointer("/fields/reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("the runtime start failed");
+                self.raise_codex_crash_loop(
+                    &subject.subject,
+                    &token,
+                    &format!("Codex failed to launch three times: {detail}"),
+                )?;
+                return Ok(());
+            }
+        }
         let workspace = Path::new(&member.workspace);
         if workspace.exists() {
             anyhow::ensure!(
@@ -1578,15 +1622,24 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         if let Err(error) = self.runtime.start(&launch_member) {
             let reason = error.to_string();
-            self.record_once(
-                &subject.subject,
-                "runtime.action.failed",
-                BTreeMap::from([
+            let desired_token = self
+                .store
+                .selected_desired_token(&subject.subject)?
+                .unwrap_or_default();
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.failed".into(),
+                actor: None,
+                fields: BTreeMap::from([
                     ("action".into(), Value::String("start".into())),
                     ("operation".into(), Value::String(operation)),
                     ("reason".into(), Value::String(reason)),
+                    ("desired_token".into(), Value::String(desired_token)),
                 ]),
-            )?;
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })?;
             self.record_once(
                 &subject.subject,
                 "runtime.observed",
@@ -1640,6 +1693,20 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         observation: &RuntimeObservation,
     ) -> Result<()> {
+        if member.driver.as_deref() == Some("codex") {
+            let token = self
+                .store
+                .selected_desired_token(&subject.subject)?
+                .unwrap_or_default();
+            if self.codex_crash_loop_raised(&subject.subject, &token)? {
+                self.raise_codex_crash_loop(
+                    &subject.subject,
+                    &token,
+                    "the prior Codex crash loop remains stopped",
+                )?;
+                return Ok(());
+            }
+        }
         match self.restart_decision(subject, member, observation)? {
             RestartDecision::Start => {
                 self.delayed_restarts
@@ -1665,16 +1732,123 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.arm_restart(&subject.subject, until);
                 Ok(())
             }
-            RestartDecision::Fail { reason } => self.record_once(
-                &subject.subject,
-                "runtime.reconcile-decision",
-                BTreeMap::from([
+            RestartDecision::Fail { reason } => {
+                if member.driver.as_deref() == Some("codex") {
+                    let token = self
+                        .store
+                        .selected_desired_token(&subject.subject)?
+                        .unwrap_or_default();
+                    let diagnostic = self
+                        .store
+                        .claims_for(&subject.subject, Some("harness.diagnostic"))?
+                        .into_iter()
+                        .rev()
+                        .find(|claim| {
+                            claim.body.pointer("/fields/code").and_then(Value::as_str)
+                                == Some("codex-driver-failed")
+                                && claim
+                                    .body
+                                    .pointer("/fields/incarnation_id")
+                                    .and_then(Value::as_str)
+                                    == observation.incarnation_id.as_deref()
+                        })
+                        .and_then(|claim| {
+                            claim
+                                .body
+                                .pointer("/fields/reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    let detail = diagnostic
+                        .or_else(|| {
+                            observation
+                                .exit_code
+                                .map(|code| format!("last exit code {code}"))
+                        })
+                        .map_or(reason.clone(), |detail| format!("{reason}; {detail}"));
+                    self.raise_codex_crash_loop(&subject.subject, &token, &detail)
+                } else {
+                    self.record_once(
+                        &subject.subject,
+                        "runtime.reconcile-decision",
+                        BTreeMap::from([
+                            ("decision".into(), Value::String("raise".into())),
+                            ("reachability".into(), Value::String("unreachable".into())),
+                            ("reason".into(), Value::String(reason)),
+                        ]),
+                    )
+                }
+            }
+        }
+    }
+
+    fn codex_crash_loop_raised(&self, subject: &str, token: &str) -> Result<bool> {
+        let decision_key = format!("codex-crash-loop:{token}");
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.reconcile-decision"))?
+            .iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/key").and_then(Value::as_str)
+                    == Some(decision_key.as_str())
+            }))
+    }
+
+    fn raise_codex_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
+        let key = format!("codex-crash-loop:{subject}:{token}");
+        let decision_key = format!("codex-crash-loop:{token}");
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention_subject = format!("attention/{}", &digest[..32]);
+        let existing = self
+            .store
+            .claims_for(subject, Some("runtime.reconcile-decision"))?
+            .into_iter()
+            .find(|claim| {
+                claim.body.pointer("/fields/key").and_then(Value::as_str)
+                    == Some(decision_key.as_str())
+            });
+        let retained_reason = existing
+            .as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/reason"))
+            .and_then(Value::as_str)
+            .unwrap_or(reason);
+        let mut changed = false;
+        if existing.is_none() {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
                     ("decision".into(), Value::String("raise".into())),
                     ("reachability".into(), Value::String("unreachable".into())),
-                    ("reason".into(), Value::String(reason)),
+                    ("key".into(), Value::String(decision_key.clone())),
+                    ("reason".into(), Value::String(reason.into())),
                 ]),
-            ),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{key}:raised")),
+            })?;
+            changed = true;
         }
+        if self.store.attention_request(&attention_subject)?.is_none() {
+            self.store.request_attention(
+                &attention_subject,
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "A Codex agent stopped after repeated failures".into(),
+                    reason: format!("{subject}: {retained_reason}. Inspect the seat and revise its desired declaration before restarting."),
+                    severity: "error".into(),
+                    targets: vec![subject.into()],
+                    actor: "agent/st3/reconciler".into(),
+                    idempotency_key: format!("{key}:attention"),
+                },
+            )?;
+            changed = true;
+        }
+        if changed {
+            self.signal_changed();
+        }
+        Ok(())
     }
 
     fn restart_decision(
@@ -1683,6 +1857,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         observation: &RuntimeObservation,
     ) -> Result<RestartDecision> {
+        let intensity = if member.driver.as_deref() == Some("codex") {
+            RestartIntensity {
+                attempts: CODEX_CRASH_LOOP_ATTEMPTS as u32,
+                interval_ms: CODEX_CRASH_LOOP_INTERVAL_MS as u64,
+                delay_ms: member.restart_intensity.delay_ms,
+                mode: "fail".into(),
+            }
+        } else {
+            member.restart_intensity.clone()
+        };
         let now = now_ms();
         let desired_token = self
             .store
@@ -1723,10 +1907,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or(0);
         launches.retain(|claim| claim.store_index > reset_index);
 
-        if member.restart_intensity.mode == "fail" {
+        if intensity.mode == "fail" {
             if let Some(last) = launches.last()
-                && now.saturating_sub(last.accepted_at_unix_ms)
-                    >= member.restart_intensity.interval_ms as u128
+                && now.saturating_sub(last.accepted_at_unix_ms) >= intensity.interval_ms as u128
             {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
@@ -1749,11 +1932,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 launches.clear();
             }
-            if launches.len() >= member.restart_intensity.attempts as usize {
+            if launches.len() >= intensity.attempts as usize {
                 return Ok(RestartDecision::Fail {
                     reason: format!(
                         "the member used {} launches without a stable {}ms interval",
-                        member.restart_intensity.attempts, member.restart_intensity.interval_ms
+                        intensity.attempts, intensity.interval_ms
                     ),
                 });
             }
@@ -1761,7 +1944,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
         let mut wait_until = now;
         let mut reasons = Vec::new();
-        if member.restart_intensity.delay_ms > 0 {
+        if intensity.delay_ms > 0 {
             let observed_at = self
                 .store
                 .claims_for(&subject.subject, Some("runtime.observed"))?
@@ -1784,30 +1967,27 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
                 .map(|claim| claim.accepted_at_unix_ms)
                 .unwrap_or(now);
-            let delayed = observed_at.saturating_add(member.restart_intensity.delay_ms as u128);
+            let delayed = observed_at.saturating_add(intensity.delay_ms as u128);
             if delayed > wait_until {
                 wait_until = delayed;
-                reasons.push(format!(
-                    "the restart delay is {}ms",
-                    member.restart_intensity.delay_ms
-                ));
+                reasons.push(format!("the restart delay is {}ms", intensity.delay_ms));
             }
         }
-        if member.restart_intensity.mode == "delay" {
-            let window_start = now.saturating_sub(member.restart_intensity.interval_ms as u128);
+        if intensity.mode == "delay" {
+            let window_start = now.saturating_sub(intensity.interval_ms as u128);
             let recent = launches
                 .iter()
                 .filter(|claim| claim.accepted_at_unix_ms > window_start)
                 .collect::<Vec<_>>();
-            if recent.len() >= member.restart_intensity.attempts as usize {
+            if recent.len() >= intensity.attempts as usize {
                 let available = recent[0]
                     .accepted_at_unix_ms
-                    .saturating_add(member.restart_intensity.interval_ms as u128);
+                    .saturating_add(intensity.interval_ms as u128);
                 if available > wait_until {
                     wait_until = available;
                     reasons.push(format!(
                         "the {} launch limit applies for {}ms",
-                        member.restart_intensity.attempts, member.restart_intensity.interval_ms
+                        intensity.attempts, intensity.interval_ms
                     ));
                 }
             }
@@ -10356,6 +10536,123 @@ version 2
                 .unwrap()
                 .iter()
                 .any(|member| member.runtime_id == "exec.node.worker.ding")
+        );
+    }
+
+    #[test]
+    fn codex_start_failures_stop_after_three_attempts_and_request_one_attention() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "worker" {
+  workspace "."
+  restart "always"
+  harness "codex" { prompt "Wait for work." }
+}
+"#,
+            "codex-start-failures",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_starts
+            .lock()
+            .unwrap()
+            .insert("node.worker".into());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+        let token = store
+            .selected_desired_token("agent/node.worker")
+            .unwrap()
+            .unwrap();
+        let key = format!("codex-crash-loop:agent/node.worker:{token}");
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention = store
+            .attention_request(&format!("attention/{}", &digest[..32]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(attention.status, "pending");
+        assert!(
+            attention
+                .reason
+                .contains("the fake runtime rejected the start")
+        );
+        let decisions = store
+            .claims_for("agent/node.worker", Some("runtime.reconcile-decision"))
+            .unwrap();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|claim| {
+                    claim.body.pointer("/fields/key").and_then(Value::as_str)
+                        == Some(format!("codex-crash-loop:{token}").as_str())
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_short_lived_exits_stop_relaunching() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "worker" {
+  workspace "."
+  restart "always"
+  harness "codex" { prompt "Wait for work." }
+}
+"#,
+            "codex-short-lived-exits",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(17),
+            incarnation_id: Some("bad-seat".into()),
+        });
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+        let decision = store
+            .latest_claim("agent/node.worker", Some("runtime.reconcile-decision"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decision
+                .body
+                .pointer("/fields/decision")
+                .and_then(Value::as_str),
+            Some("raise")
+        );
+        assert!(
+            decision
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("exit code 17")
         );
     }
 

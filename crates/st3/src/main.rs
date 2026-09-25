@@ -7234,6 +7234,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
         .context("the Codex driver catalog has no state root")?
         .to_path_buf();
     let state_dir = root.join("state");
+    let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st2::message::inbox_dir(&agent_dir);
     let archive = st2::message::archive_dir(&agent_dir);
     let driver_root = catalog.clone();
@@ -7265,10 +7266,34 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     let mut delivery = NativeDeliverySupervisor::default();
     loop {
         tokio::select! {
-            result = &mut task => return result?,
+            result = &mut task => {
+                let outcome = result.context("joining the Codex driver")?;
+                if let Err(error) = &outcome {
+                    let reason = format!("{error:#}").chars().take(2_000).collect::<String>();
+                    let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String("codex-driver-failed".into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("codex-driver-failed:{subject}:{incarnation}")),
+                    }).await;
+                }
+                return outcome;
+            },
             _ = interval.tick() => {
                 let tick: Result<()> = async {
-                    if !ready && state_dir.join("binding.json").is_file() {
+                    if !ready && std::fs::read(state_dir.join("binding.json"))
+                        .ok()
+                        .is_some_and(|binding| Some(&binding) != prior_binding.as_ref())
+                    {
                         let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
                             kind: "harness.observed".into(),

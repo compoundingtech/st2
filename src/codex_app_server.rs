@@ -31,6 +31,10 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
+// A thread/read snapshot can contain a long rollout transcript in one frame. Keep
+// this finite, but above the provider's 16 MiB default frame limit.
+const CODEX_CONTROL_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 use crate::{
     delivery_ledger, ding, driver_diagnostic, harness_context, harness_state, message, run, status,
 };
@@ -2155,6 +2159,7 @@ pub fn run_controlled(
         runtime_id,
         codex_argv,
         delivery,
+        true,
         &mut diagnostics,
     );
     match result {
@@ -2179,7 +2184,8 @@ pub fn run_controlled(
 /// Run the native Codex driver with explicit private state paths.
 ///
 /// The claims-graph runtime uses this entry point without an st2 catalog. The driver keeps the
-/// app-server protocol, thread binding, delivery receipts, and harness records unchanged.
+/// app-server protocol, delivery receipts, and harness records. Each st3 seat
+/// launch starts a new Codex thread; the graph holds continuity across restarts.
 pub fn run_controlled_paths(
     driver_root: &Path,
     state_dir: &Path,
@@ -2218,6 +2224,7 @@ pub fn run_controlled_paths(
         runtime_id,
         codex_argv,
         delivery,
+        false,
         &mut diagnostics,
     );
     match result {
@@ -2240,6 +2247,7 @@ fn run_controlled_owned(
     runtime_id: String,
     codex_argv: Vec<String>,
     delivery: CodexDeliveryConfig,
+    resume_existing: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     // Installed before ANY child exists — the hook-trust preflight spawns a detached app-server
@@ -2248,7 +2256,8 @@ fn run_controlled_owned(
     // resets the flag, so this must also run exactly once per launch.)
     crate::provider_session::install_signal_handler();
     let binding_path = state_dir.join("binding.json");
-    let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
+    let resume_thread =
+        select_resume_thread(&binding_path, &identity, &runtime_id, resume_existing)?;
 
     let socket_path = socket_path(catalog_root, &identity)?;
     let socket_dir = socket_path
@@ -3611,6 +3620,10 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
             }
         }
     };
+    websocket.set_config(|config| {
+        config.max_frame_size = Some(CODEX_CONTROL_MAX_MESSAGE_BYTES);
+        config.max_message_size = Some(CODEX_CONTROL_MAX_MESSAGE_BYTES);
+    });
     websocket.get_mut().set_nonblocking(false)?;
     websocket.get_mut().set_read_timeout(Some(CONTROL_POLL))?;
     anyhow::ensure!(
@@ -4640,6 +4653,25 @@ fn load_current_control_state(
         "Codex control state belongs to a different runtime binding"
     );
     Ok(Some(state))
+}
+
+fn select_resume_thread(
+    path: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_existing: bool,
+) -> Result<Option<String>> {
+    if resume_existing {
+        return load_resume_thread(path, agent, runtime_id);
+    }
+    // This runs under the owner lock. A stale binding must not make the next
+    // incarnation look ready before its new control connection binds.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("retiring the prior Codex thread binding"),
+    }
+    Ok(None)
 }
 
 fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Option<String>> {
