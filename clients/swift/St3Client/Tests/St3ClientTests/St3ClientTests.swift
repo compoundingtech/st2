@@ -13,9 +13,15 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(value.value.limits.maxPageItems, 200)
     }
 
-    func testGeneratedActionCoverage() {
-        XCTAssertEqual(ActionType.allCases.count, 30)
-        XCTAssertEqual(ReadOperation.allCases.count, 27)
+    func testGeneratedActionCoverage() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/schemas/operations.json"))
+        let operations = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let actions = try XCTUnwrap(operations["actions"] as? [String: Any])
+        let reads = try XCTUnwrap(operations["reads"] as? [[String: Any]])
+        XCTAssertEqual(Set(ActionType.allCases.map(\.rawValue)), Set(actions.keys))
+        XCTAssertEqual(Set(ReadOperation.allCases.map(\.rawValue)), Set(reads.compactMap { $0["id"] as? String }))
     }
 
     func testAuthorityErrorCodesAreTypedAndRoundTrip() throws {
@@ -37,7 +43,7 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(resources.count, 15)
         guard case .attention(let attention) = resources[0] else { return XCTFail("attention discriminator lost") }
         XCTAssertEqual(attention.priority, "high")
-        XCTAssertEqual(attention.actions, ["attention.resolve"])
+        XCTAssertEqual(attention.actions, ["launch.approve", "launch.cancel"])
         guard case .launch(let launch) = resources[2] else { return XCTFail("launch discriminator lost") }
         XCTAssertEqual(launch.variants, ["launch-variant/release/default"])
         XCTAssertEqual(launch.visualization?.version, "st3.visualization.v0")
