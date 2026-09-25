@@ -22,13 +22,20 @@ state="$STATE_DIR/state.json"
 now=$(/bin/date -u +%s)
 
 idle_output=
-if idle_output=$(ST3_IDLE_REPORT_REMOTE=1 FABRIC_BIN="$FABRIC_BIN" "$IDLE_REPORT" 2>&1); then
+if idle_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+  -u ST3_IDLE_REPORT_DURATION_SECONDS -u ST3_IDLE_REPORT_MAX_GAP_SECONDS \
+  -u ST3_IDLE_REPORT_MIN_SAMPLES -u ST3_IDLE_REPORT_MIN_QUIET \
+  -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS ST3_IDLE_REPORT_REMOTE=1 \
+  FABRIC_BIN="$FABRIC_BIN" "$IDLE_REPORT" 2>&1); then
   idle_report_pass=true
 else
   idle_report_pass=false
 fi
 message_output=
-if message_output=$("$MESSAGE_REPORT" 2>&1); then
+if message_output=$(/usr/bin/env -u ST3_SOAK_REPORT_LOG -u ST3_SOAK_REPORT_NOW_UNIX \
+  -u ST3_SOAK_REPORT_MIN_DURATION_SECONDS -u ST3_SOAK_REPORT_MAX_GAP_SECONDS \
+  -u ST3_SOAK_REPORT_MIN_EACH_DIRECTION -u ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS \
+  "$MESSAGE_REPORT" 2>&1); then
   message_report_pass=true
 else
   message_report_pass=false
