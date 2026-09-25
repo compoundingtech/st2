@@ -430,7 +430,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn next_work_wake_deadline(&self) -> Result<Option<u128>> {
-        let work = self.store.work(None, false)?;
+        let mut work = self.store.work_for_reconcile_all()?;
         let local_agents = self
             .store
             .desired_subjects()?
@@ -444,7 +444,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .map(|subject| subject.subject)
             .collect::<BTreeSet<_>>();
-        Ok(work_wake_deadline(&work, &local_agents, now_ms()))
+        let candidates = local_agents
+            .iter()
+            .filter_map(|agent| next_work_wake_for_agent(agent, &work).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let now = now_ms();
+        for step in &mut work {
+            if candidates.contains(step.subject.as_str()) {
+                self.store.populate_work_wake_for_reconcile(step, now)?;
+            }
+        }
+        Ok(work_wake_deadline(&work, &local_agents, now))
     }
 
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {

@@ -2904,6 +2904,22 @@ impl Store {
         self.work_at_snapshot_internal(Some(actor), true, now_ms(), false)
     }
 
+    /// Fetch current work without the presentation-only wake history. The
+    /// reconciler can enrich just the next wake candidate for each local agent.
+    pub fn work_for_reconcile_all(&self) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal(None, false, now_ms(), false)
+    }
+
+    pub fn populate_work_wake_for_reconcile(
+        &self,
+        view: &mut StepRunView,
+        snapshot_unix_ms: u128,
+    ) -> Result<()> {
+        let connection = self.readers.get();
+        enrich_step_wake_at(&connection, view, snapshot_unix_ms)?;
+        Ok(())
+    }
+
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
@@ -22641,6 +22657,17 @@ version 2
             wake.attempts, 1,
             "a wake for another recipient is not this agent's attempt"
         );
+        let mut lean = store
+            .work_for_reconcile_all()
+            .unwrap()
+            .into_iter()
+            .find(|step| step.subject == *subject)
+            .unwrap();
+        assert!(lean.wake.is_none());
+        store
+            .populate_work_wake_for_reconcile(&mut lean, now_ms())
+            .unwrap();
+        assert_eq!(lean.wake, Some(wake));
         let request = |incarnation: &str, key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some(incarnation.into()),
