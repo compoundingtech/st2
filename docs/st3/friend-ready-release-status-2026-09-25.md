@@ -46,8 +46,10 @@ the release gates after the final tested rollout.
   Silber sample from the repaired sampler; Hetz logged its corresponding
   healthy sample two seconds later. The 24-hour idle report is due September
   26 at 22:36:14 UTC. The independent delivery marker remains `1790372576`,
-  with its 72-hour report due September 28 at 21:42:56 UTC. The watcher is
-  running and awaiting a new three-minute idle preflight.
+  with its 72-hour report due September 28 at 21:42:56 UTC. At 22:39 UTC the
+  repaired window passed the three-minute preflight: four samples per host,
+  one PID each, zero errors, and maximum gaps of 61 seconds. The watcher now
+  reports `preflight=healthy`; the full gates remain waiting.
 
 ## 21:43 UTC final OMP role and TUI CPU rollout
 
