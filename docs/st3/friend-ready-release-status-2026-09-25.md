@@ -1,6 +1,6 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Candidate `0da07d7` is deployed to both active hosts, but the
+**Release hold.** Candidate `b6837bb` is deployed to both active hosts, but the
 default 24-hour idle and 72-hour bidirectional delivery gates have not elapsed.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
@@ -22,7 +22,25 @@ is installed on Hetz; its own fixture test and first service run passed. The
 
 - Each daemon restart was preceded by a normalized ACK from the independent COS
   seat. Rollback binaries are retained locally on the corresponding host.
-- After the final restart, both doctors passed; both signed peers were up with
+- The prior `0da07d7` window reached a diagnostic Hetz quiet CPU median of
+  19.7% over 26 quiet intervals, above the unchanged 15% limit. `b6837bb`
+  keeps usage samples and lease renewals durable, replicated, and visible to
+  clients without waking the full reconciler for those claims alone. It
+  retains full reconciliation for harness readiness, mission transitions,
+  non-quiet replicated claims, and projection recovery. The full st3/stui
+  suites passed (408 st3 library, 86 CLI, and 17 stui tests; 2 live stui
+  tests ignored). A new full-day measurement is required to establish whether
+  this reduces whole-daemon idle CPU enough.
+- `b6837bb` was installed on Hetz at 04:09:08 UTC (PID `482626`, binary SHA
+  `567f1a2c48517ba86b326a2d6f629c330915172cca7579e20e9a1177e1dafcc8`)
+  and Silber at 04:13:59 UTC (PID `76944`, binary SHA
+  `d1527811ff7b4f08ed42f0e3f0a5c9fa1512328133bc0527be41862e3cf324ee`).
+  Both doctors passed. COS independently confirmed each restart left both
+  seats reachable, signed replication healthy, and native inbound delivery
+  working (receipts `message/d6a01a230f02e039` and
+  `message/dc64cdd57e21d3ae`). The prior binaries remain in each host's
+  `rollout-backups/b6837bb-20260925-0415/st3-before`.
+- The previous `0da07d7` rollout had both doctors pass; both signed peers were up with
   zero pending, invalid, or unhealthy replication records. Exact linked message
   receipts passed Silber-to-Hetz in 24 seconds and Hetz-to-Silber in 22 seconds.
   COS independently confirmed both seat incarnations remained reachable and a
@@ -37,8 +55,8 @@ is installed on Hetz; its own fixture test and first service run passed. The
   with work tags while retaining closed attempts. The focused regression and
   full st3 test suite passed. `0da07d7` additionally limits deadline wake-history
   enrichment to the next ready item for each local agent. The parity regression
-  and full st3 test suite passed. Their effect on whole-daemon idle CPU is still
-  being measured by the new post-rollout window.
+  and full st3 test suite passed. The combined whole-daemon idle CPU is now
+  being measured on the new `b6837bb` window.
 
 ## Product checks
 
@@ -69,9 +87,9 @@ is installed on Hetz; its own fixture test and first service run passed. The
 
 ## Pending release evidence
 
-- The post-rollout two-host idle window begins with the first final Silber PID
-  sample at 2026-09-25 03:14:09 UTC. The unmodified report cannot pass before
-  2026-09-26 03:14:09 UTC. It must show one stable PID per host, no missing or
+- The post-rollout two-host idle window restarted with the first final Silber
+  PID sample at 2026-09-25 04:14:57 UTC. The unmodified report cannot pass
+  before 2026-09-26 04:14:57 UTC. It must show one stable PID per host, no missing or
   bad samples, enough quiet intervals, CPU within the stated limits, and flat
   last-hour RSS relative to the first hour.
 - The complete-failure-logging delivery monitor began at 2026-09-24 22:50:25
