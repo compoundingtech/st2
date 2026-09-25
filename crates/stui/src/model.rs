@@ -479,7 +479,7 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
             }
             Kind::Work => {
                 client
-                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), false)
+                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), true)
                     .await?
             }
             Kind::Agents => {
@@ -536,7 +536,7 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
         TimelineBody::Content(v) => v
             .text
             .as_deref()
-            .map(clean_message_text)
+            .map(|text| markdown_like(&clean_message_text(text)))
             .unwrap_or_else(|| format!("[{} attachment]", v.media_type)),
         TimelineBody::ToolCall(v) => format!("called {}", v.name),
         TimelineBody::ToolResult(v) => format!("tool result: {:?}", v.status),
@@ -548,26 +548,149 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
         TimelineBody::Message(_) => "[message]".into(),
         TimelineBody::Unknown { entry_type, .. } => format!("[{entry_type}]"),
     };
-    format!("{role}: {}", body.replace('\n', " ⏎ "))
+    format!("{role}: {body}")
 }
 
 pub fn conversation_needs_older_page(entries: &[TimelineEntry], has_more: bool) -> bool {
     has_more
         && entries
             .iter()
-            .filter(|entry| matches!(entry.body, TimelineBody::Content(_)))
+            .filter(|entry| match &entry.body {
+                TimelineBody::Content(content) => content
+                    .text
+                    .as_deref()
+                    .is_none_or(|text| !clean_message_text(text).is_empty()),
+                _ => false,
+            })
             .count()
             < 12
 }
 
 pub fn clean_message_text(raw: &str) -> String {
-    let text = raw.strip_prefix("[PING] ?").unwrap_or(raw).trim();
+    let normalized = raw.replace("\r\n", "\n");
+    let mut output = String::new();
+    let mut plain = String::new();
+    let mut code = false;
+    for line in normalized.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            if !code {
+                output.push_str(&strip_internal_markup(&plain));
+                plain.clear();
+            }
+            output.push_str(line);
+            code = !code;
+        } else if code {
+            output.push_str(line);
+        } else {
+            plain.push_str(line);
+        }
+    }
+    output.push_str(&strip_internal_markup(&plain));
+    let safe = output
+        .chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .collect::<String>();
+    let text = safe
+        .trim()
+        .strip_prefix("[PING] ?")
+        .unwrap_or(safe.trim())
+        .trim();
     if let Some(start) = text.rfind(" [id:message/")
         && text.ends_with(']')
     {
-        return text[..start].to_owned();
+        text[..start].trim_end().to_owned()
+    } else {
+        text.to_owned()
     }
-    text.to_owned()
+}
+fn strip_internal_markup(input: &str) -> String {
+    let mut text = input.to_owned();
+    for tag in [
+        "analysis",
+        "thinking",
+        "think",
+        "internal",
+        "system-reminder",
+        "function_calls",
+        "tool_result",
+    ] {
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else {
+                break;
+            };
+            let Some(open_end) = lower[start..].find('>').map(|offset| start + offset + 1) else {
+                text.truncate(start);
+                break;
+            };
+            let Some(close) = lower[open_end..].find(&format!("</{tag}>")) else {
+                text.truncate(start);
+                break;
+            };
+            text.replace_range(start..open_end + close + tag.len() + 3, "");
+        }
+    }
+    loop {
+        let Some(start) = text.find("<|im_start|>") else {
+            break;
+        };
+        let Some(separator) = text[start..]
+            .find("<|im_sep|>")
+            .map(|offset| start + offset)
+        else {
+            text.truncate(start);
+            break;
+        };
+        let header = &text[start..separator];
+        let hidden =
+            header.contains("<|meta_sep|>analysis") || header.contains("<|meta_sep|>commentary");
+        let body_start = separator + "<|im_sep|>".len();
+        if hidden {
+            let end = text[body_start..]
+                .find("<|im_end|>")
+                .map(|offset| body_start + offset + "<|im_end|>".len())
+                .unwrap_or(text.len());
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(start..body_start, "");
+        }
+    }
+    for token in ["<|im_end|>", "<|fim_suffix|>", "<|im_sep|>"] {
+        text = text.replace(token, "");
+    }
+    text
+}
+fn markdown_like(input: &str) -> String {
+    let mut code = false;
+    input
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if let Some(language) = trimmed.strip_prefix("```") {
+                let was_code = code;
+                code = !code;
+                if was_code {
+                    "└─".to_owned()
+                } else {
+                    format!("┌─ {}", language.trim())
+                }
+            } else if code {
+                format!("  {line}")
+            } else if let Some(heading) = trimmed.strip_prefix('#') {
+                format!("▌ {}", heading.trim_start_matches('#').trim())
+            } else if let Some(item) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                format!("• {}", item.replace("**", "").replace('`', ""))
+            } else if let Some(quote) = trimmed.strip_prefix("> ") {
+                format!("│ {}", quote.replace("**", "").replace('`', ""))
+            } else {
+                line.replace("**", "").replace('`', "")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -592,6 +715,8 @@ mod tests {
     fn regression_chat_page_skips_status_heartbeats() {
         let statuses = (0..50).map(|sequence| serde_json::from_value::<TimelineEntry>(serde_json::json!({"id":format!("timeline/{sequence}"),"sequence":sequence,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"system","type":"status","final":true,"body":{"status":"running","detail":"ready"}})).unwrap()).collect::<Vec<_>>();
         assert!(conversation_needs_older_page(&statuses, true));
+        let hidden: TimelineEntry = serde_json::from_str(r#"{"id":"timeline/hidden","sequence":100,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"assistant","type":"content","final":true,"body":{"media_type":"text/plain","text":"<thinking>private</thinking>"}}"#).unwrap();
+        assert!(conversation_needs_older_page(&[hidden], true));
     }
 
     #[test]
@@ -601,6 +726,39 @@ mod tests {
             "hello"
         );
         assert_eq!(clean_message_text("[PING] ?"), "");
+    }
+    #[test]
+    fn driver_fixtures_hide_internal_markup_preserve_lines_and_order() {
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/driver_conversations.json"))
+                .unwrap();
+        for fixture in fixtures {
+            let driver = fixture["driver"].as_str().unwrap();
+            let mut entries = fixture["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    let sequence = message["sequence"].as_u64().unwrap();
+                    let entry: TimelineEntry = serde_json::from_value(serde_json::json!({
+                        "id":format!("timeline/{driver}/{sequence}"), "sequence":sequence,
+                        "revision":1, "timestamp":"2026-09-25T08:00:00Z",
+                        "role":message["role"], "type":"content", "final":true,
+                        "body":{"media_type":"text/plain", "text":message["text"]}
+                    }))
+                    .unwrap();
+                    (entry, message["expected"].as_str().unwrap().to_owned())
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(entry, _)| entry.sequence);
+            assert!(
+                entries[0].0.sequence < entries[1].0.sequence,
+                "{driver} ordering"
+            );
+            for (entry, expected) in entries {
+                assert_eq!(timeline_line(&entry), expected, "{driver}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -616,10 +774,12 @@ mod tests {
         let mut model = Model::bootstrap(&client).await.unwrap();
         model.reload(&client).await.unwrap();
         eprintln!(
-            "full snapshot: {:?}, agents: {}, sessions: {}",
+            "full snapshot: {:?}, agents: {}, sessions: {}, work: {} (truncated: {})",
             started.elapsed(),
             model.agents().count(),
-            model.sessions.items.len()
+            model.sessions.items.len(),
+            model.work.items.len(),
+            model.work.truncated
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
@@ -636,8 +796,9 @@ mod tests {
         let started = std::time::Instant::now();
         let model = Model::bootstrap(&client).await.unwrap();
         eprintln!(
-            "bootstrap: {:?}, agents: {}",
+            "bootstrap: {:?}, attention: {}, agents: {}",
             started.elapsed(),
+            model.attention().count(),
             model.agents().count()
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
