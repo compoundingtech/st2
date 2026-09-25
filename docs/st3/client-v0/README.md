@@ -25,7 +25,7 @@ Request bodies never select an actor. Device credentials are scoped, individuall
 different from fleet replication secrets. A remote client is always online: v0 has no offline
 mutation queue, push notification service, cached graph authority, or multi-master replication.
 
-### Tailnet HTTPS carrier
+### Tailnet carrier
 
 `st3 up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
 `st3-client.sock` is the paired-only client gateway backed by `fabric_router`. The latter rejects
@@ -33,7 +33,17 @@ ordinary requests without a paired bearer credential, except for pairing complet
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
 `--client-gateway-socket` for a foreground daemon. They must never name the same path.
 
-On a Tailscale host, publish only the paired-only socket:
+For a direct tailnet connection, forward a TCP listener bound to the host's Tailscale IP to
+`st3-client.sock`. Pair the phone with `http://TAILSCALE_IP:PORT`. Tailscale encrypts the link;
+the paired gateway still authenticates each client request. Never bind this listener to a public
+or LAN interface, and never forward `st3.sock`. An unauthenticated request to
+`/v1/client/capabilities` must return a complete `403`; follow it with an authenticated read and
+concurrent-read check. Run the forwarder as a persistent service so daemon restarts do not strand
+the client. On iOS 17 and later, an App Transport Security exception can target Tailscale's
+`100.64.0.0/10` range without opening arbitrary HTTP destinations.
+
+Tailscale Serve remains an optional HTTPS carrier for clients that need it. If using Serve,
+publish only the paired-only socket:
 
 ```sh
 CLIENT_GATEWAY_SOCKET="${XDG_RUNTIME_DIR:-$HOME/.local/state/st3/run}/st3-client.sock"
