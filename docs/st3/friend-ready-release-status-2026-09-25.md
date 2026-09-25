@@ -12,6 +12,18 @@ short diagnostic into release evidence.
 The [friend trial handoff](friend-trial-handoff.md) is staged for that review,
 not an invitation to start the trial while this hold is active.
 
+## Four product checks for today's friend-ready decision
+
+| Capability | Current evidence | Remaining check |
+| --- | --- | --- |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; both hosts pass strict doctor with ready native drivers. | Verify the newly declared OMP overnight seats start on their assigned hosts and remain reachable. |
+| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions and no unresolved failure streak. | Exercise each new OMP inbox across hosts and keep the monitor running through the new window. |
+| Clean-session recovery | Codex's controlled fresh-thread restart retained its graph work and resumed delivery; current work, claims, and agent incarnations are inspectable. | Restart one disposable OMP seat with claimed work and an inbound message, then verify the new session resumes from graph state without duplicate or lost handling. |
+| Visible work | CLI mission/work detail and the iOS Control view expose current runs, goals, blockers, and work. The TUI usability worker is implementing clearer Control cards and actions. | Install and test the final TUI build against live mission data; deploy `a9e0709` so retired zero-run definitions disappear from current CLI and app views. |
+
+These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
+the release gates after the final tested rollout.
+
 ## 10:08 UTC TUI, iOS, and direct-network rollout
 
 - `5c41edc` merges the TUI and iOS presentation/refresh repairs with bounded
