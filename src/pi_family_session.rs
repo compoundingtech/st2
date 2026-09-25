@@ -70,8 +70,6 @@ pub(crate) struct HarnessKind {
     /// MINOR (OMP-R05); pi does not gate at runtime at all, so its slot is `None` rather than a
     /// function that always succeeds — a gate that cannot refuse is not a gate.
     pub(crate) verify_version: Option<fn(&str) -> Result<()>>,
-    /// Validate provider-specific launch arguments before claiming the seat.
-    pub(crate) verify_launch: Option<fn(&[String]) -> Result<()>>,
 }
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
@@ -98,9 +96,6 @@ pub(crate) fn run_for(
     // the seat's observed record, so a refused launch leaves the predecessor's state alone.
     if let Some(verify_version) = kind.verify_version {
         verify_version(&provider_argv[0])?;
-    }
-    if let Some(verify_launch) = kind.verify_launch {
-        verify_launch(&provider_argv)?;
     }
     let executable = std::env::current_exe()
         .with_context(|| format!("resolving st2 executable for the {label} channel"))?;

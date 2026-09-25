@@ -51,7 +51,6 @@ pub(crate) const PI_KIND: HarnessKind = HarnessKind {
     session_env: CHANNEL_SESSION,
     seq_env: CHANNEL_SEQ,
     verify_version: None,
-    verify_launch: None,
 };
 
 /// Run one interactive pi provider and maintain its presence until it exits.
