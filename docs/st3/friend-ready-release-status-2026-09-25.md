@@ -1,6 +1,6 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `ea74722` for `st3` and `2af1b1b` for `stui` is
+**Release hold.** Source `ea74722` for `st3` and `5a429bd` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
 source is merged at `e49c097`. The earlier 11:40:44 UTC soak windows were
 invalidated by the CPU hotfix rollout. New windows began at 13:55:44 UTC after
@@ -17,13 +17,46 @@ not an invitation to start the trial while this hold is active.
 
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
-| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The restarted OMP seat is ready; both strict doctors pass. | Keep the OMP seat ready overnight. |
-| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode and the restarted OMP seat have sent linked native graph replies. | Keep the monitor running through the new window. |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The restarted OMP seat is ready with a registry-supported declared model; both strict doctors pass. | Keep the OMP seat ready overnight. |
+| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode and the restarted OMP seat have sent linked native graph replies. | Fix the OMP closed-message replay defect and keep the monitor running through the new window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
-| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, and cleaned channel wrappers. | Nathan retests the exact installed TUI build. |
+| Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. | Continue the release soak; Nathan is not the TUI acceptance tester. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 15:34 UTC installed TUI interaction repair and OMP model correction
+
+- Nathan found that Chat clicks selected the wrong agent, conversation mouse
+  scrolling did nothing, native text selection was inaccessible, and the inline
+  bounded-history marker interrupted reading. The Chat list rendered one row
+  per agent while its click map assumed two. `5a429bd` corrects that map, adds
+  wheel scrolling and a visible Select text control, keeps the latest messages
+  at the bottom, and opens older content and session details in a History pane.
+  The pane's Load older pages row is clickable. Recent message line breaks no
+  longer render as return-arrow glyphs. The new live PTY interaction test
+  exercises the exact click target, wheel, History, older-page click, and text
+  selection mode. Its first History click run caught a wrapped-label target
+  error, which was corrected before deployment. The 43 active `stui` unit
+  tests, the release PTY interaction test, and terminal lifecycle smoke pass.
+- Hetz installed `stui` SHA-256
+  `8b1ad2d7fa8d9defb07dfeaaf3ee1ec4d43459eb25937ee999d88eee321fe059`;
+  Silber installed
+  `35b2c92f2a79f25352fe94e908c351d3b9448540b5b151ed5d24aec4b39d2296`.
+  Each host retains its prior `stui` under
+  `~/.local/state/st3/rollout-backups/5a429bd-20260925-1534/stui`.
+  The tests passed again against the installed paths on both hosts, including
+  quit, signal, PTY hangup, and tmux hangup. Both strict doctors pass after
+  removal of one test PTY. No daemon or replication worker was restarted, so
+  the 13:55:44 UTC soak markers remain in force.
+- OMP 18.1.22 lists `openai-codex/gpt-5.6-sol` as an exact supported selector.
+  `st3-network` main commit `c144f37` declares it, and the controlled OMP
+  restart at 15:11:54 UTC launched with that exact model and medium effort.
+  The new incarnation answered an exact linked native inbox probe. The staged
+  model-registry gate from `5e3b80f` remains reverted in the deployed daemon;
+  it is hardening work, while the active declaration now names a supported
+  model. OMP also reanswered two already closed messages after restart. That
+  replay defect has its own graph mission and remains a release blocker.
 
 ## 13:55 UTC Hetz idle CPU hot-loop repair
 
