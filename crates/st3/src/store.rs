@@ -14478,9 +14478,28 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
     for claim in &claims {
-        if !Store::simple_replication_kind(&claim.kind) || claim.body.get("_operation").is_some() {
+        let has_operation = claim.body.get("_operation").is_some();
+        if !Store::simple_replication_kind(&claim.kind)
+            || (has_operation
+                && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
+        {
             return Ok(false);
         }
+    }
+    // Event-only claims do not change the structural graph. Their operation
+    // registry can advance with the frontier, but ambiguous IDs still use the
+    // canonical full replay so conflict selection remains deterministic.
+    for claim in &claims {
+        let Some((operation_id, request_digest)) = operation_parts(&claim.body) else {
+            continue;
+        };
+        if let Some((stored_digest, _, state)) =
+            operation_tx(transaction, operation_id).map_err(internal)?
+            && (stored_digest != request_digest || state != "active")
+        {
+            return Ok(false);
+        }
+        register_operation_tx(transaction, claim).map_err(internal)?;
     }
     let mut latest_work_by_subject = BTreeMap::new();
     for claim in &work_claims {
@@ -17922,7 +17941,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_replication_rejects_structural_and_operation_claims() {
+    fn simple_replication_rejects_structural_and_malformed_operation_claims() {
         assert!(Store::simple_replication_kind("harness.observed"));
         assert!(Store::simple_replication_kind("work.renewed"));
         assert!(Store::simple_replication_kind("work.claimed"));
@@ -17945,6 +17964,62 @@ mod tests {
         )
         .unwrap();
         assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+    }
+
+    #[test]
+    fn simple_replication_registers_unambiguous_event_operations() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/node.test",
+                "harness.observed",
+                Some("agent/node.test"),
+                &json!({"fields": {"state": "ready"}, "_operation": {
+                    "id": "op/simple-event", "request_digest": "digest-one"
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            transaction.commit().unwrap();
+        }
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/node.test",
+                "harness.observed",
+                Some("agent/node.test"),
+                &json!({"fields": {"state": "idle"}, "_operation": {
+                    "id": "op/simple-event", "request_digest": "digest-two"
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+            transaction.commit().unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        let connection = store.connection.lock().unwrap();
+        assert_eq!(
+            operation_tx(&connection, "op/simple-event")
+                .unwrap()
+                .unwrap()
+                .2,
+            "conflict"
+        );
     }
 
     fn rewrite_envelope(
