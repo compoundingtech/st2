@@ -55,8 +55,10 @@ the release gates after the final tested rollout.
   Prior daemon binaries are retained in host-local rollout backups.
 - Both new gate starts are Unix `1790372576` (21:42:56 UTC), the first healthy
   Silber sample with its new PID after Hetz had also logged a healthy new-PID
-  sample. The watcher returned `idle=waiting`, `preflight=waiting`, and
-  `delivery=waiting` at 21:43 UTC. The idle and delivery reports are due
+  sample. The 21:46 UTC preflight passed with four healthy samples per host,
+  one PID each, no errors, and maximum sample gaps of 60 and 61 seconds.
+  The watcher reports `idle=waiting`, `preflight=healthy`, and
+  `delivery=waiting`. The idle and delivery reports are due
   September 26 and 28 at 21:42:56 UTC respectively.
 
 ## 20:53 UTC OMP timeline and final TUI retest rollout
