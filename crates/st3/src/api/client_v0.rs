@@ -5271,9 +5271,10 @@ mission "example/zero-run" state="ready" {
         std::fs::write(
             &current,
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 json!({"type":"session","id":"current","timestamp":"2026-09-25T15:11:55.793Z","cwd":"/tmp"}),
                 json!({"type":"message","id":"answer","timestamp":"2026-09-25T15:12:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Saved OMP answer"},{"type":"toolCall","id":"call-1","name":"read","arguments":{"file":"example"}}]}}),
+                json!({"type":"message","id":"result","timestamp":"2026-09-25T15:12:01Z","message":{"role":"toolResult","content":[{"type":"text","text":"{\"presence\":null}"}]}}),
             ),
         )
         .unwrap();
@@ -5304,6 +5305,12 @@ mission "example/zero-run" state="ready" {
                 .any(|entry| entry["body"]["text"] == "Saved OMP answer")
         );
         assert!(timeline.iter().any(|entry| entry["type"] == "tool_call"));
+        assert!(
+            timeline
+                .iter()
+                .any(|entry| entry["role"] == "tool"
+                    && entry["body"]["text"] == "{\"presence\":null}")
+        );
         assert!(
             super::managed_omp_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()

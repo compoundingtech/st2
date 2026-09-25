@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use st3_client::{
     Agent, Attention, Client, ClientError, Device, Envelope, ErrorCode, EventPage, EventType,
     Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Session, Snapshot,
-    TimelineBody, TimelineEntry, Work,
+    TimelineBody, TimelineEntry, TimelineRole, Work,
 };
 
 /// Each collection is deliberately capped. The UI shows a truncation marker when a cap is hit.
@@ -588,7 +588,14 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
         TimelineBody::Content(v) => v
             .text
             .as_deref()
-            .map(|text| markdown_like(&clean_message_text(text)))
+            .map(|text| {
+                let text = clean_message_text(text);
+                if entry.role == TimelineRole::Tool {
+                    markdown_like(&readable_tool_text(&text))
+                } else {
+                    markdown_like(&text)
+                }
+            })
             .unwrap_or_else(|| format!("[{} attachment]", v.media_type)),
         TimelineBody::ToolCall(v) => format!("called {}", v.name),
         TimelineBody::ToolResult(v) => format!("tool result: {:?}", v.status),
@@ -601,6 +608,33 @@ pub fn timeline_line(entry: &TimelineEntry) -> String {
         TimelineBody::Unknown { entry_type, .. } => format!("[{entry_type}]"),
     };
     format!("{role}: {body}")
+}
+
+fn readable_tool_text(text: &str) -> String {
+    let (first, rest) = text.split_once("\n\n\n").unwrap_or((text, ""));
+    if first.len() > 2_048 || !first.trim_start().starts_with('{') {
+        return text.to_owned();
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(first) else {
+        return text.to_owned();
+    };
+    if fields.is_empty() || fields.len() > 12 {
+        return text.to_owned();
+    }
+    let mut lines = fields
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            format!("- {key}: {value}")
+        })
+        .collect::<Vec<_>>();
+    if !rest.trim().is_empty() {
+        lines.push(rest.trim().to_owned());
+    }
+    lines.join("\n")
 }
 
 pub fn conversation_needs_older_page(entries: &[TimelineEntry], has_more: bool) -> bool {
@@ -803,6 +837,21 @@ mod tests {
             "hello"
         );
         assert_eq!(clean_message_text("[PING] ?"), "");
+    }
+
+    #[test]
+    fn omp_tool_json_reads_as_fields_with_timing_preserved() {
+        let entry: TimelineEntry = serde_json::from_value(serde_json::json!({
+            "id":"timeline/tool", "sequence":1, "revision":1,
+            "timestamp":"2026-09-25T08:00:00Z", "role":"tool",
+            "type":"content", "final":true,
+            "body":{"media_type":"text/plain","text":"{\"presence\":null,\"state\":\"running\"}\n\n\nWall time: 0.03 seconds"}
+        })).unwrap();
+        let line = timeline_line(&entry);
+        assert!(line.contains("• presence: null"));
+        assert!(line.contains("• state: running"));
+        assert!(line.contains("Wall time: 0.03 seconds"));
+        assert!(!line.contains("{\"presence\""));
     }
     #[test]
     fn driver_fixtures_hide_internal_markup_preserve_lines_and_order() {

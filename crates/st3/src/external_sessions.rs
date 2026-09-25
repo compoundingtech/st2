@@ -1376,7 +1376,7 @@ fn normalized_role(role: Option<&str>) -> &'static str {
     match role {
         Some("user") => "user",
         Some("assistant") => "assistant",
-        Some("tool") => "tool",
+        Some("tool" | "toolResult" | "tool_result") => "tool",
         _ => "system",
     }
 }
