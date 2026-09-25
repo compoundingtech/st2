@@ -61,6 +61,8 @@ pub struct Model {
     pending_refresh: BTreeSet<Kind>,
     #[serde(skip)]
     last_observation_refresh: Option<std::time::Instant>,
+    #[serde(skip)]
+    last_work_history_refresh: Option<std::time::Instant>,
 }
 
 impl Model {
@@ -112,6 +114,7 @@ impl Model {
         ) = (
             now, launches, missions, work, agents, sessions, runtimes, machines, devices,
         );
+        self.last_work_history_refresh = Some(std::time::Instant::now());
         self.status = "Connected".into();
         Ok(())
     }
@@ -172,7 +175,11 @@ impl Model {
     async fn reload_changed(&mut self, client: &Client) -> Result<()> {
         let mut remaining = std::mem::take(&mut self.pending_refresh);
         for kind in remaining.clone() {
-            let collection = match read_pages(client, kind).await {
+            let full_work_history = kind != Kind::Work
+                || self
+                    .last_work_history_refresh
+                    .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30));
+            let collection = match read_pages_mode(client, kind, full_work_history).await {
                 Ok(collection) => collection,
                 Err(error) => {
                     self.pending_refresh.extend(remaining);
@@ -184,7 +191,14 @@ impl Model {
                 Kind::Now => self.now = collection,
                 Kind::Launches => self.launches = collection,
                 Kind::Missions => self.missions = collection,
-                Kind::Work => self.work = collection,
+                Kind::Work => {
+                    if full_work_history {
+                        self.work = collection;
+                        self.last_work_history_refresh = Some(std::time::Instant::now());
+                    } else {
+                        self.work = with_cached_work_history(collection, &self.work);
+                    }
+                }
                 Kind::Agents => self.agents = collection,
                 Kind::Sessions => self.sessions = collection,
                 Kind::Runtimes => self.runtimes = collection,
@@ -474,8 +488,16 @@ impl Kind {
 }
 
 async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
+    read_pages_mode(client, kind, true).await
+}
+
+async fn read_pages_mode(
+    client: &Client,
+    kind: Kind,
+    include_work_history: bool,
+) -> Result<Collection> {
     for attempt in 0..3 {
-        match read_pages_once(client, kind).await {
+        match read_pages_once(client, kind, include_work_history).await {
             Ok(collection) => return Ok(collection),
             Err(error)
                 if attempt < 2
@@ -491,9 +513,16 @@ async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
     unreachable!("bounded page retry returns from every attempt")
 }
 
-async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
+async fn read_pages_once(
+    client: &Client,
+    kind: Kind,
+    include_work_history: bool,
+) -> Result<Collection> {
     if kind == Kind::Work {
         let mut current = read_pages_once_inner(client, kind, false).await?;
+        if !include_work_history {
+            return Ok(current);
+        }
         let history = read_pages_once_inner(client, kind, true).await?;
         let mut seen = current
             .items
@@ -510,6 +539,27 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
         return Ok(current);
     }
     read_pages_once_inner(client, kind, false).await
+}
+
+fn with_cached_work_history(mut current: Collection, previous: &Collection) -> Collection {
+    let mut seen = current
+        .items
+        .iter()
+        .map(|item| item.header().id.clone())
+        .collect::<BTreeSet<_>>();
+    current
+        .items
+        .extend(previous.items.iter().filter_map(|item| {
+            (item
+                .header()
+                .operational
+                .as_ref()
+                .is_some_and(|op| op.layer == "history")
+                && seen.insert(item.header().id.clone()))
+            .then(|| item.clone())
+        }));
+    current.truncated |= previous.truncated;
+    current
 }
 
 async fn read_pages_once_inner(
@@ -816,6 +866,55 @@ fn markdown_like(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn work_resource(id: &str, state: &str, layer: &str) -> Resource {
+        serde_json::from_value(serde_json::json!({
+            "kind":"work", "id":id, "revision":"one", "updated_at":"2026-09-25T08:00:00Z",
+            "operational":{"layer":layer,"actionable":layer=="current","reasons":[]},
+            "mission_run_id":"mission-run/test", "generation_id":"run-generation/test",
+            "definition_id":"definition/test", "path":"step", "state":state,
+            "attempt":1, "readiness_epoch":1, "claimant":null, "claim_incarnation":null,
+            "blocked_reason":null, "blockers":[], "goals":[], "constraints":[]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn current_work_refresh_preserves_history_without_stale_active_work() {
+        let previous = Collection {
+            items: vec![
+                work_resource("step-run/old", "claimed", "current"),
+                work_resource("step-run/done", "completed", "history"),
+            ],
+            truncated: true,
+            ..Collection::default()
+        };
+        let current = Collection {
+            items: vec![work_resource("step-run/new", "ready", "current")],
+            ..Collection::default()
+        };
+        let merged = with_cached_work_history(current, &previous);
+        assert_eq!(merged.items.len(), 2);
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|item| item.header().id == "step-run/new")
+        );
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|item| item.header().id == "step-run/done")
+        );
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|item| item.header().id == "step-run/old")
+        );
+        assert!(merged.truncated);
+    }
 
     #[test]
     fn regression_recent_messages_include_closed_and_sessionless_messages() {
