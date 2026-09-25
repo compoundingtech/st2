@@ -120,6 +120,7 @@ struct App {
     pending_reason: Option<String>,
     pending_import: Option<String>,
     action_result: Option<String>,
+    notice: Option<String>,
     chat_max_scroll: Cell<u16>,
     sidebar_offsets: [Cell<usize>; 4],
     live_ready: bool,
@@ -162,6 +163,7 @@ impl App {
             pending_reason: None,
             pending_import: None,
             action_result: None,
+            notice: None,
             chat_max_scroll: Cell::new(0),
             sidebar_offsets: [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)],
             live_ready: false,
@@ -229,7 +231,11 @@ impl App {
             .map(|(agent, _)| *agent)
     }
     fn agent_tree(&self) -> Vec<(&st3_client::Agent, usize)> {
-        let mut agents = self.model.agents().collect::<Vec<_>>();
+        let mut agents = self
+            .model
+            .agents()
+            .filter(|agent| !matches!(agent.state.as_str(), "stopped" | "failed"))
+            .collect::<Vec<_>>();
         // The API can include stopped historical seats. Keep them browseable,
         // but open Chat on an active conversation instead of an old fixture.
         agents.sort_by(|left, right| {
@@ -275,7 +281,7 @@ impl App {
         result
     }
     fn undeclared_session(&self) -> Option<&st3_client::Session> {
-        let index = self.selected[1].checked_sub(self.model.agents().count())?;
+        let index = self.selected[1].checked_sub(self.agent_tree().len())?;
         self.model.undeclared_sessions().nth(index)
     }
     fn selected_session_id(&self) -> Option<String> {
@@ -325,7 +331,7 @@ impl App {
     fn count_for(&self, tab: usize) -> usize {
         match tab {
             0 => self.model.attention().count(),
-            1 => self.model.agents().count() + self.model.undeclared_sessions().count(),
+            1 => self.agent_tree().len() + self.model.undeclared_sessions().count(),
             2 => self.control_missions().len(),
             _ => self.model.machines().count(),
         }
@@ -397,8 +403,12 @@ impl App {
         } else {
             let connection = if self.live_ready {
                 "● Online"
-            } else if self.model.status == "Loading…" {
-                "◌ Loading"
+            } else if self.model.status.is_empty()
+                || self.model.status.starts_with("Loading")
+                || self.model.status.starts_with("Cached")
+                || self.model.status.starts_with("Connected")
+            {
+                "◌ Connecting"
             } else {
                 "○ Offline"
             };
@@ -736,7 +746,7 @@ impl App {
                             },
                         );
                     }
-                    for message in recent {
+                    for message in &recent {
                         let cleaned = clean_message_text(&message.content);
                         lines.push(format!("  {}:", message.from));
                         let body = if cleaned.is_empty() {
@@ -763,16 +773,28 @@ impl App {
                         .take(12)
                         .collect::<Vec<_>>();
                     if conversation.is_empty() {
-                        lines.push(
-                            if self
-                                .selected_session_id()
-                                .is_some_and(|id| self.timeline_cache.contains_key(&id))
-                            {
-                                "No conversation in recent timeline.".into()
-                            } else {
-                                "Loading conversation…".into()
-                            },
-                        );
+                        if !recent.is_empty() {
+                            lines.push(
+                                "Native transcript unavailable · recent ST3 messages: ".into(),
+                            );
+                            for message in recent.iter().rev().take(3) {
+                                lines.push(format!("  {}:", message.from));
+                                let text = clean_message_text(&message.content);
+                                lines.extend(text.lines().map(|line| format!("    {line}")));
+                                lines.push(String::new());
+                            }
+                        } else {
+                            lines.push(
+                                if self
+                                    .selected_session_id()
+                                    .is_some_and(|id| self.timeline_cache.contains_key(&id))
+                                {
+                                    "No conversation in recent timeline.".into()
+                                } else {
+                                    "Loading conversation…".into()
+                                },
+                            );
+                        }
                     }
                     for entry in conversation.into_iter().rev() {
                         for line in timeline_line(entry).lines() {
@@ -916,7 +938,7 @@ impl App {
                     }
                 ));
                 if self.model.work.truncated {
-                    lines.push("[More progress beyond bounded view]".into());
+                    lines.push("Older completed steps omitted".into());
                 }
             }
             _ => {
@@ -925,7 +947,11 @@ impl App {
                 let selected_machine = self.model.machines().nth(self.selected[3]);
                 if let Some(machine) = selected_machine {
                     lines.push(format!("{}  ·  {}", machine.name, machine.state));
-                    lines.push(format!("Capacity: {}", machine.capacity.state));
+                    lines.push(if machine.capacity.state == "unknown" {
+                        format!("Capacity: not reported ({})", machine.capacity.reason)
+                    } else {
+                        format!("Capacity: {}", machine.capacity.state)
+                    });
                     lines.push(format!(
                         "Running runtimes: {}",
                         machine.occupancy.running_runtimes
@@ -1029,7 +1055,11 @@ impl App {
                 .filter(|entry| matches!(entry.body, st3_client::TimelineBody::Content(_)))
                 .collect::<Vec<_>>();
             let older = all_content.len().saturating_sub(12);
-            let mut history = vec![format!("{} older messages", older)];
+            let mut history = vec![if older == 0 && self.model.timeline_truncated {
+                "More history available".into()
+            } else {
+                format!("{} older messages", older)
+            }];
             if self.model.timeline_truncated {
                 history.push(if self.history_page_limit < 32 {
                     "o Load older pages".into()
@@ -1089,7 +1119,14 @@ impl App {
                 1 if self.undeclared_session().is_some_and(session_is_importable) => {
                     "↑↓/click agent · wheel/Pg scroll · h history · m import · v select · q quit".into()
                 }
-                1 => "↑↓/click agent · wheel/Pg scroll · h history · c message · v select · q quit".into(),
+                1 => {
+                    let selected = self.peer().map(|peer| format!("{} {} · ", state_glyph(&peer.state), agent_label(peer))).unwrap_or_default();
+                    if self.runtime().is_some() {
+                        format!("{selected}Enter terminal · Pg/wheel scroll · h history · c message · v select")
+                    } else {
+                        format!("{selected}Pg/wheel scroll · h history · c message · v select")
+                    }
+                }
                 2 => "↑↓/click mission · wheel/Pg scroll · c new mission · q quit".into(),
                 _ => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
             },
@@ -1112,6 +1149,7 @@ impl App {
             Mode::Workspace => format!("Workspace: {}█ · Enter create", self.input),
         }
         };
+        let footer = self.notice.as_deref().unwrap_or(&footer);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
     }
 }
@@ -1228,9 +1266,9 @@ fn mission_progress_label(
     } else if model.work.snapshot.is_none() {
         "Loading work".into()
     } else if model.work.truncated && total == 0 {
-        "Work beyond bounded view".into()
+        "No steps in recent history".into()
     } else if model.work.truncated {
-        format!("{done}/{total}+ visible steps")
+        format!("{done}/{total}+ recent steps")
     } else {
         format!("{done}/{total} steps")
     }
@@ -1252,6 +1290,14 @@ fn mission_current_work<'a>(
         })
 }
 fn next_action_label(work: &st3_client::Work) -> &'static str {
+    if work
+        .extra
+        .get("agentless")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return "Stewardship active";
+    }
     match work.state.as_str() {
         "claimed" | "running" => "Agent working",
         "blocked" => "Resolve blocker",
@@ -1262,6 +1308,14 @@ fn next_action_label(work: &st3_client::Work) -> &'static str {
     }
 }
 fn work_owner(model: &Model, work: &st3_client::Work) -> String {
+    if work
+        .extra
+        .get("agentless")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return "Agentless step".into();
+    }
     let agent_id = work.claimant.as_deref().or_else(|| {
         model
             .agents()
@@ -1551,26 +1605,44 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         return Ok(());
     };
     let runtime_id = runtime.header.id.clone();
-    let fence = app
-        .model
-        .runtimes
-        .fence(&runtime_id)
-        .context("runtime fence unavailable")?;
-    let (id, key) = action_pair();
-    let attachment = client
-        .terminal_attach(
-            id,
-            key,
-            fence,
-            TargetParameters {
-                target_id: terminal_id.clone(),
-                ..Default::default()
-            },
-        )
-        .await?
-        .value
-        .terminal_attachment
-        .context("attach returned no viewer")?;
+    let mut attached = None;
+    for attempt in 0..3 {
+        let current = client.runtimes_get(&runtime_id).await?;
+        let Resource::Runtime(runtime) = current.value else {
+            anyhow::bail!("Selected runtime is no longer available");
+        };
+        anyhow::ensure!(
+            runtime.terminal_id.as_deref() == Some(&terminal_id),
+            "Selected terminal changed; refresh Chat"
+        );
+        let fence = Fence {
+            snapshot_id: current.snapshot.id,
+            runtime_incarnation: runtime.incarnation_id,
+            terminal_sequence: runtime.terminal_sequence,
+            ..Fence::default()
+        };
+        let (id, key) = action_pair();
+        match client
+            .terminal_attach(
+                id,
+                key,
+                fence,
+                TargetParameters {
+                    target_id: terminal_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(response) => {
+                attached = response.value.terminal_attachment;
+                break;
+            }
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let attachment = attached.context("attach returned no viewer")?;
     let screen = if let Some(capability) = attachment.stream_capability.as_deref() {
         client
             .terminal_frames(
@@ -1591,6 +1663,7 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         attachment_id: attachment.attachment_id,
         screen,
     });
+    app.notice = None;
     app.dirty = true;
     Ok(())
 }
@@ -1898,7 +1971,8 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
     if app.selection_mode {
         match key.code {
             KeyCode::Char('v') => toggle_text_selection(app)?,
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Esc => toggle_text_selection(app)?,
+            KeyCode::Char('q') => return Ok(true),
             _ => {}
         }
         return Ok(false);
@@ -2105,7 +2179,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Char(d @ '1'..='4') => {
+        KeyCode::Char(d @ '1'..='4') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.tab = d as usize - '1' as usize;
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
@@ -2222,9 +2296,13 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         }
         KeyCode::Enter if app.tab == 1 => {
             if app.live_ready {
-                attach(app, client).await?;
+                if let Err(error) = attach(app, client).await {
+                    app.notice = Some(format!(
+                        "Terminal: {error} · select another agent or retry Enter"
+                    ));
+                }
             } else {
-                app.model.status = "Reconnect before attaching a terminal".into();
+                app.notice = Some("Reconnect before attaching a terminal".into());
             }
         }
         _ => {}
@@ -2716,7 +2794,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"failed","reachability":"reachable","driver":"claude","harness_state":"ended"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -2728,7 +2806,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("Harness: claude · ended"));
+        assert!(content.contains("Harness: claude · ready"));
         assert!(content.contains("observed"));
     }
 
@@ -2856,6 +2934,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ctrl_four_does_not_switch_tabs_outside_terminal() {
+        let mut app = App::new(Model::default());
+        app.tab = 1;
+        let client = Client::unix("/nonexistent-stui-test.sock");
+        assert!(
+            !handle_key(
+                &mut app,
+                &client,
+                KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(app.tab, 1);
+    }
+
     #[test]
     fn terminal_fence_uses_owner_sequence_for_relayed_screen() {
         let mut screen: st3_client::Envelope<st3_client::TerminalScreen> = serde_json::from_str(
@@ -2912,7 +3007,7 @@ mod tests {
                 .iter()
                 .map(|(agent, _)| agent.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Working", "Available", "Diagnostic"]
+            vec!["Working", "Available"]
         );
     }
 
@@ -3391,7 +3486,7 @@ mod tests {
         model.work.truncated = true;
         assert_eq!(
             mission_progress_label(&model, model.missions().next().unwrap(), 1, 3),
-            "1/3+ visible steps"
+            "1/3+ recent steps"
         );
         let mut app = App::new(model);
         app.tab = 2;

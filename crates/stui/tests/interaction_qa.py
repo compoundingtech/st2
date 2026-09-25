@@ -102,8 +102,9 @@ def main(binary: str) -> None:
         click(session, header.index("Select text [v]") + 2, 1)
         wait_screen(session, lambda value: "SELECT" in value.splitlines()[0]
                     and "Drag to select text" in value, "terminal text selection")
-        send(session, "v")
+        send(session, "\x1b")
         wait_screen(session, lambda value: "Select text [v]" in value.splitlines()[0], "return from selection")
+        assert "Chat" in screen(session).splitlines()[0], "Esc in selection must not quit"
         print("Chat interaction QA passed: click target, wheel, History, older pages, text selection")
     finally:
         try:

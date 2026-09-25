@@ -960,9 +960,9 @@ fn client_work_resources(
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
     let mut work = if history {
-        store.work_history_at_snapshot(actor, snapshot_unix_ms)?
+        store.client_work_history_at_snapshot(actor, snapshot_unix_ms)?
     } else {
-        store.work_at_snapshot(actor, false, snapshot_unix_ms)?
+        store.client_work_at_snapshot(actor, false, snapshot_unix_ms)?
     };
     if history {
         work.sort_by(|left, right| {
@@ -1009,6 +1009,7 @@ fn client_work_resources(
                 "definition_id": work.definition_hash,
                 "path": work.step,
                 "state": state,
+                "agentless": work.agentless,
                 "attempt": work.attempt,
                 "readiness_epoch": work.readiness_epoch,
                 "claimant": work.claimant,
@@ -9221,6 +9222,71 @@ mission "planned/direct" state="ready" {
         assert_eq!(
             store.selected_desired_kind(&planner).unwrap().as_deref(),
             Some("stop")
+        );
+    }
+
+    #[test]
+    fn client_work_projection_includes_agentless_mission_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "visible-agentless" state="ready" {
+  goal "Keep agentless work visible in Control."
+  step "steward" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "visible-agentless")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "visible-agentless".into(),
+                revision: None,
+                workspace: workspace.display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "visible-agentless-run".into(),
+            })
+            .unwrap();
+        let resources = client_work_resources(
+            &state.store,
+            None,
+            true,
+            client_now_ms(),
+            state.store.index().unwrap(),
+        )
+        .unwrap();
+        let step = resources
+            .iter()
+            .find(|item| item["mission_run_id"] == run.subject)
+            .unwrap();
+        assert_eq!(step["path"], "steward");
+        assert_eq!(step["agentless"], true);
+        assert!(
+            client_work_resources(
+                &state.store,
+                Some("agent/other"),
+                true,
+                client_now_ms(),
+                state.store.index().unwrap()
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

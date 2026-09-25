@@ -2905,6 +2905,22 @@ impl Store {
         self.work_at_snapshot_internal(actor, include_terminal, snapshot_unix_ms, true)
     }
 
+    /// Client projections include agentless steps so mission progress remains visible.
+    pub fn client_work_at_snapshot(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal_with_agentless(
+            actor,
+            include_terminal,
+            snapshot_unix_ms,
+            true,
+            true,
+        )
+    }
+
     /// Return the work fields needed by the reconciler without computing CLI-only
     /// timing and wake annotations. Those annotations scan immutable history and
     /// are intentionally too expensive for the daemon's inner control loop.
@@ -2980,13 +2996,30 @@ impl Store {
         snapshot_unix_ms: u128,
         detailed: bool,
     ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal_with_agentless(
+            actor,
+            include_terminal,
+            snapshot_unix_ms,
+            detailed,
+            false,
+        )
+    }
+
+    fn work_at_snapshot_internal_with_agentless(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+        detailed: bool,
+        include_agentless: bool,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
-             WHERE agentless=0
+             WHERE (agentless=0 OR (?3 AND ?1 IS NULL))
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
                AND (?1 IS NULL
                     OR assignee=?1
@@ -2996,7 +3029,7 @@ impl Store {
              ORDER BY created_at_unix_ms, step_path",
         )?;
         let rows = statement.query_map(
-            params![actor.as_deref(), include_terminal],
+            params![actor.as_deref(), include_terminal, include_agentless],
             step_run_from_row,
         )?;
         let views = rows.collect::<Result<Vec<_>, _>>()?;
@@ -3045,16 +3078,36 @@ impl Store {
         actor: Option<&str>,
         snapshot_unix_ms: u128,
     ) -> Result<Vec<StepRunView>> {
+        self.work_history_at_snapshot_with_agentless(actor, snapshot_unix_ms, false)
+    }
+
+    pub fn client_work_history_at_snapshot(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<StepRunView>> {
+        self.work_history_at_snapshot_with_agentless(actor, snapshot_unix_ms, true)
+    }
+
+    fn work_history_at_snapshot_with_agentless(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+        include_agentless: bool,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
-             WHERE agentless=0
+             WHERE (agentless=0 OR (?1 AND ?2 IS NULL))
              ORDER BY created_at_unix_ms, step_path, subject",
         )?;
-        let rows = statement.query_map([], step_run_from_row)?;
+        let rows = statement.query_map(
+            params![include_agentless, actor.as_deref()],
+            step_run_from_row,
+        )?;
         let mut visible = Vec::new();
         for row in rows {
             let mut view = row?;

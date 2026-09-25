@@ -59,6 +59,8 @@ pub struct Model {
     recent_events: VecDeque<String>,
     #[serde(skip)]
     pending_refresh: BTreeSet<Kind>,
+    #[serde(skip)]
+    last_observation_refresh: Option<std::time::Instant>,
 }
 
 impl Model {
@@ -214,10 +216,20 @@ impl Model {
             if self.recent_events.len() > 256 {
                 self.recent_events.pop_front();
             }
-            if event.body.get("change").and_then(serde_json::Value::as_str) == Some("work.renewed")
-            {
+            let change = event.body.get("change").and_then(serde_json::Value::as_str);
+            if matches!(change, Some("work.renewed" | "harness.usage")) {
                 self.event_cursor = event.next_cursor;
                 continue;
+            }
+            if change == Some("harness.observed") {
+                if self
+                    .last_observation_refresh
+                    .is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(30))
+                {
+                    self.event_cursor = event.next_cursor;
+                    continue;
+                }
+                self.last_observation_refresh = Some(std::time::Instant::now());
             }
             if matches!(event.event_type, EventType::CapabilitiesChanged) {
                 self.pending_refresh.extend(Kind::ALL);
@@ -471,6 +483,31 @@ async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
 }
 
 async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
+    if kind == Kind::Work {
+        let mut current = read_pages_once_inner(client, kind, false).await?;
+        let history = read_pages_once_inner(client, kind, true).await?;
+        let mut seen = current
+            .items
+            .iter()
+            .map(|item| item.header().id.clone())
+            .collect::<BTreeSet<_>>();
+        current.items.extend(
+            history
+                .items
+                .into_iter()
+                .filter(|item| seen.insert(item.header().id.clone())),
+        );
+        current.truncated |= history.truncated;
+        return Ok(current);
+    }
+    read_pages_once_inner(client, kind, false).await
+}
+
+async fn read_pages_once_inner(
+    client: &Client,
+    kind: Kind,
+    work_history: bool,
+) -> Result<Collection> {
     let mut result = Collection::default();
     let mut cursor = None;
     for page_index in 0..MAX_PAGES {
@@ -494,7 +531,7 @@ async fn read_pages_once(client: &Client, kind: Kind) -> Result<Collection> {
             }
             Kind::Work => {
                 client
-                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), true)
+                    .work_list(cursor.as_deref(), Some(PAGE_SIZE), work_history)
                     .await?
             }
             Kind::Agents => {
@@ -973,6 +1010,31 @@ mod tests {
         let mut model = Model::default();
         assert!(!model.consume_events(events).0);
         assert_eq!(model.event_cursor, "event-cursor/node/1");
+    }
+
+    #[test]
+    fn observation_burst_refreshes_roster_once() {
+        let events: EventPage = serde_json::from_value(serde_json::json!({
+            "kind":"event-page", "oldest_cursor":"event-cursor/node/0",
+            "resume_cursor":"event-cursor/node/2", "has_more":false,
+            "items":[
+                {"id":"event/one","epoch":"node","sequence":1,"previous_cursor":"event-cursor/node/0","next_cursor":"event-cursor/node/1","timestamp":"2026-09-25T08:00:00Z","type":"upsert","resource_ids":["agent/one"],"snapshot_id":"snapshot/one","body":{"change":"harness.observed"}},
+                {"id":"event/two","epoch":"node","sequence":2,"previous_cursor":"event-cursor/node/1","next_cursor":"event-cursor/node/2","timestamp":"2026-09-25T08:00:01Z","type":"upsert","resource_ids":["agent/two"],"snapshot_id":"snapshot/two","body":{"change":"harness.observed"}}
+            ]
+        })).unwrap();
+        let mut model = Model::default();
+        assert!(model.consume_events(events.clone()).0);
+        assert_eq!(
+            model.pending_refresh,
+            BTreeSet::from([Kind::Agents, Kind::Runtimes])
+        );
+        model.pending_refresh.clear();
+        let mut another = events;
+        another.items[0].id = "event/three".into();
+        another.items[0].next_cursor = "event-cursor/node/3".into();
+        another.items.truncate(1);
+        assert!(!model.consume_events(another).0);
+        assert!(model.pending_refresh.is_empty());
     }
 
     #[test]
