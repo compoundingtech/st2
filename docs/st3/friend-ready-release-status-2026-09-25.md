@@ -1,9 +1,9 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `ea74722` for `st3` and `5a429bd` for `stui` is
+**Release hold.** Source `9f8cf56` for `st3` and `5a429bd` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
-source is merged at `e49c097`. The earlier 11:40:44 UTC soak windows were
-invalidated by the CPU hotfix rollout. New windows began at 13:55:44 UTC after
+source is merged at `e49c097`. The 13:55:44 UTC windows were invalidated by
+the closed-message replay fix rollout. New windows began at 15:46:21 UTC after
 both daemons restarted; their full 24-hour idle and 72-hour bidirectional
 delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
@@ -18,12 +18,50 @@ not an invitation to start the trial while this hold is active.
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
 | Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The restarted OMP seat is ready with a registry-supported declared model; both strict doctors pass. | Keep the OMP seat ready overnight. |
-| Addressable inboxes | The continuous monitor has current exact linked receipts in both directions; OpenCode and the restarted OMP seat have sent linked native graph replies. | Fix the OMP closed-message replay defect and keep the monitor running through the new window. |
+| Addressable inboxes | The continuous monitor has exact linked receipts, and a temporary OMP seat answered one request exactly once before and after its restart on the repaired daemon. | Keep the monitor running through the new 72-hour window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
 | Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. | Continue the release soak; Nathan is not the TUI acceptance tester. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 15:46 UTC closed-message replay fix and fresh evidence windows
+
+- OMP's original requests were delivered before its 15:11 restart but remained
+  open after it sent linked replies. Its fresh boot mailbox showed the answered
+  requests again, and it replied twice. `9f8cf56` integrates the fix from
+  `agent/st3-closed-replay`: the message API advances an incoming request to
+  closed when its recipient sends a linked reply to the original sender. Sender
+  follow-ups do not settle another party's inbox. The regression failed before
+  the fix, then passed across OMP, PI, Claude, Codex and OpenCode transport
+  labels, including idempotent retry and an empty post-answer mailbox. The full
+  locked `st3` suite passed 415 library, 88 CLI, 5 client CLI, 21 contract, 27
+  example and 12 operational tests; Silber passed the focused regression and
+  built its host-native release binary.
+- Silber installed `st3` SHA-256
+  `88718b04000f37de58aedc09168d8b3da348369b42f5208ea2d65ed09b7bc0b3`;
+  Hetz installed
+  `ac6006347ef8c6af6a71e5c680606eb372d24741d17df94efd084a4151e17f43`.
+  The prior binaries are retained under each host's
+  `~/.local/state/st3/rollout-backups/9f8cf56-20260925-1545/st3`.
+  Services were restarted one host at a time. Both strict doctors pass, with
+  ready native drivers, signed peers up, and zero unresolved or unhealthy
+  replication records.
+- A temporary OMP seat using the supported `openai-codex/gpt-5.6-sol` model
+  sent exact linked reply `message/2ed5bc1f4a2cef52` to request
+  `message/3a4827731e44a950` and closed the request. After a controlled
+  restart onto a new incarnation, the first thread still had one reply; a new
+  request `message/a709fab03b89c788` received exactly one linked reply
+  `message/b8c590fd7fc676bb` and closed. The temporary seat was stopped and
+  strict doctor passed. The continuous monitor logged post-restart exact linked
+  receipts Silber-to-Hetz at 15:47:52 UTC and Hetz-to-Silber at 15:53:33 UTC,
+  with one matching reply for each request.
+- The release watcher now pins both starts to Unix `1790351181` (15:46:21 UTC),
+  the first healthy local Silber sample after both restarts. The retained idle
+  preflight passed at 15:49 with three Hetz and four Silber post-marker
+  samples, one PID per host, no errors or gaps. The full idle gate is due after
+  24 hours and the delivery gate after 72 hours; this short preflight does not
+  count as either gate passing.
 
 ## 15:34 UTC installed TUI interaction repair and OMP model correction
 
