@@ -211,7 +211,21 @@ impl App {
             .map(|(agent, _)| *agent)
     }
     fn agent_tree(&self) -> Vec<(&st3_client::Agent, usize)> {
-        let agents = self.model.agents().collect::<Vec<_>>();
+        let mut agents = self.model.agents().collect::<Vec<_>>();
+        // The API can include stopped historical seats. Keep them browseable,
+        // but open Chat on an active conversation instead of an old fixture.
+        agents.sort_by(|left, right| {
+            let priority = |agent: &st3_client::Agent| {
+                (
+                    if agent.state == "running" { 0 } else { 1 },
+                    if agent.active_work_count > 0 { 0 } else { 1 },
+                )
+            };
+            priority(left)
+                .cmp(&priority(right))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .then_with(|| left.header.id.cmp(&right.header.id))
+        });
         let mut result = Vec::new();
         let mut seen = HashSet::new();
         fn add<'a>(
@@ -1008,6 +1022,7 @@ fn mission_label(mission: &st3_client::Mission) -> String {
             "tui" => "TUI".into(),
             "ios" => "iOS".into(),
             "st3" => "ST3".into(),
+            "omp" => "OMP".into(),
             "api" => "API".into(),
             "pty" => "PTY".into(),
             _ => {
@@ -1022,14 +1037,13 @@ fn mission_label(mission: &st3_client::Mission) -> String {
         .join(" ")
 }
 fn mission_display_label(mission: &st3_client::Mission) -> String {
-    let fingerprint = mission
+    let path = mission
         .header
         .id
-        .bytes()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
-    format!("{:08x} · {}", fingerprint as u32, mission_label(mission))
+        .strip_prefix("mission/")
+        .unwrap_or(&mission.header.id);
+    let scope = path.rsplit_once('/').map_or(path, |(scope, _)| scope);
+    format!("{} · {}", scope, mission_label(mission))
 }
 fn action_label(action: &str) -> String {
     match action {
@@ -2437,7 +2451,8 @@ mod tests {
         else {
             panic!()
         };
-        assert_ne!(mission_display_label(&a), mission_display_label(&b));
+        assert_eq!(mission_display_label(&a), "a · Issue Triage");
+        assert_eq!(mission_display_label(&b), "b · Issue Triage");
     }
 
     #[test]
@@ -2564,6 +2579,33 @@ mod tests {
         app.selected[1] = 1;
         assert_eq!(app.peer().unwrap().name, "Child");
         assert_eq!(agent_label(app.peer().unwrap()), "Child");
+    }
+
+    #[test]
+    fn chat_opens_on_active_work_before_stopped_history() {
+        let mut model = Model::default();
+        for (id, name, state, active) in [
+            ("agent/diagnostic", "Diagnostic", "stopped", 0),
+            ("agent/available", "Available", "running", 0),
+            ("agent/working", "Working", "running", 1),
+        ] {
+            model.agents.items.push(
+                serde_json::from_value(serde_json::json!({
+                    "kind":"agent", "id":id, "revision":"one", "updated_at":"2026-09-25T08:00:00Z",
+                    "name":name, "state":state, "reachability":"reachable",
+                    "active_work_count":active
+                }))
+                .unwrap(),
+            );
+        }
+        let app = App::new(model);
+        assert_eq!(
+            app.agent_tree()
+                .iter()
+                .map(|(agent, _)| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Working", "Available", "Diagnostic"]
+        );
     }
 
     #[test]
