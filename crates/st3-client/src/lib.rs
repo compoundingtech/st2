@@ -259,6 +259,18 @@ impl Client {
         .await
     }
 
+    /// Read both sides of one agent's graph conversation from a trusted local client.
+    pub async fn messages_list_for_peer(
+        &self,
+        peer: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal_with_filters("messages", cursor, limit, history, &[("actor", peer)])
+            .await
+    }
+
     /// Read the bounded Now projection for one exact mission run without a
     /// stringly-typed path or collection name at the call site.
     pub async fn now_list_for_owner_run(

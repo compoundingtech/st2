@@ -2462,8 +2462,13 @@ async fn client_messages(
     if effective_query.cursor.is_some() {
         return client_page(&state, &snapshot, "messages", Vec::new(), &effective_query).map(Json);
     }
-    let items = client_message_resources(&state.store, person.as_deref(), query.history)
+    let mut items = client_message_resources(&state.store, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
+    if let Some(peer) = query.actor.as_deref() {
+        items.retain(|item| {
+            item["from"].as_str() == Some(peer) || item["to"].as_str() == Some(peer)
+        });
+    }
     client_page(&state, &snapshot, "messages", items, &effective_query).map(Json)
 }
 

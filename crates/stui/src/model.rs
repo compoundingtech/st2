@@ -330,7 +330,7 @@ impl Model {
             snapshot, value, ..
         } = client
             .trusted_unscoped_read()
-            .messages_list_for_recipient(peer, None, Some(PAGE_SIZE), true)
+            .messages_list_for_peer(peer, None, Some(PAGE_SIZE), true)
             .await?;
         self.messages = Collection {
             items: value.items,
