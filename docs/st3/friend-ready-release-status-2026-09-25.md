@@ -56,10 +56,20 @@ the release gates after the final tested rollout.
   or unhealthy replication records, and the same ready OMP incarnation. Direct
   LAN, `.local`, and tailnet gateway routes still return unauthenticated 403.
   The exact delivery monitor logged a Hetz-to-Silber linked receipt during the
-  rollout at 13:55:15 UTC. New release markers are Unix `1790344544`
-  (13:55:44 UTC), the first healthy post-rollout sample. The one-sample
-  preflight passes on both hosts; the full windows and a live ready-step CPU
-  comparison are still pending.
+  rollout at 13:55:15 UTC and a Silber-to-Hetz linked receipt at 14:00:35 UTC,
+  20 seconds after that request. New release markers are Unix `1790344544`
+  (13:55:44 UTC), the first healthy post-rollout sample. The preflight passes
+  with three continuous healthy samples per host, and both strict doctors
+  passed again after the ready-step check.
+- At 13:58:51 UTC the product step was released back to ready; its new wake
+  was read and closed at 13:59:06 UTC. The deployed daemon kept running without
+  the former overdue-deadline hot loop. In the first eight post-marker samples,
+  Hetz had four quiet intervals with median CPU 14.8% of one core, versus 78.3%
+  over 82 quiet intervals before the fix. Silber had five quiet intervals at
+  18.0%, below its unchanged 50% limit. Each host had one daemon PID and zero
+  bad samples. These short measurements are diagnostic only: Hetz is close to
+  its unchanged 15% limit, and the 24-hour CPU/RSS and 72-hour delivery gates
+  are still pending.
 
 ## 11:40 UTC OMP and macOS TUI repair rollout
 
