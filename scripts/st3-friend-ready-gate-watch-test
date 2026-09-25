@@ -80,28 +80,33 @@ risk_first=$(bash "$here/st3-friend-ready-gate-watch")
 risk_second=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $risk_second != *'idle CPU risk notified'* && $risk_second == *'cpu-risk=high-cpu'* ]]
 
-# A failed delivery report at its deadline still queues claimable remediation.
+# A delivery deadline alone notifies, but does not start the final audit before
+# a separately reset idle window is also due.
 export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((now - 259200))"
-run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+delivery_due=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $delivery_due == *'delivery gate fail notified'* && $delivery_due != *'friend-ready audit run started:'* ]]
+
+# Once both windows are due, a failed report still queues claimable remediation.
+export ST3_FRIEND_READY_IDLE_START_UNIX="$((now - 86400))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
 due_first=$(bash "$here/st3-friend-ready-gate-watch")
-[[ $due_first == *'friend-ready audit run started:'* && $due_first == *'delivery=fail'* ]]
+[[ $due_first == *'idle gate fail notified'* && $due_first == *'friend-ready audit run started:'* ]]
 [[ -f $run_state ]]
 due_second=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $due_second == *'friend-ready audit run already exists:'* ]]
 
 # Resetting the window must create a new run and resend the same failure state.
 export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((ST3_FRIEND_READY_MESSAGE_START_UNIX + 1))"
-run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
 reset=$(bash "$here/st3-friend-ready-gate-watch")
 [[ $reset == *'delivery gate fail notified'* && $reset == *'friend-ready audit run started:'* ]]
 [[ -f $run_state ]]
 
-export ST3_FRIEND_READY_IDLE_START_UNIX="$((now - 86400))"
-idle_due=$(bash "$here/st3-friend-ready-gate-watch")
-[[ $idle_due == *'idle gate fail notified'* ]]
 export ST3_FRIEND_READY_IDLE_START_UNIX="$((ST3_FRIEND_READY_IDLE_START_UNIX + 1))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
 idle_reset=$(bash "$here/st3-friend-ready-gate-watch")
-[[ $idle_reset == *'idle gate fail notified'* ]]
+[[ $idle_reset == *'idle gate fail notified'* && $idle_reset == *'friend-ready audit run started:'* ]]
+[[ -f $run_state ]]
 
 # A lost response after commit counts only after an exact read proves the run.
 /bin/rm -- "$run_state"

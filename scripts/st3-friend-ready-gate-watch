@@ -187,10 +187,11 @@ else
 fi
 
 # A notification is not work. At the delivery deadline, queue one exact audit
-# run whether the report passes or fails, so remediation or release review is
+# run for the pair of due windows whether a report passes or fails, so
+# remediation or release review is
 # claimable even if the operator misses a message. The queue helper reads the
 # exact run before starting it and tolerates a lost response after commit.
-if [[ $message != waiting ]]; then
+if [[ $idle != waiting && $message != waiting ]]; then
   if ! "$AUDIT_QUEUE"; then
     failures=1
   fi
