@@ -26,6 +26,10 @@ use crate::store::Store;
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
+// A new harness can spend longer than the retry sequence reading its boot
+// contract before it claims work. Keep the quick delivery retries, but do not
+// diagnose a failed wake while that bounded startup window is still open.
+const WORK_WAKE_EXHAUST_GRACE_MS: u128 = 5 * 60_000;
 const CODEX_CRASH_LOOP_ATTEMPTS: usize = 3;
 const CODEX_CRASH_LOOP_INTERVAL_MS: u128 = 5 * 60_000;
 
@@ -1170,11 +1174,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .filter_map(|message| message_sent_at(&self.store, message).map(|at| (at, message)))
                 .collect::<Vec<_>>();
             attempts.sort_by_key(|(at, _)| *at);
-            let acknowledged = attempts.first().is_some_and(|(requested, _)| {
-                harness.as_ref().is_some_and(|harness| {
-                    harness.state == "working" && harness.observed_at_unix_ms >= *requested
-                })
-            });
+            let acknowledged = work_wake_acknowledged(&attempts, harness.as_ref());
             if acknowledged {
                 continue;
             }
@@ -1182,6 +1182,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             match work_wake_decision(
                 attempt_count,
                 attempts.last().map(|(last, _)| *last),
+                attempts.first().map(|(first, _)| *first),
                 acknowledged,
                 now_ms(),
             ) {
@@ -7308,6 +7309,7 @@ enum WorkWakeDecision {
 fn work_wake_decision(
     attempts: u32,
     last_attempt_at_unix_ms: Option<u128>,
+    first_attempt_at_unix_ms: Option<u128>,
     acknowledged: bool,
     now_unix_ms: u128,
 ) -> WorkWakeDecision {
@@ -7320,9 +7322,29 @@ fn work_wake_decision(
         WorkWakeDecision::Wait
     } else if attempts < WORK_WAKE_MAX_ATTEMPTS {
         WorkWakeDecision::Request(attempts.saturating_add(1))
+    } else if first_attempt_at_unix_ms
+        .is_none_or(|first| now_unix_ms.saturating_sub(first) < WORK_WAKE_EXHAUST_GRACE_MS)
+    {
+        WorkWakeDecision::Wait
     } else {
         WorkWakeDecision::Exhaust
     }
+}
+
+fn work_wake_acknowledged(
+    attempts: &[(u128, &crate::model::MessageView)],
+    harness: Option<&CurrentHarnessView>,
+) -> bool {
+    // A native read or close is durable evidence of a consumed wake even if a
+    // short turn returned to ready before the harness observation caught it.
+    attempts
+        .iter()
+        .any(|(_, message)| matches!(message.status.as_str(), "read" | "closed"))
+        || attempts.first().is_some_and(|(requested, _)| {
+            harness.is_some_and(|harness| {
+                harness.state == "working" && harness.observed_at_unix_ms >= *requested
+            })
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7456,13 +7478,18 @@ fn work_wake_deadline(
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
                 && wake.acknowledged_by.is_none()
                 && wake.failure.is_none()
-                // Reconciliation records exhaustion after the final attempt;
-                // an expired retry deadline cannot do any further work.
-                && wake.attempts < WORK_WAKE_MAX_ATTEMPTS
+                && wake.attempts <= WORK_WAKE_MAX_ATTEMPTS
         })
         .map(|wake| {
+            let delay = if wake.attempts == WORK_WAKE_MAX_ATTEMPTS {
+                // Reconcile once more after startup grace to record a genuine
+                // exhaustion even when no other graph event arrives.
+                WORK_WAKE_EXHAUST_GRACE_MS
+            } else {
+                WORK_WAKE_RETRY_MS
+            };
             wake.last_attempt_at_unix_ms
-                .map_or(now, |last| last.saturating_add(WORK_WAKE_RETRY_MS))
+                .map_or(now, |last| last.saturating_add(delay))
         })
         .min()
 }
@@ -14554,25 +14581,75 @@ mission "ios-proof-blocked" state="ready" {
     #[test]
     fn work_wakes_retry_with_a_bound_and_stop_after_acknowledgement() {
         assert_eq!(
-            work_wake_decision(0, None, false, 1),
+            work_wake_decision(0, None, None, false, 1),
             WorkWakeDecision::Request(1)
         );
         assert_eq!(
-            work_wake_decision(1, Some(1_000), false, 1_000 + WORK_WAKE_RETRY_MS - 1),
+            work_wake_decision(
+                1,
+                Some(1_000),
+                Some(1_000),
+                false,
+                1_000 + WORK_WAKE_RETRY_MS - 1
+            ),
             WorkWakeDecision::Wait
         );
         assert_eq!(
-            work_wake_decision(1, Some(1_000), false, 1_000 + WORK_WAKE_RETRY_MS),
+            work_wake_decision(
+                1,
+                Some(1_000),
+                Some(1_000),
+                false,
+                1_000 + WORK_WAKE_RETRY_MS
+            ),
             WorkWakeDecision::Request(2)
         );
         assert_eq!(
-            work_wake_decision(3, Some(1_000), false, 1_000 + WORK_WAKE_RETRY_MS),
+            work_wake_decision(
+                3,
+                Some(1_000),
+                Some(1_000),
+                false,
+                1_000 + WORK_WAKE_RETRY_MS
+            ),
+            WorkWakeDecision::Wait
+        );
+        assert_eq!(
+            work_wake_decision(
+                3,
+                Some(1_000),
+                Some(1_000),
+                false,
+                1_000 + WORK_WAKE_EXHAUST_GRACE_MS
+            ),
             WorkWakeDecision::Exhaust
         );
         assert_eq!(
-            work_wake_decision(1, Some(1_000), true, u128::MAX),
+            work_wake_decision(1, Some(1_000), Some(1_000), true, u128::MAX),
             WorkWakeDecision::Wait
         );
+    }
+
+    #[test]
+    fn a_read_or_closed_work_wake_acknowledges_a_short_turn() {
+        let mut wake = crate::model::MessageView {
+            subject: "message/work-wake".into(),
+            from: "daemon/runtime".into(),
+            to: "agent/worker".into(),
+            content: "Claim work".into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        assert!(!work_wake_acknowledged(&[(1_000, &wake)], None));
+        wake.status = "delivered".into();
+        assert!(!work_wake_acknowledged(&[(1_000, &wake)], None));
+        wake.status = "read".into();
+        assert!(work_wake_acknowledged(&[(1_000, &wake)], None));
+        wake.status = "closed".into();
+        assert!(work_wake_acknowledged(&[(1_000, &wake)], None));
     }
 
     #[test]
@@ -14781,12 +14858,22 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
         exhausted.wake.as_mut().unwrap().attempts = WORK_WAKE_MAX_ATTEMPTS;
         assert_eq!(
             work_wake_deadline(
-                &[exhausted],
+                &[exhausted.clone()],
                 &BTreeSet::from(["agent/remote.worker".into()]),
                 2_000 + WORK_WAKE_RETRY_MS
             ),
+            Some(1_000 + WORK_WAKE_EXHAUST_GRACE_MS),
+            "a final wake needs one bounded post-startup check"
+        );
+        exhausted.wake.as_mut().unwrap().failure = Some("work-wake-exhausted".into());
+        assert_eq!(
+            work_wake_deadline(
+                &[exhausted],
+                &BTreeSet::from(["agent/remote.worker".into()]),
+                2_000 + WORK_WAKE_EXHAUST_GRACE_MS
+            ),
             None,
-            "an exhausted wake must not keep the daemon in a busy retry loop"
+            "a recorded failure must not keep the daemon in a busy retry loop"
         );
     }
 }
