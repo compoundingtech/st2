@@ -253,9 +253,14 @@ The response shows a short-lived single-use code and pairing ID. A remote device
 loopback gateway through Fabric, proves the code, supplies its public key, and receives a scoped
 credential bound to that key. The resulting session returns the exact delegated person, its derived
 device-session actor, and granted scopes.
-Pairing codes expire after five minutes, reveal no fleet secret, and cannot request their own actor
-or scopes. Revocation takes effect for every subsequent request, including a new bounded terminal
-WebSocket exchange.
+Pairing codes expire after five minutes and reveal no fleet secret. The remote device cannot
+request its own actor or scopes. By default the trusted local begin grants projection reads,
+terminal reads, attention control, and launch control. For an intentionally trusted device that
+needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
+must use `st3 devices --as person/nathan pair --full-control "Nathan iPhone"` on the trusted local
+socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
+not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
+effect for every subsequent request, including a new bounded terminal WebSocket exchange.
 
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response

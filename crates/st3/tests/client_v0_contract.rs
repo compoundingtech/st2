@@ -1168,6 +1168,93 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
 }
 
 #[tokio::test]
+async fn full_control_pairing_requires_explicit_local_person_opt_in_and_can_be_revoked() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let local = st3::api::router(state.clone());
+    let paired_gateway = st3::api::fabric_router(state);
+
+    let begin = serde_json::json!({
+        "api_version": "st3.client.v0",
+        "device_name": "Full control test phone",
+        "person_id": "person/nathan",
+        "full_control": true
+    });
+    let (status, denied) =
+        client_post_json(paired_gateway.clone(), "/v1/client/pairings", begin.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    let (status, challenge) =
+        client_post_json_person(local.clone(), "/v1/client/pairings", "person/nathan", begin).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let (status, paired) = client_post_json(
+        paired_gateway.clone(),
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "code": challenge["value"]["code"],
+            "device_public_key": "full-control-test-phone-key-0000000000000000"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    let scopes = paired["value"]["scopes"].as_array().unwrap();
+    assert!(scopes.iter().any(|scope| scope == "terminal.control"));
+    assert!(scopes.iter().any(|scope| scope == "control.messages"));
+    assert!(scopes.iter().any(|scope| scope == "control.missions"));
+    assert!(scopes.iter().any(|scope| scope == "control.work"));
+    let credential = paired["value"]["credential"].as_str().unwrap();
+    let (status, capabilities) = client_json_auth(
+        paired_gateway.clone(),
+        "/v1/client/capabilities",
+        credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    for action in [
+        "message.send",
+        "mission.start",
+        "work.complete",
+        "terminal.input",
+    ] {
+        assert!(
+            capabilities["value"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability["id"] == action && capability["state"] == "granted"),
+            "{action} was not granted"
+        );
+    }
+
+    let (_, local_capabilities) =
+        client_json_person(local.clone(), "/v1/client/capabilities", "person/nathan").await;
+    let (status, revoked) = client_post_json_person(
+        local,
+        "/v1/client/actions",
+        "person/nathan",
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "id": "action/revoke-full-control-test",
+            "type": "pairing.revoke",
+            "idempotency_key": "revoke-full-control-test-0001",
+            "fence": {
+                "snapshot_id": local_capabilities["snapshot"]["id"],
+                "subject_revisions": {}
+            },
+            "parameters": { "target_id": paired["value"]["device_id"] }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (status, _) = client_json_auth(paired_gateway, "/v1/client/capabilities", credential).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn core_launch_and_mission_actions_use_session_identity_and_exact_fences() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

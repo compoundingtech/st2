@@ -4,7 +4,7 @@ The four-tab Expo app uses the generated `st3.client.v0` TypeScript client. It c
 
 ## Connect
 
-1. On a trusted st3 machine, begin device pairing for the intended person with `st3 devices --as person/... pair "iPhone"`.
+1. On a trusted st3 machine, begin device pairing for the intended person with `st3 devices --as person/... pair --full-control "iPhone"` if this trusted device should use Chat, mission/work, runtime, and terminal controls. Without `--full-control`, pairing intentionally grants a limited read/attention/launch scope set; an existing limited device must be re-paired to gain controls.
 2. On the iPhone, connect Tailscale, enter the **paired-only gateway** HTTPS URL, then enter the pairing ID and code. Never publish the privileged `st3.sock`.
 3. Open Now, Chat, Control, and Fleet. The app shows offline/reconnect state; actions require a live connection. It does not queue offline mutations.
 

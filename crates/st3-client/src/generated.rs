@@ -1767,6 +1767,8 @@ pub struct PairingBegin {
     pub api_version: String,
     pub device_name: String,
     pub person_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_control: Option<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingChallenge {

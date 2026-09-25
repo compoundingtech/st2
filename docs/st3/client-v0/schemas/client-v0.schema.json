@@ -1046,7 +1046,8 @@
       "properties": {
         "api_version": { "const": "st3.client.v0" },
         "device_name": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "person_id": { "type": "string", "pattern": "^person/[^/]+$" }
+        "person_id": { "type": "string", "pattern": "^person/[^/]+$" },
+        "full_control": { "type": "boolean" }
       }
     },
     "PairingChallenge": {

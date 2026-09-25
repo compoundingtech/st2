@@ -55,7 +55,8 @@ On a trusted host, expose **only** the paired client gateway through
 tailnet-only HTTPS, following the
 [client boundary guide](client-v0/README.md#tailnet-https-carrier). Never expose
 the privileged `st3.sock`. Begin a single-use pairing for the intended person
-with `st3 devices --as person/<name> pair "iPhone"`, then enter the gateway URL,
+with `st3 devices --as person/<name> pair --full-control "iPhone"` only if this
+trusted device should have full person-delegated control, then enter the gateway URL,
 pairing ID, and code on the app. The credential belongs in iOS Keychain. Test
 Now, Chat (including fenced terminal input on a permitted running terminal),
 Control, Fleet, and revocation while connected; revoked credentials must lose

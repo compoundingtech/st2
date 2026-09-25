@@ -21,6 +21,12 @@ const ALL_SCOPES: &[&str] = &[
     "control.runtimes",
     "control.pairing",
 ];
+const LIMITED_PAIRING_SCOPES: &[&str] = &[
+    "read.projections",
+    "terminal.read",
+    "control.attention",
+    "control.launches",
+];
 const ACTIONS: &[&str] = &[
     "attention.resolve",
     "review.approve",
@@ -1986,6 +1992,7 @@ pub(super) struct PairingBegin {
     api_version: String,
     device_name: String,
     person_id: String,
+    full_control: Option<bool>,
 }
 
 pub(super) async fn pairing_begin(
@@ -2025,6 +2032,11 @@ pub(super) async fn pairing_begin(
     let subject = format!("custom/client/pairing-{}", &stable[..24]);
     let expires_at = client_now_ms() + 300_000;
     let person_id = request.person_id;
+    let scopes = if request.full_control.unwrap_or(false) {
+        ALL_SCOPES
+    } else {
+        LIMITED_PAIRING_SCOPES
+    };
     state
         .store
         .append_claim(&ClaimInput {
@@ -2035,6 +2047,7 @@ pub(super) async fn pairing_begin(
                 ("pairing_id".into(), Value::String(pairing_id.clone())),
                 ("device_name".into(), Value::String(request.device_name)),
                 ("person_id".into(), Value::String(person_id)),
+                ("scopes".into(), json!(scopes)),
                 ("code_hash".into(), Value::String(credential_digest(&code))),
                 ("expires_at_unix_ms".into(), json!(expires_at)),
             ]),
@@ -2121,12 +2134,17 @@ pub(super) async fn pairing_complete(
         .to_owned();
     let session_actor = format!("{person_id}/session/{actor_suffix}");
     let expires_at = client_now_ms() + 30 * 24 * 60 * 60 * 1_000;
-    let scopes = vec![
-        "read.projections",
-        "terminal.read",
-        "control.attention",
-        "control.launches",
-    ];
+    // The concrete scope list was sealed into the authenticated local begin
+    // claim. Legacy pending challenges retain their original limited grant.
+    let scopes = match begun.body.pointer("/fields/scopes") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| value.as_str().filter(|scope| ALL_SCOPES.contains(scope)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| validation("the pairing has invalid delegated scopes"))?,
+        None => LIMITED_PAIRING_SCOPES.to_vec(),
+        Some(_) => return Err(validation("the pairing has invalid delegated scopes")),
+    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),

@@ -663,7 +663,12 @@ enum DevicesCommand {
     /// List paired devices visible to the authenticated person.
     Ls,
     /// Begin local pairing for one named person and device.
-    Pair { device_name: String },
+    Pair {
+        device_name: String,
+        /// Delegate every current client scope to this trusted device.
+        #[arg(long)]
+        full_control: bool,
+    },
     /// Revoke one paired device.
     Revoke {
         device: String,
@@ -2983,12 +2988,16 @@ async fn run_devices(
                 &format!("st3 devices --as {person}{history}"),
             )
         }
-        DevicesCommand::Pair { device_name } => {
+        DevicesCommand::Pair {
+            device_name,
+            full_control,
+        } => {
             let response = client
                 .pairing_begin(&PairingBegin {
                     api_version: CLIENT_V0_API_VERSION.into(),
                     device_name,
                     person_id: person,
+                    full_control: full_control.then_some(true),
                 })
                 .await?;
             print_client_value(&response, json_output)
@@ -9517,6 +9526,40 @@ mod tests {
                 "accepted shorthand human identity: {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn full_control_device_pairing_is_an_explicit_cli_choice() {
+        let limited =
+            Cli::try_parse_from(["st3", "devices", "--as", "person/nathan", "pair", "iPhone"])
+                .unwrap();
+        let Command::Devices(DevicesArgs {
+            command: Some(DevicesCommand::Pair { full_control, .. }),
+            ..
+        }) = limited.command
+        else {
+            panic!("expected a device pairing command")
+        };
+        assert!(!full_control);
+
+        let full = Cli::try_parse_from([
+            "st3",
+            "devices",
+            "--as",
+            "person/nathan",
+            "pair",
+            "--full-control",
+            "iPhone",
+        ])
+        .unwrap();
+        let Command::Devices(DevicesArgs {
+            command: Some(DevicesCommand::Pair { full_control, .. }),
+            ..
+        }) = full.command
+        else {
+            panic!("expected a device pairing command")
+        };
+        assert!(full_control);
     }
 
     #[test]

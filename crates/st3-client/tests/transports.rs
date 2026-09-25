@@ -251,6 +251,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 api_version: st3_client::API_VERSION.into(),
                 device_name: "Unattributed device".into(),
                 person_id: "person/nathan".into(),
+                full_control: None,
             })
             .await
             .is_err(),
@@ -651,6 +652,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
             api_version: st3_client::API_VERSION.into(),
             device_name: "Conformance phone".into(),
             person_id: "person/nathan".into(),
+            full_control: None,
         })
         .await
         .unwrap();
