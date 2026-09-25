@@ -6,13 +6,14 @@ import * as Crypto from 'expo-crypto';
 import { API_VERSION, ClientError, St3Client, type Attention, type Capabilities, type Device, type Launch, type LaunchVariant, type Message, type Mission, type Page, type Resource, type Runtime, type Snapshot, type TerminalScreen, type TimelineEntry, type Work } from '../../clients/typescript/st3-client';
 import { conversationRows, isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, loadRecentConversation, sessionDetail, sessionLabel, sessionMessagesFor, timelineText, type Conversation, type SessionView } from './sessionView';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, offlinePresentation, PROJECTION_CACHE_KEY, type Data, type MachineView } from './projectionCache';
-import { listCollectionPages, settleCollections, type CollectionResult } from './collectionPages';
+import { listCollectionPages, settleCollections, withConcurrency, type CollectionResult } from './collectionPages';
 import { agentLabel, agentTree } from './agentTree';
 import { tabsChangedByProjectionEvents } from './projectionRefresh';
 import { rememberBounded } from './boundedCache';
 import { withFreshTerminalFence } from './terminalControls';
 import { coalescedRefreshDelay, RefreshFlight } from './refreshFlight';
 import { ForegroundGate } from './foreground';
+import { gatewayFetch } from './gatewayFetch';
 import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, deviceDetail, deviceTitle, missionLabels, pingPresentation, queuedWorkSummary } from './presentation';
 
 const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
@@ -95,7 +96,7 @@ export default function App() {
   const cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
   const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
-  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined }) : null, [url, credential]);
+  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch() }) : null, [url, credential]);
 
   useEffect(() => {
     if (active !== 'Chat' || !chatDetailOpen || !sessionId) return;
@@ -124,6 +125,11 @@ export default function App() {
       if (parsed.hostname === 'tab') {
         const tab = parsed.pathname.replace(/^\//, '');
         if (tabs.includes(tab as Tab)) setActive(tab as Tab);
+        return;
+      }
+      if (parsed.hostname === 'scroll') {
+        const y = Number(parsed.searchParams.get('y'));
+        if (Number.isFinite(y) && y >= 0) scrollView.current?.scrollTo({ y, animated: false });
         return;
       }
       if (parsed.hostname === 'mission') {
@@ -215,17 +221,17 @@ export default function App() {
         if (encoded) void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => {});
       }
       const keys = ['attention', 'messages', 'agents', 'missions', 'launches', 'machines', 'devices', 'runtimes', 'work'] as const;
-      const [settled, sessionsResult] = await Promise.all([Promise.allSettled([
-        listCollectionPages(options => client.attentionList(options), limit, 10),
-        listCollectionPages(options => client.messagesList(options), limit),
-        listCollectionPages(options => client.agentsList(options), limit),
-        listCollectionPages(options => client.missionsList(options), limit),
-        listCollectionPages(options => client.launchesList(options), limit),
-        listCollectionPages(options => client.machinesList(options), limit),
-        listCollectionPages(options => client.devicesList(options), limit),
-        listCollectionPages(options => client.runtimesList(options), limit),
-        listCollectionPages(options => client.workList(options), limit),
-      ]), listSessionPages(options => client.sessionsList(options), limit).then(value => ({ value }), (reason: unknown) => ({ reason }))]);
+      const [settled, sessionsResult] = await Promise.all([withConcurrency([
+        () => listCollectionPages(options => client.attentionList(options), limit, 10),
+        () => listCollectionPages(options => client.messagesList(options), limit),
+        () => listCollectionPages(options => client.agentsList(options), limit),
+        () => listCollectionPages(options => client.missionsList(options), limit),
+        () => listCollectionPages(options => client.launchesList(options), limit),
+        () => listCollectionPages(options => client.machinesList(options), limit),
+        () => listCollectionPages(options => client.devicesList(options), limit),
+        () => listCollectionPages(options => client.runtimesList(options), limit),
+        () => listCollectionPages(options => client.workList(options), limit),
+      ], 4), listSessionPages(options => client.sessionsList(options), limit).then(value => ({ value }), (reason: unknown) => ({ reason }))]);
       if (generation !== cacheGeneration.current) return;
       // Snapshot churn means the pages disagree; retry the whole read rather than mixing snapshots.
       const churn = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected' && isSnapshotChurn(result.reason));

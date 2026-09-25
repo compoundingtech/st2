@@ -49,3 +49,19 @@ export function settleCollections<K extends string, V>(keys: readonly K[], resul
   const firstError = Object.keys(values).length ? undefined : results.find((result): result is PromiseRejectedResult => result.status === 'rejected')?.reason;
   return { values, errors, ...(firstError === undefined ? {} : { firstError }) };
 }
+
+// Runs tasks with at most `limit` in flight and settles each, preserving order. Bursting every
+// collection at once overloads the daemon and the paired gateway path.
+export async function withConcurrency<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const index = next++;
+      try { results[index] = { status: 'fulfilled', value: await tasks[index]() }; }
+      catch (reason) { results[index] = { status: 'rejected', reason }; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
+}

@@ -39,3 +39,11 @@ assert.deepEqual(settled.errors, { devices: 'forbidden: device inventory require
 assert.equal(settled.firstError, undefined);
 const allFailed = settleCollections(['attention'], await Promise.allSettled([Promise.reject(forbidden)]), String);
 assert.equal(allFailed.firstError, forbidden);
+
+// A refresh reads its collections with bounded concurrency instead of bursting all of them at once.
+const { withConcurrency } = await import('./collectionPages.ts');
+let inFlight = 0, peak = 0;
+const tasks = Array.from({ length: 10 }, (_, index) => async () => { inFlight++; peak = Math.max(peak, inFlight); await new Promise(resolve => setTimeout(resolve, 5)); inFlight--; if (index === 3) throw new Error('four'); return index; });
+const outcomes = await withConcurrency(tasks, 4);
+assert.equal(peak, 4);
+assert.deepEqual(outcomes.map(result => result.status === 'fulfilled' ? result.value : result.reason.message), [0, 1, 2, 'four', 4, 5, 6, 7, 8, 9]);
