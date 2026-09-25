@@ -1,9 +1,9 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `9f8cf56` for `st3` and `5a429bd` for `stui` is
+**Release hold.** Source `08dbe1a` for `st3` and `5a429bd` for `stui` is
 deployed as host-native binaries on Hetz and Silber. The direct-network iOS
-source is merged at `e49c097`. The 13:55:44 UTC windows were invalidated by
-the closed-message replay fix rollout. New windows began at 15:46:21 UTC after
+source is merged at `e49c097`. The 15:46:21 UTC windows were invalidated by
+the revision-phase fix rollout. New windows began at 16:12:47 UTC after
 both daemons restarted; their full 24-hour idle and 72-hour bidirectional
 delivery reports are still due.
 Do not describe the friend-ready trial as released until both reports pass and
@@ -17,13 +17,49 @@ not an invitation to start the trial while this hold is active.
 
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
-| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The restarted OMP seat is ready with a registry-supported declared model; both strict doctors pass. | Keep the OMP seat ready overnight. |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The pty-rust seat is restored as a top-level durable agent, with its observer and subscriptions in an active intake run. The restarted OMP seat uses a supported model; both strict doctors pass. | Keep the seats and pty-rust intake active overnight. |
 | Addressable inboxes | The continuous monitor has exact linked receipts, and a temporary OMP seat answered one request exactly once before and after its restart on the repaired daemon. | Keep the monitor running through the new 72-hour window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
 | Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. | Continue the release soak; Nathan is not the TUI acceptance tester. |
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## 16:12 UTC revision-phase repair and pty-rust intake recovery
+
+- Revising the zero-step pty-rust standing mission exposed the current parser's
+  finite default: its new revision selected `all-steps-exhausted` and completed
+  immediately. Terminal cleanup stopped the mission-owned agent and ended its
+  PR and issue intake. The original agent address is now a top-level durable
+  seat, running as incarnation `3585252:2026-09-25T16:02:28.365Z`. A new
+  `mission-run/fleet/pty-rust/intake-20260925` owns a healthy GitHub observer
+  and active PR and issue subscriptions. Its agentless retirement gate keeps
+  the run open without occupying the agent's one available work claim, so PR
+  route steps remain claimable. The declarations and corrected mission are on
+  `st3-network` main at `236ecd7`.
+- The completed UI mission was stuck `revision-draining` because a late
+  `revision-proposal.created` projection reset the successor generation's
+  phase. `08dbe1a` fences draining claims to their source generation and
+  makes the reconciler durably restore `normal` when no current draining
+  proposal exists. The replay regression failed before the fix and passes
+  after it; the self-heal regression and the full locked suite pass (416
+  library, 88 CLI, 5 client CLI, 21 client contract, 27 example, and 12
+  operational tests). After Hetz received the fix, the UI mission advanced
+  through its stop steps to `completed/terminal`; Silber now projects the
+  same state.
+- Hetz installed `st3` SHA-256
+  `2de9ce3f578fd3d10807496f5ba2c830202521a0b03aa727991dd968db6ecf95`;
+  Silber installed
+  `56966efe664e933a0e74fcd3daa6c73a176abda38f5a33e23e9b715314397d75`.
+  Each host retained its prior binary at
+  `~/.local/state/st3/rollout-backups/08dbe1a-20260925-1611/st3`.
+  Daemon and replication worker were restarted one host at a time; both strict
+  doctors pass. The pty-rust seat and intake remained active after restart.
+- Both release starts are now Unix `1790352767` (16:12:47 UTC), the first
+  healthy Silber sample after the final restart. The immediate retained idle
+  preflight passed with one post-marker sample per host, one PID each, and no
+  errors. The full idle gate is due after 24 hours and the delivery gate after
+  72 hours. Their reports remain pending.
 
 ## 15:46 UTC closed-message replay fix and fresh evidence windows
 
