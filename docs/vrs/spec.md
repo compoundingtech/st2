@@ -1327,9 +1327,11 @@ retirement ledger:
 Each value is the epoch millis of the supervisor's first observation of that
 death. Every pass that runs the step reconciles the local host's map to
 exactly the currently dead actors: a PTY that runs again drops its row, so a
-later death serves a fresh grace period. An absent, unreadable, or
-foreign-schema ledger reads as empty and restarts every clock, which errs
-toward keeping actors live.
+later death serves a fresh grace period. The ledger also keeps the direct scan's
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due actors unexamined. An absent, unreadable, or foreign-schema ledger
+reads as empty and restarts every clock and the scan, which errs toward keeping
+actors live.
 
 The step obeys the same gates as retired-seat archival: `archive-after "0"`
 disables it, a contended exclusive lock skips it, and an incomplete strict
@@ -1344,10 +1346,16 @@ one pass:
    the step refuses do not count, and a supervisor never takes a slot ahead of
    a retired dependent that is not in the batch.
 2. Direct actors dead for at least `archive-after` fill what remains, in
-   identity order.
+   identity order, starting after the ledger's resume point and wrapping
+   around. The scan is bounded like the retired-seat scan: it examines at most
+   four times the remaining bound (100 when no retired seat was accepted),
+   stops early once the remaining bound is filled, and reports the unexamined
+   remainder as `auto-archive examined <n> due dead direct actors and deferred
+   <m> to the next pass`; the next pass resumes after the last actor examined.
 3. A due actor whose `.st2/archive/<host>/<identity>` slot already exists is a
-   reported `archive-occupied` refusal. It does not consume the bound and keeps
-   its ledger row, so it is retried on every pass until the slot is cleared.
+   reported `archive-occupied` refusal. It does not consume the bound but does
+   consume the scan window, and keeps its ledger row, so it is retried whenever
+   the scan reaches it again until the slot is cleared.
 4. The rows of the selected actors are dropped in the same ledger write,
    before the moves.
 5. Each selected actor is archived exactly like a retired seat, inside the same

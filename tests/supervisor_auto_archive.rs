@@ -529,6 +529,73 @@ fn a_pass_over_many_refused_seats_examines_a_bounded_window_and_resumes_after_it
     }
 }
 
+/// The direct-actor half of the bounded scan: refused dead actors do not consume the limit either,
+/// so one pass examines at most 100 of them, reports the rest as deferred, and the next pass
+/// resumes after its cursor in the direct ledger, reaching a clean actor behind the refusals.
+#[test]
+fn a_pass_over_many_refused_direct_actors_examines_a_bounded_window_and_resumes_after_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    // Encoded PTY IDs keep identity order equal to the plain names' order.
+    let encode = |pty_id: &str| {
+        let hex: String = pty_id.bytes().map(|byte| format!("{byte:02x}")).collect();
+        format!("direct.omp.x-{hex}")
+    };
+    let blocked: Vec<String> = (0..101)
+        .map(|index| encode(&format!("blocked-{index:03}")))
+        .collect();
+    for identity in &blocked {
+        direct_actor(&catalog, identity);
+        write(
+            &catalog,
+            &format!(".st2/archive/h/{identity}/resources/note"),
+            "occupied\n",
+        );
+    }
+    let clean = encode("zz-clean");
+    direct_actor(&catalog, &clean);
+    let mut observed: Vec<(&str, u64)> = blocked
+        .iter()
+        .map(|identity| (identity.as_str(), 8 * DAY_MS))
+        .collect();
+    observed.push((clean.as_str(), 8 * DAY_MS));
+    seed_direct_ledger(&catalog, &observed);
+
+    let first = up_once(&catalog, &bin);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+
+    assert_eq!(
+        stderr.matches("auto-archive skipped").count(),
+        100,
+        "one pass examines at most four times its limit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "auto-archive examined 100 due dead direct actors and deferred 2 to the next pass"
+        ),
+        "the unexamined remainder must be reported:\n{stderr}"
+    );
+    assert!(catalog.join("agents/h").join(&clean).is_dir(), "{stderr}");
+    assert_eq!(
+        ledger_at(&catalog, DIRECT_LEDGER).unwrap()["resumeAfter"]["h"],
+        blocked[99].as_str(),
+        "the cursor is persisted in the direct ledger"
+    );
+
+    let second = up_once(&catalog, &bin);
+    assert!(
+        catalog.join(".st2/archive/h").join(&clean).is_dir(),
+        "the next pass resumes after the window and reaches the clean actor:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    for identity in &blocked {
+        assert!(
+            catalog.join("agents/h").join(identity).is_dir(),
+            "{identity}"
+        );
+    }
+}
+
 #[test]
 fn repeated_passes_over_an_archived_seat_change_nothing() {
     let temporary = tempfile::tempdir().unwrap();

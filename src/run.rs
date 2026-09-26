@@ -2159,6 +2159,12 @@ fn archive_expired_retirements(
                     pass.scanned, pass.deferred
                 ));
             }
+            if pass.direct_deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due dead direct actors and deferred {} to the next pass",
+                    pass.direct_scanned, pass.direct_deferred
+                ));
+            }
         }
         Err(error) => report
             .warnings

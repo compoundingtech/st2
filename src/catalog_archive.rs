@@ -82,11 +82,13 @@ pub struct AutoArchiveRequest {
     pub grace: Duration,
     /// Most seats one pass may archive. A catalog holding hundreds of retirements drains over
     /// several passes rather than one that holds the authoring lock through all of them. The pass
-    /// also examines at most `limit * DUE_SCAN_FACTOR` due retired seats.
+    /// also examines at most `limit * DUE_SCAN_FACTOR` due retired seats, and at most
+    /// `remaining * DUE_SCAN_FACTOR` due dead direct actors, where `remaining` is the part of
+    /// `limit` the retired seats left.
     pub limit: usize,
 }
 
-/// What one supervisor pass did: the archive result plus how far its bounded scan reached.
+/// What one supervisor pass did: the archive result plus how far its bounded scans reached.
 #[derive(Debug, Clone)]
 pub struct AutoArchiveResult {
     pub archive: ArchiveResult,
@@ -94,6 +96,10 @@ pub struct AutoArchiveResult {
     pub scanned: usize,
     /// Due retired seats left for a later pass, which resumes the scan after the last one examined.
     pub deferred: usize,
+    /// Due dead direct actors examined this pass.
+    pub direct_scanned: usize,
+    /// Due dead direct actors left for a later pass, which resumes after the last one examined.
+    pub direct_deferred: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +273,7 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Au
     let mut candidates = batch.candidates;
     let mut refused = batch.refused;
 
-    let (direct, direct_refused) = due_direct_actors(
+    let direct = due_direct_actors(
         &catalog,
         &found,
         &request.host,
@@ -275,13 +281,15 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Au
         request.limit - candidates.len(),
         now_ms,
     )?;
-    candidates.extend(direct);
-    refused.extend(direct_refused);
+    candidates.extend(direct.candidates);
+    refused.extend(direct.refused);
     let archive = archive_locked(&lock, &catalog, &request.host, false, candidates, refused)?;
     Ok(Some(AutoArchiveResult {
         archive,
         scanned: batch.scanned,
         deferred: batch.deferred,
+        direct_scanned: direct.scanned,
+        direct_deferred: direct.deferred,
     }))
 }
 
@@ -294,6 +302,10 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Au
 /// ledger row, so a later death serves a fresh grace period. The registry read happens under the
 /// exclusive lock and only when a direct actor exists, so a catalog without them pays nothing.
 ///
+/// The scan is bounded exactly as [`plan_due`] bounds retired seats: refused actors do not
+/// consume `limit`, so at most `limit * DUE_SCAN_FACTOR` due actors are examined, in identity
+/// order starting after the host's cursor in the direct ledger and wrapping around.
+///
 /// Rows of the actors about to leave are dropped in the same ledger write: an unarchived actor
 /// then serves a fresh grace period instead of leaving again on the next pass, and a failed move
 /// errs toward keeping the actor live for another period.
@@ -304,7 +316,7 @@ fn due_direct_actors(
     grace: Duration,
     limit: usize,
     now_ms: u64,
-) -> Result<(Vec<Candidate>, Vec<Refusal>)> {
+) -> Result<DueBatch> {
     let actors = crate::direct_actor::discover(catalog, found, Some(host))?;
     let dead = if actors.is_empty() {
         BTreeSet::new()
@@ -323,18 +335,31 @@ fn due_direct_actors(
     let (mut changed, due) = observe_retirements(&mut ledger.hosts, host, &dead, grace, now_ms);
 
     let due: BTreeSet<String> = due.into_iter().collect();
-    let mut candidates = Vec::new();
-    let mut refused = Vec::new();
-    for actor in actors
+    let mut selected: Vec<crate::direct_actor::DirectActor> = actors
         .into_iter()
         .filter(|actor| due.contains(&actor.identity))
-    {
-        if candidates.len() == limit {
+        .collect();
+    selected.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let resume_after = ledger.resume_after.get(host).cloned();
+    start_after(&mut selected, resume_after.as_deref(), |actor| {
+        actor.identity.as_str()
+    });
+    let scan_limit = limit.saturating_mul(DUE_SCAN_FACTOR);
+    let mut batch = DueBatch {
+        candidates: Vec::new(),
+        refused: Vec::new(),
+        scanned: 0,
+        deferred: 0,
+        resume_after: None,
+    };
+    for actor in &selected {
+        if batch.candidates.len() == limit || batch.scanned == scan_limit {
             break;
         }
+        batch.scanned += 1;
         let occupied = archive_root(catalog).join(host).join(&actor.identity);
         if fs::symlink_metadata(&occupied).is_ok() {
-            refused.push(Refusal {
+            batch.refused.push(Refusal {
                 id: actor.id(),
                 code: "archive-occupied",
                 message: format!(
@@ -344,26 +369,40 @@ fn due_direct_actors(
             });
             continue;
         }
-        candidates.push(Candidate {
+        batch.candidates.push(Candidate {
             id: actor.id(),
             reason: Some(format!(
                 "direct OMP actor: PTY session {} has no running record",
                 actor.pty_id
             )),
-            host: actor.host,
-            identity: actor.identity,
-            from: actor.dir,
+            host: actor.host.clone(),
+            identity: actor.identity.clone(),
+            from: actor.dir.clone(),
         });
     }
+    batch.deferred = selected.len() - batch.scanned;
+    batch.resume_after =
+        next_resume_after(&selected, batch.scanned, resume_after.as_deref(), |actor| {
+            actor.identity.as_str()
+        });
+    if batch.resume_after != resume_after {
+        match &batch.resume_after {
+            Some(identity) => ledger
+                .resume_after
+                .insert(host.to_owned(), identity.clone()),
+            None => ledger.resume_after.remove(host),
+        };
+        changed = true;
+    }
     if let Some(observed) = ledger.hosts.get_mut(host) {
-        for candidate in &candidates {
+        for candidate in &batch.candidates {
             changed |= observed.remove(&candidate.identity).is_some();
         }
     }
     if changed {
         write_ledger(catalog, &DIRECT_DEAD_LEDGER, &ledger)?;
     }
-    Ok((candidates, refused))
+    Ok(batch)
 }
 
 /// The identities of `actors` whose PTY session is not among the `running` PTY session IDs.
@@ -647,21 +686,47 @@ fn plan(
     Ok((candidates, refused))
 }
 
-/// How many due retired seats one supervisor pass may examine, as a multiple of its archive
-/// limit. Refused seats do not consume the limit, so without this bound a catalog full of them
-/// would make one pass under the exclusive lock scan every due seat.
+/// How many due retired seats (or dead direct actors) one supervisor pass may examine, as a
+/// multiple of its archive limit. Refused ones do not consume the limit, so without this bound a
+/// catalog full of them would make one pass under the exclusive lock scan every due one.
 const DUE_SCAN_FACTOR: usize = 4;
 
-/// The supervisor's bounded batch of grace-expired retired seats.
+/// The supervisor's bounded batch of grace-expired retired seats or dead direct actors.
 struct DueBatch {
     candidates: Vec<Candidate>,
     refused: Vec<Refusal>,
-    /// Due seats examined this pass: at most `limit * DUE_SCAN_FACTOR`.
+    /// Due entries examined this pass: at most `limit * DUE_SCAN_FACTOR`.
     scanned: usize,
-    /// Due seats this pass left unexamined because it reached its limit or its scan bound.
+    /// Due entries this pass left unexamined because it reached its limit or its scan bound.
     deferred: usize,
-    /// The identity the next pass's scan resumes after; `None` once a scan reached every due seat.
+    /// The identity the next pass's scan resumes after; `None` once a scan reached every due one.
     resume_after: Option<String>,
+}
+
+/// Rotate identity-sorted `items` so the scan starts after `resume_after`, wrapping around.
+fn start_after<T>(items: &mut [T], resume_after: Option<&str>, identity: impl Fn(&T) -> &str) {
+    if let Some(after) = resume_after {
+        let start = items.partition_point(|item| identity(item) <= after);
+        items.rotate_left(start);
+    }
+}
+
+/// Where the next pass resumes after a scan examined the first `scanned` of the rotated `items`:
+/// the last one examined, the unchanged cursor when nothing was examined, or `None` once the scan
+/// reached every item.
+fn next_resume_after<T>(
+    items: &[T],
+    scanned: usize,
+    resume_after: Option<&str>,
+    identity: impl Fn(&T) -> &str,
+) -> Option<String> {
+    if scanned == items.len() {
+        return None;
+    }
+    match scanned.checked_sub(1) {
+        Some(last) => Some(identity(&items[last]).to_owned()),
+        None => resume_after.map(str::to_owned),
+    }
 }
 
 /// Build the supervisor's batch from the `due` identities, bounded in both archived and examined
@@ -691,10 +756,7 @@ fn plan_due(
         })
         .collect();
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
-    if let Some(after) = resume_after {
-        let start = selected.partition_point(|spec| spec.identity.as_str() <= after);
-        selected.rotate_left(start);
-    }
+    start_after(&mut selected, resume_after, |spec| spec.identity.as_str());
     let mut batch = DueBatch {
         candidates: Vec::new(),
         refused: Vec::new(),
@@ -739,12 +801,9 @@ fn plan_due(
     }
 
     batch.deferred = selected.len() - batch.scanned;
-    if batch.deferred > 0 {
-        batch.resume_after = match batch.scanned.checked_sub(1) {
-            Some(last) => Some(selected[last].identity.clone()),
-            None => resume_after.map(str::to_owned),
-        };
-    }
+    batch.resume_after = next_resume_after(&selected, batch.scanned, resume_after, |spec| {
+        spec.identity.as_str()
+    });
     batch.candidates = accepted
         .into_iter()
         .map(|(_, candidate)| candidate)
@@ -1001,8 +1060,8 @@ struct ObservationLedger {
     /// host → identity → epoch millis of the first observation.
     #[serde(default)]
     hosts: BTreeMap<String, BTreeMap<String, u64>>,
-    /// host → the identity the supervisor's bounded scan of due seats resumes after. Present only
-    /// while the last pass left due seats unexamined; retirement ledger only.
+    /// host → the identity the supervisor's bounded scan of due seats (or due dead direct actors)
+    /// resumes after. Present only while the last pass left due ones unexamined.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     resume_after: BTreeMap<String, String>,
 }
