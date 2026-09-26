@@ -1767,6 +1767,16 @@ impl CodexControlState {
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
+            "systemError"
+                if matches!(
+                    self.observed,
+                    CodexObservedState::TerminalError {
+                        reason: CodexTerminalError::SystemError
+                    }
+                ) =>
+            {
+                self.observed.clone()
+            }
             "systemError" => CodexObservedState::Held {
                 reason: CodexHoldReason::SystemError,
                 turn_id: None,
@@ -1993,6 +2003,16 @@ fn observed_from_thread_snapshot(
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
+            "systemError"
+                if matches!(
+                    previous,
+                    CodexObservedState::TerminalError {
+                        reason: CodexTerminalError::SystemError
+                    }
+                ) =>
+            {
+                previous.clone()
+            }
             "systemError" => CodexObservedState::Held {
                 reason: CodexHoldReason::SystemError,
                 turn_id: None,
@@ -4163,22 +4183,52 @@ fn recover_transcript_turn_if_due(
     control_state_path: &Path,
     events: &Sender<ControlEvent>,
 ) -> Result<()> {
+    let system_error = matches!(
+        state.observed,
+        CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            ..
+        }
+    );
     if last_recovery.is_some_and(|last| last.elapsed() < TRANSCRIPT_TURN_RECOVERY_INTERVAL)
-        || !delivery
-            .as_ref()
-            .is_some_and(CodexInboxDelivery::transcript_recovery_due)
-        || !matches!(
-            state.observed,
-            CodexObservedState::AwaitingStatus
-                | CodexObservedState::Held {
-                    reason: CodexHoldReason::ActiveWithoutTurn,
-                    ..
-                }
-        )
+        || (!system_error
+            && (!delivery
+                .as_ref()
+                .is_some_and(CodexInboxDelivery::transcript_recovery_due)
+                || !matches!(
+                    state.observed,
+                    CodexObservedState::AwaitingStatus
+                        | CodexObservedState::Held {
+                            reason: CodexHoldReason::ActiveWithoutTurn,
+                            ..
+                        }
+                )))
     {
         return Ok(());
     }
     *last_recovery = Some(Instant::now());
+    if system_error {
+        let Some(path) = latest_codex_transcript(state.thread_id())? else {
+            return Ok(());
+        };
+        if failed_completed_turn_from_codex_frames(&codex_transcript_tail(&path)?).is_none() {
+            return Ok(());
+        }
+        // Some Codex app-server versions report the terminal thread status but
+        // omit turn/completed. The saved task_complete with an error proves the
+        // turn ended, so the next inbox delivery can safely start a new turn.
+        state.observed = CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        };
+        atomic_json(control_state_path, state)
+            .context("persisting transcript-recovered Codex system error")?;
+        if let Some(delivery) = delivery.as_mut() {
+            delivery.observe_harness(&state.observed);
+            delivery.accept_transcript_recovery(state.observed.clone());
+        }
+        let _ = events.send(ControlEvent::Observed);
+        return Ok(());
+    }
     let Some(turn_id) = recover_active_codex_turn(state.thread_id())? else {
         return Ok(());
     };
@@ -4319,6 +4369,34 @@ fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
         }
     }
     active
+}
+
+fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+    let mut active = None;
+    let mut failed = None;
+    for value in frames {
+        let event = value.pointer("/payload/type").and_then(Value::as_str);
+        let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
+        match (event, turn_id) {
+            (Some("task_started"), Some(turn_id)) => {
+                active = Some(turn_id);
+                failed = None;
+            }
+            (Some("task_complete"), Some(turn_id)) if active == Some(turn_id) => {
+                active = None;
+                failed = value
+                    .pointer("/payload/error")
+                    .filter(|error| !error.is_null())
+                    .map(|_| turn_id.to_string());
+            }
+            (Some("turn_aborted"), Some(turn_id)) if active == Some(turn_id) => {
+                active = None;
+                failed = None;
+            }
+            _ => {}
+        }
+    }
+    failed
 }
 
 fn subscription_candidate(message: &Value, thread_id: &str) -> bool {

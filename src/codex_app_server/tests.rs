@@ -3832,6 +3832,41 @@ fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
 }
 
 #[test]
+fn transcript_proves_only_the_latest_matching_failed_completion() {
+    let started = |id| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+    let completed = |id, error: Option<&str>| json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id,"error":error}});
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("old"),
+            completed("old", Some("unauthorized")),
+        ]),
+        Some("old".into())
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("old"),
+            completed("old", Some("unauthorized")),
+            started("new"),
+        ]),
+        None,
+        "a newer live turn cannot be unblocked by an older failed turn"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("one"),
+            completed("other", Some("unauthorized")),
+        ]),
+        None,
+        "the completion must match the started turn"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[started("one"), completed("one", None),]),
+        None,
+        "a successful completion cannot prove a terminal system error"
+    );
+}
+
+#[test]
 fn a_long_active_turn_recovers_from_recent_typed_transcript_evidence() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout-thread-main.jsonl");
