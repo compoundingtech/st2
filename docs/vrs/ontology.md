@@ -449,10 +449,25 @@ One stable PTY session running OMP without a declaration, addressed as
 `<host>.direct.omp.<encoded-pty-id>`. The identity decodes strictly to the
 exact PTY session ID, which is the only join to its runtime: the actor is dead
 when the catalog's PTY registry holds no running record for that ID. Its live
-directory is archived after the `archive-after` grace period like a retired
-seat's.
+directory is archived once that death, measured from the supervisor's first
+observation of it, outlives the `archive-after` grace period, like a retired
+seat's. Never an `agents` row: a directory holding a declaration is a declared
+agent whatever its name looks like.
 
-Authority: [R48](requirements.md); [`direct_actor`](../../src/direct_actor.rs)
+Authority: [R47](requirements.md), [R48](requirements.md);
+[`direct_actor`](../../src/direct_actor.rs)
+
+### death observation
+
+The supervisor's record of when it first saw a [direct OMP
+actor](#direct-omp-actor) without a running PTY record, kept in
+`.st2/direct-dead-observed.json`. It is dropped when the PTY runs again and
+when the actor is archived, so each death serves a fresh grace period. The
+direct-actor counterpart of the retirement observation.
+
+Authority: [R48](requirements.md); [`direct_actor`](../../src/direct_actor.rs);
+[`catalog_archive`](../../src/catalog_archive.rs);
+[`0018-st2-owns-direct-actor-lifecycle`](.decisions/0018-st2-owns-direct-actor-lifecycle.md)
 
 ### working state
 
