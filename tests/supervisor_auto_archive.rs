@@ -845,8 +845,7 @@ impl Drop for KillOnDrop {
 
 /// Only the PTY registry is direct actor liveness. A running `exec` task whose runtime ID equals
 /// the dead actor's decoded PTY ID must not keep the actor in the live catalog.
-#[test]
-fn a_running_exec_task_sharing_a_dead_actors_pty_id_does_not_keep_it_alive() {
+fn assert_exec_record_is_not_pty_evidence(pty_id: &str, identity: &str) {
     let temporary = tempfile::tempdir().unwrap();
     let (catalog, bin) = fixture(&temporary);
     seat(
@@ -854,29 +853,41 @@ fn a_running_exec_task_sharing_a_dead_actors_pty_id_does_not_keep_it_alive() {
         "held",
         "desired-state \"suspended\" reason=\"paused\"",
     );
-    direct_actor(&catalog, "direct.omp.2ahzpbs3");
-    seed_direct_ledger(&catalog, &[("direct.omp.2ahzpbs3", 8 * DAY_MS)]);
+    direct_actor(&catalog, identity);
+    seed_direct_ledger(&catalog, &[(identity, 8 * DAY_MS)]);
 
     let exec = KillOnDrop(Command::new("sleep").arg("300").spawn().unwrap());
-    // The exec backend's record for runtime ID `2ahzpbs3` (under `up_once`'s `XDG_STATE_HOME`),
+    // The exec backend's record for this runtime ID (under `up_once`'s `XDG_STATE_HOME`),
     // published after the process started, as the backend writes it.
     std::thread::sleep(Duration::from_millis(50));
     write(
         temporary.path(),
-        "home/state/st2/h/exec/2ahzpbs3.pid",
+        &format!("home/state/st2/h/exec/{pty_id}.pid"),
         &exec.0.id().to_string(),
     );
 
     let output = up_once(&catalog, &bin);
 
     assert!(
-        catalog.join(".st2/archive/h/direct.omp.2ahzpbs3").is_dir(),
+        catalog.join(format!(".st2/archive/h/{identity}")).is_dir(),
         "an exec record is not PTY evidence:\n{}\n{}",
         stdout(&output),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!catalog.join("agents/h/direct.omp.2ahzpbs3").exists());
+    assert!(!catalog.join(format!("agents/h/{identity}")).exists());
     drop(exec);
+}
+
+#[test]
+fn a_running_exec_task_sharing_a_dead_actors_pty_id_does_not_keep_it_alive() {
+    assert_exec_record_is_not_pty_evidence("2ahzpbs3", "direct.omp.2ahzpbs3");
+}
+
+/// An exec task keeps an explicit runtime ID verbatim, so a non-generated PTY ID (hex-encoded in
+/// the actor identity) can collide with it too.
+#[test]
+fn a_running_exec_task_with_an_explicit_id_does_not_keep_a_hex_encoded_actor_alive() {
+    assert_exec_record_is_not_pty_evidence("web", "direct.omp.x-776562");
 }
 
 #[test]
