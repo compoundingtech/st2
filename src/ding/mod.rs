@@ -40,6 +40,7 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
+const ST3_BODY_MAX_CHARS: usize = 2048;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
@@ -68,11 +69,38 @@ pub fn poke_id(filename: &str) -> &str {
 /// Prefer the canonical st3 message subject carried across the compatibility inbox boundary.
 /// Native st2 messages retain their stable filename-derived identifier.
 fn poke_reference(msg: &Message) -> &str {
+    st3_message_reference(msg).unwrap_or_else(|| poke_id(&msg.filename))
+}
+
+pub fn st3_message_reference(msg: &Message) -> Option<&str> {
     msg.tags
         .iter()
         .find_map(|tag| tag.strip_prefix("st3-message:"))
         .filter(|reference| reference.starts_with("message/") && reference.len() > "message/".len())
-        .unwrap_or_else(|| poke_id(&msg.filename))
+}
+
+/// One recognizable ST3 envelope, shared by native drivers and extension channels.
+/// The graph remains the source of the complete message when the preview is bounded.
+pub fn st3_notification_text(
+    reference: &str,
+    from: &str,
+    subject: Option<&str>,
+    body: &str,
+) -> String {
+    let from = normalize_field(Some(from), "unknown", SENDER_MAX_CHARS);
+    let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
+    let header = format!("[PING from st3] {reference} from {from}: {subject}");
+    let normalized_body = normalize_line(body);
+    if normalized_body.is_empty() {
+        return header;
+    }
+    let mut characters = normalized_body.chars();
+    let preview: String = characters.by_ref().take(ST3_BODY_MAX_CHARS).collect();
+    if characters.next().is_some() {
+        format!("{header}\n\n{preview}… [read the full message in st3]")
+    } else {
+        format!("{header}\n\n{preview}")
+    }
 }
 
 /// Convert arbitrary text into one printable line.
@@ -192,6 +220,14 @@ fn poke_text_with_resolver(
     recipient: &str,
     msg: &Message,
 ) -> String {
+    if let Some(reference) = st3_message_reference(msg) {
+        return st3_notification_text(
+            reference,
+            msg.from.as_deref().unwrap_or_default(),
+            msg.subject.as_deref(),
+            &msg.body,
+        );
+    }
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
     let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
     let marker = if msg.stream.is_some() && msg.event_id.is_some() {

@@ -7151,10 +7151,13 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     if !delivered.insert(message.subject.clone()) {
                         continue;
                     }
-                    let mut content = message_content(client, &message).await?;
-                    if let Some(title) = &message.title {
-                        content = format!("Subject: {title}\n\n{content}");
-                    }
+                    let body = message_content(client, &message).await?;
+                    let content = st2::ding::st3_notification_text(
+                        &message.subject,
+                        &message.from,
+                        message.title.as_deref(),
+                        &body,
+                    );
                     let frame = json!({
                         "type": "message",
                         "deliverAs": "steer",

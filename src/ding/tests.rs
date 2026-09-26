@@ -180,8 +180,29 @@ fn st3_message_ding_uses_its_canonical_graph_reference() {
 
     assert_eq!(
         render_without_catalog(&message),
-        "[PING] ? daemon/runtime: Mission step ready [id:message/0199abcdef0123456789abcdef012345]"
+        "[PING from st3] message/0199abcdef0123456789abcdef012345 from daemon/runtime: Mission step ready"
     );
+}
+
+#[test]
+fn st3_notification_has_the_same_bounded_envelope_for_every_driver() {
+    assert_eq!(
+        st3_notification_text(
+            "message/abc123",
+            "agent/fleet/cos\nspoofed",
+            Some("Check\rreceipt"),
+            "Reply once\nwith token.",
+        ),
+        "[PING from st3] message/abc123 from agent/fleet/cos spoofed: Check receipt\n\nReply once with token."
+    );
+    let long = st3_notification_text(
+        "message/abc123",
+        "agent/a",
+        Some("title"),
+        &"x".repeat(ST3_BODY_MAX_CHARS + 1),
+    );
+    assert!(long.ends_with("… [read the full message in st3]"));
+    assert!(!long.contains(&"x".repeat(ST3_BODY_MAX_CHARS + 1)));
 }
 
 #[test]

@@ -122,11 +122,16 @@ fn run_named(
                     // promoted the channel notification into a real model turn. The outer st3
                     // driver correlates this exact immutable inbox filename before publishing
                     // `message.delivered`; writing MCP bytes alone is not a receipt.
-                    let content = format!(
-                        "[st3-delivery:{}]\n{}",
-                        msg.filename,
-                        channel_content(msg.subject.as_deref(), &msg.body)
-                    );
+                    let notice = match crate::ding::st3_message_reference(&msg) {
+                        Some(reference) => crate::ding::st3_notification_text(
+                            reference,
+                            msg.from.as_deref().unwrap_or_default(),
+                            msg.subject.as_deref(),
+                            &msg.body,
+                        ),
+                        None => channel_content(msg.subject.as_deref(), &msg.body),
+                    };
+                    let content = format!("[st3-delivery:{}]\n{notice}", msg.filename);
                     write_json(
                         &mut stdout,
                         &json!({"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
