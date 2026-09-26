@@ -56,6 +56,11 @@ the release gates after the final tested rollout.
   (10:25:36 UTC), after those checks. The 24-hour idle and 72-hour delivery
   gates still need their full retained windows; this short check is not a
   release verdict.
+- Exact receipts after the new marker passed Silber-to-Hetz at 10:27:16 UTC
+  (12 seconds) and Hetz-to-Silber at 10:27:47 UTC (31 seconds). At 10:28:40
+  UTC the idle preflight passed with three post-marker samples per host, zero
+  errors, one PID each, and maximum gaps of 60 and 61 seconds. The gate watcher
+  reports `idle=waiting`, `preflight=healthy`, and `delivery=waiting`.
 
 ## 22:36 UTC idle evidence repair and reset
 
