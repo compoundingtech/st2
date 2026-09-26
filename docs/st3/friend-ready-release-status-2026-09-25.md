@@ -719,3 +719,30 @@ The exact gate definitions and override rules are in the
 [friend-ready delivery gate](friend-ready-delivery-gate.md). Any failure is a
 release hold requiring diagnosis and a new complete window after remediation;
 do not delete evidence or lower thresholds to obtain a pass.
+
+## 2026-09-26 delivery repair and new evidence window
+
+- Both disposable Codex delivery recipients stopped replying after an HTTP 401
+  turn on 2026-09-25. Their native transcripts recorded a completed failed
+  turn, while the app-server omitted `turn/completed`; the driver held later
+  inbox deliveries indefinitely. Commit `678103d` recovers only a matching
+  failed completion from a bounded transcript tail. The 82 Codex driver tests
+  and 836 ST2 library tests passed (one library test ignored).
+- Commit `6217e0d` gives ST3 messages the same `[PING from st3]` envelope,
+  canonical message ID, sender, title, and bounded body preview in Codex,
+  OpenCode, Claude, Pi, and OMP. Rendered `boot.md` explains exact-ID reads,
+  threaded replies, and the recipient's own mailbox. The 837 ST2 library tests
+  and 418 ST3 library tests passed (one ST2 test ignored). This also addresses
+  a live reverse-probe failure where the recipient read the sender's mailbox.
+- The final `6217e0d` daemon and driver were installed and restarted on both
+  hosts. Both strict doctors passed, both new recipient incarnations ran, and
+  exact linked replies passed Silber-to-Hetz at 08:46:00 UTC and
+  Hetz-to-Silber at 08:47:55 UTC. The continuous delivery monitor restarted
+  at 08:48:33 UTC. Earlier failed probes remain in the retained log.
+- The new idle window begins at Unix `1790412393` (08:46:33 UTC), the first
+  healthy Hetz sample after both final daemon restarts; Silber's first sample
+  in this window followed within 60 seconds. The new message window begins
+  at Unix `1790412513` (08:48:33 UTC), when complete failure logging resumed.
+  The first idle continuity preflight passed with one PID, no sample errors,
+  and healthy peers on both hosts. The 24-hour idle and 72-hour delivery gates
+  remain pending; these are start markers, not pass results.
