@@ -423,6 +423,112 @@ fn permanently_refused_retired_seats_do_not_starve_eligible_seats_or_direct_acto
     }
 }
 
+/// A supervisor and its retired dependent straddling the 25-seat cutoff must not split: the
+/// supervisor may leave only in a batch that also carries the dependent, never ahead of it.
+#[test]
+fn a_supervisor_never_leaves_ahead_of_a_retired_dependent_cut_by_the_pass_limit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let fillers: Vec<String> = (0..24).map(|index| format!("a-{index:02}")).collect();
+    for identity in &fillers {
+        seat(&catalog, identity, RETIRED);
+    }
+    seat(&catalog, "boss", RETIRED);
+    seat(
+        &catalog,
+        "worker",
+        &format!("{RETIRED}\n  supervisor \"h.boss\""),
+    );
+    let mut observed: Vec<(&str, u64)> = fillers
+        .iter()
+        .map(|identity| (identity.as_str(), 8 * DAY_MS))
+        .collect();
+    observed.extend([("boss", 8 * DAY_MS), ("worker", 8 * DAY_MS)]);
+    seed_ledger(&catalog, &observed);
+
+    let first = up_once(&catalog, &bin);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+
+    assert!(
+        catalog.join("agents/h/boss").is_dir(),
+        "the supervisor must not leave while its dependent stays live:\n{}\n{stderr}",
+        stdout(&first)
+    );
+    assert!(
+        stderr.contains("auto-archive skipped h.boss [supervisor-referenced]"),
+        "{stderr}"
+    );
+    assert!(
+        catalog.join(".st2/archive/h/worker").is_dir(),
+        "the dependent takes the last slot:\n{}",
+        stdout(&first)
+    );
+
+    let second = up_once(&catalog, &bin);
+    assert!(
+        catalog.join(".st2/archive/h/boss").is_dir(),
+        "with its dependent gone the supervisor leaves next pass:\n{}\n{}",
+        stdout(&second),
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+/// Refused seats do not consume the 25-seat limit, so the scan itself is bounded: one pass
+/// examines at most 100 due seats, reports the rest as deferred, and the next pass resumes after
+/// the last seat examined, so an eligible seat behind a wall of refusals still leaves.
+#[test]
+fn a_pass_over_many_refused_seats_examines_a_bounded_window_and_resumes_after_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let blocked: Vec<String> = (0..101)
+        .map(|index| format!("blocked-{index:03}"))
+        .collect();
+    for identity in &blocked {
+        seat(&catalog, identity, RETIRED);
+        write(
+            &catalog,
+            &format!(".st2/archive/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\" }}\n"),
+        );
+    }
+    seat(&catalog, "zz-clean", RETIRED);
+    let mut observed: Vec<(&str, u64)> = blocked
+        .iter()
+        .map(|identity| (identity.as_str(), 8 * DAY_MS))
+        .collect();
+    observed.push(("zz-clean", 8 * DAY_MS));
+    seed_ledger(&catalog, &observed);
+
+    let first = up_once(&catalog, &bin);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+
+    assert_eq!(
+        stderr.matches("auto-archive skipped").count(),
+        100,
+        "one pass examines at most four times its limit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "auto-archive examined 100 due retired seats and deferred 2 to the next pass"
+        ),
+        "the unexamined remainder must be reported:\n{stderr}"
+    );
+    assert!(catalog.join("agents/h/zz-clean").is_dir(), "{stderr}");
+
+    let second = up_once(&catalog, &bin);
+    assert!(
+        catalog.join(".st2/archive/h/zz-clean").is_dir(),
+        "the next pass resumes after the window and reaches the eligible seat:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    for identity in &blocked {
+        assert!(
+            catalog.join("agents/h").join(identity).is_dir(),
+            "{identity}"
+        );
+    }
+}
+
 #[test]
 fn repeated_passes_over_an_archived_seat_change_nothing() {
     let temporary = tempfile::tempdir().unwrap();

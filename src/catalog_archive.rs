@@ -62,9 +62,6 @@ pub enum Selection {
     Identities(Vec<String>),
     /// Every eligible retired identity of the selected host. Ineligible ones are reported, not fatal.
     AllRetired,
-    /// The grace-expired subset the supervisor decided on: `AllRetired` narrowed to these
-    /// identities, so an ineligible one is reported and skipped rather than fatal.
-    Due(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -84,8 +81,19 @@ pub struct AutoArchiveRequest {
     /// the operator's off switch, checked by the caller before the pass runs at all.
     pub grace: Duration,
     /// Most seats one pass may archive. A catalog holding hundreds of retirements drains over
-    /// several passes rather than one that holds the authoring lock through all of them.
+    /// several passes rather than one that holds the authoring lock through all of them. The pass
+    /// also examines at most `limit * DUE_SCAN_FACTOR` due retired seats.
     pub limit: usize,
+}
+
+/// What one supervisor pass did: the archive result plus how far its bounded scan reached.
+#[derive(Debug, Clone)]
+pub struct AutoArchiveResult {
+    pub archive: ArchiveResult,
+    /// Due retired seats examined this pass.
+    pub scanned: usize,
+    /// Due retired seats left for a later pass, which resumes the scan after the last one examined.
+    pub deferred: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -208,11 +216,11 @@ pub fn archive(request: ArchiveRequest) -> Result<ArchiveResult> {
 /// `Ok(None)` means another authoring holder has the lock, so the pass did nothing. Skipping is
 /// the point: a reconcile pass queued behind `st2 catalog apply` stalls every live agent's
 /// reconciliation, and the seats are still due next pass.
-pub fn auto_archive(request: AutoArchiveRequest) -> Result<Option<ArchiveResult>> {
+pub fn auto_archive(request: AutoArchiveRequest) -> Result<Option<AutoArchiveResult>> {
     auto_archive_at(request, crate::message::now_ms())
 }
 
-fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<ArchiveResult>> {
+fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<AutoArchiveResult>> {
     anyhow::ensure!(
         !request.grace.is_zero(),
         "auto-archive is disabled by archive-after \"0\""
@@ -226,18 +234,38 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Ar
 
     // Persist the observation before archiving. A failed move then costs one batch, not every
     // seat's clock; the rows the move retires are pruned by the next pass's reconciliation.
-    let mut hosts = read_ledger(&catalog, &RETIRED_LEDGER);
+    let mut ledger = read_ledger(&catalog, &RETIRED_LEDGER);
     let retired = retired_identities(&found.specs, &request.host);
-    let (changed, due) =
-        observe_retirements(&mut hosts, &request.host, &retired, request.grace, now_ms);
+    let (changed, due) = observe_retirements(
+        &mut ledger.hosts,
+        &request.host,
+        &retired,
+        request.grace,
+        now_ms,
+    );
     if changed {
-        write_ledger(&catalog, &RETIRED_LEDGER, hosts)?;
+        write_ledger(&catalog, &RETIRED_LEDGER, &ledger)?;
     }
-    // The bound applies to seats that can actually leave. Truncating the due list before `plan`
-    // would let the same refused seats fill every pass's window and starve the rest.
-    let (mut candidates, mut refused) =
-        plan(&catalog, &request.host, &found, &Selection::Due(due))?;
-    candidates.truncate(request.limit);
+    let resume_after = ledger.resume_after.get(&request.host).cloned();
+    let batch = plan_due(
+        &catalog,
+        &request.host,
+        &found,
+        &due,
+        resume_after.as_deref(),
+        request.limit,
+    )?;
+    if batch.resume_after != resume_after {
+        match &batch.resume_after {
+            Some(identity) => ledger
+                .resume_after
+                .insert(request.host.clone(), identity.clone()),
+            None => ledger.resume_after.remove(&request.host),
+        };
+        write_ledger(&catalog, &RETIRED_LEDGER, &ledger)?;
+    }
+    let mut candidates = batch.candidates;
+    let mut refused = batch.refused;
 
     let (direct, direct_refused) = due_direct_actors(
         &catalog,
@@ -249,7 +277,12 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Ar
     )?;
     candidates.extend(direct);
     refused.extend(direct_refused);
-    archive_locked(&lock, &catalog, &request.host, false, candidates, refused).map(Some)
+    let archive = archive_locked(&lock, &catalog, &request.host, false, candidates, refused)?;
+    Ok(Some(AutoArchiveResult {
+        archive,
+        scanned: batch.scanned,
+        deferred: batch.deferred,
+    }))
 }
 
 /// Observe this host's direct OMP actors against a fresh PTY registry read and plan the ones
@@ -286,8 +319,8 @@ fn due_direct_actors(
             .collect();
         dead_direct_identities(&actors, &running)
     };
-    let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
-    let (mut changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
+    let mut ledger = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
+    let (mut changed, due) = observe_retirements(&mut ledger.hosts, host, &dead, grace, now_ms);
 
     let due: BTreeSet<String> = due.into_iter().collect();
     let mut candidates = Vec::new();
@@ -322,13 +355,13 @@ fn due_direct_actors(
             from: actor.dir,
         });
     }
-    if let Some(observed) = hosts.get_mut(host) {
+    if let Some(observed) = ledger.hosts.get_mut(host) {
         for candidate in &candidates {
             changed |= observed.remove(&candidate.identity).is_some();
         }
     }
     if changed {
-        write_ledger(catalog, &DIRECT_DEAD_LEDGER, hosts)?;
+        write_ledger(catalog, &DIRECT_DEAD_LEDGER, &ledger)?;
     }
     Ok((candidates, refused))
 }
@@ -554,10 +587,9 @@ pub fn observe(catalog: &Path) -> Result<ArchiveObservation> {
 
 /// Decide, without mutating anything, which selected identities may leave the live catalog.
 ///
-/// Eligibility is fail-closed on every axis: the identity is discovered at its canonical path on
-/// the selected host, its declaration is retired in either spelling, no runtime record of any of
-/// its declared tasks exists (the rule `st2 doctor` already applies to retirement), and no
-/// declaration that stays behind names it as `supervisor`.
+/// Every selected identity counts as leaving, so a supervisor archived together with all of its
+/// dependents is eligible. The operator's verb has no per-run bound, so the whole selection is the
+/// batch; the supervisor's bounded pass builds its batch with [`plan_due`] instead.
 fn plan(
     catalog: &Path,
     host: &str,
@@ -571,17 +603,6 @@ fn plan(
         Selection::AllRetired => {
             for spec in &found.specs {
                 if spec.resolved_host(host) == host && spec.desired_state.is_retired() {
-                    selected.push(spec);
-                }
-            }
-        }
-        Selection::Due(identities) => {
-            let due: BTreeSet<&str> = identities.iter().map(String::as_str).collect();
-            for spec in &found.specs {
-                if spec.resolved_host(host) == host
-                    && spec.desired_state.is_retired()
-                    && due.contains(spec.identity.as_str())
-                {
                     selected.push(spec);
                 }
             }
@@ -611,122 +632,258 @@ fn plan(
         }
     }
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut candidates = Vec::new();
+    if !selected.is_empty() {
+        let records = runtime_records(catalog, host)?;
+        let leaving: BTreeSet<&Path> = selected.iter().map(|spec| spec.path.as_path()).collect();
+        for spec in &selected {
+            match eligibility(catalog, host, found, &records, &leaving, spec) {
+                Ok(candidate) => candidates.push(candidate),
+                Err(refusal) => refused.push(refusal),
+            }
+        }
+    }
+    refused.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok((candidates, refused))
+}
+
+/// How many due retired seats one supervisor pass may examine, as a multiple of its archive
+/// limit. Refused seats do not consume the limit, so without this bound a catalog full of them
+/// would make one pass under the exclusive lock scan every due seat.
+const DUE_SCAN_FACTOR: usize = 4;
+
+/// The supervisor's bounded batch of grace-expired retired seats.
+struct DueBatch {
+    candidates: Vec<Candidate>,
+    refused: Vec<Refusal>,
+    /// Due seats examined this pass: at most `limit * DUE_SCAN_FACTOR`.
+    scanned: usize,
+    /// Due seats this pass left unexamined because it reached its limit or its scan bound.
+    deferred: usize,
+    /// The identity the next pass's scan resumes after; `None` once a scan reached every due seat.
+    resume_after: Option<String>,
+}
+
+/// Build the supervisor's batch from the `due` identities, bounded in both archived and examined
+/// seats.
+///
+/// Seats are walked in identity order, starting after `resume_after` and wrapping around, so a run
+/// of seats refused every pass cannot hold the scan window: the next pass resumes where this one
+/// stopped. Each seat is judged against the batch accepted so far, which is the only set leaving
+/// this pass; a supervisor whose retired dependent has not been accepted yet is refused and leaves
+/// on a later pass, after the dependent. Refused seats do not consume `limit`.
+fn plan_due(
+    catalog: &Path,
+    host: &str,
+    found: &crate::Discovered,
+    due: &[String],
+    resume_after: Option<&str>,
+    limit: usize,
+) -> Result<DueBatch> {
+    let due: BTreeSet<&str> = due.iter().map(String::as_str).collect();
+    let mut selected: Vec<&agent_spec::spec::AgentSpec> = found
+        .specs
+        .iter()
+        .filter(|spec| {
+            spec.resolved_host(host) == host
+                && spec.desired_state.is_retired()
+                && due.contains(spec.identity.as_str())
+        })
+        .collect();
+    selected.sort_by(|left, right| left.identity.cmp(&right.identity));
+    if let Some(after) = resume_after {
+        let start = selected.partition_point(|spec| spec.identity.as_str() <= after);
+        selected.rotate_left(start);
+    }
+    let mut batch = DueBatch {
+        candidates: Vec::new(),
+        refused: Vec::new(),
+        scanned: 0,
+        deferred: selected.len(),
+        resume_after: None,
+    };
     if selected.is_empty() {
-        refused.sort_by(|left, right| left.id.cmp(&right.id));
-        return Ok((Vec::new(), refused));
+        return Ok(batch);
     }
 
-    // Only reached with a candidate in hand: the runtime snapshot costs a `pty list` subprocess,
-    // and the supervisor's pass asks this question on every tick.
+    let records = runtime_records(catalog, host)?;
+    let scan_limit = limit.saturating_mul(DUE_SCAN_FACTOR);
+    let mut accepted: Vec<(&agent_spec::spec::AgentSpec, Candidate)> = Vec::new();
+    let mut leaving: BTreeSet<&Path> = BTreeSet::new();
+    for spec in &selected {
+        if accepted.len() == limit || batch.scanned == scan_limit {
+            break;
+        }
+        batch.scanned += 1;
+        match eligibility(catalog, host, found, &records, &leaving, spec) {
+            Ok(candidate) => {
+                leaving.insert(spec.path.as_path());
+                accepted.push((spec, candidate));
+            }
+            Err(refusal) => batch.refused.push(refusal),
+        }
+    }
+    // The gate that keeps a supervisor from leaving ahead of its dependents, re-checked against
+    // the final batch: a supervisor accepted here must leave with every dependent it still has.
+    while let Some((index, dependents)) =
+        accepted.iter().enumerate().find_map(|(index, (spec, _))| {
+            let dependents = dependents(found, host, spec, &leaving);
+            (!dependents.is_empty()).then_some((index, dependents))
+        })
+    {
+        let (spec, candidate) = accepted.remove(index);
+        leaving.remove(spec.path.as_path());
+        batch
+            .refused
+            .push(supervisor_referenced(candidate.id, &dependents));
+    }
+
+    batch.deferred = selected.len() - batch.scanned;
+    if batch.deferred > 0 {
+        batch.resume_after = match batch.scanned.checked_sub(1) {
+            Some(last) => Some(selected[last].identity.clone()),
+            None => resume_after.map(str::to_owned),
+        };
+    }
+    batch.candidates = accepted
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect();
+    batch.refused.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(batch)
+}
+
+/// Task runtime ID → alive, from the host's runtime registries.
+///
+/// Only read with a candidate in hand: the snapshot costs a `pty list` subprocess, and the
+/// supervisor's pass asks this question on every tick.
+fn runtime_records(catalog: &Path, host: &str) -> Result<BTreeMap<String, bool>> {
     let runner =
         crate::run::SystemRunner::new(catalog.to_path_buf(), crate::run::exec_state_dir(host));
-    let records: BTreeMap<String, bool> = runner
+    Ok(runner
         .list_sessions()
         .context("read task runtime records for archive eligibility")?
         .into_iter()
         .map(|session| (session.pty_id, session.alive))
-        .collect();
+        .collect())
+}
 
-    let leaving: BTreeSet<&Path> = selected.iter().map(|spec| spec.path.as_path()).collect();
-    let mut candidates = Vec::new();
-    for spec in &selected {
-        let id = spec.bus_id(host);
-        let identity = spec.identity.clone();
-        let from = catalog.join("agents").join(host).join(&identity);
-        if spec.path != from.join("agent.kdl") {
-            refused.push(Refusal {
-                id,
-                code: "non-canonical-declaration",
-                message: format!(
-                    "declaration is at {}, not the canonical agents/{host}/{identity}/agent.kdl",
-                    relative(catalog, &spec.path)
-                        .unwrap_or_else(|| spec.path.display().to_string())
-                ),
-            });
-            continue;
-        }
-        if !spec.desired_state.is_retired() {
-            refused.push(Refusal {
-                id,
-                code: "not-retired",
-                message: format!(
-                    "desired state is '{}'; archive requires 'retired'",
-                    spec.desired_state.as_str()
-                ),
-            });
-            continue;
-        }
-        let live = spec
-            .tasks
-            .iter()
-            .map(|task| {
-                task.id
-                    .clone()
-                    .unwrap_or_else(|| format!("{id}.{}", task.name))
-            })
-            .filter_map(|task_id| {
-                records
-                    .get(&task_id)
-                    .map(|alive| format!("{task_id} ({})", if *alive { "alive" } else { "dead" }))
-            })
-            .collect::<Vec<_>>();
-        if !live.is_empty() {
-            refused.push(Refusal {
-                id,
-                code: "runtime-record-present",
-                message: format!("retirement is incomplete: {}", live.join(", ")),
-            });
-            continue;
-        }
-        let dependents = found
-            .specs
-            .iter()
-            .filter(|other| !leaving.contains(other.path.as_path()))
-            .filter(|other| {
-                other.supervisor.as_deref().is_some_and(|supervisor| {
-                    crate::supervisor_chain::resolve_spec(
-                        &found.specs,
-                        supervisor,
-                        other.resolved_host(host),
-                    )
-                    .is_some_and(|resolved| resolved.path == spec.path)
-                })
-            })
-            .map(|other| other.bus_id(host))
-            .collect::<Vec<_>>();
-        if !dependents.is_empty() {
-            refused.push(Refusal {
-                id,
-                code: "supervisor-referenced",
-                message: format!("still supervises {}", dependents.join(", ")),
-            });
-            continue;
-        }
-        // A declaration re-created under a name the archive still holds — a `catalog apply` after
-        // an archival, say. Refusing it as one skip keeps the rest of the batch moving; letting
-        // `move_out` fail instead would abort every remaining candidate on every pass.
-        let occupied = archive_root(catalog).join(host).join(&identity);
-        if fs::symlink_metadata(&occupied).is_ok() {
-            refused.push(Refusal {
-                id,
-                code: "archive-occupied",
-                message: format!(
-                    "the archive already holds {}; unarchive it or move it aside first",
-                    relative(catalog, &occupied).unwrap_or_else(|| occupied.display().to_string())
-                ),
-            });
-            continue;
-        }
-        candidates.push(Candidate {
+/// Whether one selected declaration may leave together with `leaving`.
+///
+/// Eligibility is fail-closed on every axis: the identity is discovered at its canonical path on
+/// the selected host, its declaration is retired in either spelling, no runtime record of any of
+/// its declared tasks exists (the rule `st2 doctor` already applies to retirement), no declaration
+/// outside `leaving` names it as `supervisor`, and its archive slot is free.
+fn eligibility(
+    catalog: &Path,
+    host: &str,
+    found: &crate::Discovered,
+    records: &BTreeMap<String, bool>,
+    leaving: &BTreeSet<&Path>,
+    spec: &agent_spec::spec::AgentSpec,
+) -> std::result::Result<Candidate, Refusal> {
+    let id = spec.bus_id(host);
+    let identity = spec.identity.clone();
+    let from = catalog.join("agents").join(host).join(&identity);
+    if spec.path != from.join("agent.kdl") {
+        return Err(Refusal {
             id,
-            host: host.to_owned(),
-            identity,
-            reason: spec.desired_state.reason().map(str::to_owned),
-            from,
+            code: "non-canonical-declaration",
+            message: format!(
+                "declaration is at {}, not the canonical agents/{host}/{identity}/agent.kdl",
+                relative(catalog, &spec.path).unwrap_or_else(|| spec.path.display().to_string())
+            ),
         });
     }
-    refused.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok((candidates, refused))
+    if !spec.desired_state.is_retired() {
+        return Err(Refusal {
+            id,
+            code: "not-retired",
+            message: format!(
+                "desired state is '{}'; archive requires 'retired'",
+                spec.desired_state.as_str()
+            ),
+        });
+    }
+    let live = spec
+        .tasks
+        .iter()
+        .map(|task| {
+            task.id
+                .clone()
+                .unwrap_or_else(|| format!("{id}.{}", task.name))
+        })
+        .filter_map(|task_id| {
+            records
+                .get(&task_id)
+                .map(|alive| format!("{task_id} ({})", if *alive { "alive" } else { "dead" }))
+        })
+        .collect::<Vec<_>>();
+    if !live.is_empty() {
+        return Err(Refusal {
+            id,
+            code: "runtime-record-present",
+            message: format!("retirement is incomplete: {}", live.join(", ")),
+        });
+    }
+    let dependents = dependents(found, host, spec, leaving);
+    if !dependents.is_empty() {
+        return Err(supervisor_referenced(id, &dependents));
+    }
+    // A declaration re-created under a name the archive still holds — a `catalog apply` after
+    // an archival, say. Refusing it as one skip keeps the rest of the batch moving; letting
+    // `move_out` fail instead would abort every remaining candidate on every pass.
+    let occupied = archive_root(catalog).join(host).join(&identity);
+    if fs::symlink_metadata(&occupied).is_ok() {
+        return Err(Refusal {
+            id,
+            code: "archive-occupied",
+            message: format!(
+                "the archive already holds {}; unarchive it or move it aside first",
+                relative(catalog, &occupied).unwrap_or_else(|| occupied.display().to_string())
+            ),
+        });
+    }
+    Ok(Candidate {
+        id,
+        host: host.to_owned(),
+        identity,
+        reason: spec.desired_state.reason().map(str::to_owned),
+        from,
+    })
+}
+
+/// Bus IDs of the declarations outside `leaving` that name `spec` as their `supervisor`.
+fn dependents(
+    found: &crate::Discovered,
+    host: &str,
+    spec: &agent_spec::spec::AgentSpec,
+    leaving: &BTreeSet<&Path>,
+) -> Vec<String> {
+    found
+        .specs
+        .iter()
+        .filter(|other| !leaving.contains(other.path.as_path()))
+        .filter(|other| {
+            other.supervisor.as_deref().is_some_and(|supervisor| {
+                crate::supervisor_chain::resolve_spec(
+                    &found.specs,
+                    supervisor,
+                    other.resolved_host(host),
+                )
+                .is_some_and(|resolved| resolved.path == spec.path)
+            })
+        })
+        .map(|other| other.bus_id(host))
+        .collect()
+}
+
+fn supervisor_referenced(id: String, dependents: &[String]) -> Refusal {
+    Refusal {
+        id,
+        code: "supervisor-referenced",
+        message: format!("still supervises {}", dependents.join(", ")),
+    }
 }
 
 /// Rename the identity directory into the archive root, then record its tombstone.
@@ -844,6 +1001,10 @@ struct ObservationLedger {
     /// host → identity → epoch millis of the first observation.
     #[serde(default)]
     hosts: BTreeMap<String, BTreeMap<String, u64>>,
+    /// host → the identity the supervisor's bounded scan of due seats resumes after. Present only
+    /// while the last pass left due seats unexamined; retirement ledger only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resume_after: BTreeMap<String, String>,
 }
 
 /// Which observation ledger a read or write addresses.
@@ -867,27 +1028,24 @@ pub fn direct_dead_ledger_path(catalog: &Path) -> PathBuf {
 /// A lost ledger restarts every grace period, which errs toward keeping identities in the live
 /// catalog — the recoverable direction. Refusing the pass instead would let one unreadable control
 /// file stop reconciliation.
-fn read_ledger(catalog: &Path, ledger: &Ledger) -> BTreeMap<String, BTreeMap<String, u64>> {
+fn read_ledger(catalog: &Path, ledger: &Ledger) -> ObservationLedger {
+    let empty = || ObservationLedger {
+        schema: ledger.schema.to_owned(),
+        ..ObservationLedger::default()
+    };
     let Ok(body) = fs::read(catalog.join(CONTROL_DIR).join(ledger.file)) else {
-        return BTreeMap::new();
+        return empty();
     };
     match serde_json::from_slice::<ObservationLedger>(&body) {
-        Ok(read) if read.schema == ledger.schema => read.hosts,
-        _ => BTreeMap::new(),
+        Ok(read) if read.schema == ledger.schema => read,
+        _ => empty(),
     }
 }
 
-/// Replace a ledger atomically. The caller holds the exclusive authoring lock.
-fn write_ledger(
-    catalog: &Path,
-    ledger: &Ledger,
-    hosts: BTreeMap<String, BTreeMap<String, u64>>,
-) -> Result<()> {
-    let body = ObservationLedger {
-        schema: ledger.schema.to_owned(),
-        hosts,
-    };
-    let mut body = serde_json::to_vec_pretty(&body)?;
+/// Replace a ledger atomically with `contents`, as [`read_ledger`] returned and the caller then
+/// updated. The caller holds the exclusive authoring lock.
+fn write_ledger(catalog: &Path, ledger: &Ledger, contents: &ObservationLedger) -> Result<()> {
+    let mut body = serde_json::to_vec_pretty(contents)?;
     body.push(b'\n');
 
     let path = catalog.join(CONTROL_DIR).join(ledger.file);
@@ -987,7 +1145,7 @@ fn pass_has_work_at(
     now_ms: u64,
 ) -> bool {
     let retired = retired_identities(&found.specs, host);
-    let mut hosts = read_ledger(catalog, &RETIRED_LEDGER);
+    let mut hosts = read_ledger(catalog, &RETIRED_LEDGER).hosts;
     let (changed, due) = observe_retirements(&mut hosts, host, &retired, grace, now_ms);
     if changed || !due.is_empty() {
         return true;
@@ -997,7 +1155,7 @@ fn pass_has_work_at(
         return true;
     };
     let dead = dead_direct_identities(&actors, running_pty);
-    let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
+    let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER).hosts;
     let (changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
     changed || !due.is_empty()
 }

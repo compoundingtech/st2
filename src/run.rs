@@ -2137,8 +2137,8 @@ fn archive_expired_retirements(
     match attempt {
         // Contended: someone is authoring the catalog right now, and the seats stay due.
         Ok(None) => {}
-        Ok(Some(result)) => {
-            for entry in result.archived {
+        Ok(Some(pass)) => {
+            for entry in pass.archive.archived {
                 tracing::info!(
                     target: "st2",
                     id = %entry.id,
@@ -2147,10 +2147,16 @@ fn archive_expired_retirements(
                 );
                 report.archived.push(entry.id);
             }
-            for refusal in result.refused {
+            for refusal in pass.archive.refused {
                 report.warnings.push(format!(
                     "auto-archive skipped {} [{}] {}",
                     refusal.id, refusal.code, refusal.message
+                ));
+            }
+            if pass.deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due retired seats and deferred {} to the next pass",
+                    pass.scanned, pass.deferred
                 ));
             }
         }

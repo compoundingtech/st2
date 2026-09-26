@@ -1264,6 +1264,18 @@ the same fail-closed eligibility as the verb and archiving at most 25 seats per
 pass so one pass stays bounded. The bound counts only seats that pass
 eligibility: a due seat the step refuses is reported and does not consume it,
 so refusals that recur every pass never starve the seats behind them. The step
+builds its batch incrementally: due seats are walked in identity order and
+each is judged against the seats already accepted this pass, which are the
+only ones counted as leaving. A supervisor whose retired dependent is not yet
+in the batch is refused as `supervisor-referenced` and leaves on a later pass,
+after the dependent, so the 25-seat cutoff never separates a supervisor from a
+dependent that still names it. The batch is re-checked against that rule
+before any move. The scan is bounded too: one pass examines at most 100 due
+seats (four times the archive bound), stops early once 25 are accepted, and
+reports the unexamined remainder as `auto-archive examined <n> due retired
+seats and deferred <m> to the next pass`. The next pass resumes the walk after
+the last seat examined, wrapping around, so a run of permanently refused seats
+cannot hold every pass's window. The step
 runs after the pass releases its shared lock and takes the exclusive lock
 non-blockingly: a contended lock skips the step, because a pass queued behind
 `st2 catalog apply` would stall every live agent's reconciliation and a due
@@ -1271,11 +1283,13 @@ seat is still due next pass. st2 records no
 timestamp for a desired-state edit, so the grace period is measured from the
 supervisor's first observation of the retirement, kept in
 `.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
-identity → epoch millis and never in the spec. That ledger is reconciled to
+identity → epoch millis and never in the spec. The same ledger keeps the
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due seats unexamined. That ledger is reconciled to
 exactly the currently retired seats on every pass it runs, so a seat that comes
 back drops its row and a second retirement serves a fresh grace period; an
-absent or unreadable ledger restarts every clock, which errs toward keeping
-seats in the live catalog.
+absent or unreadable ledger restarts every clock and the scan, which errs
+toward keeping seats in the live catalog.
 
 The same supervisor step archives dead direct OMP actors (R48), because nothing
 else retires them: they have no declaration to retire. st2 owns this lifecycle
@@ -1326,7 +1340,9 @@ direct actor exists, and moves bytes only on that fresh read. Ordering within
 one pass:
 
 1. Eligible retired seats due under the retirement ledger fill the
-   25-per-pass bound first; due seats the step refuses do not count.
+   25-per-pass bound first, within the 100-seat scan window above; due seats
+   the step refuses do not count, and a supervisor never takes a slot ahead of
+   a retired dependent that is not in the batch.
 2. Direct actors dead for at least `archive-after` fill what remains, in
    identity order.
 3. A due actor whose `.st2/archive/<host>/<identity>` slot already exists is a
