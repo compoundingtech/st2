@@ -181,14 +181,24 @@ pub fn archive(request: ArchiveRequest) -> Result<ArchiveResult> {
     let catalog = canonical(&request.catalog)?;
     let lock = CatalogLock::exclusive(&catalog)?;
     let found = discovered(&catalog)?;
+    let (candidates, refused) = plan(&catalog, &request.host, &found, &request.selection)?;
+    if let Selection::Identities(_) = request.selection
+        && let Some(refusal) = refused.first()
+    {
+        anyhow::bail!(
+            "refusing to archive {}: [{}] {}",
+            refusal.id,
+            refusal.code,
+            refusal.message
+        );
+    }
     archive_locked(
         &lock,
         &catalog,
-        &found,
         &request.host,
-        &request.selection,
         request.dry_run,
-        (Vec::new(), Vec::new()),
+        candidates,
+        refused,
     )
 }
 
@@ -218,38 +228,36 @@ fn auto_archive_at(request: AutoArchiveRequest, now_ms: u64) -> Result<Option<Ar
     // seat's clock; the rows the move retires are pruned by the next pass's reconciliation.
     let mut hosts = read_ledger(&catalog, &RETIRED_LEDGER);
     let retired = retired_identities(&found.specs, &request.host);
-    let (changed, mut due) =
+    let (changed, due) =
         observe_retirements(&mut hosts, &request.host, &retired, request.grace, now_ms);
     if changed {
         write_ledger(&catalog, &RETIRED_LEDGER, hosts)?;
     }
-    due.truncate(request.limit);
+    // The bound applies to seats that can actually leave. Truncating the due list before `plan`
+    // would let the same refused seats fill every pass's window and starve the rest.
+    let (mut candidates, mut refused) =
+        plan(&catalog, &request.host, &found, &Selection::Due(due))?;
+    candidates.truncate(request.limit);
 
-    let direct = due_direct_actors(
+    let (direct, direct_refused) = due_direct_actors(
         &catalog,
         &found,
         &request.host,
         request.grace,
-        request.limit - due.len(),
+        request.limit - candidates.len(),
         now_ms,
     )?;
-    archive_locked(
-        &lock,
-        &catalog,
-        &found,
-        &request.host,
-        &Selection::Due(due),
-        false,
-        direct,
-    )
-    .map(Some)
+    candidates.extend(direct);
+    refused.extend(direct_refused);
+    archive_locked(&lock, &catalog, &request.host, false, candidates, refused).map(Some)
 }
 
 /// Observe this host's direct OMP actors against a fresh PTY registry read and plan the ones
 /// whose death outlived `grace`, at most `limit` of them.
 ///
-/// Death is exact evidence only: the identity decodes to one PTY session ID, and the registry the
-/// catalog's supervisor manages holds no running record for it. A PTY that runs again drops its
+/// Death is exact evidence only: the identity decodes to one PTY session ID, and the PTY registry
+/// the catalog's supervisor manages holds no running record for it. `exec` task records are not
+/// PTY evidence, so one sharing the ID keeps nothing alive. A PTY that runs again drops its
 /// ledger row, so a later death serves a fresh grace period. The registry read happens under the
 /// exclusive lock and only when a direct actor exists, so a catalog without them pays nothing.
 ///
@@ -268,12 +276,15 @@ fn due_direct_actors(
     let dead = if actors.is_empty() {
         BTreeSet::new()
     } else {
-        let runner =
-            crate::run::SystemRunner::new(catalog.to_path_buf(), crate::run::exec_state_dir(host));
-        let sessions = runner
+        let sessions = crate::run::PtyCli::new(catalog.to_path_buf())
             .list_sessions()
             .context("read PTY registry for direct actor liveness")?;
-        dead_direct_identities(&actors, &sessions)
+        let running: BTreeSet<String> = sessions
+            .into_iter()
+            .filter(|session| session.alive)
+            .map(|session| session.pty_id)
+            .collect();
+        dead_direct_identities(&actors, &running)
     };
     let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
     let (mut changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
@@ -322,48 +333,27 @@ fn due_direct_actors(
     Ok((candidates, refused))
 }
 
-/// The identities of `actors` whose PTY session has no running record in `sessions`.
+/// The identities of `actors` whose PTY session is not among the `running` PTY session IDs.
 fn dead_direct_identities(
     actors: &[crate::direct_actor::DirectActor],
-    sessions: &[crate::Session],
+    running: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    let running: BTreeSet<&str> = sessions
-        .iter()
-        .filter(|session| session.alive)
-        .map(|session| session.pty_id.as_str())
-        .collect();
     actors
         .iter()
-        .filter(|actor| !running.contains(actor.pty_id.as_str()))
+        .filter(|actor| !running.contains(&actor.pty_id))
         .map(|actor| actor.identity.clone())
         .collect()
 }
 
-/// Archive under a lock the caller already holds, against a discovery it already made.
+/// Archive planned candidates under a lock the caller already holds.
 fn archive_locked(
     lock: &CatalogLock,
     catalog: &Path,
-    found: &crate::Discovered,
     host: &str,
-    selection: &Selection,
     dry_run: bool,
-    (direct, direct_refused): (Vec<Candidate>, Vec<Refusal>),
+    candidates: Vec<Candidate>,
+    refused: Vec<Refusal>,
 ) -> Result<ArchiveResult> {
-    let (mut candidates, mut refused) = plan(catalog, host, found, selection)?;
-
-    if let Selection::Identities(_) = selection
-        && let Some(refusal) = refused.first()
-    {
-        anyhow::bail!(
-            "refusing to archive {}: [{}] {}",
-            refusal.id,
-            refusal.code,
-            refusal.message
-        );
-    }
-    candidates.extend(direct);
-    refused.extend(direct_refused);
-
     let root = archive_root(catalog);
     let mut archived = Vec::new();
     if candidates.is_empty() || dry_run {
@@ -916,7 +906,8 @@ fn write_ledger(
     drop(file);
     if let Err(error) = fs::rename(&staged, &path) {
         let _ = fs::remove_file(&staged);
-        return Err(error).with_context(|| format!("install observation ledger {}", path.display()));
+        return Err(error)
+            .with_context(|| format!("install observation ledger {}", path.display()));
     }
     sync_dir(control)
 }
@@ -966,24 +957,32 @@ fn observe_retirements(
 ///
 /// Answered from the discovery and PTY registry snapshot the pass already made, one two-level
 /// directory read, and two small JSON reads, so a steady catalog pays neither a second discovery
-/// nor a second `pty list`. Deliberately advisory: the decision that moves bytes is re-made under
-/// the exclusive lock, because a seat can be un-retired, or a PTY restarted, between this
-/// question and that lock.
+/// nor a second `pty list`. `running_pty` holds the IDs the PTY backend alone reported running;
+/// `exec` records are not direct actor liveness. Deliberately advisory: the decision that moves
+/// bytes is re-made under the exclusive lock, because a seat can be un-retired, or a PTY
+/// restarted, between this question and that lock.
 pub fn pass_has_work(
     catalog: &Path,
     host: &str,
     found: &crate::Discovered,
-    sessions: &[crate::Session],
+    running_pty: &BTreeSet<String>,
     grace: Duration,
 ) -> bool {
-    pass_has_work_at(catalog, host, found, sessions, grace, crate::message::now_ms())
+    pass_has_work_at(
+        catalog,
+        host,
+        found,
+        running_pty,
+        grace,
+        crate::message::now_ms(),
+    )
 }
 
 fn pass_has_work_at(
     catalog: &Path,
     host: &str,
     found: &crate::Discovered,
-    sessions: &[crate::Session],
+    running_pty: &BTreeSet<String>,
     grace: Duration,
     now_ms: u64,
 ) -> bool {
@@ -997,7 +996,7 @@ fn pass_has_work_at(
     let Ok(actors) = crate::direct_actor::discover(catalog, found, Some(host)) else {
         return true;
     };
-    let dead = dead_direct_identities(&actors, sessions);
+    let dead = dead_direct_identities(&actors, running_pty);
     let mut hosts = read_ledger(catalog, &DIRECT_DEAD_LEDGER);
     let (changed, due) = observe_retirements(&mut hosts, host, &dead, grace, now_ms);
     changed || !due.is_empty()
@@ -1176,18 +1175,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_running_record_for_the_exact_pty_id_keeps_a_direct_actor_alive() {
+    fn only_the_exact_running_pty_id_keeps_a_direct_actor_alive() {
         let actor = |segment: &str| crate::direct_actor::DirectActor {
             host: HOST.to_owned(),
             identity: format!("direct.omp.{segment}"),
             pty_id: crate::direct_actor::decode_pty_segment(segment).unwrap(),
             dir: PathBuf::from(format!("/catalog/agents/h/direct.omp.{segment}")),
-        };
-        let session = |pty_id: &str, alive: bool| crate::Session {
-            pty_id: pty_id.to_owned(),
-            alive,
-            exit_code: None,
-            presentation: None,
         };
         let actors = [
             actor("e2jcd9pf"),
@@ -1195,15 +1188,10 @@ mod tests {
             actor("x-776562"),
             actor("3bk3wt7v"),
         ];
-        let sessions = [
-            session("e2jcd9pf", true),
-            session("2ahzpbs3", false),
-            session("web", true),
-            // A running session whose ID merely contains the actor's is not its session.
-            session("3bk3wt7v-child", true),
-        ];
+        // A running session whose ID merely contains the actor's is not its session.
+        let running = retired(&["e2jcd9pf", "web", "3bk3wt7v-child"]);
         assert_eq!(
-            dead_direct_identities(&actors, &sessions),
+            dead_direct_identities(&actors, &running),
             retired(&["direct.omp.2ahzpbs3", "direct.omp.3bk3wt7v"])
         );
     }

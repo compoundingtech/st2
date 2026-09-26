@@ -11,7 +11,7 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt as _;
@@ -106,6 +106,13 @@ pub trait Runner {
     }
     /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+    /// The ids the PTY backend alone reported running in the last `list_sessions`. Direct OMP
+    /// actor liveness is PTY evidence only, so a running `exec` task that shares the id must not
+    /// count. `None` means the runner has no separate PTY backend: every running row of its
+    /// snapshot is PTY evidence.
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        None
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -924,6 +931,9 @@ pub struct SystemRunner {
     exec: ExecBackend,
     /// id → kind, refreshed each `list_sessions`, so kill/remove hit the right backend.
     index: RefCell<HashMap<String, TaskKind>>,
+    /// Ids the PTY backend reported running in the last `list_sessions`. Kept apart from `index`,
+    /// which an `exec` record with the same id overwrites.
+    running_pty: RefCell<BTreeSet<String>>,
 }
 
 impl SystemRunner {
@@ -933,6 +943,7 @@ impl SystemRunner {
             pty: PtyCli::new(catalog_root.clone()),
             exec: ExecBackend::new(exec_state_dir, catalog_root),
             index: RefCell::new(HashMap::new()),
+            running_pty: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -1036,12 +1047,21 @@ impl Runner for SystemRunner {
         for s in &all {
             idx.insert(s.pty_id.clone(), TaskKind::Pty);
         }
+        *self.running_pty.borrow_mut() = all
+            .iter()
+            .filter(|s| s.alive)
+            .map(|s| s.pty_id.clone())
+            .collect();
         let ex = self.exec.list()?;
         for s in &ex {
             idx.insert(s.pty_id.clone(), TaskKind::Exec);
         }
         all.extend(ex);
         Ok(all)
+    }
+
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        Some(self.running_pty.borrow().clone())
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -2058,7 +2078,7 @@ fn reconcile_pass_with_residency(
     // exclusive lock, which is what makes its eligibility decision current rather than a snapshot
     // this pass took before it launched anything.
     drop(catalog_lock);
-    archive_expired_retirements(root, this_host, &found, &sessions, &mut report);
+    archive_expired_retirements(root, this_host, &found, runner, &sessions, &mut report);
     report
 }
 
@@ -2078,6 +2098,7 @@ fn archive_expired_retirements(
     root: &Path,
     this_host: &str,
     found: &crate::Discovered,
+    runner: &dyn Runner,
     sessions: &[Session],
     report: &mut UpReport,
 ) {
@@ -2090,9 +2111,19 @@ fn archive_expired_retirements(
             return;
         }
     };
-    if grace.is_zero()
-        || !crate::catalog_archive::pass_has_work(root, this_host, found, sessions, grace)
-    {
+    if grace.is_zero() {
+        return;
+    }
+    // Direct actor liveness is PTY evidence only: an `exec` task sharing a dead actor's PTY id
+    // must not keep the actor live.
+    let running_pty = runner.running_pty_ids().unwrap_or_else(|| {
+        sessions
+            .iter()
+            .filter(|session| session.alive)
+            .map(|session| session.pty_id.clone())
+            .collect()
+    });
+    if !crate::catalog_archive::pass_has_work(root, this_host, found, &running_pty, grace) {
         return;
     }
 

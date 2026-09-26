@@ -1261,10 +1261,13 @@ The supervisor closes the same edge without an operator. Each `st2 up` reconcile
 pass ends by archiving every local seat whose retirement outlived the catalog's
 `archive-after` grace period (default `7d`; `"0"` disables the step), applying
 the same fail-closed eligibility as the verb and archiving at most 25 seats per
-pass so one pass stays bounded. The step runs after the pass releases its shared
-lock and takes the exclusive lock non-blockingly: a contended lock skips the
-step, because a pass queued behind `st2 catalog apply` would stall every live
-agent's reconciliation and a due seat is still due next pass. st2 records no
+pass so one pass stays bounded. The bound counts only seats that pass
+eligibility: a due seat the step refuses is reported and does not consume it,
+so refusals that recur every pass never starve the seats behind them. The step
+runs after the pass releases its shared lock and takes the exclusive lock
+non-blockingly: a contended lock skips the step, because a pass queued behind
+`st2 catalog apply` would stall every live agent's reconciliation and a due
+seat is still due next pass. st2 records no
 timestamp for a desired-state edit, so the grace period is measured from the
 supervisor's first observation of the retirement, kept in
 `.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
@@ -1287,11 +1290,13 @@ stateDiagram-v2
     archived --> live: st2 catalog unarchive (fresh clock)
 ```
 
-Liveness is exact registry evidence. On the local host only, a direct actor is
-dead when the catalog's effective PTY registry — the one the pass already
-lists — holds no `running` record whose session ID equals its decoded `ptyId`
-byte for byte; an exited record, a vanished record, and an absent one are the
-same fact, and a running session whose ID merely contains the actor's does not
+Liveness is exact PTY registry evidence. On the local host only, a direct
+actor is dead when the catalog's effective PTY registry — the one the pass
+already lists — holds no `running` record whose session ID equals its decoded
+`ptyId` byte for byte; an exited record, a vanished record, and an absent one
+are the same fact, and a running session whose ID merely contains the actor's
+does not keep it alive. Only the PTY backend counts: a running `exec` task
+whose runtime ID equals the `ptyId` is not the actor's session and does not
 keep it alive. Another host's registry is not observable, so its direct actors
 are never judged.
 
@@ -1315,12 +1320,13 @@ toward keeping actors live.
 The step obeys the same gates as retired-seat archival: `archive-after "0"`
 disables it, a contended exclusive lock skips it, and an incomplete strict
 discovery refuses it. The pass decides whether the step has work from its own
-discovery and registry snapshot; the step then re-reads the registry under the
-exclusive lock, only when a local direct actor exists, and moves bytes only on
-that fresh read. Ordering within one pass:
+discovery and the PTY backend's part of its registry snapshot; the step then
+re-reads the PTY registry alone under the exclusive lock, only when a local
+direct actor exists, and moves bytes only on that fresh read. Ordering within
+one pass:
 
-1. Retired seats due under the retirement ledger fill the 25-per-pass bound
-   first.
+1. Eligible retired seats due under the retirement ledger fill the
+   25-per-pass bound first; due seats the step refuses do not count.
 2. Direct actors dead for at least `archive-after` fill what remains, in
    identity order.
 3. A due actor whose `.st2/archive/<host>/<identity>` slot already exists is a
