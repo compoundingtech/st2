@@ -11,7 +11,7 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt as _;
@@ -106,6 +106,13 @@ pub trait Runner {
     }
     /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+    /// The ids the PTY backend alone reported running in the last `list_sessions`. Direct OMP
+    /// actor liveness is PTY evidence only, so a running `exec` task that shares the id must not
+    /// count. `None` means the runner has no separate PTY backend: every running row of its
+    /// snapshot is PTY evidence.
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        None
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -924,6 +931,9 @@ pub struct SystemRunner {
     exec: ExecBackend,
     /// id → kind, refreshed each `list_sessions`, so kill/remove hit the right backend.
     index: RefCell<HashMap<String, TaskKind>>,
+    /// Ids the PTY backend reported running in the last `list_sessions`. Kept apart from `index`,
+    /// which an `exec` record with the same id overwrites.
+    running_pty: RefCell<BTreeSet<String>>,
 }
 
 impl SystemRunner {
@@ -933,6 +943,7 @@ impl SystemRunner {
             pty: PtyCli::new(catalog_root.clone()),
             exec: ExecBackend::new(exec_state_dir, catalog_root),
             index: RefCell::new(HashMap::new()),
+            running_pty: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -1036,12 +1047,21 @@ impl Runner for SystemRunner {
         for s in &all {
             idx.insert(s.pty_id.clone(), TaskKind::Pty);
         }
+        *self.running_pty.borrow_mut() = all
+            .iter()
+            .filter(|s| s.alive)
+            .map(|s| s.pty_id.clone())
+            .collect();
         let ex = self.exec.list()?;
         for s in &ex {
             idx.insert(s.pty_id.clone(), TaskKind::Exec);
         }
         all.extend(ex);
         Ok(all)
+    }
+
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        Some(self.running_pty.borrow().clone())
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -1159,8 +1179,8 @@ pub struct UpReport {
     pub other_host: Vec<String>,
     /// identities with no runnable task (unrendered).
     pub unrunnable: Vec<String>,
-    /// bus ids archived out of the live catalog this pass because their retirement outlived
-    /// `archive-after`.
+    /// bus ids archived out of the live catalog this pass because their retirement, or a direct
+    /// OMP actor's PTY death, outlived `archive-after`.
     pub archived: Vec<String>,
     /// discovery warnings (mismatches, …).
     pub warnings: Vec<String>,
@@ -2058,7 +2078,7 @@ fn reconcile_pass_with_residency(
     // exclusive lock, which is what makes its eligibility decision current rather than a snapshot
     // this pass took before it launched anything.
     drop(catalog_lock);
-    archive_expired_retirements(root, this_host, &found.specs, &mut report);
+    archive_expired_retirements(root, this_host, &found, runner, &sessions, &mut report);
     report
 }
 
@@ -2067,8 +2087,8 @@ fn reconcile_pass_with_residency(
 /// them — the same bound `MAX_PRESENTATION_PATCHES_PER_PASS` puts on presentation repair.
 const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 
-/// Archive retired seats whose grace period expired — the supervisor's half of
-/// `st2 catalog archive` (dotfiles#2411, Q11).
+/// Archive retired seats and dead direct OMP actors whose grace period expired — the supervisor's
+/// half of `st2 catalog archive` (dotfiles#2411, Q11).
 ///
 /// `archive-after "0"` in `catalog.kdl` disables the step entirely. It never queues for the
 /// exclusive lock: a pass blocked behind `st2 catalog apply` would stall every live agent's
@@ -2077,7 +2097,9 @@ const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 fn archive_expired_retirements(
     root: &Path,
     this_host: &str,
-    specs: &[agent_spec::spec::AgentSpec],
+    found: &crate::Discovered,
+    runner: &dyn Runner,
+    sessions: &[Session],
     report: &mut UpReport,
 ) {
     let grace = match crate::catalog::load(root) {
@@ -2089,7 +2111,19 @@ fn archive_expired_retirements(
             return;
         }
     };
-    if grace.is_zero() || !crate::catalog_archive::pass_has_work(root, this_host, specs, grace) {
+    if grace.is_zero() {
+        return;
+    }
+    // Direct actor liveness is PTY evidence only: an `exec` task sharing a dead actor's PTY id
+    // must not keep the actor live.
+    let running_pty = runner.running_pty_ids().unwrap_or_else(|| {
+        sessions
+            .iter()
+            .filter(|session| session.alive)
+            .map(|session| session.pty_id.clone())
+            .collect()
+    });
+    if !crate::catalog_archive::pass_has_work(root, this_host, found, &running_pty, grace) {
         return;
     }
 
@@ -2103,20 +2137,32 @@ fn archive_expired_retirements(
     match attempt {
         // Contended: someone is authoring the catalog right now, and the seats stay due.
         Ok(None) => {}
-        Ok(Some(result)) => {
-            for entry in result.archived {
+        Ok(Some(pass)) => {
+            for entry in pass.archive.archived {
                 tracing::info!(
                     target: "st2",
                     id = %entry.id,
                     to = %entry.to,
-                    "archived a retired agent out of the live catalog"
+                    "archived an agent out of the live catalog"
                 );
                 report.archived.push(entry.id);
             }
-            for refusal in result.refused {
+            for refusal in pass.archive.refused {
                 report.warnings.push(format!(
                     "auto-archive skipped {} [{}] {}",
                     refusal.id, refusal.code, refusal.message
+                ));
+            }
+            if pass.deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due retired seats and deferred {} to the next pass",
+                    pass.scanned, pass.deferred
+                ));
+            }
+            if pass.direct_deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due dead direct actors and deferred {} to the next pass",
+                    pass.direct_scanned, pass.direct_deferred
                 ));
             }
         }

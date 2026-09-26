@@ -1173,6 +1173,58 @@ these admitted facts rather than walking supervisor edges themselves. The
 `desiredState: "retired"`; an absent lifecycle stays null, which lowers to
 running.
 
+The same envelope publishes every actor's resource root (R47) as a
+catalog-relative directory, the subject boundary under which the actor's
+declaration-anchored state, driver records, and `resources/` live. Both fields
+are appended to `st2.catalog-graph.v2` without a schema bump: a reader that
+ignores unknown fields reads the envelope unchanged, and neither field affects
+`complete`.
+
+```json
+{
+  "agents": [{ "id": "dev3.worker", "resourceRoot": "agents/dev3/worker" }],
+  "directActors": [
+    {
+      "id": "dev3.direct.omp.e2jcd9pf",
+      "host": "dev3",
+      "identity": "direct.omp.e2jcd9pf",
+      "ptyId": "e2jcd9pf",
+      "resourceRoot": "agents/dev3/direct.omp.e2jcd9pf"
+    }
+  ]
+}
+```
+
+Each `agents` row carries `resourceRoot`, its declaration's parent directory —
+the directory st2 itself resolves for that agent's inbox and context. A direct
+OMP actor has no declaration: its entrypoint derives
+`ST_AGENT=<host>.direct.omp.<encoded-pty-id>` from `PTY_SESSION`, and writers
+create `agents/<host>/direct.omp.<encoded-pty-id>/` lazily under that identity.
+`id` is byte-identical to that `ST_AGENT`. The `directActors` array lists every
+such directory across all hosts, sorted by host then identity. Direct actors
+never enter `agents`, and an archived one is an `archived` row like any other
+identity. Consumers fold per-actor views at these roots and never infer
+subject boundaries themselves.
+
+The PTY segment codec is shared with the dotfiles `agent-identity
+encode-pty`/`decode-pty` contract and is strict and reversible:
+
+| PTY session ID | Segment | Example |
+| --- | --- | --- |
+| PTY-generated: 8 characters from `23456789abcdefghjkmnpqrstuvwxyz` | the ID itself | `e2jcd9pf` → `e2jcd9pf` |
+| any other valid ID: 1–255 bytes of `[A-Za-z0-9._-]`, not `.` or `..` | `x-` plus its lowercase hex bytes | `web` → `x-776562` |
+| invalid ID | none; no identity exists | `a/b` |
+
+Decoding accepts only the canonical encoding of a valid ID: `x-` over a
+generated ID, uppercase or odd-length hex, and non-UTF-8 bytes all fail, so two
+segments never name the same PTY session and `ptyId` is exact. Discovery reads
+exactly two directory levels, `agents/<host>/<identity>`, and never descends
+into an actor's contents. An entry is a direct actor only when it is a real
+directory (a symlink is not), its name is `direct.omp.` plus a segment that
+decodes, and no declaration — parsed or failed — lives beneath it; a declared
+identity is a declared actor whatever its name looks like. Nothing reads names
+beyond the codec, cwd, process ancestry, activity, or mtimes.
+
 Retired reconciliation first attempts every live task teardown for the agent.
 Only when all of those attempts succeed does it settle the declaration's whole
 inbox; one failure leaves every inbox file untouched and the next pass retries
@@ -1209,18 +1261,116 @@ The supervisor closes the same edge without an operator. Each `st2 up` reconcile
 pass ends by archiving every local seat whose retirement outlived the catalog's
 `archive-after` grace period (default `7d`; `"0"` disables the step), applying
 the same fail-closed eligibility as the verb and archiving at most 25 seats per
-pass so one pass stays bounded. The step runs after the pass releases its shared
-lock and takes the exclusive lock non-blockingly: a contended lock skips the
-step, because a pass queued behind `st2 catalog apply` would stall every live
-agent's reconciliation and a due seat is still due next pass. st2 records no
+pass so one pass stays bounded. The bound counts only seats that pass
+eligibility: a due seat the step refuses is reported and does not consume it,
+so refusals that recur every pass never starve the seats behind them. The step
+builds its batch incrementally: due seats are walked in identity order and
+each is judged against the seats already accepted this pass, which are the
+only ones counted as leaving. A supervisor whose retired dependent is not yet
+in the batch is refused as `supervisor-referenced` and leaves on a later pass,
+after the dependent, so the 25-seat cutoff never separates a supervisor from a
+dependent that still names it. The batch is re-checked against that rule
+before any move. The scan is bounded too: one pass examines at most 100 due
+seats (four times the archive bound), stops early once 25 are accepted, and
+reports the unexamined remainder as `auto-archive examined <n> due retired
+seats and deferred <m> to the next pass`. The next pass resumes the walk after
+the last seat examined, wrapping around, so a run of permanently refused seats
+cannot hold every pass's window. The step
+runs after the pass releases its shared lock and takes the exclusive lock
+non-blockingly: a contended lock skips the step, because a pass queued behind
+`st2 catalog apply` would stall every live agent's reconciliation and a due
+seat is still due next pass. st2 records no
 timestamp for a desired-state edit, so the grace period is measured from the
 supervisor's first observation of the retirement, kept in
 `.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
-identity → epoch millis and never in the spec. That ledger is reconciled to
+identity → epoch millis and never in the spec. The same ledger keeps the
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due seats unexamined. That ledger is reconciled to
 exactly the currently retired seats on every pass it runs, so a seat that comes
 back drops its row and a second retirement serves a fresh grace period; an
-absent or unreadable ledger restarts every clock, which errs toward keeping
-seats in the live catalog.
+absent or unreadable ledger restarts every clock and the scan, which errs
+toward keeping seats in the live catalog.
+
+The same supervisor step archives dead direct OMP actors (R48), because nothing
+else retires them: they have no declaration to retire. st2 owns this lifecycle
+([`0018-st2-owns-direct-actor-lifecycle`](.decisions/0018-st2-owns-direct-actor-lifecycle.md)).
+
+```mermaid
+stateDiagram-v2
+    [*] --> live: writer creates agents/<host>/direct.omp.<segment>
+    live --> deadObserved: no running record (row written)
+    deadObserved --> live: running record for ptyId (row dropped)
+    deadObserved --> archived: dead for archive-after (row dropped, rename + tombstone)
+    archived --> live: st2 catalog unarchive (fresh clock)
+```
+
+Liveness is exact PTY registry evidence. On the local host only, a direct
+actor is dead when the catalog's effective PTY registry — the one the pass
+already lists — holds no `running` record whose session ID equals its decoded
+`ptyId` byte for byte; an exited record, a vanished record, and an absent one
+are the same fact, and a running session whose ID merely contains the actor's
+does not keep it alive. Only the PTY backend counts: a running `exec` task
+whose runtime ID equals the `ptyId` is not the actor's session and does not
+keep it alive. Another host's registry is not observable, so its direct actors
+are never judged.
+
+Deaths are observed in `.st2/direct-dead-observed.json`, the same shape as the
+retirement ledger:
+
+```json
+{
+  "schema": "st2.catalog-direct-dead-observed.v1",
+  "hosts": { "dev3": { "direct.omp.2ahzpbs3": 1790000000000 } }
+}
+```
+
+Each value is the epoch millis of the supervisor's first observation of that
+death. Every pass that runs the step reconciles the local host's map to
+exactly the currently dead actors: a PTY that runs again drops its row, so a
+later death serves a fresh grace period. The ledger also keeps the direct scan's
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due actors unexamined. An absent, unreadable, or foreign-schema ledger
+reads as empty and restarts every clock and the scan, which errs toward keeping
+actors live.
+
+The step obeys the same gates as retired-seat archival: `archive-after "0"`
+disables it, a contended exclusive lock skips it, and an incomplete strict
+discovery refuses it. The pass decides whether the step has work from its own
+discovery and the PTY backend's part of its registry snapshot; the step then
+re-reads the PTY registry alone under the exclusive lock, only when a local
+direct actor exists, and moves bytes only on that fresh read. Ordering within
+one pass:
+
+1. Eligible retired seats due under the retirement ledger fill the
+   25-per-pass bound first, within the 100-seat scan window above; due seats
+   the step refuses do not count, and a supervisor never takes a slot ahead of
+   a retired dependent that is not in the batch.
+2. Direct actors dead for at least `archive-after` fill what remains, in
+   identity order, starting after the ledger's resume point and wrapping
+   around. The scan is bounded like the retired-seat scan: it examines at most
+   four times the remaining bound (100 when no retired seat was accepted),
+   stops early once the remaining bound is filled, and reports the unexamined
+   remainder as `auto-archive examined <n> due dead direct actors and deferred
+   <m> to the next pass`; the next pass resumes after the last actor examined.
+3. A due actor whose `.st2/archive/<host>/<identity>` slot already exists is a
+   reported `archive-occupied` refusal. It does not consume the bound but does
+   consume the scan window, and keeps its ledger row, so it is retried whenever
+   the scan reaches it again until the slot is cleared.
+4. The rows of the selected actors are dropped in the same ledger write,
+   before the moves.
+5. Each selected actor is archived exactly like a retired seat, inside the same
+   generation commit: whole-directory rename to `.st2/archive/<host>/<identity>`
+   plus a tombstone whose `reason` is
+   `direct OMP actor: PTY session <ptyId> has no running record`.
+
+Dropping rows before the move means a failed move keeps the actor live for
+another full grace period, and `st2 catalog unarchive` restores the directory
+with no row, so the restored actor serves a fresh grace period instead of
+leaving again on the next pass. `st2 catalog archive` selects declarations only
+and refuses a direct actor as `unknown-identity`; the supervisor step is the
+only way a direct actor leaves. Nothing is deleted: the directory's bytes,
+`resources/tmp` included, move whole. How long an archived identity is
+retained is open ([DQ6](#open-design-questions)).
 
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:
@@ -1728,3 +1878,12 @@ the resident supervisor continues to reconcile the complete local catalog.
   a failure signal that does not block provider startup, is distinguishable
   from an ordinary cold start, and reaches the responsible supervisor under
   R17.
+- **DQ6 Archive retention (R48):** Archival moves whole identity
+  directories, `resources/tmp` included, and nothing ever prunes
+  `.st2/archive`, so the archive grows without bound and can dominate a
+  long-lived catalog's tree. Any retention rule is irreversible, unlike
+  archival itself. Resolve by choosing what an archived identity keeps
+  (declaration, decisions, notes, tombstone) versus what may be dropped or
+  packed, naming the owner of that deletion, and deciding whether the
+  per-seat `resources/tmp` budget is enforced before archival. See
+  [#530](https://github.com/compoundingtech/st2/issues/530).

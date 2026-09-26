@@ -18,6 +18,7 @@ pub mod claude_session;
 pub mod codex_app_server;
 pub mod context;
 pub mod delivery_ledger;
+pub mod direct_actor;
 pub mod ding;
 pub mod driver;
 pub mod driver_diagnostic;

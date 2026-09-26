@@ -512,6 +512,14 @@ accepted.
   supervisor cycle, bounded-depth overflow, and a per-host root count other
   than exactly one are errors; affected topology facts are null and the graph
   is incomplete. Consumers do not reimplement those generic graph rules.
+- **R47 Published actor resource roots:** The admitted graph publishes one
+  catalog-relative resource root for every actor in the live catalog: each
+  declared agent's declaration directory, and each direct OMP actor directory
+  `agents/<host>/direct.omp.<encoded-pty-id>` that holds no declaration,
+  together with the exact PTY session ID its identity decodes to. Publication
+  is additive: the graph schema and completeness are unchanged. Consumers
+  bound per-actor views at these roots rather than inferring subject
+  boundaries from names, depth, or file shapes.
 - **R36 Explicit native delivery readiness:** Managed Claude, Codex, pi,
   OpenCode, OMP sessions declare their matching native session driver and one
   tagged delivery-readiness value. Credential readiness may name a non-secret
@@ -526,6 +534,17 @@ accepted.
   the durable receipt: repeated settlement and a sync-restored duplicate remove
   the inbox copy without overwriting the archived bytes. Suspension retains the
   inbox and does not settle it.
+- **R48 Direct actor archival:** A local direct OMP actor directory whose PTY
+  session has no running record in the catalog's PTY registry, continuously
+  for the catalog's `archive-after` grace period measured from the
+  supervisor's first observation of that death, leaves the live catalog
+  through the same structural archive and per-pass bound as a retired seat: a
+  whole-directory move plus a tombstone, reversible by `st2 catalog
+  unarchive`, nothing deleted. A PTY that runs again, and an unarchived actor,
+  each serve a fresh grace period. Liveness comes only from the strict
+  reversible PTY-ID decoding and the exact registry record; names, mtimes, and
+  activity never decide it. Archive retention is outside this requirement
+  ([DQ6](spec.md#open-design-questions)).
 - **R38 Codex schema admission:** Codex app-server launch is gated by an
   admitted fingerprint of the delivery-critical schema projection. Admission
   proves each emitted or consumed method discriminator is linked to its exact
