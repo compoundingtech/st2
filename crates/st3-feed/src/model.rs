@@ -1,3 +1,5 @@
+//! Bounded read-only projections, timeline history and event-cursor recovery.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result};
@@ -149,6 +151,8 @@ impl Model {
         Ok(())
     }
 
+    /// Consume events and refresh affected projections. Returns whether anything changed,
+    /// the sessions whose timelines changed, and whether a cursor gap required a full reload.
     pub async fn sync(&mut self, client: &Client) -> Result<(bool, Vec<String>, bool)> {
         let response = client
             .events(Some(&self.event_cursor), Some(PAGE_SIZE), Some(15_000))

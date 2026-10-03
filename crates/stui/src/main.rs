@@ -1,11 +1,12 @@
-mod cache;
 mod connection;
-mod feed;
-mod model;
-mod tree;
 mod ui;
 mod version;
 mod voice;
+
+#[cfg(test)]
+use st3_feed::terminal_screen_fence;
+use st3_feed as feed;
+use st3_feed::{action_pair, cache, model, terminal_fence, tree};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -1279,10 +1280,6 @@ impl App {
     }
 }
 
-fn action_pair() -> (String, String) {
-    let id = format!("action/{}", uuid::Uuid::now_v7());
-    (id.clone(), id)
-}
 fn mission_label(mission: &st3_client::Mission) -> String {
     let slug = mission.title.rsplit('/').next().unwrap_or(&mission.title);
     slug.split('-')
@@ -1899,25 +1896,6 @@ async fn detach_terminal(client: &Client, attached: &Attached) -> Result<()> {
         }
     }
     Ok(())
-}
-async fn terminal_fence(client: &Client, terminal_id: &str, incarnation: &str) -> Result<Fence> {
-    let screen = client.terminal_screen(terminal_id).await?;
-    terminal_screen_fence(&screen, incarnation)
-}
-fn terminal_screen_fence(
-    screen: &st3_client::Envelope<st3_client::TerminalScreen>,
-    incarnation: &str,
-) -> Result<Fence> {
-    anyhow::ensure!(
-        screen.value.runtime_incarnation == incarnation,
-        "terminal incarnation changed; reattach before sending input"
-    );
-    Ok(Fence {
-        snapshot_id: screen.snapshot.id.clone(),
-        runtime_incarnation: Some(incarnation.to_owned()),
-        terminal_sequence: Some(screen.value.next_sequence),
-        ..Fence::default()
-    })
 }
 async fn run_attention_action(
     app: &mut App,
