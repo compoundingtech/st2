@@ -1098,7 +1098,12 @@ fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
             } else {
                 format!("COALESCE({column},'')||'-changed'")
             };
-            transaction.execute(&format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), []).unwrap();
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1)"),
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("mutate {table}.{column}: {error}"));
             let current = projection_digest::tables(&transaction).unwrap();
             assert_eq!(
                 current,
